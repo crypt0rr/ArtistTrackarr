@@ -21,6 +21,7 @@ type Config struct {
 	TrustProxy         bool
 	SpotifyClientID    string
 	SpotifySecret      string
+	SpotifyMarket      string
 }
 
 func Load() (Config, error) {
@@ -44,6 +45,7 @@ func Load() (Config, error) {
 		TrustProxy:         strings.EqualFold(env("TRUST_PROXY", "false"), "true"),
 		SpotifyClientID:    strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
 		SpotifySecret:      secret("SPOTIFY_CLIENT_SECRET"),
+		SpotifyMarket:      strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 	}
 	if len(cfg.EncryptionKey) < 32 || len(cfg.SessionSecret) < 32 {
 		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must each be at least 32 characters")
@@ -53,6 +55,11 @@ func Load() (Config, error) {
 	}
 	if (cfg.SpotifyClientID == "") != (cfg.SpotifySecret == "") {
 		return Config{}, errors.New("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be configured together")
+	}
+	if len(cfg.SpotifyMarket) != 2 ||
+		cfg.SpotifyMarket[0] < 'A' || cfg.SpotifyMarket[0] > 'Z' ||
+		cfg.SpotifyMarket[1] < 'A' || cfg.SpotifyMarket[1] > 'Z' {
+		return Config{}, errors.New("SPOTIFY_MARKET must be a two-letter ISO country code")
 	}
 	return cfg, nil
 }

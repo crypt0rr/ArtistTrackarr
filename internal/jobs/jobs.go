@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 type Runner struct {
 	store      *store.Store
 	catalog    catalog.CatalogProvider
+	spotify    catalog.SpotifyReleaseProvider
 	normalizer catalog.ReleaseNormalizer
 	sender     notify.NotificationSender
 	cipher     *security.Cipher
@@ -23,12 +25,23 @@ type Runner struct {
 	syncMu     sync.Mutex
 }
 
+type Option func(*Runner)
+
+func WithSpotify(provider catalog.SpotifyReleaseProvider) Option {
+	return func(r *Runner) { r.spotify = provider }
+}
+
 func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.ReleaseNormalizer,
-	sender notify.NotificationSender, cipher *security.Cipher, interval time.Duration, logger *slog.Logger) *Runner {
-	return &Runner{
+	sender notify.NotificationSender, cipher *security.Cipher, interval time.Duration, logger *slog.Logger,
+	options ...Option) *Runner {
+	runner := &Runner{
 		store: s, catalog: provider, normalizer: normalizer, sender: sender,
 		cipher: cipher, interval: interval, logger: logger,
 	}
+	for _, option := range options {
+		option(runner)
+	}
+	return runner
 }
 
 func (r *Runner) Run(ctx context.Context) {
@@ -195,12 +208,32 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) error {
 }
 
 func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) error {
+	var batches []store.ReleaseBatch
+	var providerErrors []error
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
-	if err != nil {
-		return err
+	if err == nil {
+		batches = append(batches, store.ReleaseBatch{
+			Provider: "musicbrainz", Releases: r.normalizer.Normalize(releases),
+		})
+	} else {
+		providerErrors = append(providerErrors, err)
+		r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
 	}
-	releases = r.normalizer.Normalize(releases)
-	if err := r.store.ApplyReleaseSync(ctx, artist, releases, now); err != nil {
+	if artist.SpotifyID != "" && r.spotify != nil {
+		spotifyReleases, spotifyErr := r.spotify.ArtistReleases(ctx, artist.SpotifyID)
+		if spotifyErr == nil {
+			batches = append(batches, store.ReleaseBatch{
+				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
+			})
+		} else {
+			providerErrors = append(providerErrors, spotifyErr)
+			r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
+		}
+	}
+	if len(batches) == 0 {
+		return errors.Join(providerErrors...)
+	}
+	if err := r.store.ApplyReleaseBatches(ctx, artist, batches, now); err != nil {
 		return err
 	}
 	return r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval)

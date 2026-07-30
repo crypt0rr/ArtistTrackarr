@@ -140,8 +140,10 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	}
 	loginBody, _ := io.ReadAll(loginPage.Body)
 	loginPage.Body.Close()
-	if !strings.Contains(string(loginBody), "/static/logo-full.webp") {
-		t.Fatalf("login logo missing: %q", loginBody)
+	if !strings.Contains(string(loginBody), "/static/logo-full.webp") ||
+		!strings.Contains(string(loginBody), "Artist Trackarr") ||
+		strings.Contains(string(loginBody), "Artist Tracker") {
+		t.Fatalf("login branding missing or stale: %q", loginBody)
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/setup")
@@ -159,8 +161,36 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
 		!strings.Contains(string(body), "/static/logo-mark.webp") ||
+		!strings.Contains(string(body), "Artist Trackarr") ||
+		strings.Contains(string(body), "Artist Tracker") ||
 		!strings.Contains(string(body), `href="/artists"`) {
 		t.Fatalf("dashboard status/body = %d, %q", response.StatusCode, body)
+	}
+	if strings.Contains(string(body), "Reminder settings") || strings.Contains(string(body), `action="/profile"`) {
+		t.Fatalf("dashboard still contains reminder settings: %q", body)
+	}
+	response, err = client.Get(server.URL + "/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Reminder settings") ||
+		!strings.Contains(string(body), `action="/admin/profile"`) {
+		t.Fatalf("admin reminder settings status/body = %d, %q", response.StatusCode, body)
+	}
+	csrf = getCSRF(t, client, server.URL+"/admin")
+	response = postForm(t, client, server.URL+"/admin/profile", url.Values{
+		"_csrf": {csrf}, "timezone": {"America/New_York"}, "reminder_time": {"08:30"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Reminder settings updated") {
+		t.Fatalf("admin profile update status/body = %d, %q", response.StatusCode, body)
+	}
+	updatedUser, err := database.UserByEmail(context.Background(), "admin@example.com")
+	if err != nil || updatedUser.Timezone != "America/New_York" || updatedUser.ReminderTime != "08:30" {
+		t.Fatalf("updated admin profile = %#v, %v", updatedUser, err)
 	}
 	response, err = client.Get(server.URL + "/artists/search?q=Laura+pausini")
 	if err != nil {
@@ -442,6 +472,14 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("member admin status=%d", response.StatusCode)
 	}
+	csrf := getCSRF(t, client, server.URL+"/")
+	response = postForm(t, client, server.URL+"/admin/profile", url.Values{
+		"_csrf": {csrf}, "timezone": {"America/New_York"}, "reminder_time": {"08:30"},
+	})
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("member admin profile status=%d", response.StatusCode)
+	}
 
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
 	if _, err := database.DB.Exec(`UPDATE users SET role='admin' WHERE id=?`, user.ID); err != nil {
@@ -560,6 +598,46 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-user review status=%d", response.StatusCode)
+	}
+}
+
+func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, &fakeSpotify{}, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "33333333-3333-4333-8333-333333333333", Name: "Pjotr", SortName: "Pjotr",
+		SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "spotify",
+		Releases: []store.Release{{
+			MBID: "spotify:album-id", SpotifyID: "album-id", Title: "1. KRUIS", PrimaryType: "EP",
+			FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+			SpotifyURL:      "https://open.spotify.com/album/album-id",
+			SpotifyImageURL: "https://i.scdn.co/image/album-art", Source: "spotify",
+		}},
+	}}, time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(page, "MusicBrainz and Spotify are checked") ||
+		!strings.Contains(page, `href="https://open.spotify.com/album/album-id"`) ||
+		!strings.Contains(page, `src="https://i.scdn.co/image/album-art"`) ||
+		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") {
+		t.Fatalf("Spotify release dashboard status/body=%d %q", response.StatusCode, body)
 	}
 }
 

@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    image: artist-release-tracker:local
+    image: artist-trackarr:local
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -17,6 +17,7 @@ services:
       SESSION_SECRET_FILE: /run/secrets/session_secret
       SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
       SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
+      SPOTIFY_MARKET: "${SPOTIFY_MARKET:-US}"
     secrets:
       - setup_token
       - encryption_key

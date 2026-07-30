@@ -2,6 +2,16 @@
 <section class="page-head"><p class="eyebrow">Administrator</p><h1>Household access</h1><p>Links are single-use and expire automatically. Share them through a trusted channel.</p></section>
 {{if .GeneratedURL}}<section class="panel highlight"><h2>{{.TokenKind}} for {{.TokenEmail}}</h2>
 <label>Secure link<input value="{{.GeneratedURL}}" readonly data-copy-value></label><button type="button" class="secondary" data-copy>Copy link</button></section>{{end}}
+<section class="panel narrow settings-panel">
+  <p class="eyebrow">Notifications</p><h2>Reminder settings</h2>
+  <p>Set the timezone and local time used for your release-day reminders.</p>
+  <form method="post" action="/admin/profile" class="stack compact">
+    {{template "csrf" .}}
+    <label>Timezone<input name="timezone" value="{{.User.Timezone}}" required></label>
+    <label>Release-day time<input type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
+    <button>Save settings</button>
+  </form>
+</section>
 <div class="grid two">
 <section class="panel"><h2>Invite a member</h2><p>Invitation links expire after 48 hours.</p>
 <form method="post" action="/admin/invite" class="stack">{{template "csrf" .}}<label>Email<input name="email" type="email" required></label><button>Create invitation link</button></form></section>

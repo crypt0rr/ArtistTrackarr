@@ -1,7 +1,7 @@
-# Artist Release Tracker
+# Artist Trackarr
 
-A self-hosted household dashboard that watches MusicBrainz for new albums and
-EPs and sends announcement and release-day notifications through
+A self-hosted household dashboard that watches MusicBrainz and, when configured,
+Spotify for new albums and EPs and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
 
 ## Quick start
@@ -19,8 +19,9 @@ EPs and sends announcement and release-day notifications through
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
    first administrator.
 
-Application data is stored in the `artist-tracker-data` Docker volume. The app
-supports a single running replica.
+Application data is stored in the legacy-named `artist-tracker-data` Docker
+volume so existing installations can upgrade without moving their data. The
+app supports a single running replica.
 
 Release-group artwork is loaded from the Cover Art Archive and cached alongside
 the database in the persistent data volume.
@@ -37,25 +38,39 @@ the database in the persistent data volume.
 | `POLL_INTERVAL` | no | `6h` | Catalog polling interval; values below one hour are rejected. |
 | `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
 | `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
+| `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
 
 Every secret also supports Docker's `*_FILE` convention, for example
 `APP_ENCRYPTION_KEY_FILE=/run/secrets/encryption_key`.
 
-## Spotify discovery
+## Spotify discovery and release observation
 
 Create an application in the [Spotify developer dashboard](https://developer.spotify.com/dashboard),
 then set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`. When configured,
-Spotify supplies the primary artist search, images, and links. MusicBrainz still
-provides the canonical artist identity and all release tracking. Selections that
-cannot be identified while MusicBrainz is unavailable remain pending and retry
-automatically.
+Spotify supplies the primary artist search, images, links, and an independent
+album/EP observation feed. MusicBrainz remains the canonical artist and release
+identity whenever a release-group match is available. Spotify-only releases are
+stored under a stable provider identity and may generate notifications; they are
+promoted to the MusicBrainz release group later when a conservative title, type,
+and date match is found.
+
+Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
+example `NL`. Existing followed artists are silently baselined the first time
+Spotify release polling runs after an upgrade, preventing back-catalogue
+notification floods. New releases observed after that baseline can notify
+independently of MusicBrainz. Spotify entries classified as albums are tracked;
+items classified as singles are excluded, while multi-track releases with at
+least four tracks are treated as EPs.
+
+Selections that cannot be identified while MusicBrainz is unavailable remain
+pending and retry automatically.
 
 Spotify Development Mode currently requires the application owner to have an
 active Premium subscription and limits new applications to five authorized
-users. No Spotify user login is required for this application's client-credentials
-search flow.
+users. No Spotify user login is required for this application's
+client-credentials search and release-observation flow.
 
 ## Notification destinations
 

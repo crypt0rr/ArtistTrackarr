@@ -151,10 +151,10 @@ func (a *App) Handler() http.Handler {
 		private.Post("/destinations/{id}/rename", a.renameDestination)
 		private.Post("/destinations/{id}/test", a.testDestination)
 		private.Post("/destinations/{id}/delete", a.deleteDestination)
-		private.Post("/profile", a.profile)
 		private.Group(func(admin chi.Router) {
 			admin.Use(a.requireAdmin)
 			admin.Get("/admin", a.admin)
+			admin.Post("/admin/profile", a.profile)
 			admin.Post("/admin/invite", a.createInvite)
 			admin.Post("/admin/reset", a.createReset)
 		})
@@ -847,7 +847,7 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		var serviceURL string
 		serviceURL, err = a.cipher.Decrypt(destination.EncryptedURL)
 		if err == nil {
-			err = a.sender.Send(r.Context(), serviceURL, "Artist Tracker test", "Your notification destination is working.")
+			err = a.sender.Send(r.Context(), serviceURL, "Artist Trackarr test", "Your notification destination is working.")
 		}
 	}
 	if err != nil {
@@ -888,10 +888,10 @@ func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
 func (a *App) profile(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	if err := a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time")); err != nil {
-		http.Redirect(w, r, "/?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/?message=Profile+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?message=Reminder+settings+updated", http.StatusSeeOther)
 }
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {

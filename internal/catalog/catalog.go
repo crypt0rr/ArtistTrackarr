@@ -32,6 +32,10 @@ type SpotifyProvider interface {
 	Artist(context.Context, string) (SpotifyArtist, error)
 }
 
+type SpotifyReleaseProvider interface {
+	ArtistReleases(context.Context, string) ([]store.Release, error)
+}
+
 type ArtistResult struct {
 	MBID            string
 	Name            string
@@ -77,7 +81,7 @@ func (e *HTTPStatusError) Error() string {
 func NewMusicBrainz(contact string) *MusicBrainz {
 	return &MusicBrainz{
 		client:    &http.Client{Timeout: 20 * time.Second},
-		userAgent: fmt.Sprintf("ArtistReleaseTracker/1.0 (%s)", contact),
+		userAgent: fmt.Sprintf("ArtistTrackarr/1.0 (%s)", contact),
 		baseURL:   "https://musicbrainz.org",
 		interval:  time.Second,
 		retryBase: 250 * time.Millisecond,
@@ -345,6 +349,7 @@ type Spotify struct {
 	client           *http.Client
 	accountsURL      string
 	apiURL           string
+	market           string
 	mu               sync.Mutex
 	token            string
 	expires          time.Time
@@ -354,13 +359,17 @@ type SpotifyArtist struct {
 	ID, Name, URL, ImageURL string
 }
 
-func NewSpotify(id, secret string) *Spotify {
+func NewSpotify(id, secret string, market ...string) *Spotify {
 	if id == "" || secret == "" {
 		return nil
 	}
+	selectedMarket := "US"
+	if len(market) > 0 && strings.TrimSpace(market[0]) != "" {
+		selectedMarket = strings.ToUpper(strings.TrimSpace(market[0]))
+	}
 	return &Spotify{
 		clientID: id, secret: secret, client: &http.Client{Timeout: 15 * time.Second},
-		accountsURL: "https://accounts.spotify.com", apiURL: "https://api.spotify.com",
+		accountsURL: "https://accounts.spotify.com", apiURL: "https://api.spotify.com", market: selectedMarket,
 	}
 }
 
@@ -506,6 +515,142 @@ func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) 
 		result.ImageURL = item.Images[len(item.Images)-1].URL
 	}
 	return result, nil
+}
+
+func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.Release, error) {
+	if s == nil {
+		return nil, errors.New("Spotify is not configured")
+	}
+	if _, ok := SpotifyID(artistID); !ok {
+		return nil, errors.New("invalid Spotify artist ID")
+	}
+	token, err := s.accessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	const pageSize = 10
+	var result []store.Release
+	seen := make(map[string]bool)
+	for offset := 0; offset < 1000; {
+		endpoint := fmt.Sprintf(
+			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=%d",
+			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
+		)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Total int `json:"total"`
+			Items []struct {
+				ID            string            `json:"id"`
+				Name          string            `json:"name"`
+				AlbumType     string            `json:"album_type"`
+				AlbumGroup    string            `json:"album_group"`
+				TotalTracks   int               `json:"total_tracks"`
+				ReleaseDate   string            `json:"release_date"`
+				DatePrecision string            `json:"release_date_precision"`
+				ExternalURLs  map[string]string `json:"external_urls"`
+				Images        []struct {
+					URL   string `json:"url"`
+					Width int    `json:"width"`
+				} `json:"images"`
+			} `json:"items"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&page)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("Spotify artist albums returned %s", resp.Status)
+		}
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		for _, item := range page.Items {
+			if item.ID == "" || seen[item.ID] {
+				continue
+			}
+			primaryType, secondaryTypes, eligible := spotifyReleaseType(
+				item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
+			)
+			if !eligible {
+				continue
+			}
+			seen[item.ID] = true
+			precision := spotifyDatePrecision(item.DatePrecision, item.ReleaseDate)
+			imageURL := spotifyReleaseImage(item.Images)
+			result = append(result, store.Release{
+				MBID:             "spotify:" + item.ID,
+				Title:            item.Name,
+				PrimaryType:      primaryType,
+				SecondaryTypes:   secondaryTypes,
+				FirstReleaseDate: item.ReleaseDate,
+				DatePrecision:    precision,
+				SpotifyID:        item.ID,
+				SpotifyURL:       item.ExternalURLs["spotify"],
+				SpotifyImageURL:  imageURL,
+				Source:           "spotify",
+			})
+		}
+		offset += len(page.Items)
+		if len(page.Items) == 0 || offset >= page.Total {
+			break
+		}
+	}
+	return result, nil
+}
+
+func spotifyReleaseType(albumType, albumGroup, title string, totalTracks int) (string, []string, bool) {
+	kind := strings.ToLower(strings.TrimSpace(albumType))
+	group := strings.ToLower(strings.TrimSpace(albumGroup))
+	switch {
+	case kind == "album" && group == "compilation", kind == "compilation":
+		return "Album", []string{"Compilation"}, true
+	case kind == "album":
+		return "Album", nil, true
+	case kind == "single" && (totalTracks >= 4 || strings.Contains(strings.ToLower(title), " ep")):
+		return "EP", nil, true
+	default:
+		return "", nil, false
+	}
+}
+
+func spotifyDatePrecision(precision, value string) int {
+	switch strings.ToLower(precision) {
+	case "year":
+		return 1
+	case "month":
+		return 2
+	case "day":
+		return 3
+	}
+	switch len(value) {
+	case 4:
+		return 1
+	case 7:
+		return 2
+	case 10:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func spotifyReleaseImage(images []struct {
+	URL   string `json:"url"`
+	Width int    `json:"width"`
+}) string {
+	if len(images) == 0 {
+		return ""
+	}
+	selected := images[0].URL
+	for _, image := range images {
+		if image.Width >= 250 {
+			selected = image.URL
+		}
+	}
+	return selected
 }
 
 func extractMBID(value string) string {
