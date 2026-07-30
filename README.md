@@ -72,6 +72,14 @@ active Premium subscription and limits new applications to five authorized
 users. No Spotify user login is required for this application's
 client-credentials search and release-observation flow.
 
+## Artist management
+
+The **Add artists** page combines individual search, multi-select following,
+bulk paste/CSV import, and watchlist export. Exports contain canonical
+MusicBrainz URLs and IDs plus optional Spotify identifiers. The first `artist`
+column can be imported into Artist Trackarr again, making the CSV suitable for
+backups or moving a watchlist between installations.
+
 ## Notification destinations
 
 Users can add guided Email, Discord, Telegram, ntfy, Gotify, and generic

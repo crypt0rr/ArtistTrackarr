@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -458,6 +459,85 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 	response.Body.Close()
 	if !strings.Contains(string(body), "0 added") || !strings.Contains(string(body), "2 already followed") {
 		t.Fatalf("duplicate batch body=%q", body)
+	}
+}
+
+func TestCombinedArtistToolsAndOwnerScopedCSVExport(t *testing.T) {
+	mb := &searchCatalog{}
+	database, server, client := authenticatedTestServer(t, mb, nil, nil)
+	ctx := context.Background()
+	user, _ := database.UserByEmail(ctx, "member@example.com")
+	otherID, _ := database.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	followed, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "11111111-1111-4111-8111-111111111111", Name: "Comma, Artist", SortName: "Artist, Comma",
+		SpotifyID:  "0OdUWJ0sBjDrqHygGUXeCF",
+		SpotifyURL: "https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notFollowed, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "22222222-2222-4222-8222-222222222222", Name: "Other User Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	database.Follow(ctx, user.ID, followed.ID)
+	database.Follow(ctx, otherID, notFollowed.ID)
+
+	response, err := client.Get(server.URL + "/artists/search")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(page, "<h1>Add artists</h1>") ||
+		!strings.Contains(page, `action="/imports"`) ||
+		!strings.Contains(page, `href="/artists/export"`) ||
+		!strings.Contains(page, "Export watchlist (1)") ||
+		strings.Contains(page, `>Bulk import</a>`) {
+		t.Fatalf("combined artist tools status/body=%d %q", response.StatusCode, body)
+	}
+
+	noRedirect := *client
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err = noRedirect.Get(server.URL + "/imports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther ||
+		response.Header.Get("Location") != "/artists/search#import-export" {
+		t.Fatalf("legacy import redirect status/location=%d %q",
+			response.StatusCode, response.Header.Get("Location"))
+	}
+
+	response, err = client.Get(server.URL + "/artists/export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK ||
+		response.Header.Get("Content-Type") != "text/csv; charset=utf-8" ||
+		!strings.Contains(response.Header.Get("Content-Disposition"), "artist-trackarr-watched-artists-") ||
+		response.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("export headers status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	records, err := csv.NewReader(strings.NewReader(string(body))).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || len(records[0]) != 6 ||
+		records[0][0] != "artist" ||
+		records[1][0] != "https://musicbrainz.org/artist/11111111-1111-4111-8111-111111111111" ||
+		records[1][1] != "Comma, Artist" ||
+		records[1][2] != "11111111-1111-4111-8111-111111111111" ||
+		records[1][4] != "0OdUWJ0sBjDrqHygGUXeCF" ||
+		strings.Contains(string(body), "Other User Artist") {
+		t.Fatalf("unexpected owner-scoped CSV records=%#v body=%q", records, body)
 	}
 }
 
