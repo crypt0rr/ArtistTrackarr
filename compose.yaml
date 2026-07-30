@@ -1,8 +1,7 @@
 services:
   app:
     container_name: artist-trackarr
-    build: .
-    image: artist-trackarr:local
+    image: "${ARTIST_TRACKARR_IMAGE:-ghcr.io/crypt0rr/artist-trackarr:latest}"
     restart: unless-stopped
     ports:
       - "8080:8080"

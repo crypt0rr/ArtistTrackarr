@@ -13,7 +13,8 @@ Spotify for new albums and EPs and sends announcement and release-day notificati
 3. Start the application:
 
    ```console
-   docker compose up --build -d
+   docker compose pull
+   docker compose up -d
    ```
 
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
@@ -31,6 +32,26 @@ The interface follows the operating-system color theme by default. Use the
 header theme control to select and remember an explicit light or dark mode.
 The running application version and project repository are available in the
 footer.
+
+## Container images
+
+GitHub Actions builds and publishes the Docker image to
+`ghcr.io/crypt0rr/artist-trackarr` for `linux/amd64` and `linux/arm64`.
+
+- `latest` and `main` follow the current `main` branch.
+- `sha-<commit>` identifies an exact source revision.
+- Pushing a tag such as `v0.1.7` publishes `0.1.7`, `0.1`, and `latest`.
+
+Pin a deployment to a release by setting the Compose image before starting:
+
+```console
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.1.7 docker compose up -d
+```
+
+The first workflow run creates the package. If anonymous Docker pulls are
+required, set the package visibility to **Public** once in the package settings
+on GitHub. The workflow uses the repository-scoped `GITHUB_TOKEN`; no registry
+password or personal access token is required.
 
 ## Configuration
 
@@ -83,7 +104,7 @@ client-credentials search and release-observation flow.
 The **Add artists** page combines individual search, multi-select following,
 and watchlist export. Exports contain canonical MusicBrainz URLs and IDs plus
 optional Spotify identifiers for backups and external processing. Bulk import
-is not available in v0.1.6.
+is not currently available.
 
 ## Notification destinations
 
@@ -123,6 +144,13 @@ The test suite runs in the pinned Go toolchain from the build image:
 
 ```console
 docker build --target test .
+```
+
+To build and run the current checkout instead of the published image:
+
+```console
+docker build -t artist-trackarr:local .
+ARTIST_TRACKARR_IMAGE=artist-trackarr:local docker compose up -d
 ```
 
 No Node.js toolchain or external asset CDN is required.
