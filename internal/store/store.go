@@ -102,6 +102,21 @@ type DeliveryHistory struct {
 	SentAt      *time.Time
 }
 
+type AdminDeliveryHistory struct {
+	UserEmail   string
+	Title       string
+	Body        string
+	EventType   string
+	Destination string
+	Service     string
+	Status      string
+	Attempts    int
+	LastError   string
+	CreatedAt   time.Time
+	NextAttempt *time.Time
+	SentAt      *time.Time
+}
+
 type ImportRow struct {
 	ArtistID    int64
 	SourceValue string
@@ -109,6 +124,41 @@ type ImportRow struct {
 	Status      string
 	ArtistName  string
 	Reason      string
+}
+
+type ResolutionCandidate struct {
+	MBID           string   `json:"mbid"`
+	Name           string   `json:"name"`
+	SortName       string   `json:"sort_name"`
+	Type           string   `json:"type"`
+	Country        string   `json:"country"`
+	Disambiguation string   `json:"disambiguation"`
+	Aliases        []string `json:"aliases,omitempty"`
+	Score          int      `json:"score"`
+}
+
+func (c ResolutionCandidate) Artist() Artist {
+	return Artist{
+		MBID: c.MBID, Name: c.Name, SortName: c.SortName, Type: c.Type,
+		Country: c.Country, Disambiguation: c.Disambiguation,
+	}
+}
+
+type ArtistResolution struct {
+	ID          int64
+	UserID      int64
+	Provider    string
+	ProviderID  string
+	DisplayName string
+	ProviderURL string
+	ImageURL    string
+	Status      string
+	Candidates  []ResolutionCandidate
+	Attempts    int
+	NextAttempt *time.Time
+	LastError   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 type syncedRelease struct {
@@ -423,6 +473,203 @@ func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
 	return err
 }
 
+func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, providerID, name, providerURL, imageURL string) (ArtistResolution, bool, error) {
+	providerID, name, providerURL = strings.TrimSpace(providerID), strings.TrimSpace(name), strings.TrimSpace(providerURL)
+	if providerID == "" || name == "" || providerURL == "" {
+		return ArtistResolution{}, false, errors.New("Spotify artist identity is incomplete")
+	}
+	now := nowText()
+	result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO artist_resolutions
+		(user_id,provider,provider_id,display_name,provider_url,image_url,status,next_attempt_at,created_at,updated_at)
+		VALUES(?,'spotify',?,?,?,?, 'pending',?,?,?)`,
+		userID, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now)
+	if err != nil {
+		return ArtistResolution{}, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return ArtistResolution{}, false, err
+	}
+	resolution, err := s.artistResolutionByProvider(ctx, userID, "spotify", providerID)
+	return resolution, changed > 0, err
+}
+
+func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution, error) {
+	var resolution ArtistResolution
+	var candidates, nextAttempt, created, updated string
+	var nullableNext sql.NullString
+	err := row.Scan(
+		&resolution.ID, &resolution.UserID, &resolution.Provider, &resolution.ProviderID,
+		&resolution.DisplayName, &resolution.ProviderURL, &resolution.ImageURL, &resolution.Status,
+		&candidates, &resolution.Attempts, &nullableNext, &resolution.LastError, &created, &updated,
+	)
+	if err != nil {
+		return ArtistResolution{}, err
+	}
+	if candidates != "" {
+		_ = json.Unmarshal([]byte(candidates), &resolution.Candidates)
+	}
+	if nullableNext.Valid {
+		nextAttempt = nullableNext.String
+		parsed, parseErr := parseTime(nextAttempt)
+		if parseErr == nil {
+			resolution.NextAttempt = &parsed
+		}
+	}
+	resolution.CreatedAt, _ = parseTime(created)
+	resolution.UpdatedAt, _ = parseTime(updated)
+	return resolution, nil
+}
+
+const artistResolutionColumns = `id,user_id,provider,provider_id,display_name,provider_url,image_url,status,
+	candidate_json,attempts,next_attempt_at,last_error,created_at,updated_at`
+
+func (s *Store) artistResolutionByProvider(ctx context.Context, userID int64, provider, providerID string) (ArtistResolution, error) {
+	return scanArtistResolution(s.DB.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+		FROM artist_resolutions WHERE user_id=? AND provider=? AND provider_id=?`, userID, provider, providerID))
+}
+
+func (s *Store) ArtistResolution(ctx context.Context, userID, resolutionID int64) (ArtistResolution, error) {
+	return scanArtistResolution(s.DB.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+		FROM artist_resolutions WHERE id=? AND user_id=?`, resolutionID, userID))
+}
+
+func (s *Store) ArtistResolutions(ctx context.Context, userID int64) ([]ArtistResolution, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+artistResolutionColumns+`
+		FROM artist_resolutions WHERE user_id=? ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ArtistResolution
+	for rows.Next() {
+		resolution, err := scanArtistResolution(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resolution)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) DueArtistResolutions(ctx context.Context, now time.Time, limit int) ([]ArtistResolution, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+artistResolutionColumns+`
+		FROM artist_resolutions WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+		ORDER BY COALESCE(next_attempt_at,'') LIMIT ?`, timeText(now), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ArtistResolution
+	for rows.Next() {
+		resolution, err := scanArtistResolution(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resolution)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) MarkArtistResolutionReview(ctx context.Context, userID, resolutionID int64, candidates []ResolutionCandidate) error {
+	payload, err := json.Marshal(candidates)
+	if err != nil {
+		return err
+	}
+	result, err := s.DB.ExecContext(ctx, `UPDATE artist_resolutions
+		SET status='review',candidate_json=?,next_attempt_at=NULL,last_error='',updated_at=?
+		WHERE id=? AND user_id=?`, string(payload), nowText(), resolutionID, userID)
+	return changedOrNotFound(result, err)
+}
+
+func (s *Store) RetryArtistResolution(ctx context.Context, userID, resolutionID int64, attempts int, next time.Time, message string) error {
+	result, err := s.DB.ExecContext(ctx, `UPDATE artist_resolutions
+		SET status='pending',candidate_json='[]',attempts=?,next_attempt_at=?,last_error=?,updated_at=?
+		WHERE id=? AND user_id=?`,
+		attempts, timeText(next), message, nowText(), resolutionID, userID)
+	return changedOrNotFound(result, err)
+}
+
+func (s *Store) CancelArtistResolution(ctx context.Context, userID, resolutionID int64) error {
+	result, err := s.DB.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`, resolutionID, userID)
+	return changedOrNotFound(result, err)
+}
+
+func changedOrNotFound(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistResolution, artist Artist) (Artist, bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Artist{}, false, err
+	}
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM artist_resolutions WHERE id=? AND user_id=?`,
+		resolution.ID, resolution.UserID).Scan(&exists); err != nil || exists == 0 {
+		tx.Rollback()
+		if err != nil {
+			return Artist{}, false, err
+		}
+		return Artist{}, false, sql.ErrNoRows
+	}
+	now := nowText()
+	_, err = tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
+		spotify_id,spotify_url,spotify_image_url,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
+		artist_type=excluded.artist_type,country=excluded.country,disambiguation=excluded.disambiguation,
+		spotify_id=COALESCE(excluded.spotify_id,artists.spotify_id),
+		spotify_url=COALESCE(excluded.spotify_url,artists.spotify_url),
+		spotify_image_url=COALESCE(excluded.spotify_image_url,artists.spotify_image_url),updated_at=excluded.updated_at`,
+		artist.MBID, artist.Name, artist.SortName, artist.Type, artist.Country, artist.Disambiguation,
+		nullString(artist.SpotifyID), nullString(artist.SpotifyURL), nullString(artist.SpotifyImageURL), now, now)
+	if err != nil {
+		tx.Rollback()
+		return Artist{}, false, err
+	}
+	var sid, surl, image, checked sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,
+		spotify_id,spotify_url,spotify_image_url,last_checked_at FROM artists WHERE mbid=?`, artist.MBID).Scan(
+		&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type, &artist.Country,
+		&artist.Disambiguation, &sid, &surl, &image, &checked)
+	if err != nil {
+		tx.Rollback()
+		return Artist{}, false, err
+	}
+	artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
+	if checked.Valid {
+		parsed, _ := parseTime(checked.String)
+		artist.LastCheckedAt = &parsed
+	}
+	follow, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
+		resolution.UserID, artist.ID, now)
+	if err != nil {
+		tx.Rollback()
+		return Artist{}, false, err
+	}
+	added, _ := follow.RowsAffected()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`,
+		resolution.ID, resolution.UserID); err != nil {
+		tx.Rollback()
+		return Artist{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Artist{}, false, err
+	}
+	return artist, added > 0, nil
+}
+
 func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,f.baseline_synced_at
@@ -448,6 +695,12 @@ func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, er
 		result = append(result, a)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, error) {
+	var count int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=?`, userID).Scan(&count)
+	return count, err
 }
 
 func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Artist, error) {
@@ -886,6 +1139,64 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
 		h.CreatedAt, _ = parseTime(created)
+		if sent.Valid {
+			t, _ := parseTime(sent.String)
+			h.SentAt = &t
+		}
+		result = append(result, h)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) AdminDeliveryHistoryCount(ctx context.Context) (int, error) {
+	var count int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events e
+		LEFT JOIN deliveries d ON d.event_id=e.id`).Scan(&count)
+	return count, err
+}
+
+func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]AdminDeliveryHistory, error) {
+	if limit < 1 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
+		FROM notification_events e
+		JOIN users u ON u.id=e.user_id
+		LEFT JOIN deliveries d ON d.event_id=e.id
+		LEFT JOIN destinations dst ON dst.id=d.destination_id
+		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []AdminDeliveryHistory
+	for rows.Next() {
+		var h AdminDeliveryHistory
+		var destination, service, status, lastError sql.NullString
+		var attempts sql.NullInt64
+		var created string
+		var nextAttempt, sent sql.NullString
+		if err := rows.Scan(
+			&h.UserEmail, &h.Title, &h.Body, &h.EventType,
+			&destination, &service, &status, &attempts, &lastError,
+			&created, &nextAttempt, &sent,
+		); err != nil {
+			return nil, err
+		}
+		h.Destination, h.Service = destination.String, service.String
+		h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), lastError.String
+		if h.Destination == "" {
+			h.Destination, h.Status = "No destination configured", "not sent"
+		}
+		h.CreatedAt, _ = parseTime(created)
+		if nextAttempt.Valid {
+			t, _ := parseTime(nextAttempt.String)
+			h.NextAttempt = &t
+		}
 		if sent.Valid {
 			t, _ := parseTime(sent.String)
 			h.SentAt = &t

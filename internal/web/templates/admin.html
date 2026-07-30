@@ -8,4 +8,25 @@
 <section class="panel"><h2>Reset a password</h2><p>Reset links expire after one hour and revoke all sessions after use.</p>
 <form method="post" action="/admin/reset" class="stack">{{template "csrf" .}}<label>Member email<input name="email" type="email" required></label><button>Create reset link</button></form></section>
 </div>
+<section class="panel admin-log">
+  <div class="section-head"><div><p class="eyebrow">Delivery audit</p><h2>Household notification history</h2></div><span class="badge">Page {{.AdminPage}} of {{.AdminPages}}</span></div>
+  {{if .AdminHistory}}<div class="table-scroll">
+    <table>
+      <thead><tr><th>User</th><th>Notification</th><th>Destination</th><th>Delivery</th><th>Timing</th></tr></thead>
+      <tbody>{{range .AdminHistory}}<tr>
+        <td><strong>{{.UserEmail}}</strong></td>
+        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small><details><summary>Message</summary><p>{{.Body}}</p></details></td>
+        <td><strong>{{.Destination}}</strong>{{if .Service}}<small>{{.Service}}</small>{{end}}</td>
+        <td><span class="badge {{.Status}}">{{.Status}}</span><small>{{.Attempts}} attempts</small>{{if .LastError}}<details><summary>Error</summary><p class="error-copy">{{.LastError}}</p></details>{{end}}</td>
+        <td><small>Created {{formatTime .CreatedAt}}</small>{{if .NextAttempt}}<small>Next {{.NextAttempt.Format "2006-01-02 15:04"}}</small>{{end}}{{if .SentAt}}<small>Sent {{.SentAt.Format "2006-01-02 15:04"}}</small>{{end}}</td>
+      </tr>{{end}}</tbody>
+    </table>
+  </div>
+  {{else}}<div class="empty">No notification deliveries have been recorded.</div>{{end}}
+  {{if or .AdminPrevPage .AdminNextPage}}<nav class="pagination" aria-label="Delivery history pages">
+    {{if .AdminPrevPage}}<a class="button secondary" href="/admin?page={{.AdminPrevPage}}">Previous</a>{{end}}
+    <span>Page {{.AdminPage}} of {{.AdminPages}}</span>
+    {{if .AdminNextPage}}<a class="button secondary" href="/admin?page={{.AdminNextPage}}">Next</a>{{end}}
+  </nav>{{end}}
+</section>
 {{template "foot" .}}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -212,6 +213,188 @@ func TestRenameDestinationIsOwnerScopedAndPreservesCredentials(t *testing.T) {
 		if err := s.RenameDestination(ctx, ownerID, id, name); err == nil {
 			t.Fatalf("accepted invalid name %q", name)
 		}
+	}
+}
+
+func TestArtistResolutionLifecycleIsOwnerScoped(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	ownerID, _ := s.CreateUser(ctx, "owner@example.com", "unused", "member", "UTC")
+	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	resolution, created, err := s.CreateArtistResolution(
+		ctx, ownerID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example",
+	)
+	if err != nil || !created {
+		t.Fatalf("create resolution = %#v, %v, created=%v", resolution, err, created)
+	}
+	duplicate, created, err := s.CreateArtistResolution(
+		ctx, ownerID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "",
+	)
+	if err != nil || created || duplicate.ID != resolution.ID {
+		t.Fatalf("duplicate resolution = %#v, %v, created=%v", duplicate, err, created)
+	}
+	if _, err := s.ArtistResolution(ctx, otherID, resolution.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user lookup error = %v", err)
+	}
+	if err := s.CancelArtistResolution(ctx, otherID, resolution.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user cancel error = %v", err)
+	}
+	candidates := []ResolutionCandidate{{
+		MBID: "artist-mbid", Name: "Example", SortName: "Example", Type: "Person", Country: "NL",
+	}}
+	if err := s.MarkArtistResolutionReview(ctx, ownerID, resolution.ID, candidates); err != nil {
+		t.Fatal(err)
+	}
+	review, err := s.ArtistResolution(ctx, ownerID, resolution.ID)
+	if err != nil || review.Status != "review" || len(review.Candidates) != 1 {
+		t.Fatalf("review resolution = %#v, %v", review, err)
+	}
+	artist := candidates[0].Artist()
+	artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL =
+		resolution.ProviderID, resolution.ProviderURL, resolution.ImageURL
+	artist, added, err := s.CompleteArtistResolution(ctx, review, artist)
+	if err != nil || !added || artist.SpotifyID != "spotify-id" {
+		t.Fatalf("complete resolution artist=%#v added=%v err=%v", artist, added, err)
+	}
+	if _, err := s.ArtistResolution(ctx, ownerID, resolution.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("completed resolution still exists: %v", err)
+	}
+	followed, err := s.FollowedArtists(ctx, ownerID)
+	if err != nil || len(followed) != 1 || followed[0].MBID != "artist-mbid" {
+		t.Fatalf("followed artists = %#v, %v", followed, err)
+	}
+}
+
+func TestArtistResolutionRetryScheduling(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	resolution, _, _ := s.CreateArtistResolution(
+		ctx, userID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "",
+	)
+	now := time.Now().UTC()
+	if err := s.RetryArtistResolution(ctx, userID, resolution.ID, 2, now.Add(time.Hour), "try later"); err != nil {
+		t.Fatal(err)
+	}
+	due, err := s.DueArtistResolutions(ctx, now, 10)
+	if err != nil || len(due) != 0 {
+		t.Fatalf("early due resolutions = %#v, %v", due, err)
+	}
+	due, err = s.DueArtistResolutions(ctx, now.Add(2*time.Hour), 10)
+	if err != nil || len(due) != 1 || due[0].Attempts != 2 || due[0].LastError != "try later" {
+		t.Fatalf("due resolutions = %#v, %v", due, err)
+	}
+}
+
+func TestFollowedArtistCount(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	for i := range 2 {
+		artist, err := s.UpsertArtist(ctx, Artist{
+			MBID: fmt.Sprintf("artist-%d", i), Name: fmt.Sprintf("Artist %d", i), SortName: fmt.Sprintf("Artist %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			s.Follow(ctx, otherID, artist.ID)
+		}
+	}
+	count, err := s.FollowedArtistCount(ctx, userID)
+	if err != nil || count != 2 {
+		t.Fatalf("followed artist count=%d err=%v", count, err)
+	}
+}
+
+func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "audit-artist", Name: "Audit Artist", SortName: "Audit Artist"})
+	if err := s.AddDestination(ctx, userID, "Phone", "ntfy", []byte("encrypted-secret")); err != nil {
+		t.Fatal(err)
+	}
+	destination, _ := s.Destinations(ctx, userID)
+	base := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	for i := range 55 {
+		releaseResult, err := s.DB.Exec(`INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			fmt.Sprintf("release-%02d", i), artist.ID, fmt.Sprintf("Release %02d", i), "Album", "[]",
+			"2026-07-30", 3, "https://musicbrainz.test/release", timeText(base), timeText(base))
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseID, _ := releaseResult.LastInsertId()
+		eventResult, err := s.DB.Exec(`INSERT INTO notification_events
+			(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+			userID, releaseID, "announcement", fmt.Sprintf("Event %02d", i),
+			fmt.Sprintf("Detailed body %02d", i), timeText(base.Add(time.Duration(i)*time.Minute)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventID, _ := eventResult.LastInsertId()
+		if _, err := s.DB.Exec(`INSERT INTO deliveries
+			(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+			eventID, destination[0].ID, "failed", 5, timeText(base.Add(time.Hour)), "provider rejected request"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count, err := s.AdminDeliveryHistoryCount(ctx)
+	if err != nil || count != 55 {
+		t.Fatalf("admin delivery count=%d err=%v", count, err)
+	}
+	first, err := s.AdminDeliveryHistory(ctx, 50, 0)
+	if err != nil || len(first) != 50 || first[0].Title != "Event 54" {
+		t.Fatalf("first admin page len=%d first=%#v err=%v", len(first), first[0], err)
+	}
+	if first[0].UserEmail != "listener@example.com" || first[0].Body != "Detailed body 54" ||
+		first[0].Destination != "Phone" || first[0].Service != "ntfy" ||
+		first[0].Status != "failed" || first[0].Attempts != 5 ||
+		first[0].LastError != "provider rejected request" || first[0].NextAttempt == nil {
+		t.Fatalf("admin delivery details=%#v", first[0])
+	}
+	second, err := s.AdminDeliveryHistory(ctx, 50, 50)
+	if err != nil || len(second) != 5 || second[0].Title != "Event 04" {
+		t.Fatalf("second admin page=%#v err=%v", second, err)
+	}
+}
+
+func TestMigrationTwoUpgradesVersionOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionOne, err := migrations.ReadFile("migrations/001_initial.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(versionOne)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(1,'2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var applied int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=2`).Scan(&applied); err != nil || applied != 1 {
+		t.Fatalf("migration 2 applied=%d err=%v", applied, err)
+	}
+	var table string
+	if err := s.DB.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='artist_resolutions'`).Scan(&table); err != nil {
+		t.Fatal(err)
 	}
 }
 

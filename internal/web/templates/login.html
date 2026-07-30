@@ -1,5 +1,6 @@
 {{template "head" .}}
 <section class="auth-card">
+  {{template "auth-logo" .}}
   <p class="eyebrow">Welcome back</p>
   <h1>Sign in</h1>
   {{if .SetupNeeded}}<p>No administrator exists yet. <a href="/setup">Complete first-run setup</a>.</p>{{else}}

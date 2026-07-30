@@ -51,9 +51,13 @@ func main() {
 	}
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret)
+	var spotifyProvider catalog.SpotifyProvider
+	if spotify != nil {
+		spotifyProvider = spotify
+	}
 	sender := notify.ShoutrrrSender{}
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger)
-	app, err := appweb.New(cfg, database, musicBrainz, spotify, sender, cipher, artworkCache, runner, logger)
+	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger)
 	if err != nil {
 		logger.Error("initialize web application", "error", err)
 		os.Exit(1)

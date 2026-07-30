@@ -5,23 +5,22 @@
   <a class="button" href="/artists/search">Add an artist</a>
 </section>
 <section class="stats">
-  <article><strong>{{len .Artists}}</strong><span>followed artists</span></article>
+  <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
   <article><strong>{{len .Releases}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
-<div class="grid two">
-<section class="panel">
-  <div class="section-head"><div><p class="eyebrow">Watchlist</p><h2>Followed artists</h2></div><a href="/imports">Bulk import</a></div>
-  {{if .Artists}}<div class="list">
-  {{range .Artists}}<article class="list-row">
-    <div><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span></div>
-    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
-    <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">MusicBrainz</a>
-    <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
+{{if .Resolutions}}<section class="panel highlight">
+  <div class="section-head"><div><p class="eyebrow">Identification</p><h2>Artists waiting for MusicBrainz</h2></div><span class="badge">{{len .Resolutions}} pending</span></div>
+  <div class="list">{{range .Resolutions}}<article class="list-row">
+    <div class="resolution-artist">{{if .ImageURL}}<img class="avatar" src="{{.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .DisplayName}}</span>{{end}}
+      <span><strong>{{.DisplayName}}</strong><small>{{if eq .Status "review"}}Choose the matching MusicBrainz artist.{{else}}Identification will retry automatically.{{end}}</small></span>
+    </div>
+    <div class="actions"><a href="{{.ProviderURL}}" rel="noreferrer">Spotify</a><a href="/artist-resolutions/{{.ID}}">{{if eq .Status "review"}}Review{{else}}Details{{end}}</a>
+      <form method="post" action="/artist-resolutions/{{.ID}}/cancel" class="inline">{{template "csrf" $}}<button class="danger link">Cancel</button></form>
+    </div>
   </article>{{end}}</div>
-  {{else}}<div class="empty">No artists yet. Search for one or import a list.</div>{{end}}
-</section>
-<section class="panel">
+</section>{{end}}
+<section class="panel narrow settings-panel">
   <p class="eyebrow">Profile</p><h2>Reminder settings</h2>
   <form method="post" action="/profile" class="stack compact">
     {{template "csrf" .}}
@@ -30,7 +29,6 @@
     <button>Save settings</button>
   </form>
 </section>
-</div>
 <section class="panel">
   <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
   {{if .Releases}}<div class="release-grid">{{range .Releases}}
@@ -39,9 +37,9 @@
 </section>
 <section class="panel">
   <p class="eyebrow">Delivery log</p><h2>Recent notifications</h2>
-  {{if .History}}<div class="list">{{range .History}}<article class="list-row">
+  {{if .History}}<div class="list delivery-scroll" data-delivery-scroll tabindex="0" aria-label="Recent notification deliveries">{{range .History}}<article class="list-row delivery-row">
     <div><strong>{{.Title}}</strong><span>{{.EventType}} · {{.Destination}}</span></div>
-    <div><span class="badge {{.Status}}">{{.Status}}</span>{{if .LastError}}<small>{{.LastError}}</small>{{end}}</div>
+    <div class="delivery-state"><span class="badge {{.Status}}">{{.Status}}</span><small>{{formatTime .CreatedAt}}</small></div>
   </article>{{end}}</div>{{else}}<div class="empty">No notification events yet.</div>{{end}}
 </section>
 {{template "foot" .}}
