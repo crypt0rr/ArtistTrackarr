@@ -144,7 +144,7 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	if err != nil {
 		return fallback(stale, "error")
 	}
-	request.Header.Set("User-Agent", "ArtistReleaseTracker/0.1.1")
+	request.Header.Set("User-Agent", "ArtistTrackarr/0.1.2")
 	response, err := c.client.Do(request)
 	if err != nil {
 		return fallback(stale, "upstream-error")

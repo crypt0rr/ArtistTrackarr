@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{.Title}} · Artist Tracker</title>
+  <title>{{.Title}} · Artist Trackarr</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="/"><img src="/static/logo-mark.webp" width="44" height="44" alt=""><span>Artist Tracker</span></a>
+  <a class="brand" href="/"><img src="/static/logo-mark.webp" width="44" height="44" alt=""><span>Artist Trackarr</span></a>
   {{if .User}}<nav>
     <a href="/">Dashboard</a>
     <a href="/artists">Artists</a>
@@ -23,6 +23,6 @@
   {{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 {{end}}
-{{define "foot"}}</main><footer>Self-hosted · Music data by <a href="https://musicbrainz.org">MusicBrainz</a></footer><script src="/static/app.js"></script></body></html>{{end}}
+{{define "foot"}}</main><footer>Self-hosted · Music data by <a href="https://musicbrainz.org">MusicBrainz</a>{{if .SpotifyOn}} and <a href="https://spotify.com">Spotify</a>{{end}}</footer><script src="/static/app.js"></script></body></html>{{end}}
 {{define "csrf"}}<input type="hidden" name="_csrf" value="{{.CSRF}}">{{end}}
-{{define "auth-logo"}}<img class="auth-logo" src="/static/logo-full.webp" width="640" height="640" alt="Artist Tracker">{{end}}
+{{define "auth-logo"}}<img class="auth-logo" src="/static/logo-full.webp" width="960" height="311" alt="Artist Trackarr">{{end}}

@@ -20,6 +20,7 @@ type resolutionCatalog struct {
 	search       []catalog.ArtistResult
 	searchErr    error
 	releases     []store.Release
+	releaseErr   error
 	releaseCalls atomic.Int32
 }
 
@@ -37,7 +38,18 @@ func (f *resolutionCatalog) ResolveExternalArtist(context.Context, string) ([]ca
 
 func (f *resolutionCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
 	f.releaseCalls.Add(1)
-	return f.releases, nil
+	return f.releases, f.releaseErr
+}
+
+type spotifyReleaseCatalog struct {
+	releases []store.Release
+	err      error
+	calls    atomic.Int32
+}
+
+func (f *spotifyReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	f.calls.Add(1)
+	return f.releases, f.err
 }
 
 func resolutionTestStore(t *testing.T) *store.Store {
@@ -151,6 +163,33 @@ func TestExistingFollowCompletesWithoutAnotherInitialSync(t *testing.T) {
 	status, err := testRunner(database, provider).ResolveArtistResolutionNow(ctx, resolution)
 	if err != nil || status != "followed" || provider.releaseCalls.Load() != 0 {
 		t.Fatalf("status=%q err=%v release calls=%d", status, err, provider.releaseCalls.Load())
+	}
+}
+
+func TestSyncContinuesWithSpotifyWhenMusicBrainzFails(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{
+		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	database.Follow(ctx, userID, artist.ID)
+	spotify := &spotifyReleaseCatalog{releases: []store.Release{{
+		MBID: "spotify:album-id", SpotifyID: "album-id", Title: "Spotify Album", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/album-id", Source: "spotify",
+	}}}
+	runner := New(
+		database, &resolutionCatalog{releaseErr: io.ErrUnexpectedEOF}, catalog.AlbumEPNormalizer{},
+		nil, nil, 6*time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify),
+	)
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := database.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].Source != "spotify" ||
+		releases[0].SpotifyID != "album-id" || spotify.calls.Load() != 1 {
+		t.Fatalf("releases=%#v Spotify calls=%d err=%v", releases, spotify.calls.Load(), err)
 	}
 }
 

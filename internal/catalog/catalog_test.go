@@ -146,6 +146,67 @@ func TestSpotifyArtistSearchUsesCurrentResultLimit(t *testing.T) {
 	}
 }
 
+func TestSpotifyArtistReleasesPaginatesAndFiltersAlbumsAndEPs(t *testing.T) {
+	var tokenRequests, albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/token":
+			tokenRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums":
+			albumRequests.Add(1)
+			if request.URL.Query().Get("limit") != "10" || request.URL.Query().Get("market") != "NL" ||
+				request.URL.Query().Get("include_groups") != "album,single,compilation" ||
+				request.Header.Get("Authorization") != "Bearer test-token" {
+				t.Fatalf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if request.URL.Query().Get("offset") == "0" {
+				_, _ = io.WriteString(w, `{"total":4,"items":[
+					{"id":"album-id","name":"Album","album_type":"album","album_group":"album","total_tracks":10,
+					 "release_date":"2026-08-01","release_date_precision":"day",
+					 "external_urls":{"spotify":"https://open.spotify.com/album/album-id"},
+					 "images":[{"url":"https://i.scdn.co/640","width":640},{"url":"https://i.scdn.co/300","width":300},{"url":"https://i.scdn.co/64","width":64}]},
+					{"id":"single-id","name":"Single","album_type":"single","album_group":"single","total_tracks":1,
+					 "release_date":"2026","release_date_precision":"year","external_urls":{"spotify":"https://open.spotify.com/album/single-id"}},
+					{"id":"ep-id","name":"1. KRUIS","album_type":"single","album_group":"single","total_tracks":6,
+					 "release_date":"2026-07","release_date_precision":"month","external_urls":{"spotify":"https://open.spotify.com/album/ep-id"}}
+				]}`)
+				return
+			}
+			if request.URL.Query().Get("offset") != "3" {
+				t.Fatalf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
+			}
+			_, _ = io.WriteString(w, `{"total":4,"items":[
+				{"id":"compilation-id","name":"Collected","album_type":"compilation","album_group":"compilation","total_tracks":14,
+				 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}
+			]}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret", "NL")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	releases, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenRequests.Load() != 1 || albumRequests.Load() != 2 || len(releases) != 3 {
+		t.Fatalf("token requests=%d album requests=%d releases=%#v",
+			tokenRequests.Load(), albumRequests.Load(), releases)
+	}
+	if releases[0].PrimaryType != "Album" || releases[0].DatePrecision != 3 ||
+		releases[0].SpotifyImageURL != "https://i.scdn.co/300" ||
+		releases[1].PrimaryType != "EP" || releases[1].Title != "1. KRUIS" ||
+		releases[1].DatePrecision != 2 ||
+		releases[2].PrimaryType != "Album" || len(releases[2].SecondaryTypes) != 1 ||
+		releases[2].SecondaryTypes[0] != "Compilation" {
+		t.Fatalf("unexpected Spotify releases: %#v", releases)
+	}
+}
+
 func TestAlbumEPNormalizer(t *testing.T) {
 	input := []store.Release{
 		{MBID: "album", PrimaryType: "Album", SecondaryTypes: []string{"Live"}},

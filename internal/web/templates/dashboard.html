@@ -1,7 +1,7 @@
 {{template "head" .}}
 <section class="hero">
   <div><p class="eyebrow">Your music watchlist</p><h1>Never miss the next record.</h1>
-  <p>Announcements arrive when MusicBrainz records a new album or EP. Release-day reminders follow at your local reminder time.</p></div>
+  <p>{{if .SpotifyOn}}MusicBrainz and Spotify are checked for new albums and EPs.{{else}}MusicBrainz is checked for new albums and EPs.{{end}} Release-day reminders follow at your local reminder time.</p></div>
   <a class="button" href="/artists/search">Add an artist</a>
 </section>
 <section class="stats">
@@ -20,19 +20,16 @@
     </div>
   </article>{{end}}</div>
 </section>{{end}}
-<section class="panel narrow settings-panel">
-  <p class="eyebrow">Profile</p><h2>Reminder settings</h2>
-  <form method="post" action="/profile" class="stack compact">
-    {{template "csrf" .}}
-    <label>Timezone<input name="timezone" value="{{.User.Timezone}}" required></label>
-    <label>Release-day time<input type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
-    <button>Save settings</button>
-  </form>
-</section>
 <section class="panel">
   <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
   {{if .Releases}}<div class="release-grid">{{range .Releases}}
-  <a class="release-card" href="{{.MusicBrainzURL}}" rel="noreferrer"><img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}"><span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span><small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</small></span></a>
+  <a class="release-card" href="{{if .MusicBrainzURL}}{{.MusicBrainzURL}}{{else}}{{.SpotifyURL}}{{end}}" rel="noreferrer">
+    {{if and (eq .Source "spotify") .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
+    {{else}}<img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}">{{end}}
+    <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
+      <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{if eq .Source "spotify"}}Spotify{{else if eq .Source "both"}}MusicBrainz + Spotify{{else}}MusicBrainz{{end}}</small>
+    </span>
+  </a>
   {{end}}</div>{{else}}<div class="empty">Releases appear after the first catalog sync.</div>{{end}}
 </section>
 <section class="panel">

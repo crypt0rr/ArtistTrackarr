@@ -139,6 +139,166 @@ func TestInitialSyncWithOnlyUndatedReleasesCreatesNoEvent(t *testing.T) {
 	assertEventCount(t, s, userID, "announcement", 0)
 }
 
+func TestInitialMultiSourceSyncCanChooseSpotifyRelease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{
+		MBID: "artist-id", Name: "Pjotr", SortName: "Pjotr", SpotifyID: "spotify-artist",
+	})
+	s.Follow(ctx, userID, artist.ID)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{
+		{Provider: "musicbrainz", Releases: []Release{{
+			MBID: "old-mbid", Title: "Old Album", PrimaryType: "Album",
+			FirstReleaseDate: "2017-01-01", DatePrecision: 3,
+			MusicBrainzURL: "https://musicbrainz.org/release-group/old-mbid",
+		}}},
+		{Provider: "spotify", Releases: []Release{{
+			MBID: "spotify:new-album", SpotifyID: "new-album", Title: "1. KRUIS", PrimaryType: "EP",
+			FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+			SpotifyURL: "https://open.spotify.com/album/new-album", Source: "spotify",
+		}}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var title, body, source string
+	if err := s.DB.QueryRow(`SELECT e.title,e.body,rg.source FROM notification_events e
+		JOIN release_groups rg ON rg.id=e.release_group_id WHERE e.user_id=?`, userID).
+		Scan(&title, &body, &source); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Upcoming release from Pjotr" || source != "spotify" ||
+		!strings.Contains(body, "1. KRUIS") ||
+		!strings.Contains(body, "https://open.spotify.com/album/new-album") {
+		t.Fatalf("unexpected Spotify onboarding event: title=%q body=%q source=%q", title, body, source)
+	}
+}
+
+func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{
+		MBID: "artist-id", Name: "Example", SortName: "Example", SpotifyID: "spotify-artist",
+	})
+	s.Follow(ctx, userID, artist.ID)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	oldSpotify := Release{
+		MBID: "spotify:old", SpotifyID: "old", Title: "Back Catalogue", PrimaryType: "Album",
+		FirstReleaseDate: "2020-01-01", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/old", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "spotify", Releases: []Release{oldSpotify},
+	}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+	var spotifyBaseline sql.NullString
+	if err := s.DB.QueryRow(`SELECT spotify_baseline_synced_at FROM follows
+		WHERE user_id=? AND artist_id=?`, userID, artist.ID).Scan(&spotifyBaseline); err != nil || !spotifyBaseline.Valid {
+		t.Fatalf("Spotify baseline=%#v err=%v", spotifyBaseline, err)
+	}
+	newSpotify := Release{
+		MBID: "spotify:new", SpotifyID: "new", Title: "New EP", PrimaryType: "EP",
+		FirstReleaseDate: "2026-08-02", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/new", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "spotify", Releases: []Release{oldSpotify, newSpotify},
+	}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
+func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
+	s.Follow(ctx, userID, artist.ID)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	spotifyRelease := Release{
+		MBID: "spotify:spotify-release", SpotifyID: "spotify-release", Title: "Shared Album",
+		PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/spotify-release", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "spotify", Releases: []Release{spotifyRelease},
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	musicBrainzRelease := Release{
+		MBID: "release-mbid", Title: "Shared Album", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+		MusicBrainzURL: "https://musicbrainz.org/release-group/release-mbid",
+	}
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{musicBrainzRelease}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var count, observations int
+	var mbid, source, spotifyID string
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT mbid,source,spotify_id FROM release_groups WHERE artist_id=?`, artist.ID).
+		Scan(&mbid, &source, &spotifyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM provider_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || observations != 2 || mbid != "release-mbid" || source != "both" ||
+		spotifyID != "spotify-release" {
+		t.Fatalf("release count=%d observations=%d mbid=%q source=%q spotifyID=%q",
+			count, observations, mbid, source, spotifyID)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
+func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
+	s.Follow(ctx, userID, artist.ID)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "spotify",
+		Releases: []Release{
+			{
+				MBID: "spotify:standard", SpotifyID: "standard", Title: "Shared Album",
+				PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+				SpotifyURL: "https://open.spotify.com/album/standard", Source: "spotify",
+			},
+			{
+				MBID: "spotify:deluxe", SpotifyID: "deluxe", Title: "Shared Album (Deluxe Edition)",
+				PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+				SpotifyURL: "https://open.spotify.com/album/deluxe", Source: "spotify",
+			},
+		},
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var releases, observations int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM provider_observations WHERE provider='spotify'`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if releases != 1 || observations != 2 {
+		t.Fatalf("release groups=%d Spotify observations=%d", releases, observations)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
 func TestSessionRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -365,7 +525,7 @@ func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 	}
 }
 
-func TestMigrationTwoUpgradesVersionOneDatabase(t *testing.T) {
+func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -392,9 +552,20 @@ func TestMigrationTwoUpgradesVersionOneDatabase(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=2`).Scan(&applied); err != nil || applied != 1 {
 		t.Fatalf("migration 2 applied=%d err=%v", applied, err)
 	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=3`).Scan(&applied); err != nil || applied != 1 {
+		t.Fatalf("migration 3 applied=%d err=%v", applied, err)
+	}
 	var table string
 	if err := s.DB.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='artist_resolutions'`).Scan(&table); err != nil {
 		t.Fatal(err)
+	}
+	var spotifyBaseline, source, spotifyImage string
+	if err := s.DB.QueryRow(`SELECT spotify_baseline_synced_at FROM follows LIMIT 1`).Scan(&spotifyBaseline); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unexpected follows column check error: %v", err)
+	}
+	if err := s.DB.QueryRow(`SELECT source,spotify_image_url FROM release_groups LIMIT 1`).
+		Scan(&source, &spotifyImage); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unexpected release columns check error: %v", err)
 	}
 }
 
