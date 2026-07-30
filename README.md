@@ -92,6 +92,13 @@ webhook destinations. Any service supported by Shoutrrr can be added with its
 raw service URL. Credentials are encrypted in SQLite and redacted from the UI
 and logs. Use the **Send test** action after adding a destination.
 
+## Household administration
+
+Administrators can review every household account, its role, reminder settings,
+follow count, and notification-destination count. They can permanently delete
+another user and all of that user's private data. Administrators cannot delete
+their own account or leave the household without an administrator.
+
 ## Reverse proxy and backups
 
 Terminate TLS at Caddy, Traefik, nginx, or another reverse proxy and set

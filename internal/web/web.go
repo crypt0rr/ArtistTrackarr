@@ -68,6 +68,7 @@ type PageData struct {
 	Destinations   []store.Destination
 	History        []store.DeliveryHistory
 	AdminHistory   []store.AdminDeliveryHistory
+	AdminUsers     []store.AdminUser
 	ImportRows     []store.ImportRow
 	ImportID       int64
 	FollowCount    int
@@ -160,6 +161,7 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/profile", a.profile)
 			admin.Post("/admin/invite", a.createInvite)
 			admin.Post("/admin/reset", a.createReset)
+			admin.Post("/admin/users/{id}/delete", a.deleteUser)
 		})
 	})
 	return r
@@ -949,6 +951,7 @@ func (a *App) adminData(r *http.Request) PageData {
 		page = pages
 	}
 	d := a.data(r, "Household administration")
+	d.AdminUsers, _ = a.store.AdminUsers(r.Context())
 	d.AdminHistory, _ = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
 	d.AdminPage, d.AdminPages = page, pages
 	if page > 1 {
@@ -958,6 +961,31 @@ func (a *App) adminData(r *http.Request) PageData {
 		d.AdminNextPage = page + 1
 	}
 	return d
+}
+
+func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	userID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || userID < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	if err := a.store.DeleteUser(r.Context(), session.User.ID, userID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if errors.Is(err, store.ErrCannotDeleteSelf) || errors.Is(err, store.ErrLastAdmin) {
+			d := a.adminData(r)
+			d.Error = err.Error()
+			a.render(w, "admin", d, http.StatusBadRequest)
+			return
+		}
+		a.logger.Error("delete user failed", "acting_user_id", session.User.ID, "user_id", userID, "error", err)
+		http.Error(w, "user could not be deleted", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin?message=User+deleted", http.StatusSeeOther)
 }
 
 func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {

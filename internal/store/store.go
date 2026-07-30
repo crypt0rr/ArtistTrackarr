@@ -36,6 +36,23 @@ type User struct {
 	CreatedAt    time.Time
 }
 
+type AdminUser struct {
+	ID               int64
+	Email            string
+	Role             string
+	Timezone         string
+	ReminderTime     string
+	FollowCount      int
+	DestinationCount int
+	CreatedAt        time.Time
+}
+
+var (
+	ErrAdminRequired    = errors.New("administrator access is required")
+	ErrCannotDeleteSelf = errors.New("you cannot delete your own account")
+	ErrLastAdmin        = errors.New("the last administrator cannot be deleted")
+)
+
 type Session struct {
 	User      User
 	CSRFToken string
@@ -288,6 +305,76 @@ func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
 func (s *Store) UserByID(ctx context.Context, id int64) (User, error) {
 	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,password_hash,role,timezone,reminder_time,created_at
 		FROM users WHERE id=?`, id))
+}
+
+func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT u.id,u.email,u.role,u.timezone,u.reminder_time,u.created_at,
+		COUNT(DISTINCT f.artist_id),COUNT(DISTINCT d.id)
+		FROM users u
+		LEFT JOIN follows f ON f.user_id=u.id
+		LEFT JOIN destinations d ON d.user_id=u.id
+		GROUP BY u.id,u.email,u.role,u.timezone,u.reminder_time,u.created_at
+		ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END,lower(u.email)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []AdminUser
+	for rows.Next() {
+		var user AdminUser
+		var created string
+		if err := rows.Scan(
+			&user.ID, &user.Email, &user.Role, &user.Timezone, &user.ReminderTime, &created,
+			&user.FollowCount, &user.DestinationCount,
+		); err != nil {
+			return nil, err
+		}
+		user.CreatedAt, _ = parseTime(created)
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) error {
+	if actingAdminID == userID {
+		return ErrCannotDeleteSelf
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var actingRole string
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id=?`, actingAdminID).Scan(&actingRole); err != nil {
+		return err
+	}
+	if actingRole != "admin" {
+		return ErrAdminRequired
+	}
+	var email, role string
+	if err := tx.QueryRowContext(ctx, `SELECT email,role FROM users WHERE id=?`, userID).Scan(&email, &role); err != nil {
+		return err
+	}
+	if role == "admin" {
+		var admins int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role='admin'`).Scan(&admins); err != nil {
+			return err
+		}
+		if admins <= 1 {
+			return ErrLastAdmin
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_tokens WHERE email=? OR created_by=?`, email, userID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id=?`, userID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) error {
