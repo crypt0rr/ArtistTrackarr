@@ -525,6 +525,77 @@ func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 	}
 }
 
+func TestAdminUsersAndDeleteUser(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	adminID, _ := s.CreateUser(ctx, "admin@example.com", "unused", "admin", "Europe/Amsterdam")
+	memberID, _ := s.CreateUser(ctx, "member@example.com", "unused", "member", "UTC")
+	otherMemberID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "admin-user-artist", Name: "Example", SortName: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, memberID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, memberID, "Phone", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuthToken(ctx, "invite", "member@example.com", nil, adminID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuthToken(ctx, "invite", "new@example.com", nil, memberID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	users, err := s.AdminUsers(ctx)
+	if err != nil || len(users) != 3 {
+		t.Fatalf("admin users=%#v err=%v", users, err)
+	}
+	if users[0].ID != adminID || users[1].Email != "member@example.com" ||
+		users[1].FollowCount != 1 || users[1].DestinationCount != 1 {
+		t.Fatalf("unexpected admin users=%#v", users)
+	}
+	if err := s.DeleteUser(ctx, otherMemberID, memberID); !errors.Is(err, ErrAdminRequired) {
+		t.Fatalf("member delete error=%v", err)
+	}
+	if err := s.DeleteUser(ctx, adminID, adminID); !errors.Is(err, ErrCannotDeleteSelf) {
+		t.Fatalf("self delete error=%v", err)
+	}
+	if err := s.DeleteUser(ctx, adminID, memberID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserByID(ctx, memberID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted user lookup error=%v", err)
+	}
+	for name, query := range map[string]string{
+		"sessions":     `SELECT COUNT(*) FROM sessions WHERE user_id=?`,
+		"follows":      `SELECT COUNT(*) FROM follows WHERE user_id=?`,
+		"destinations": `SELECT COUNT(*) FROM destinations WHERE user_id=?`,
+	} {
+		var count int
+		if err := s.DB.QueryRowContext(ctx, query, memberID).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v", name, count, err)
+		}
+	}
+	var tokens int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM auth_tokens WHERE email='member@example.com' OR created_by=?`, memberID,
+	).Scan(&tokens); err != nil || tokens != 0 {
+		t.Fatalf("auth tokens count=%d err=%v", tokens, err)
+	}
+	var artists int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM artists WHERE id=?`, artist.ID).Scan(&artists); err != nil || artists != 1 {
+		t.Fatalf("shared artist count=%d err=%v", artists, err)
+	}
+	if err := s.DeleteUser(ctx, adminID, 99999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing user delete error=%v", err)
+	}
+}
+
 func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.db")
 	db, err := sql.Open("sqlite", path)

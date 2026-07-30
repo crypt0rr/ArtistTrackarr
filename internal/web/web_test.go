@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 type fakeSender struct{}
@@ -143,7 +145,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	loginPage.Body.Close()
 	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
-		!strings.Contains(string(loginBody), "v0.1.4") ||
+		!strings.Contains(string(loginBody), "v"+version.Current) ||
 		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/Artist-Trackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-select`) ||
 		!strings.Contains(string(loginBody), "Artist Trackarr") ||
@@ -570,6 +572,10 @@ func TestCombinedArtistToolsAndOwnerScopedCSVExport(t *testing.T) {
 func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	mb := &searchCatalog{}
 	database, server, client := authenticatedTestServer(t, mb, nil, nil)
+	targetID, err := database.CreateUser(context.Background(), "delete-me@example.com", "unused", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
 	response, err := client.Get(server.URL + "/admin")
 	if err != nil {
 		t.Fatal(err)
@@ -585,6 +591,16 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("member admin profile status=%d", response.StatusCode)
+	}
+	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(targetID, 10)+"/delete", url.Values{
+		"_csrf": {csrf},
+	})
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("member user deletion status=%d", response.StatusCode)
+	}
+	if _, err := database.UserByID(context.Background(), targetID); err != nil {
+		t.Fatalf("member deleted another user: %v", err)
 	}
 
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
@@ -641,7 +657,8 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	response.Body.Close()
 	for _, expected := range []string{
 		"member@example.com", "Audited Album", "Kitchen display", "ntfy", "failed", "5 attempts",
-		"provider rejected secret detail",
+		"provider rejected secret detail", "Household accounts", "delete-me@example.com",
+		"/admin/users/" + strconv.FormatInt(targetID, 10) + "/delete", "Current account",
 	} {
 		if !strings.Contains(string(body), expected) {
 			t.Fatalf("admin audit missing %q in %q", expected, body)
@@ -649,6 +666,28 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	if strings.Contains(string(body), "encrypted-secret") {
 		t.Fatalf("admin audit exposed encrypted destination: %q", body)
+	}
+	csrf = getCSRF(t, client, server.URL+"/admin")
+	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(user.ID, 10)+"/delete", url.Values{
+		"_csrf": {csrf},
+	})
+	selfDeleteBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(string(selfDeleteBody), "cannot delete your own account") {
+		t.Fatalf("self deletion status/body=%d %q", response.StatusCode, selfDeleteBody)
+	}
+	csrf = getCSRF(t, client, server.URL+"/admin")
+	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(targetID, 10)+"/delete", url.Values{
+		"_csrf": {csrf},
+	})
+	deleteBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(deleteBody), "User deleted") {
+		t.Fatalf("admin deletion status/body=%d %q", response.StatusCode, deleteBody)
+	}
+	if _, err := database.UserByID(context.Background(), targetID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted user lookup error=%v", err)
 	}
 }
 

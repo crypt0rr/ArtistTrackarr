@@ -1,5 +1,5 @@
 {{template "head" .}}
-<section class="page-head"><p class="eyebrow">Administrator</p><h1>Household access</h1><p>Links are single-use and expire automatically. Share them through a trusted channel.</p></section>
+<section class="page-head"><p class="eyebrow">Administrator</p><h1>Household administration</h1><p>Manage household accounts, access links, reminder settings, and notification delivery history.</p></section>
 {{if .GeneratedURL}}<section class="panel highlight"><h2>{{.TokenKind}} for {{.TokenEmail}}</h2>
 <label>Secure link<input value="{{.GeneratedURL}}" readonly data-copy-value></label><button type="button" class="secondary" data-copy>Copy link</button></section>{{end}}
 <section class="panel narrow settings-panel">
@@ -11,6 +11,26 @@
     <label>Release-day time<input type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
     <button>Save settings</button>
   </form>
+</section>
+<section class="panel user-admin">
+  <div class="section-head"><div><p class="eyebrow">Users</p><h2>Household accounts</h2></div><span class="badge">{{len .AdminUsers}} user{{if ne (len .AdminUsers) 1}}s{{end}}</span></div>
+  <p>Deleting an account permanently removes its follows, notification destinations, pending imports, sessions, and delivery history.</p>
+  <div class="table-scroll">
+    <table class="user-table">
+      <thead><tr><th>Account</th><th>Reminders</th><th>Usage</th><th>Joined</th><th>Actions</th></tr></thead>
+      <tbody>{{range .AdminUsers}}<tr>
+        <td><strong>{{.Email}}</strong><small>{{.Role}}{{if eq .ID $.User.ID}} · Current account{{end}}</small></td>
+        <td><strong>{{.ReminderTime}}</strong><small>{{.Timezone}}</small></td>
+        <td><strong>{{.FollowCount}} artist{{if ne .FollowCount 1}}s{{end}}</strong><small>{{.DestinationCount}} destination{{if ne .DestinationCount 1}}s{{end}}</small></td>
+        <td><small>{{formatTime .CreatedAt}}</small></td>
+        <td>{{if eq .ID $.User.ID}}<span class="badge">Signed in</span>{{else}}<details class="user-delete">
+          <summary>Delete user</summary>
+          <p>This permanently deletes {{.Email}} and their private data.</p>
+          <form method="post" action="/admin/users/{{.ID}}/delete">{{template "csrf" $}}<button class="danger">Confirm deletion</button></form>
+        </details>{{end}}</td>
+      </tr>{{end}}</tbody>
+    </table>
+  </div>
 </section>
 <div class="grid two">
 <section class="panel"><h2>Invite a member</h2><p>Invitation links expire after 48 hours.</p>
