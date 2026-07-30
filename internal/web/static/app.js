@@ -1,4 +1,22 @@
 (() => {
+  const themeSelect = document.querySelector("[data-theme-select]");
+  if (themeSelect) {
+    const key = "artist-trackarr-theme";
+    let saved = "system";
+    try {
+      const candidate = localStorage.getItem(key);
+      if (["system", "light", "dark"].includes(candidate)) saved = candidate;
+    } catch (_) {}
+    const applyTheme = (theme) => {
+      if (theme === "system") delete document.documentElement.dataset.theme;
+      else document.documentElement.dataset.theme = theme;
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    };
+    themeSelect.value = saved;
+    applyTheme(saved);
+    themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
+  }
+
   const form = document.querySelector("[data-destination-form]");
   if (form) {
     const visible = {

@@ -28,6 +28,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 type ctxKey int
@@ -52,6 +53,7 @@ type App struct {
 
 type PageData struct {
 	Title          string
+	Version        string
 	User           *store.User
 	CSRF           string
 	Error          string
@@ -244,7 +246,10 @@ func currentSession(r *http.Request) (store.Session, bool) {
 }
 
 func (a *App) data(r *http.Request, title string) PageData {
-	d := PageData{Title: title, CSRF: r.Context().Value(csrfKey).(string), Message: r.URL.Query().Get("message"), SpotifyOn: a.spotify != nil}
+	d := PageData{
+		Title: title, Version: version.Current, CSRF: r.Context().Value(csrfKey).(string),
+		Message: r.URL.Query().Get("message"), SpotifyOn: a.spotify != nil,
+	}
 	if session, ok := currentSession(r); ok {
 		u := session.User
 		d.User = &u
