@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/containrrr/shoutrrr v0.8.0
-	github.com/go-chi/chi/v5 v5.2.1
+	github.com/go-chi/chi/v5 v5.3.1
 	golang.org/x/crypto v0.36.0
 	modernc.org/sqlite v1.36.1
 )
