@@ -1,0 +1,7 @@
+{{template "head" .}}
+<section class="page-head"><p class="eyebrow">Import #{{.ImportID}}</p><h1>Import results</h1><p>Ambiguous rows were not added. Use artist search to select those identities manually.</p></section>
+<section class="panel"><div class="list">{{range .ImportRows}}<article class="list-row">
+  <div><strong>{{.SourceValue}}</strong>{{if .ArtistName}}<span>Resolved to {{.ArtistName}}</span>{{end}}{{if .Reason}}<small>{{.Reason}}</small>{{end}}</div>
+  <span class="badge {{.Status}}">{{.Status}}</span>
+</article>{{end}}</div></section>
+{{template "foot" .}}

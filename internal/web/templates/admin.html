@@ -1,0 +1,11 @@
+{{template "head" .}}
+<section class="page-head"><p class="eyebrow">Administrator</p><h1>Household access</h1><p>Links are single-use and expire automatically. Share them through a trusted channel.</p></section>
+{{if .GeneratedURL}}<section class="panel highlight"><h2>{{.TokenKind}} for {{.TokenEmail}}</h2>
+<label>Secure link<input value="{{.GeneratedURL}}" readonly data-copy-value></label><button type="button" class="secondary" data-copy>Copy link</button></section>{{end}}
+<div class="grid two">
+<section class="panel"><h2>Invite a member</h2><p>Invitation links expire after 48 hours.</p>
+<form method="post" action="/admin/invite" class="stack">{{template "csrf" .}}<label>Email<input name="email" type="email" required></label><button>Create invitation link</button></form></section>
+<section class="panel"><h2>Reset a password</h2><p>Reset links expire after one hour and revoke all sessions after use.</p>
+<form method="post" action="/admin/reset" class="stack">{{template "csrf" .}}<label>Member email<input name="email" type="email" required></label><button>Create reset link</button></form></section>
+</div>
+{{template "foot" .}}

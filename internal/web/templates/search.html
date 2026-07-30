@@ -1,0 +1,15 @@
+{{template "head" .}}
+<section class="page-head"><p class="eyebrow">Discovery</p><h1>Find an artist</h1><p>MusicBrainz identities prevent similarly named artists from being mixed up.{{if .SpotifyOn}} Spotify is connected for links and artwork.{{end}}</p></section>
+<form method="get" action="/artists/search" class="searchbar">
+  <input name="q" value="{{.Query}}" placeholder="Artist name" required autofocus>
+  <button>Search</button>
+</form>
+{{if .Results}}<section class="panel"><div class="list">{{range .Results}}<article class="search-result">
+  {{if .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
+  <div class="grow"><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
+  {{if .Aliases}}<small>Also known as {{join .Aliases ", "}}</small>{{end}}</div>
+  <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
+  <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a>
+  <form method="post" action="/artists/follow" class="inline">{{template "csrf" $}}<input type="hidden" name="mbid" value="{{.MBID}}"><button>Follow</button></form></div>
+</article>{{end}}</div></section>{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
+{{template "foot" .}}
