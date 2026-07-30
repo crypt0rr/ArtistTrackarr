@@ -1,0 +1,36 @@
+{{template "head" .}}
+<section class="page-head"><p class="eyebrow">Shoutrrr</p><h1>Notification destinations</h1><p>Credentials are encrypted at rest. Send a test after adding a destination.</p></section>
+<div class="grid two">
+<section class="panel">
+  <h2>Your destinations</h2>
+  {{if .Destinations}}<div class="list">{{range .Destinations}}<article class="list-row">
+    <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span></div>
+    <div class="actions"><form method="post" action="/destinations/{{.ID}}/test" class="inline">{{template "csrf" $}}<button class="secondary">Send test</button></form>
+    <form method="post" action="/destinations/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Delete</button></form></div>
+  </article>{{end}}</div>{{else}}<div class="empty">No destinations configured.</div>{{end}}
+</section>
+<section class="panel">
+  <h2>Add destination</h2>
+  <form method="post" action="/destinations" class="stack" data-destination-form>
+    {{template "csrf" .}}
+    <label>Name<input name="name" required placeholder="My phone"></label>
+    <label>Service<select name="service" data-service>
+      <option value="ntfy">ntfy</option><option value="email">Email / SMTP</option>
+      <option value="discord">Discord</option><option value="telegram">Telegram</option>
+      <option value="gotify">Gotify</option><option value="generic">Generic webhook</option>
+      <option value="advanced">Advanced Shoutrrr URL</option>
+    </select></label>
+    <div data-field="host"><label>Host<input name="host" placeholder="ntfy.sh"></label></div>
+    <div data-field="port"><label>Port<input name="port" placeholder="587"></label></div>
+    <div data-field="username"><label>Username<input name="username" autocomplete="off"></label></div>
+    <div data-field="password"><label>Password<input name="password" type="password" autocomplete="new-password"></label></div>
+    <div data-field="token"><label>Token<input name="token" type="password" autocomplete="off"></label></div>
+    <div data-field="target"><label>Target / chat / webhook URL<input name="target"></label></div>
+    <div data-field="topic"><label>Topic<input name="topic"></label></div>
+    <div data-field="from"><label>From address<input name="from" type="email"></label></div>
+    <div data-field="to"><label>Recipient(s)<input name="to" placeholder="person@example.com"></label></div>
+    <div data-field="raw_url"><label>Shoutrrr URL<input name="raw_url" type="password" autocomplete="off"></label></div>
+    <button>Add destination</button>
+  </form>
+</section></div>
+{{template "foot" .}}

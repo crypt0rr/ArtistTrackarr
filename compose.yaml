@@ -1,0 +1,46 @@
+services:
+  app:
+    build: .
+    image: artist-release-tracker:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      PUBLIC_URL: "${PUBLIC_URL:-http://localhost:8080}"
+      DATABASE_PATH: "/data/artist-tracker.db"
+      MUSICBRAINZ_CONTACT: "${MUSICBRAINZ_CONTACT:?Set MUSICBRAINZ_CONTACT in .env}"
+      POLL_INTERVAL: "${POLL_INTERVAL:-6h}"
+      TRUST_PROXY: "${TRUST_PROXY:-false}"
+      SETUP_TOKEN_FILE: /run/secrets/setup_token
+      APP_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
+      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
+    secrets:
+      - setup_token
+      - encryption_key
+      - session_secret
+    volumes:
+      - artist-tracker-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  artist-tracker-data:
+
+secrets:
+  setup_token:
+    environment: SETUP_TOKEN
+  encryption_key:
+    environment: APP_ENCRYPTION_KEY
+  session_secret:
+    environment: SESSION_SECRET

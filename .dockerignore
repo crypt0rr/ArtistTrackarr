@@ -1,0 +1,5 @@
+.git
+.env
+*.db
+artist-tracker
+coverage.out

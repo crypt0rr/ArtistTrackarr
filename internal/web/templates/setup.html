@@ -1,0 +1,15 @@
+{{template "head" .}}
+<section class="auth-card">
+  <p class="eyebrow">First run</p>
+  <h1>Create the administrator</h1>
+  <p>The setup token is read from your Docker secret and is only accepted while no users exist.</p>
+  <form method="post" action="/setup" class="stack">
+    {{template "csrf" .}}
+    <label>Setup token<input name="setup_token" type="password" required autocomplete="off"></label>
+    <label>Email<input name="email" type="email" required autocomplete="email"></label>
+    <label>Password<input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters.</small></label>
+    <label>Timezone<input name="timezone" value="Europe/Amsterdam" required><small>Use an IANA timezone, for example Europe/Amsterdam.</small></label>
+    <button>Create administrator</button>
+  </form>
+</section>
+{{template "foot" .}}

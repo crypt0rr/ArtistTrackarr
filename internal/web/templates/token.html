@@ -1,0 +1,11 @@
+{{template "head" .}}
+<section class="auth-card">
+  {{if eq .TokenKind "invite"}}<p class="eyebrow">Household invitation</p><h1>Create your account</h1>{{else}}<p class="eyebrow">Account recovery</p><h1>Choose a new password</h1>{{end}}
+  <form method="post" action="/{{.TokenKind}}/{{.Token}}" class="stack">
+    {{template "csrf" .}}
+    <label>New password<input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters.</small></label>
+    {{if eq .TokenKind "invite"}}<label>Timezone<input name="timezone" value="Europe/Amsterdam" required></label>{{end}}
+    <button>{{if eq .TokenKind "invite"}}Create account{{else}}Update password{{end}}</button>
+  </form>
+</section>
+{{template "foot" .}}

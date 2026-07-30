@@ -1,0 +1,47 @@
+{{template "head" .}}
+<section class="hero">
+  <div><p class="eyebrow">Your music watchlist</p><h1>Never miss the next record.</h1>
+  <p>Announcements arrive when MusicBrainz records a new album or EP. Release-day reminders follow at your local reminder time.</p></div>
+  <a class="button" href="/artists/search">Add an artist</a>
+</section>
+<section class="stats">
+  <article><strong>{{len .Artists}}</strong><span>followed artists</span></article>
+  <article><strong>{{len .Releases}}</strong><span>catalog entries shown</span></article>
+  <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
+</section>
+<div class="grid two">
+<section class="panel">
+  <div class="section-head"><div><p class="eyebrow">Watchlist</p><h2>Followed artists</h2></div><a href="/imports">Bulk import</a></div>
+  {{if .Artists}}<div class="list">
+  {{range .Artists}}<article class="list-row">
+    <div><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span></div>
+    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
+    <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">MusicBrainz</a>
+    <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
+  </article>{{end}}</div>
+  {{else}}<div class="empty">No artists yet. Search for one or import a list.</div>{{end}}
+</section>
+<section class="panel">
+  <p class="eyebrow">Profile</p><h2>Reminder settings</h2>
+  <form method="post" action="/profile" class="stack compact">
+    {{template "csrf" .}}
+    <label>Timezone<input name="timezone" value="{{.User.Timezone}}" required></label>
+    <label>Release-day time<input type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
+    <button>Save settings</button>
+  </form>
+</section>
+</div>
+<section class="panel">
+  <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
+  {{if .Releases}}<div class="release-grid">{{range .Releases}}
+  <a class="release-card" href="{{.MusicBrainzURL}}" rel="noreferrer"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span><small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</small></a>
+  {{end}}</div>{{else}}<div class="empty">Releases appear after the first catalog sync.</div>{{end}}
+</section>
+<section class="panel">
+  <p class="eyebrow">Delivery log</p><h2>Recent notifications</h2>
+  {{if .History}}<div class="list">{{range .History}}<article class="list-row">
+    <div><strong>{{.Title}}</strong><span>{{.EventType}} · {{.Destination}}</span></div>
+    <div><span class="badge {{.Status}}">{{.Status}}</span>{{if .LastError}}<small>{{.LastError}}</small>{{end}}</div>
+  </article>{{end}}</div>{{else}}<div class="empty">No notification events yet.</div>{{end}}
+</section>
+{{template "foot" .}}
