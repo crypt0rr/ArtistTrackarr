@@ -22,6 +22,9 @@ EPs and sends announcement and release-day notifications through
 Application data is stored in the `artist-tracker-data` Docker volume. The app
 supports a single running replica.
 
+Release-group artwork is loaded from the Cover Art Archive and cached alongside
+the database in the persistent data volume.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -32,13 +35,27 @@ supports a single running replica.
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
 | `MUSICBRAINZ_CONTACT` | yes | — | Contact included in the required MusicBrainz User-Agent. |
 | `POLL_INTERVAL` | no | `6h` | Catalog polling interval; values below one hour are rejected. |
-| `SPOTIFY_CLIENT_ID` | no | — | Enables optional Spotify search enrichment. |
+| `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
 | `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
 
 Every secret also supports Docker's `*_FILE` convention, for example
 `APP_ENCRYPTION_KEY_FILE=/run/secrets/encryption_key`.
+
+## Spotify discovery
+
+Create an application in the [Spotify developer dashboard](https://developer.spotify.com/dashboard),
+then set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`. When configured,
+Spotify supplies the primary artist search, images, and links. MusicBrainz still
+provides the canonical artist identity and all release tracking. Selections that
+cannot be identified while MusicBrainz is unavailable remain pending and retry
+automatically.
+
+Spotify Development Mode currently requires the application owner to have an
+active Premium subscription and limits new applications to five authorized
+users. No Spotify user login is required for this application's client-credentials
+search flow.
 
 ## Notification destinations
 

@@ -4,7 +4,13 @@
 <section class="panel">
   <h2>Your destinations</h2>
   {{if .Destinations}}<div class="list">{{range .Destinations}}<article class="list-row">
-    <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span></div>
+    <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span>
+      <details class="rename"><summary>Rename</summary>
+        <form method="post" action="/destinations/{{.ID}}/rename" class="rename-form">
+          {{template "csrf" $}}<label>New name<input name="name" value="{{.Name}}" maxlength="80" required></label><button class="secondary">Save</button>
+        </form>
+      </details>
+    </div>
     <div class="actions"><form method="post" action="/destinations/{{.ID}}/test" class="inline">{{template "csrf" $}}<button class="secondary">Send test</button></form>
     <form method="post" action="/destinations/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Delete</button></form></div>
   </article>{{end}}</div>{{else}}<div class="empty">No destinations configured.</div>{{end}}

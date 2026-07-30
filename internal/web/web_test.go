@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,11 +12,15 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
+	"github.com/crypt0rr/artist-tracker/internal/jobs"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -23,6 +29,87 @@ type fakeSender struct{}
 
 func (fakeSender) Validate(string) error                              { return nil }
 func (fakeSender) Send(context.Context, string, string, string) error { return nil }
+
+type fakeCatalog struct {
+	searchErr error
+}
+
+func (f fakeCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
+	return nil, f.searchErr
+}
+
+func (fakeCatalog) ResolveArtist(context.Context, string) (catalog.ArtistResult, error) {
+	return catalog.ArtistResult{}, errors.New("not implemented")
+}
+
+func (fakeCatalog) ResolveExternalArtist(context.Context, string) ([]catalog.ArtistResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (fakeCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	return nil, nil
+}
+
+type searchCatalog struct {
+	results      []catalog.ArtistResult
+	resolved     map[string]catalog.ArtistResult
+	resolveError map[string]error
+	err          error
+	calls        int
+}
+
+func (f *searchCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
+	f.calls++
+	return f.results, f.err
+}
+
+func (f *searchCatalog) ResolveArtist(_ context.Context, mbid string) (catalog.ArtistResult, error) {
+	if err := f.resolveError[mbid]; err != nil {
+		return catalog.ArtistResult{}, err
+	}
+	if result, ok := f.resolved[mbid]; ok {
+		return result, nil
+	}
+	return catalog.ArtistResult{}, errors.New("not implemented")
+}
+
+func (*searchCatalog) ResolveExternalArtist(context.Context, string) ([]catalog.ArtistResult, error) {
+	return nil, nil
+}
+
+func (*searchCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	return nil, nil
+}
+
+type fakeSpotify struct {
+	results     []catalog.SpotifyArtist
+	searchErr   error
+	artist      catalog.SpotifyArtist
+	artists     map[string]catalog.SpotifyArtist
+	artistErr   error
+	searchCalls int
+}
+
+func (f *fakeSpotify) SearchArtists(context.Context, string) ([]catalog.SpotifyArtist, error) {
+	f.searchCalls++
+	return f.results, f.searchErr
+}
+
+func (f *fakeSpotify) Artist(_ context.Context, id string) (catalog.SpotifyArtist, error) {
+	if artist, ok := f.artists[id]; ok {
+		return artist, nil
+	}
+	return f.artist, f.artistErr
+}
+
+type fakeArtwork struct{}
+
+func (fakeArtwork) Get(context.Context, string) artwork.Asset {
+	return artwork.Asset{
+		Data: []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), ContentType: "image/svg+xml",
+		Status: "test", MaxAge: time.Minute,
+	}
+}
 
 func TestSetupLoginAndDashboard(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "web.db"))
@@ -37,8 +124,8 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		EncryptionKey: "the encryption key has more than 32 bytes",
 	}
 	cipher, _ := security.NewCipher(cfg.EncryptionKey)
-	app, err := New(cfg, database, catalog.NewMusicBrainz("test@example.com"), nil,
-		fakeSender{}, cipher, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	app, err := New(cfg, database, fakeCatalog{searchErr: io.ErrUnexpectedEOF}, nil,
+		fakeSender{}, cipher, fakeArtwork{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +133,16 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	defer server.Close()
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar}
+
+	loginPage, err := client.Get(server.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginBody, _ := io.ReadAll(loginPage.Body)
+	loginPage.Body.Close()
+	if !strings.Contains(string(loginBody), "/static/logo-full.webp") {
+		t.Fatalf("login logo missing: %q", loginBody)
+	}
 
 	csrf := getCSRF(t, client, server.URL+"/setup")
 	setupResponse := postForm(t, client, server.URL+"/setup", url.Values{
@@ -60,9 +157,458 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	})
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") {
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
+		!strings.Contains(string(body), "/static/logo-mark.webp") ||
+		!strings.Contains(string(body), `href="/artists"`) {
 		t.Fatalf("dashboard status/body = %d, %q", response.StatusCode, body)
 	}
+	response, err = client.Get(server.URL + "/artists/search?q=Laura+pausini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(string(body), "MusicBrainz is temporarily unavailable") ||
+		strings.Contains(string(body), "EOF") {
+		t.Fatalf("search failure status/body = %d, %q", response.StatusCode, body)
+	}
+
+	user, err := database.UserByEmail(context.Background(), "admin@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(context.Background(), user.ID, "Phone", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.PostForm(server.URL+"/destinations/1/rename", url.Values{"name": {"Without CSRF"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("rename without CSRF status = %d", response.StatusCode)
+	}
+	response.Body.Close()
+
+	csrf = getCSRF(t, client, server.URL+"/destinations")
+	response = postForm(t, client, server.URL+"/destinations/1/rename", url.Values{
+		"_csrf": {csrf}, "name": {"My phone"},
+	})
+	response.Body.Close()
+	destination, err := database.Destination(context.Background(), user.ID, 1)
+	if err != nil || destination.Name != "My phone" {
+		t.Fatalf("renamed destination = %#v, %v", destination, err)
+	}
+
+	response, err = client.Get(server.URL + "/art/release-group/6e335887-60ba-38f0-95af-fae7774336bf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Artwork-Status") != "test" ||
+		response.Header.Get("Content-Type") != "image/svg+xml" {
+		t.Fatalf("artwork response status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	response.Body.Close()
+}
+
+func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
+	mb := &searchCatalog{results: []catalog.ArtistResult{{MBID: "should-not-appear", Name: "MusicBrainz"}}}
+	spotify := &fakeSpotify{results: []catalog.SpotifyArtist{{
+		ID: "0OdUWJ0sBjDrqHygGUXeCF", Name: "Spotify Result",
+		URL: "https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF", ImageURL: "https://i.scdn.co/example",
+	}}}
+	_, server, client := authenticatedTestServer(t, mb, spotify, nil)
+	response, err := client.Get(server.URL + "/artists/search?q=example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Spotify Result") ||
+		!strings.Contains(string(body), "/artists/follow/spotify") {
+		t.Fatalf("Spotify search status/body=%d %q", response.StatusCode, body)
+	}
+	if spotify.searchCalls != 1 || mb.calls != 0 {
+		t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", spotify.searchCalls, mb.calls)
+	}
+}
+
+func TestSearchFallsBackToMusicBrainz(t *testing.T) {
+	tests := []struct {
+		name    string
+		spotify *fakeSpotify
+		notice  string
+	}{
+		{name: "provider failure", spotify: &fakeSpotify{searchErr: io.ErrUnexpectedEOF}, notice: "Spotify is temporarily unavailable"},
+		{name: "no results", spotify: &fakeSpotify{}, notice: "No Spotify matches were found"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mb := &searchCatalog{results: []catalog.ArtistResult{{MBID: "musicbrainz-id", Name: "Fallback Result"}}}
+			_, server, client := authenticatedTestServer(t, mb, test.spotify, nil)
+			response, err := client.Get(server.URL + "/artists/search?q=example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Fallback Result") ||
+				!strings.Contains(string(body), test.notice) {
+				t.Fatalf("fallback status/body=%d %q", response.StatusCode, body)
+			}
+			if test.spotify.searchCalls != 1 || mb.calls != 1 {
+				t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", test.spotify.searchCalls, mb.calls)
+			}
+		})
+	}
+}
+
+func TestSpotifyFollowCreatesOnePendingResolution(t *testing.T) {
+	const spotifyID = "0OdUWJ0sBjDrqHygGUXeCF"
+	mb := &searchCatalog{}
+	spotify := &fakeSpotify{artist: catalog.SpotifyArtist{
+		ID: spotifyID, Name: "Pending Artist",
+		URL: "https://open.spotify.com/artist/" + spotifyID, ImageURL: "https://i.scdn.co/example",
+	}}
+	database, server, client := authenticatedTestServer(t, mb, spotify, func(database *store.Store) *jobs.Runner {
+		return jobs.New(
+			database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
+		)
+	})
+	response, err := client.PostForm(server.URL+"/artists/follow/spotify", url.Values{"spotify_id": {spotifyID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("Spotify follow without CSRF status=%d", response.StatusCode)
+	}
+	csrf := getCSRF(t, client, server.URL+"/artists/search")
+	for range 2 {
+		response = postForm(t, client, server.URL+"/artists/follow/spotify", url.Values{
+			"_csrf": {csrf}, "spotify_id": {spotifyID},
+		})
+		response.Body.Close()
+	}
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	resolutions, err := database.ArtistResolutions(context.Background(), user.ID)
+	if err != nil || len(resolutions) != 1 || resolutions[0].DisplayName != "Pending Artist" {
+		t.Fatalf("pending resolutions=%#v err=%v", resolutions, err)
+	}
+}
+
+func TestSpotifyBatchFollowSelection(t *testing.T) {
+	const firstID = "0OdUWJ0sBjDrqHygGUXeCF"
+	const secondID = "1OdUWJ0sBjDrqHygGUXeCG"
+	mb := &searchCatalog{}
+	spotify := &fakeSpotify{
+		results: []catalog.SpotifyArtist{
+			{ID: firstID, Name: "First", URL: "https://open.spotify.com/artist/" + firstID},
+			{ID: secondID, Name: "Second", URL: "https://open.spotify.com/artist/" + secondID},
+		},
+		artists: map[string]catalog.SpotifyArtist{
+			firstID:  {ID: firstID, Name: "First", URL: "https://open.spotify.com/artist/" + firstID},
+			secondID: {ID: secondID, Name: "Second", URL: "https://open.spotify.com/artist/" + secondID},
+		},
+	}
+	database, server, client := authenticatedTestServer(t, mb, spotify, nil)
+	response, err := client.Get(server.URL + "/artists/search?q=artists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if !strings.Contains(string(body), `name="spotify_ids"`) ||
+		!strings.Contains(string(body), `data-select-all`) ||
+		!strings.Contains(string(body), `/artists/follow/spotify/batch`) {
+		t.Fatalf("Spotify multi-select markup missing: %q", body)
+	}
+	response, err = client.PostForm(server.URL+"/artists/follow/spotify/batch", url.Values{
+		"spotify_ids": {firstID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("batch follow without CSRF status=%d", response.StatusCode)
+	}
+
+	csrf := getCSRF(t, client, server.URL+"/artists/search")
+	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", url.Values{
+		"_csrf":       {csrf},
+		"spotify_ids": {firstID, firstID, secondID, "invalid"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "2 queued") ||
+		!strings.Contains(string(body), "1 failed") {
+		t.Fatalf("batch follow status/body=%d %q", response.StatusCode, body)
+	}
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	resolutions, err := database.ArtistResolutions(context.Background(), user.ID)
+	if err != nil || len(resolutions) != 2 {
+		t.Fatalf("resolutions=%#v err=%v", resolutions, err)
+	}
+
+	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", url.Values{"_csrf": {csrf}})
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty selection status=%d", response.StatusCode)
+	}
+	tooMany := url.Values{"_csrf": {csrf}}
+	for i := range 11 {
+		tooMany.Add("spotify_ids", fmt.Sprintf("%022d", i))
+	}
+	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", tooMany)
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized selection status=%d", response.StatusCode)
+	}
+}
+
+func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
+	const firstMBID = "11111111-1111-4111-8111-111111111111"
+	const secondMBID = "22222222-2222-4222-8222-222222222222"
+	mb := &searchCatalog{
+		results: []catalog.ArtistResult{
+			{MBID: firstMBID, Name: "First Artist"},
+			{MBID: secondMBID, Name: "Second Artist"},
+		},
+		resolved: map[string]catalog.ArtistResult{
+			firstMBID:  {MBID: firstMBID, Name: "First Artist", SortName: "First Artist"},
+			secondMBID: {MBID: secondMBID, Name: "Second Artist", SortName: "Second Artist"},
+		},
+		resolveError: map[string]error{"broken": errors.New("provider failure")},
+	}
+	database, server, client := authenticatedTestServer(t, mb, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/artists/search?q=artists")
+	response := postForm(t, client, server.URL+"/artists/follow/batch", url.Values{
+		"_csrf": {csrf},
+		"mbids": {firstMBID, firstMBID, secondMBID, "broken"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "2 added") ||
+		!strings.Contains(string(body), "1 failed") {
+		t.Fatalf("MusicBrainz batch status/body=%d %q", response.StatusCode, body)
+	}
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	count, err := database.FollowedArtistCount(context.Background(), user.ID)
+	if err != nil || count != 2 {
+		t.Fatalf("follow count=%d err=%v", count, err)
+	}
+
+	response, err = client.Get(server.URL + "/artists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "First Artist") ||
+		!strings.Contains(string(body), "Second Artist") ||
+		!strings.Contains(string(body), "Initial release synchronization pending") {
+		t.Fatalf("artists page status/body=%d %q", response.StatusCode, body)
+	}
+	response, err = client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if !strings.Contains(string(body), "<strong>2</strong>") || strings.Contains(string(body), "First Artist") {
+		t.Fatalf("dashboard count/list body=%q", body)
+	}
+
+	response = postForm(t, client, server.URL+"/artists/follow/batch", url.Values{
+		"_csrf": {csrf}, "mbids": {firstMBID, secondMBID},
+	})
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if !strings.Contains(string(body), "0 added") || !strings.Contains(string(body), "2 already followed") {
+		t.Fatalf("duplicate batch body=%q", body)
+	}
+}
+
+func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
+	mb := &searchCatalog{}
+	database, server, client := authenticatedTestServer(t, mb, nil, nil)
+	response, err := client.Get(server.URL + "/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("member admin status=%d", response.StatusCode)
+	}
+
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	if _, err := database.DB.Exec(`UPDATE users SET role='admin' WHERE id=?`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(context.Background(), user.ID, "Kitchen display", "ntfy", []byte("encrypted-secret")); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "33333333-3333-4333-8333-333333333333", Name: "Audit Artist", SortName: "Audit Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyReleaseSync(context.Background(), artist, []store.Release{{
+		MBID:             "44444444-4444-4444-8444-444444444444",
+		Title:            "Audited Album",
+		PrimaryType:      "Album",
+		FirstReleaseDate: "2026-07-30",
+		DatePrecision:    3,
+		MusicBrainzURL:   "https://musicbrainz.org/release-group/44444444-4444-4444-8444-444444444444",
+	}}, time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := database.DueDeliveries(context.Background(), time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC), 10)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("due deliveries=%#v err=%v", deliveries, err)
+	}
+	if err := database.MarkDeliveryFailed(
+		context.Background(), deliveries[0].ID, 5, "provider rejected secret detail",
+		time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboardBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if !strings.Contains(string(dashboardBody), "delivery-scroll") ||
+		strings.Contains(string(dashboardBody), "provider rejected secret detail") {
+		t.Fatalf("dashboard delivery log is not compact: %q", dashboardBody)
+	}
+	response, err = client.Get(server.URL + "/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	for _, expected := range []string{
+		"member@example.com", "Audited Album", "Kitchen display", "ntfy", "failed", "5 attempts",
+		"provider rejected secret detail",
+	} {
+		if !strings.Contains(string(body), expected) {
+			t.Fatalf("admin audit missing %q in %q", expected, body)
+		}
+	}
+	if strings.Contains(string(body), "encrypted-secret") {
+		t.Fatalf("admin audit exposed encrypted destination: %q", body)
+	}
+}
+
+func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
+	mb := &searchCatalog{}
+	database, server, client := authenticatedTestServer(t, mb, nil, func(database *store.Store) *jobs.Runner {
+		return jobs.New(
+			database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
+		)
+	})
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	resolution, _, err := database.CreateArtistResolution(
+		context.Background(), user.ID, "spotify-id", "Example",
+		"https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.MarkArtistResolutionReview(context.Background(), user.ID, resolution.ID, []store.ResolutionCandidate{{
+		MBID: "candidate-mbid", Name: "Example", SortName: "Example", Type: "Group",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/artist-resolutions/" + strconv.FormatInt(resolution.ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Choose the MusicBrainz artist") {
+		t.Fatalf("review status/body=%d %q", response.StatusCode, body)
+	}
+	csrf := getCSRF(t, client, server.URL+"/artist-resolutions/"+strconv.FormatInt(resolution.ID, 10))
+	response = postForm(t, client, server.URL+"/artist-resolutions/"+strconv.FormatInt(resolution.ID, 10), url.Values{
+		"_csrf": {csrf}, "mbid": {"candidate-mbid"},
+	})
+	response.Body.Close()
+	followed, err := database.FollowedArtists(context.Background(), user.ID)
+	if err != nil || len(followed) != 1 || followed[0].MBID != "candidate-mbid" {
+		t.Fatalf("reviewed follow=%#v err=%v", followed, err)
+	}
+
+	otherID, _ := database.CreateUser(context.Background(), "other@example.com", "unused", "member", "UTC")
+	otherResolution, _, _ := database.CreateArtistResolution(
+		context.Background(), otherID, "other-spotify", "Other",
+		"https://open.spotify.com/artist/other-spotify", "",
+	)
+	response, err = client.Get(server.URL + "/artist-resolutions/" + strconv.FormatInt(otherResolution.ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-user review status=%d", response.StatusCode)
+	}
+}
+
+func authenticatedTestServer(
+	t *testing.T,
+	mb catalog.CatalogProvider,
+	spotify catalog.SpotifyProvider,
+	runnerFactory func(*store.Store) *jobs.Runner,
+) (*store.Store, *httptest.Server, *http.Client) {
+	t.Helper()
+	database, err := store.Open(filepath.Join(t.TempDir(), "authenticated.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	public, _ := url.Parse("http://example.test")
+	cfg := config.Config{
+		PublicURL: public, SessionSecret: "the session secret has more than 32 bytes",
+		EncryptionKey: "the encryption key has more than 32 bytes",
+	}
+	cipher, _ := security.NewCipher(cfg.EncryptionKey)
+	userID, err := database.CreateUser(context.Background(), "member@example.com", "unused", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := database.CreateSession(context.Background(), userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runner *jobs.Runner
+	if runnerFactory != nil {
+		runner = runnerFactory(database)
+	}
+	app, err := New(
+		cfg, database, mb, spotify, fakeSender{}, cipher, fakeArtwork{}, runner,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(app.Handler())
+	t.Cleanup(server.Close)
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	serverURL, _ := url.Parse(server.URL)
+	jar.SetCookies(serverURL, []*http.Cookie{{
+		Name: "artist_session", Value: security.SignedToken(cfg.SessionSecret, raw), Path: "/",
+	}})
+	return database, server, client
 }
 
 var csrfPattern = regexp.MustCompile(`name="_csrf" value="([^"]+)"`)

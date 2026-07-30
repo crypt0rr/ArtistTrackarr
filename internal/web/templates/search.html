@@ -1,15 +1,26 @@
 {{template "head" .}}
-<section class="page-head"><p class="eyebrow">Discovery</p><h1>Find an artist</h1><p>MusicBrainz identities prevent similarly named artists from being mixed up.{{if .SpotifyOn}} Spotify is connected for links and artwork.{{end}}</p></section>
+<section class="page-head"><p class="eyebrow">Discovery</p><h1>Find an artist</h1><p>{{if .SpotifyOn}}Spotify provides fast artist discovery and MusicBrainz confirms the identity used for release tracking.{{else}}MusicBrainz identities prevent similarly named artists from being mixed up.{{end}}</p></section>
 <form method="get" action="/artists/search" class="searchbar">
   <input name="q" value="{{.Query}}" placeholder="Artist name" required autofocus>
   <button>Search</button>
 </form>
-{{if .Results}}<section class="panel"><div class="list">{{range .Results}}<article class="search-result">
+{{if .ProviderNotice}}<div class="notice">{{.ProviderNotice}}</div>{{end}}
+{{if .SpotifyResults}}<form method="post" action="/artists/follow/spotify/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>Spotify artists</h2><span class="badge">Spotify</span></div>
+<div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
+<div class="list">{{range .SpotifyResults}}<article class="search-result">
+  <label class="result-select"><input type="checkbox" name="spotify_ids" value="{{.ID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
+  {{if .ImageURL}}<img src="{{.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
+  <div class="grow"><strong>{{.Name}}</strong><small>Identity will be confirmed with MusicBrainz after selection.</small></div>
+  <div class="actions"><a href="{{.URL}}" rel="noreferrer">Open in Spotify</a></div>
+</article>{{end}}</div></section></form>
+{{else if .Results}}<form method="post" action="/artists/follow/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>MusicBrainz artists</h2><span class="badge">MusicBrainz</span></div>
+<div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
+<div class="list">{{range .Results}}<article class="search-result">
+  <label class="result-select"><input type="checkbox" name="mbids" value="{{.MBID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
   {{if .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
   <div class="grow"><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
   {{if .Aliases}}<small>Also known as {{join .Aliases ", "}}</small>{{end}}</div>
   <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
-  <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a>
-  <form method="post" action="/artists/follow" class="inline">{{template "csrf" $}}<input type="hidden" name="mbid" value="{{.MBID}}"><button>Follow</button></form></div>
-</article>{{end}}</div></section>{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
+  <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a></div>
+</article>{{end}}</div></section></form>{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
 {{template "foot" .}}

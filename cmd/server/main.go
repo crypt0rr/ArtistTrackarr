@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
@@ -43,11 +44,20 @@ func main() {
 		logger.Error("create credential cipher", "error", err)
 		os.Exit(1)
 	}
+	artworkCache, err := artwork.NewCache(filepath.Join(filepath.Dir(cfg.DatabasePath), "covers"))
+	if err != nil {
+		logger.Error("initialize artwork cache", "error", err)
+		os.Exit(1)
+	}
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret)
+	var spotifyProvider catalog.SpotifyProvider
+	if spotify != nil {
+		spotifyProvider = spotify
+	}
 	sender := notify.ShoutrrrSender{}
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger)
-	app, err := appweb.New(cfg, database, musicBrainz, spotify, sender, cipher, runner, logger)
+	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger)
 	if err != nil {
 		logger.Error("initialize web application", "error", err)
 		os.Exit(1)

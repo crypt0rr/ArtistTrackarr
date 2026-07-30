@@ -24,4 +24,43 @@
     await navigator.clipboard.writeText(document.querySelector("[data-copy-value]").value);
     copy.textContent = "Copied";
   });
+
+  document.querySelectorAll("[data-multi-follow]").forEach((multi) => {
+    const choices = [...multi.querySelectorAll("[data-artist-choice]")];
+    const selectAll = multi.querySelector("[data-select-all]");
+    const count = multi.querySelector("[data-selected-count]");
+    const submit = multi.querySelector("[data-follow-selected]");
+    const refresh = () => {
+      const selected = choices.filter((choice) => choice.checked).length;
+      count.textContent = `${selected} selected`;
+      submit.disabled = selected === 0;
+      selectAll.checked = selected > 0 && selected === choices.length;
+      selectAll.indeterminate = selected > 0 && selected < choices.length;
+    };
+    selectAll.addEventListener("change", () => {
+      choices.forEach((choice) => { choice.checked = selectAll.checked; });
+      refresh();
+    });
+    choices.forEach((choice) => choice.addEventListener("change", refresh));
+    refresh();
+  });
+
+  const deliveryScroll = document.querySelector("[data-delivery-scroll]");
+  if (deliveryScroll) {
+    const sizeDeliveryLog = () => {
+      const rows = [...deliveryScroll.children];
+      if (rows.length <= 4) {
+        deliveryScroll.style.maxHeight = "none";
+        deliveryScroll.removeAttribute("tabindex");
+        return;
+      }
+      const visibleHeight = rows.slice(0, 4).reduce(
+        (height, row) => height + row.getBoundingClientRect().height,
+        0
+      );
+      deliveryScroll.style.maxHeight = `${Math.ceil(visibleHeight)}px`;
+    };
+    sizeDeliveryLog();
+    window.addEventListener("resize", sizeDeliveryLog);
+  }
 })();

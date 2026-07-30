@@ -19,11 +19,17 @@ import (
 type CatalogProvider interface {
 	SearchArtists(context.Context, string, int) ([]ArtistResult, error)
 	ResolveArtist(context.Context, string) (ArtistResult, error)
+	ResolveExternalArtist(context.Context, string) ([]ArtistResult, error)
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
 type ReleaseNormalizer interface {
 	Normalize([]store.Release) []store.Release
+}
+
+type SpotifyProvider interface {
+	SearchArtists(context.Context, string) ([]SpotifyArtist, error)
+	Artist(context.Context, string) (SpotifyArtist, error)
 }
 
 type ArtistResult struct {
@@ -51,22 +57,37 @@ func (a ArtistResult) StoreArtist() store.Artist {
 type MusicBrainz struct {
 	client    *http.Client
 	userAgent string
-	limiter   *time.Ticker
+	baseURL   string
+	interval  time.Duration
+	retryBase time.Duration
 	mu        sync.Mutex
 	lastCall  time.Time
+}
+
+type HTTPStatusError struct {
+	Provider string
+	Status   int
+	Text     string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s returned %s", e.Provider, e.Text)
 }
 
 func NewMusicBrainz(contact string) *MusicBrainz {
 	return &MusicBrainz{
 		client:    &http.Client{Timeout: 20 * time.Second},
 		userAgent: fmt.Sprintf("ArtistReleaseTracker/1.0 (%s)", contact),
+		baseURL:   "https://musicbrainz.org",
+		interval:  time.Second,
+		retryBase: 250 * time.Millisecond,
 	}
 }
 
 func (m *MusicBrainz) wait(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if remaining := time.Second - time.Since(m.lastCall); remaining > 0 {
+	if remaining := m.interval - time.Since(m.lastCall); remaining > 0 {
 		timer := time.NewTimer(remaining)
 		defer timer.Stop()
 		select {
@@ -81,7 +102,7 @@ func (m *MusicBrainz) wait(ctx context.Context) error {
 
 func (m *MusicBrainz) getJSON(ctx context.Context, endpoint string, target any) error {
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		if err := m.wait(ctx); err != nil {
 			return err
 		}
@@ -93,13 +114,20 @@ func (m *MusicBrainz) getJSON(ctx context.Context, endpoint string, target any) 
 		req.Header.Set("Accept", "application/json")
 		resp, err := m.client.Do(req)
 		if err != nil {
-			last = err
+			last = fmt.Errorf("request MusicBrainz: %w", err)
+			if err := m.waitForRetry(ctx, attempt, ""); err != nil {
+				return err
+			}
 			continue
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if readErr != nil {
-			return readErr
+			last = fmt.Errorf("read MusicBrainz response: %w", readErr)
+			if err := m.waitForRetry(ctx, attempt, ""); err != nil {
+				return err
+			}
+			continue
 		}
 		if resp.StatusCode == http.StatusOK {
 			if err := json.Unmarshal(body, target); err != nil {
@@ -107,18 +135,37 @@ func (m *MusicBrainz) getJSON(ctx context.Context, endpoint string, target any) 
 			}
 			return nil
 		}
-		last = fmt.Errorf("MusicBrainz returned %s", resp.Status)
-		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable {
+		last = &HTTPStatusError{Provider: "MusicBrainz", Status: resp.StatusCode, Text: resp.Status}
+		if !transientStatus(resp.StatusCode) {
 			return last
 		}
-		delay := time.Duration(attempt+1) * 2 * time.Second
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
+		if err := m.waitForRetry(ctx, attempt, resp.Header.Get("Retry-After")); err != nil {
+			return err
 		}
 	}
 	return last
+}
+
+func transientStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+}
+
+func (m *MusicBrainz) waitForRetry(ctx context.Context, attempt int, retryAfter string) error {
+	if attempt >= 3 {
+		return nil
+	}
+	delay := time.Duration(1<<attempt) * m.retryBase
+	if seconds, err := time.ParseDuration(strings.TrimSpace(retryAfter) + "s"); err == nil && seconds > delay {
+		delay = min(seconds, 30*time.Second)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int) ([]ArtistResult, error) {
@@ -128,7 +175,7 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 	if limit < 1 || limit > 25 {
 		limit = 10
 	}
-	endpoint := "https://musicbrainz.org/ws/2/artist?fmt=json&limit=" +
+	endpoint := m.baseURL + "/ws/2/artist?fmt=json&limit=" +
 		fmt.Sprint(limit) + "&query=" + url.QueryEscape(query)
 	var response struct {
 		Artists []struct {
@@ -169,7 +216,7 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 	if !validMBID(mbid) {
 		return ArtistResult{}, errors.New("invalid MusicBrainz artist ID")
 	}
-	endpoint := "https://musicbrainz.org/ws/2/artist/" + url.PathEscape(mbid) + "?fmt=json&inc=aliases"
+	endpoint := m.baseURL + "/ws/2/artist/" + url.PathEscape(mbid) + "?fmt=json&inc=aliases"
 	var item struct {
 		ID             string `json:"id"`
 		Name           string `json:"name"`
@@ -190,12 +237,54 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 	}, nil
 }
 
+func (m *MusicBrainz) ResolveExternalArtist(ctx context.Context, externalURL string) ([]ArtistResult, error) {
+	externalURL = strings.TrimSpace(externalURL)
+	parsed, err := url.Parse(externalURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, errors.New("invalid external artist URL")
+	}
+	endpoint := m.baseURL + "/ws/2/url?fmt=json&inc=artist-rels&resource=" + url.QueryEscape(externalURL)
+	var response struct {
+		Relations []struct {
+			Artist *struct {
+				ID             string `json:"id"`
+				Name           string `json:"name"`
+				SortName       string `json:"sort-name"`
+				Type           string `json:"type"`
+				Country        string `json:"country"`
+				Disambiguation string `json:"disambiguation"`
+			} `json:"artist"`
+		} `json:"relations"`
+	}
+	if err := m.getJSON(ctx, endpoint, &response); err != nil {
+		var status *HTTPStatusError
+		if errors.As(err, &status) && status.Status == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var result []ArtistResult
+	for _, relation := range response.Relations {
+		if relation.Artist == nil || !validMBID(relation.Artist.ID) || seen[relation.Artist.ID] {
+			continue
+		}
+		seen[relation.Artist.ID] = true
+		result = append(result, ArtistResult{
+			MBID: relation.Artist.ID, Name: relation.Artist.Name, SortName: relation.Artist.SortName,
+			Type: relation.Artist.Type, Country: relation.Artist.Country,
+			Disambiguation: relation.Artist.Disambiguation,
+		})
+	}
+	return result, nil
+}
+
 func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.Release, error) {
 	var all []store.Release
 	offset := 0
 	for {
-		endpoint := fmt.Sprintf("https://musicbrainz.org/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep&release-group-status=website-default&limit=100&offset=%d",
-			url.QueryEscape(mbid), offset)
+		endpoint := fmt.Sprintf("%s/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep&release-group-status=website-default&limit=100&offset=%d",
+			m.baseURL, url.QueryEscape(mbid), offset)
 		var response struct {
 			Count         int `json:"release-group-count"`
 			ReleaseGroups []struct {
@@ -254,6 +343,8 @@ func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
 type Spotify struct {
 	clientID, secret string
 	client           *http.Client
+	accountsURL      string
+	apiURL           string
 	mu               sync.Mutex
 	token            string
 	expires          time.Time
@@ -267,7 +358,10 @@ func NewSpotify(id, secret string) *Spotify {
 	if id == "" || secret == "" {
 		return nil
 	}
-	return &Spotify{clientID: id, secret: secret, client: &http.Client{Timeout: 15 * time.Second}}
+	return &Spotify{
+		clientID: id, secret: secret, client: &http.Client{Timeout: 15 * time.Second},
+		accountsURL: "https://accounts.spotify.com", apiURL: "https://api.spotify.com",
+	}
 }
 
 func (s *Spotify) accessToken(ctx context.Context) (string, error) {
@@ -277,7 +371,7 @@ func (s *Spotify) accessToken(ctx context.Context) (string, error) {
 		return s.token, nil
 	}
 	form := strings.NewReader("grant_type=client_credentials")
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://accounts.spotify.com/api/token", form)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.accountsURL+"/api/token", form)
 	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(s.clientID+":"+s.secret)))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
@@ -307,7 +401,7 @@ func (s *Spotify) SearchArtists(ctx context.Context, query string) ([]SpotifyArt
 	if err != nil {
 		return nil, err
 	}
-	endpoint := "https://api.spotify.com/v1/search?type=artist&limit=10&q=" + url.QueryEscape(query)
+	endpoint := s.apiURL + "/v1/search?type=artist&limit=10&q=" + url.QueryEscape(query)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := s.client.Do(req)
@@ -386,7 +480,7 @@ func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) 
 	if err != nil {
 		return SpotifyArtist{}, err
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.spotify.com/v1/artists/"+url.PathEscape(id), nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.apiURL+"/v1/artists/"+url.PathEscape(id), nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := s.client.Do(req)
 	if err != nil {

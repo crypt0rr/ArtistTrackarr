@@ -1,0 +1,23 @@
+{{template "head" .}}
+<section class="page-head split-head">
+  <div><p class="eyebrow">Watchlist</p><h1>Followed artists</h1><p>Your canonical MusicBrainz watchlist and its optional Spotify links.</p></div>
+  <div class="actions"><a href="/imports">Bulk import</a><a class="button" href="/artists/search">Add artists</a></div>
+</section>
+<section class="stats single-stat">
+  <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
+</section>
+<section class="panel">
+  {{if .Artists}}<div class="list">
+  {{range .Artists}}<article class="list-row">
+    <div class="artist-summary">
+      {{if .SpotifyImageURL}}<img class="avatar" src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Name}}</span>{{end}}
+      <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
+      <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}</small></span>
+    </div>
+    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
+    <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">MusicBrainz</a>
+    <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
+  </article>{{end}}</div>
+  {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists</a> or <a href="/imports">import a list</a>.</div>{{end}}
+</section>
+{{template "foot" .}}

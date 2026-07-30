@@ -1,5 +1,6 @@
 {{template "head" .}}
 <section class="auth-card">
+  {{template "auth-logo" .}}
   {{if eq .TokenKind "invite"}}<p class="eyebrow">Household invitation</p><h1>Create your account</h1>{{else}}<p class="eyebrow">Account recovery</p><h1>Choose a new password</h1>{{end}}
   <form method="post" action="/{{.TokenKind}}/{{.Token}}" class="stack">
     {{template "csrf" .}}
