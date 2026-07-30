@@ -1,7 +1,7 @@
 {{template "head" .}}
 <section class="page-head split-head">
   <div><p class="eyebrow">Watchlist</p><h1>Followed artists</h1><p>Your canonical MusicBrainz watchlist and its optional Spotify links.</p></div>
-  <div class="actions"><a class="button" href="/artists/search">Add or import artists</a></div>
+  <div class="actions"><a class="button" href="/artists/search">Add artists</a></div>
 </section>
 <section class="stats single-stat">
   <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
@@ -18,6 +18,6 @@
     <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">MusicBrainz</a>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
   </article>{{end}}</div>
-  {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists or import a list</a>.</div>{{end}}
+  {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists</a>.</div>{{end}}
 </section>
 {{template "foot" .}}

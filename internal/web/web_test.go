@@ -490,7 +490,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 	}
 }
 
-func TestCombinedArtistToolsAndOwnerScopedCSVExport(t *testing.T) {
+func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	mb := &searchCatalog{}
 	database, server, client := authenticatedTestServer(t, mb, nil, nil)
 	ctx := context.Background()
@@ -522,10 +522,10 @@ func TestCombinedArtistToolsAndOwnerScopedCSVExport(t *testing.T) {
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, "<h1>Add artists</h1>") ||
-		!strings.Contains(page, `action="/imports"`) ||
 		!strings.Contains(page, `href="/artists/export"`) ||
-		!strings.Contains(page, "Export watchlist (1)") ||
-		strings.Contains(page, `>Bulk import</a>`) {
+		!strings.Contains(page, "Export CSV") ||
+		strings.Contains(page, `action="/imports"`) ||
+		strings.Contains(page, "Review and import") {
 		t.Fatalf("combined artist tools status/body=%d %q", response.StatusCode, body)
 	}
 
@@ -536,10 +536,17 @@ func TestCombinedArtistToolsAndOwnerScopedCSVExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusSeeOther ||
-		response.Header.Get("Location") != "/artists/search#import-export" {
-		t.Fatalf("legacy import redirect status/location=%d %q",
-			response.StatusCode, response.Header.Get("Location"))
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("removed import endpoint status=%d", response.StatusCode)
+	}
+	csrf := getCSRF(t, client, server.URL+"/artists/search")
+	response, err = noRedirect.PostForm(server.URL+"/imports", url.Values{"_csrf": {csrf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("removed import POST endpoint status=%d", response.StatusCode)
 	}
 
 	response, err = client.Get(server.URL + "/artists/export")

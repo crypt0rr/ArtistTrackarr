@@ -144,15 +144,6 @@ type AdminDeliveryHistory struct {
 	SentAt      *time.Time
 }
 
-type ImportRow struct {
-	ArtistID    int64
-	SourceValue string
-	DisplayName string
-	Status      string
-	ArtistName  string
-	Reason      string
-}
-
 type ResolutionCandidate struct {
 	MBID           string   `json:"mbid"`
 	Name           string   `json:"name"`
@@ -1583,51 +1574,6 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 			h.SentAt = &t
 		}
 		result = append(result, h)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) CreateImportJob(ctx context.Context, userID int64, rows []ImportRow) (int64, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO import_jobs(user_id,created_at) VALUES(?,?)`, userID, nowText())
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	id, _ := result.LastInsertId()
-	for _, row := range rows {
-		var artistID any
-		if row.ArtistID > 0 {
-			artistID = row.ArtistID
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO import_rows(job_id,source_value,display_name,status,artist_id,reason)
-			VALUES(?,?,?,?,?,?)`, id, row.SourceValue, row.DisplayName, row.Status, artistID, row.Reason)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-	}
-	return id, tx.Commit()
-}
-
-func (s *Store) ImportRows(ctx context.Context, userID, jobID int64) ([]ImportRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT r.source_value,r.display_name,r.status,COALESCE(a.name,''),r.reason
-		FROM import_rows r JOIN import_jobs j ON j.id=r.job_id LEFT JOIN artists a ON a.id=r.artist_id
-		WHERE j.user_id=? AND j.id=? ORDER BY r.id`, userID, jobID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []ImportRow
-	for rows.Next() {
-		var r ImportRow
-		if err := rows.Scan(&r.SourceValue, &r.DisplayName, &r.Status, &r.ArtistName, &r.Reason); err != nil {
-			return nil, err
-		}
-		result = append(result, r)
 	}
 	return result, rows.Err()
 }
