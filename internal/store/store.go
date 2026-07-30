@@ -824,6 +824,11 @@ func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.
 	return err
 }
 
+func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
+	return err
+}
+
 func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []Release, observed time.Time) error {
 	return s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
 		Provider: "musicbrainz",
@@ -1349,6 +1354,54 @@ func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]
 		return nil, err
 	}
 	defer rows.Close()
+	return scanReleases(rows)
+}
+
+func (s *Store) DashboardReleases(
+	ctx context.Context, userID int64, today string, limit int,
+) (upcoming []Release, recent []Release, err error) {
+	const definitelyFuture = `(
+		(rg.date_precision=3 AND length(rg.first_release_date)=10
+			AND date(rg.first_release_date) IS NOT NULL AND rg.first_release_date>?)
+		OR (rg.date_precision=2 AND length(rg.first_release_date)=7
+			AND date(rg.first_release_date || '-01') IS NOT NULL AND rg.first_release_date>substr(?,1,7))
+		OR (rg.date_precision=1 AND length(rg.first_release_date)=4
+			AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
+	)`
+	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
+		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+		WHERE f.user_id=? AND `+definitelyFuture+`
+		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
+		userID, today, today, today, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	upcoming, err = scanReleases(upcomingRows)
+	upcomingRows.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	recentRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
+		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+		WHERE f.user_id=? AND NOT COALESCE(`+definitelyFuture+`,0)
+		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
+		userID, today, today, today, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	recent, err = scanReleases(recentRows)
+	recentRows.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	return upcoming, recent, nil
+}
+
+func scanReleases(rows *sql.Rows) ([]Release, error) {
 	var result []Release
 	for rows.Next() {
 		var r Release

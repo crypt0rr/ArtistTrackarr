@@ -15,7 +15,7 @@
   <label class="result-select"><input type="checkbox" name="spotify_ids" value="{{.ID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
   {{if .ImageURL}}<img src="{{.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
   <div class="grow"><strong>{{.Name}}</strong><small>Identity will be confirmed with MusicBrainz after selection.</small></div>
-  <div class="actions"><a href="{{.URL}}" rel="noreferrer">Open in Spotify</a></div>
+  <div class="actions"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">Open in Spotify</a></div>
 </article>{{end}}</div></section></form>
 {{else if .Results}}<form method="post" action="/artists/follow/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>MusicBrainz artists</h2><span class="badge">MusicBrainz</span></div>
 <div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
@@ -24,8 +24,8 @@
   {{if .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
   <div class="grow"><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
   {{if .Aliases}}<small>Also known as {{join .Aliases ", "}}</small>{{end}}</div>
-  <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
-  <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a></div>
+  <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
+  <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">Inspect</a></div>
 </article>{{end}}</div></section></form>{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
 <section class="panel watchlist-export">
   <div class="section-head">

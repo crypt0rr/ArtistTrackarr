@@ -6,7 +6,7 @@
 </section>
 <section class="stats">
   <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
-  <article><strong>{{len .Releases}}</strong><span>catalog entries shown</span></article>
+  <article><strong>{{.ReleaseCount}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
 {{if .Resolutions}}<section class="panel highlight">
@@ -15,22 +15,34 @@
     <div class="resolution-artist">{{if .ImageURL}}<img class="avatar" src="{{.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .DisplayName}}</span>{{end}}
       <span><strong>{{.DisplayName}}</strong><small>{{if eq .Status "review"}}Choose the matching MusicBrainz artist.{{else}}Identification will retry automatically.{{end}}</small></span>
     </div>
-    <div class="actions"><a href="{{.ProviderURL}}" rel="noreferrer">Spotify</a><a href="/artist-resolutions/{{.ID}}">{{if eq .Status "review"}}Review{{else}}Details{{end}}</a>
+    <div class="actions"><a href="{{.ProviderURL}}" target="_blank" rel="noopener noreferrer">Spotify</a><a href="/artist-resolutions/{{.ID}}">{{if eq .Status "review"}}Review{{else}}Details{{end}}</a>
       <form method="post" action="/artist-resolutions/{{.ID}}/cancel" class="inline">{{template "csrf" $}}<button class="danger link">Cancel</button></form>
     </div>
   </article>{{end}}</div>
 </section>{{end}}
-<section class="panel">
-  <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
-  {{if .Releases}}<div class="release-grid">{{range .Releases}}
-  <a class="release-card" href="{{if .MusicBrainzURL}}{{.MusicBrainzURL}}{{else}}{{.SpotifyURL}}{{end}}" rel="noreferrer">
+{{if .UpcomingReleases}}<section class="panel release-section">
+  <p class="eyebrow">Coming soon</p><h2>Upcoming releases</h2>
+  <div class="release-grid">{{range .UpcomingReleases}}
+  <a class="release-card" href="{{if .MusicBrainzURL}}{{.MusicBrainzURL}}{{else}}{{.SpotifyURL}}{{end}}" target="_blank" rel="noopener noreferrer">
     {{if and (eq .Source "spotify") .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
     {{else}}<img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}">{{end}}
     <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
       <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{if eq .Source "spotify"}}Spotify{{else if eq .Source "both"}}MusicBrainz + Spotify{{else}}MusicBrainz{{end}}</small>
     </span>
   </a>
-  {{end}}</div>{{else}}<div class="empty">Releases appear after the first catalog sync.</div>{{end}}
+  {{end}}</div>
+</section>{{end}}
+<section class="panel release-section">
+  <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
+  {{if .RecentReleases}}<div class="release-grid">{{range .RecentReleases}}
+  <a class="release-card" href="{{if .MusicBrainzURL}}{{.MusicBrainzURL}}{{else}}{{.SpotifyURL}}{{end}}" target="_blank" rel="noopener noreferrer">
+    {{if and (eq .Source "spotify") .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
+    {{else}}<img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}">{{end}}
+    <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
+      <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{if eq .Source "spotify"}}Spotify{{else if eq .Source "both"}}MusicBrainz + Spotify{{else}}MusicBrainz{{end}}</small>
+    </span>
+  </a>
+  {{end}}</div>{{else}}<div class="empty">Past releases appear after the first catalog sync.</div>{{end}}
 </section>
 <section class="panel">
   <p class="eyebrow">Delivery log</p><h2>Recent notifications</h2>

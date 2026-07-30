@@ -50,35 +50,37 @@ type App struct {
 }
 
 type PageData struct {
-	Title          string
-	Version        string
-	User           *store.User
-	CSRF           string
-	Error          string
-	Message        string
-	SetupNeeded    bool
-	Artists        []store.Artist
-	Results        []catalog.ArtistResult
-	SpotifyResults []catalog.SpotifyArtist
-	Releases       []store.Release
-	Resolutions    []store.ArtistResolution
-	Resolution     *store.ArtistResolution
-	Destinations   []store.Destination
-	History        []store.DeliveryHistory
-	AdminHistory   []store.AdminDeliveryHistory
-	AdminUsers     []store.AdminUser
-	FollowCount    int
-	AdminPage      int
-	AdminPages     int
-	AdminPrevPage  int
-	AdminNextPage  int
-	Query          string
-	GeneratedURL   string
-	Token          string
-	TokenKind      string
-	TokenEmail     string
-	SpotifyOn      bool
-	ProviderNotice string
+	Title            string
+	Version          string
+	User             *store.User
+	CSRF             string
+	Error            string
+	Message          string
+	SetupNeeded      bool
+	Artists          []store.Artist
+	Results          []catalog.ArtistResult
+	SpotifyResults   []catalog.SpotifyArtist
+	UpcomingReleases []store.Release
+	RecentReleases   []store.Release
+	ReleaseCount     int
+	Resolutions      []store.ArtistResolution
+	Resolution       *store.ArtistResolution
+	Destinations     []store.Destination
+	History          []store.DeliveryHistory
+	AdminHistory     []store.AdminDeliveryHistory
+	AdminUsers       []store.AdminUser
+	FollowCount      int
+	AdminPage        int
+	AdminPages       int
+	AdminPrevPage    int
+	AdminNextPage    int
+	Query            string
+	GeneratedURL     string
+	Token            string
+	TokenKind        string
+	TokenEmail       string
+	SpotifyOn        bool
+	ProviderNotice   string
 }
 
 func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify catalog.SpotifyProvider,
@@ -361,7 +363,15 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	d := a.data(r, "Dashboard")
 	d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
-	d.Releases, _ = a.store.RecentReleases(r.Context(), session.User.ID, 20)
+	location, err := time.LoadLocation(session.User.Timezone)
+	if err != nil {
+		location = time.UTC
+	}
+	today := time.Now().In(location).Format("2006-01-02")
+	d.UpcomingReleases, d.RecentReleases, _ = a.store.DashboardReleases(
+		r.Context(), session.User.ID, today, 20,
+	)
+	d.ReleaseCount = len(d.UpcomingReleases) + len(d.RecentReleases)
 	d.History, _ = a.store.DeliveryHistory(r.Context(), session.User.ID, 10)
 	d.Resolutions, _ = a.store.ArtistResolutions(r.Context(), session.User.ID)
 	a.render(w, "dashboard", d, http.StatusOK)
@@ -769,7 +779,7 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		var serviceURL string
 		serviceURL, err = a.cipher.Decrypt(destination.EncryptedURL)
 		if err == nil {
-			err = a.sender.Send(r.Context(), serviceURL, "Artist Trackarr test", "Your notification destination is working.")
+			err = a.sender.Send(r.Context(), serviceURL, "ArtistTrackarr test", "Your notification destination is working.")
 		}
 	}
 	if err != nil {

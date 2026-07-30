@@ -79,7 +79,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
           labels: |
-            org.opencontainers.image.title=Artist Trackarr
+            org.opencontainers.image.title=ArtistTrackarr
             org.opencontainers.image.description=Self-hosted artist release tracker
 
       - name: Build and publish image

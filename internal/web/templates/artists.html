@@ -14,8 +14,8 @@
       <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
       <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}</small></span>
     </div>
-    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
-    <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">MusicBrainz</a>
+    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
+    <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
   </article>{{end}}</div>
   {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists</a>.</div>{{end}}

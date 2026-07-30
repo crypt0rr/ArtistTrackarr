@@ -299,6 +299,67 @@ func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
 	assertEventCount(t, s, userID, "announcement", 1)
 }
 
+func TestDashboardReleasesSeparatesDefinitelyFutureDates(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
+	s.Follow(ctx, userID, artist.ID)
+	releases := []Release{
+		{MBID: "future-day", Title: "Future day", PrimaryType: "Album", FirstReleaseDate: "2026-08-15", DatePrecision: 3},
+		{MBID: "future-month", Title: "Future month", PrimaryType: "Album", FirstReleaseDate: "2026-09", DatePrecision: 2},
+		{MBID: "future-year", Title: "Future year", PrimaryType: "Album", FirstReleaseDate: "2027", DatePrecision: 1},
+		{MBID: "today", Title: "Today", PrimaryType: "Album", FirstReleaseDate: "2026-07-30", DatePrecision: 3},
+		{MBID: "past", Title: "Past", PrimaryType: "Album", FirstReleaseDate: "2026-07-29", DatePrecision: 3},
+		{MBID: "current-month", Title: "Current month", PrimaryType: "Album", FirstReleaseDate: "2026-07", DatePrecision: 2},
+		{MBID: "current-year", Title: "Current year", PrimaryType: "Album", FirstReleaseDate: "2026", DatePrecision: 1},
+		{MBID: "invalid-date", Title: "Invalid date", PrimaryType: "Album", FirstReleaseDate: "not-a-date", DatePrecision: 3},
+		{MBID: "wrong-precision", Title: "Wrong precision", PrimaryType: "Album", FirstReleaseDate: "2028", DatePrecision: 3},
+		{MBID: "undated", Title: "Undated", PrimaryType: "Album"},
+	}
+	if err := s.ApplyReleaseSync(ctx, artist, releases, time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+
+	upcoming, recent, err := s.DashboardReleases(ctx, userID, "2026-07-30", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertReleaseMBIDs(t, upcoming, []string{"future-day", "future-month", "future-year"})
+	assertReleaseMBIDs(t, recent, []string{
+		"invalid-date", "wrong-precision", "today", "past", "current-month", "current-year", "undated",
+	})
+}
+
+func TestScheduleArtistCheckDefersDueArtist(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
+	s.Follow(ctx, userID, artist.ID)
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	if err := s.ScheduleArtistCheck(ctx, artist.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.ArtistsDue(ctx, now, 10); err != nil || len(due) != 0 {
+		t.Fatalf("artists due immediately=%#v err=%v", due, err)
+	}
+	if due, err := s.ArtistsDue(ctx, now.Add(time.Hour), 10); err != nil || len(due) != 1 || due[0].ID != artist.ID {
+		t.Fatalf("artists due after cooldown=%#v err=%v", due, err)
+	}
+}
+
+func assertReleaseMBIDs(t *testing.T, releases []Release, want []string) {
+	t.Helper()
+	got := make([]string, len(releases))
+	for i := range releases {
+		got[i] = releases[i].MBID
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("release order=%v want=%v", got, want)
+	}
+}
+
 func TestSessionRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

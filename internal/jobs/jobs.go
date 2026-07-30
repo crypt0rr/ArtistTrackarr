@@ -210,6 +210,7 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) error {
 func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) error {
 	var batches []store.ReleaseBatch
 	var providerErrors []error
+	var spotifyRateLimit *catalog.SpotifyRateLimitError
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 	if err == nil {
 		batches = append(batches, store.ReleaseBatch{
@@ -227,16 +228,44 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			})
 		} else {
 			providerErrors = append(providerErrors, spotifyErr)
-			r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
+			if errors.As(spotifyErr, &spotifyRateLimit) {
+				r.logger.Warn("Spotify release observation rate limited",
+					"artist_id", artist.ID,
+					"reason", spotifyRateLimit.Reason,
+					"retry_after", spotifyRateLimit.RetryAfter,
+					"quota_exceeded", spotifyRateLimit.QuotaExceeded,
+				)
+			} else {
+				r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
+			}
 		}
 	}
 	if len(batches) == 0 {
-		return errors.Join(providerErrors...)
+		retryAt := now.Add(providerFailureRetryDelay(spotifyRateLimit, r.interval))
+		return errors.Join(errors.Join(providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
 	}
 	if err := r.store.ApplyReleaseBatches(ctx, artist, batches, now); err != nil {
 		return err
 	}
-	return r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval)
+	return r.store.MarkArtistChecked(ctx, artist.ID, now, syncRetryDelay(spotifyRateLimit, r.interval))
+}
+
+func syncRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interval time.Duration) time.Duration {
+	if rateLimit == nil {
+		return interval
+	}
+	if rateLimit.QuotaExceeded {
+		return interval
+	}
+	delay := max(rateLimit.RetryAfter, time.Minute)
+	return min(delay, interval)
+}
+
+func providerFailureRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interval time.Duration) time.Duration {
+	if rateLimit != nil {
+		return syncRetryDelay(rateLimit, interval)
+	}
+	return min(15*time.Minute, interval)
 }
 
 func (r *Runner) deliver(ctx context.Context, now time.Time) error {
