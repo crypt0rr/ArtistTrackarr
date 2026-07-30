@@ -1,4 +1,4 @@
-# Artist Trackarr
+# ArtistTrackarr
 
 A self-hosted household dashboard that watches MusicBrainz and, when configured,
 Spotify for new albums and EPs and sends announcement and release-day notifications through

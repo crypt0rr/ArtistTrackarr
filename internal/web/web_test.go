@@ -148,7 +148,8 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		!strings.Contains(string(loginBody), "v"+version.Current) ||
 		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/Artist-Trackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-select`) ||
-		!strings.Contains(string(loginBody), "Artist Trackarr") ||
+		!strings.Contains(string(loginBody), "ArtistTrackarr") ||
+		strings.Contains(string(loginBody), "Artist Trackarr") ||
 		strings.Contains(string(loginBody), "Artist Tracker") {
 		t.Fatalf("login branding missing or stale: %q", loginBody)
 	}
@@ -190,7 +191,8 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
 		!strings.Contains(string(body), "/static/logo-mark.png") ||
-		!strings.Contains(string(body), "Artist Trackarr") ||
+		!strings.Contains(string(body), "ArtistTrackarr") ||
+		strings.Contains(string(body), "Artist Trackarr") ||
 		strings.Contains(string(body), "Artist Tracker") ||
 		!strings.Contains(string(body), `href="/artists"`) {
 		t.Fatalf("dashboard status/body = %d, %q", response.StatusCode, body)
@@ -766,11 +768,12 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
+	futureDate := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02")
 	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
 		Provider: "spotify",
 		Releases: []store.Release{{
 			MBID: "spotify:album-id", SpotifyID: "album-id", Title: "1. KRUIS", PrimaryType: "EP",
-			FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+			FirstReleaseDate: futureDate, DatePrecision: 3,
 			SpotifyURL:      "https://open.spotify.com/album/album-id",
 			SpotifyImageURL: "https://i.scdn.co/image/album-art", Source: "spotify",
 		}},
@@ -786,9 +789,11 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, "MusicBrainz and Spotify are checked") ||
-		!strings.Contains(page, `href="https://open.spotify.com/album/album-id"`) ||
+		!strings.Contains(page, "Upcoming releases") ||
+		!strings.Contains(page, `href="https://open.spotify.com/album/album-id" target="_blank" rel="noopener noreferrer"`) ||
 		!strings.Contains(page, `src="https://i.scdn.co/image/album-art"`) ||
-		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") {
+		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") ||
+		strings.Contains(page, `href="/artists/search" target="_blank"`) {
 		t.Fatalf("Spotify release dashboard status/body=%d %q", response.StatusCode, body)
 	}
 }

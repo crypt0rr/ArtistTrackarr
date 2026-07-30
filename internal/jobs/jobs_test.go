@@ -193,6 +193,93 @@ func TestSyncContinuesWithSpotifyWhenMusicBrainzFails(t *testing.T) {
 	}
 }
 
+func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{
+		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	database.Follow(ctx, userID, artist.ID)
+	oldSpotify := store.Release{
+		MBID: "spotify:old", SpotifyID: "old", Title: "Stored Spotify Album", PrimaryType: "Album",
+		FirstReleaseDate: "2025-01-01", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/old", Source: "spotify",
+	}
+	if err := database.ApplyReleaseBatches(ctx, artist, []store.ReleaseBatch{{
+		Provider: "spotify", Releases: []store.Release{oldSpotify},
+	}}, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rateLimit := &catalog.SpotifyRateLimitError{
+		Operation: "Spotify artist albums", Status: 429, Reason: "rate_limited", RetryAfter: 2 * time.Minute,
+	}
+	runner := New(
+		database,
+		&resolutionCatalog{releases: []store.Release{{
+			MBID: "musicbrainz-new", Title: "Canonical Album", PrimaryType: "Album",
+			FirstReleaseDate: "2026-07-30", DatePrecision: 3,
+		}}},
+		catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithSpotify(&spotifyReleaseCatalog{err: rateLimit}),
+	)
+	before := time.Now().UTC()
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := database.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 2 {
+		t.Fatalf("preserved releases=%#v err=%v", releases, err)
+	}
+	var nextCheck string
+	if err := database.DB.QueryRow(`SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextCheck)
+	if err != nil || next.Before(before.Add(119*time.Second)) || next.After(before.Add(3*time.Minute)) {
+		t.Fatalf("next Spotify retry=%q parsed=%v err=%v", nextCheck, next, err)
+	}
+}
+
+func TestTotalProviderFailureSchedulesBoundedRetry(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{MBID: "artist-mbid", Name: "Example"})
+	database.Follow(ctx, userID, artist.ID)
+	before := time.Now().UTC()
+	err := testRunner(database, &resolutionCatalog{releaseErr: io.ErrUnexpectedEOF}).SyncArtistNow(ctx, artist)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("sync error=%v", err)
+	}
+	var nextCheck string
+	if err := database.DB.QueryRow(`SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+		t.Fatal(err)
+	}
+	next, parseErr := time.Parse(time.RFC3339Nano, nextCheck)
+	if parseErr != nil || next.Before(before.Add(14*time.Minute+59*time.Second)) ||
+		next.After(before.Add(16*time.Minute)) {
+		t.Fatalf("bounded provider retry=%q parsed=%v err=%v", nextCheck, next, parseErr)
+	}
+	if due, err := database.ArtistsDue(ctx, time.Now(), 10); err != nil || len(due) != 0 {
+		t.Fatalf("provider failure retried immediately: due=%#v err=%v", due, err)
+	}
+}
+
+func TestSpotifyRetrySchedulingBounds(t *testing.T) {
+	interval := 6 * time.Hour
+	if got := syncRetryDelay(&catalog.SpotifyRateLimitError{RetryAfter: 10 * time.Second}, interval); got != time.Minute {
+		t.Fatalf("short retry delay=%s", got)
+	}
+	if got := syncRetryDelay(&catalog.SpotifyRateLimitError{RetryAfter: 24 * time.Hour}, interval); got != interval {
+		t.Fatalf("long retry delay=%s", got)
+	}
+	if got := syncRetryDelay(&catalog.SpotifyRateLimitError{QuotaExceeded: true, RetryAfter: time.Minute}, interval); got != interval {
+		t.Fatalf("quota retry delay=%s", got)
+	}
+}
+
 func TestArtistResolutionRetryDelayIsBounded(t *testing.T) {
 	tests := []struct {
 		attempts int

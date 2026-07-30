@@ -5,7 +5,7 @@
 <section class="panel highlight">
   <div class="resolution-artist">
     {{if .Resolution.ImageURL}}<img class="avatar" src="{{.Resolution.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Resolution.DisplayName}}</span>{{end}}
-    <span><strong>{{.Resolution.DisplayName}}</strong><a href="{{.Resolution.ProviderURL}}" rel="noreferrer">Open in Spotify</a></span>
+    <span><strong>{{.Resolution.DisplayName}}</strong><a href="{{.Resolution.ProviderURL}}" target="_blank" rel="noopener noreferrer">Open in Spotify</a></span>
   </div>
 </section>
 {{if eq .Resolution.Status "review"}}
@@ -14,7 +14,7 @@
   <div class="grow"><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
     {{if .Aliases}}<small>Also known as {{join .Aliases ", "}}</small>{{end}}
   </div>
-  <div class="actions"><a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a>
+  <div class="actions"><a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">Inspect</a>
     <form method="post" action="/artist-resolutions/{{$.Resolution.ID}}" class="inline">{{template "csrf" $}}<input type="hidden" name="mbid" value="{{.MBID}}"><button>Choose</button></form>
   </div>
 </article>{{end}}</div></section>
