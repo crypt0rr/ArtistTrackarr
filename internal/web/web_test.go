@@ -141,10 +141,36 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	}
 	loginBody, _ := io.ReadAll(loginPage.Body)
 	loginPage.Body.Close()
-	if !strings.Contains(string(loginBody), "/static/logo-full.webp") ||
+	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
+		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
+		!strings.Contains(string(loginBody), "v0.1.4") ||
+		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/Artist-Trackarr") ||
+		!strings.Contains(string(loginBody), `data-theme-select`) ||
 		!strings.Contains(string(loginBody), "Artist Trackarr") ||
 		strings.Contains(string(loginBody), "Artist Tracker") {
 		t.Fatalf("login branding missing or stale: %q", loginBody)
+	}
+	for _, asset := range []struct {
+		path        string
+		contentType string
+	}{
+		{"/static/favicon.ico", "image/"},
+		{"/static/favicon-32.png", "image/png"},
+		{"/static/apple-touch-icon.png", "image/png"},
+		{"/static/logo-full.png", "image/png"},
+		{"/static/logo-mark.png", "image/png"},
+	} {
+		staticResponse, err := client.Get(server.URL + asset.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, staticResponse.Body)
+		staticResponse.Body.Close()
+		if staticResponse.StatusCode != http.StatusOK ||
+			!strings.HasPrefix(staticResponse.Header.Get("Content-Type"), asset.contentType) {
+			t.Fatalf("static asset %s status/type = %d, %q", asset.path,
+				staticResponse.StatusCode, staticResponse.Header.Get("Content-Type"))
+		}
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/setup")
@@ -161,7 +187,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
-		!strings.Contains(string(body), "/static/logo-mark.webp") ||
+		!strings.Contains(string(body), "/static/logo-mark.png") ||
 		!strings.Contains(string(body), "Artist Trackarr") ||
 		strings.Contains(string(body), "Artist Tracker") ||
 		!strings.Contains(string(body), `href="/artists"`) {

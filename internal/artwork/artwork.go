@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 const (
@@ -144,7 +146,7 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	if err != nil {
 		return fallback(stale, "error")
 	}
-	request.Header.Set("User-Agent", "ArtistTrackarr/0.1.3")
+	request.Header.Set("User-Agent", version.UserAgent)
 	response, err := c.client.Do(request)
 	if err != nil {
 		return fallback(stale, "upstream-error")

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 type CatalogProvider interface {
@@ -81,7 +82,7 @@ func (e *HTTPStatusError) Error() string {
 func NewMusicBrainz(contact string) *MusicBrainz {
 	return &MusicBrainz{
 		client:    &http.Client{Timeout: 20 * time.Second},
-		userAgent: fmt.Sprintf("ArtistTrackarr/1.0 (%s)", contact),
+		userAgent: fmt.Sprintf("%s (%s)", version.UserAgent, contact),
 		baseURL:   "https://musicbrainz.org",
 		interval:  time.Second,
 		retryBase: 250 * time.Millisecond,

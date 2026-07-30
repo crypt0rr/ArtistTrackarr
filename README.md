@@ -26,6 +26,11 @@ app supports a single running replica.
 Release-group artwork is loaded from the Cover Art Archive and cached alongside
 the database in the persistent data volume.
 
+The interface follows the operating-system color theme by default. Use the
+header theme control to select and remember an explicit light or dark mode.
+The running application version and project repository are available in the
+footer.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
