@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/artist-tracker ./cmd/server
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S -g 10001 tracker && adduser -S -D -H -u 10001 -G tracker tracker && \
     mkdir /data && chown tracker:tracker /data
