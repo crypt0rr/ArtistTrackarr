@@ -73,11 +73,9 @@ func main() {
 		Handler:           app.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		// Bulk imports deliberately resolve rows serially to honor MusicBrainz's
-		// one-request-per-second policy.
-		WriteTimeout:   5 * time.Minute,
-		IdleTimeout:    2 * time.Minute,
-		MaxHeaderBytes: 1 << 20,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

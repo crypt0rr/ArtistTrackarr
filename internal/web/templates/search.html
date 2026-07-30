@@ -1,5 +1,5 @@
 {{template "head" .}}
-<section class="page-head"><p class="eyebrow">Artist management</p><h1>Add artists</h1><p>Search and select artists individually, import a complete list, or export your current watchlist from one place.</p></section>
+<section class="page-head"><p class="eyebrow">Artist management</p><h1>Add artists</h1><p>Search for artists to follow or export your current watchlist.</p></section>
 <section class="panel artist-search">
 <div class="section-head"><div><p class="eyebrow">Discovery</p><h2>Search by artist name</h2></div><span class="badge">{{if .SpotifyOn}}Spotify first{{else}}MusicBrainz{{end}}</span></div>
 <p>{{if .SpotifyOn}}Spotify provides fast discovery and MusicBrainz confirms the canonical identity used for tracking.{{else}}MusicBrainz identities prevent similarly named artists from being mixed up.{{end}}</p>
@@ -27,21 +27,10 @@
   <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" rel="noreferrer">Spotify</a>{{end}}
   <a href="https://musicbrainz.org/artist/{{.MBID}}" rel="noreferrer">Inspect</a></div>
 </article>{{end}}</div></section></form>{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
-<section class="panel bulk-tools" id="import-export">
-  <div class="section-head"><div><p class="eyebrow">Bulk tools</p><h2>Import or export artists</h2></div><span class="badge">{{.FollowCount}} followed</span></div>
-  <div class="grid two import-export-grid">
-    <form method="post" action="/imports" enctype="multipart/form-data" class="stack">
-      {{template "csrf" .}}
-      <p>Paste one value per line or upload a CSV. Names, MusicBrainz IDs/URLs, and Spotify artist URLs are accepted, up to 100 rows.</p>
-      <label>Artist list<textarea name="artists" rows="9" placeholder="Björk&#10;https://musicbrainz.org/artist/...&#10;https://open.spotify.com/artist/..."></textarea></label>
-      <div class="divider">or</div>
-      <label>CSV file<input type="file" name="file" accept=".csv,text/csv"></label>
-      <button>Review and import</button>
-    </form>
-    <aside class="export-block">
-      <div><h3>Export watchlist</h3><p>Download every followed artist as a CSV containing canonical MusicBrainz and optional Spotify identifiers. The file can be imported again later.</p></div>
-      <a class="button secondary" href="/artists/export">Export watchlist ({{.FollowCount}})</a>
-    </aside>
+<section class="panel watchlist-export">
+  <div class="section-head">
+    <div><p class="eyebrow">Watchlist backup</p><h2>Export followed artists</h2><p>Download a CSV containing canonical MusicBrainz and optional Spotify identifiers.</p></div>
+    <div class="actions"><span class="badge">{{.FollowCount}} followed</span><a class="button secondary" href="/artists/export">Export CSV</a></div>
   </div>
 </section>
 {{template "foot" .}}

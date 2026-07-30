@@ -21,7 +21,8 @@ Spotify for new albums and EPs and sends announcement and release-day notificati
 
 Application data is stored in the legacy-named `artist-tracker-data` Docker
 volume so existing installations can upgrade without moving their data. The
-app supports a single running replica.
+app supports a single running replica. Docker Compose names that container
+`artist-trackarr` for predictable logs and administration commands.
 
 Release-group artwork is loaded from the Cover Art Archive and cached alongside
 the database in the persistent data volume.
@@ -80,10 +81,9 @@ client-credentials search and release-observation flow.
 ## Artist management
 
 The **Add artists** page combines individual search, multi-select following,
-bulk paste/CSV import, and watchlist export. Exports contain canonical
-MusicBrainz URLs and IDs plus optional Spotify identifiers. The first `artist`
-column can be imported into Artist Trackarr again, making the CSV suitable for
-backups or moving a watchlist between installations.
+and watchlist export. Exports contain canonical MusicBrainz URLs and IDs plus
+optional Spotify identifiers for backups and external processing. Bulk import
+is not available in v0.1.6.
 
 ## Notification destinations
 

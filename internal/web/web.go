@@ -8,9 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"log/slog"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,8 +67,6 @@ type PageData struct {
 	History        []store.DeliveryHistory
 	AdminHistory   []store.AdminDeliveryHistory
 	AdminUsers     []store.AdminUser
-	ImportRows     []store.ImportRow
-	ImportID       int64
 	FollowCount    int
 	AdminPage      int
 	AdminPages     int
@@ -145,9 +141,6 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artist-resolutions/{id}", a.artistResolution)
 		private.Post("/artist-resolutions/{id}", a.selectArtistResolution)
 		private.Post("/artist-resolutions/{id}/cancel", a.cancelArtistResolution)
-		private.Get("/imports", a.importForm)
-		private.Post("/imports", a.importArtists)
-		private.Get("/imports/{id}", a.importResult)
 		private.Get("/artists/export", a.exportArtists)
 		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
@@ -696,35 +689,6 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message=Pending+artist+cancelled", http.StatusSeeOther)
 }
 
-func (a *App) importForm(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/artists/search#import-export", http.StatusSeeOther)
-}
-
-func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
-	values, err := importValues(r)
-	if err != nil {
-		d := a.data(r, "Add artists")
-		d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
-		d.Error = err.Error()
-		a.render(w, "search", d, http.StatusBadRequest)
-		return
-	}
-	if len(values) > 100 {
-		values = values[:100]
-	}
-	rows := make([]store.ImportRow, 0, len(values))
-	for _, value := range values {
-		rows = append(rows, a.resolveImport(r.Context(), session.User.ID, value))
-	}
-	jobID, err := a.store.CreateImportJob(r.Context(), session.User.ID, rows)
-	if err != nil {
-		http.Error(w, "could not store import result", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/imports/%d", jobID), http.StatusSeeOther)
-}
-
 func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	artists, err := a.store.FollowedArtists(r.Context(), session.User.ID)
@@ -750,86 +714,6 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	if err := writer.Error(); err != nil {
 		a.logger.Warn("write artist export failed", "user_id", session.User.ID, "error", err)
 	}
-}
-
-func (a *App) resolveImport(ctx context.Context, userID int64, value string) store.ImportRow {
-	row := store.ImportRow{SourceValue: value, DisplayName: value}
-	var result catalog.ArtistResult
-	var err error
-	if spotifyID, ok := catalog.SpotifyID(value); ok {
-		if a.spotify == nil {
-			row.Status, row.Reason = "invalid", "Spotify is not configured"
-			return row
-		}
-		spotifyArtist, spotifyErr := a.spotify.Artist(ctx, spotifyID)
-		if spotifyErr != nil {
-			row.Status, row.Reason = "invalid", spotifyErr.Error()
-			return row
-		}
-		matches, resolveErr := a.mb.ResolveExternalArtist(ctx, spotifyArtist.URL)
-		if resolveErr != nil {
-			row.Status, row.Reason = "invalid", "MusicBrainz is temporarily unavailable"
-			return row
-		}
-		if len(matches) != 1 {
-			row.Status, row.Reason = "ambiguous", "Spotify artist has no unique MusicBrainz URL relationship"
-			return row
-		}
-		result = matches[0]
-		result.SpotifyID, result.SpotifyURL, result.SpotifyImageURL = spotifyArtist.ID, spotifyArtist.URL, spotifyArtist.ImageURL
-	} else if looksLikeMBID(value) {
-		result, err = a.mb.ResolveArtist(ctx, value)
-	} else {
-		var matches []catalog.ArtistResult
-		matches, err = a.mb.SearchArtists(ctx, value, 10)
-		if err == nil {
-			var exact []catalog.ArtistResult
-			for _, match := range matches {
-				if strings.EqualFold(strings.TrimSpace(match.Name), strings.TrimSpace(value)) && match.Score >= 95 {
-					exact = append(exact, match)
-				}
-			}
-			if len(exact) != 1 {
-				row.Status, row.Reason = "ambiguous", fmt.Sprintf("%d high-confidence exact matches; choose manually", len(exact))
-				return row
-			}
-			result = exact[0]
-		}
-	}
-	if err != nil {
-		row.Status, row.Reason = "invalid", err.Error()
-		return row
-	}
-	artist, err := a.store.UpsertArtist(ctx, result.StoreArtist())
-	if err != nil {
-		row.Status, row.Reason = "invalid", "could not save artist"
-		return row
-	}
-	added, err := a.store.Follow(ctx, userID, artist.ID)
-	if err != nil {
-		row.Status, row.Reason = "invalid", "could not follow artist"
-		return row
-	}
-	row.ArtistID, row.ArtistName = artist.ID, artist.Name
-	if added {
-		row.Status = "added"
-	} else {
-		row.Status = "already_followed"
-	}
-	return row
-}
-
-func (a *App) importResult(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	rows, err := a.store.ImportRows(r.Context(), session.User.ID, id)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	d := a.data(r, "Import results")
-	d.ImportID, d.ImportRows = id, rows
-	a.render(w, "import_result", d, http.StatusOK)
 }
 
 func (a *App) destinations(w http.ResponseWriter, r *http.Request) {
@@ -1086,57 +970,4 @@ func (a *App) clientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
-}
-
-func importValues(r *http.Request) ([]string, error) {
-	var values []string
-	for _, line := range strings.Split(r.FormValue("artists"), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			values = append(values, line)
-		}
-	}
-	file, _, err := r.FormFile("file")
-	if err != nil && !errors.Is(err, http.ErrMissingFile) {
-		return nil, err
-	}
-	if err == nil {
-		defer file.Close()
-		more, parseErr := readCSV(file)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		values = append(values, more...)
-	}
-	if len(values) == 0 {
-		return nil, errors.New("paste at least one artist or upload a CSV file")
-	}
-	return values, nil
-}
-
-func readCSV(file multipart.File) ([]string, error) {
-	reader := csv.NewReader(io.LimitReader(file, 1<<20))
-	reader.FieldsPerRecord = -1
-	var values []string
-	for {
-		record, err := reader.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, errors.New("invalid CSV file")
-		}
-		if len(record) > 0 && strings.TrimSpace(record[0]) != "" {
-			if len(values) == 0 && strings.EqualFold(strings.TrimSpace(record[0]), "artist") {
-				continue
-			}
-			values = append(values, strings.TrimSpace(record[0]))
-		}
-	}
-	return values, nil
-}
-
-func looksLikeMBID(value string) bool {
-	value = strings.TrimSpace(value)
-	return len(value) == 36 || strings.Contains(value, "musicbrainz.org/artist/")
 }

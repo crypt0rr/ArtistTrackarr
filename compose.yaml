@@ -1,5 +1,6 @@
 services:
   app:
+    container_name: artist-trackarr
     build: .
     image: artist-trackarr:local
     restart: unless-stopped
