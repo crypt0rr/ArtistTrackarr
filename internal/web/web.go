@@ -145,6 +145,7 @@ func (a *App) Handler() http.Handler {
 		private.Get("/imports", a.importForm)
 		private.Post("/imports", a.importArtists)
 		private.Get("/imports/{id}", a.importResult)
+		private.Get("/artists/export", a.exportArtists)
 		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
 		private.Post("/destinations", a.addDestination)
@@ -375,7 +376,9 @@ func (a *App) artists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
-	d := a.data(r, "Find artists")
+	session, _ := currentSession(r)
+	d := a.data(r, "Add artists")
+	d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
 	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
 	if d.Query != "" {
 		if a.spotify != nil {
@@ -687,16 +690,17 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) importForm(w http.ResponseWriter, r *http.Request) {
-	a.render(w, "import", a.data(r, "Bulk import"), http.StatusOK)
+	http.Redirect(w, r, "/artists/search#import-export", http.StatusSeeOther)
 }
 
 func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	values, err := importValues(r)
 	if err != nil {
-		d := a.data(r, "Bulk import")
+		d := a.data(r, "Add artists")
+		d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
 		d.Error = err.Error()
-		a.render(w, "import", d, http.StatusBadRequest)
+		a.render(w, "search", d, http.StatusBadRequest)
 		return
 	}
 	if len(values) > 100 {
@@ -712,6 +716,33 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/imports/%d", jobID), http.StatusSeeOther)
+}
+
+func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	artists, err := a.store.FollowedArtists(r.Context(), session.User.ID)
+	if err != nil {
+		http.Error(w, "could not export followed artists", http.StatusInternalServerError)
+		return
+	}
+	filename := "artist-trackarr-watched-artists-" + time.Now().UTC().Format("2006-01-02") + ".csv"
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.Header().Set("Cache-Control", "private, no-store")
+	writer := csv.NewWriter(w)
+	_ = writer.Write([]string{
+		"artist", "display_name", "musicbrainz_id", "musicbrainz_url", "spotify_id", "spotify_url",
+	})
+	for _, artist := range artists {
+		musicBrainzURL := "https://musicbrainz.org/artist/" + artist.MBID
+		_ = writer.Write([]string{
+			musicBrainzURL, artist.Name, artist.MBID, musicBrainzURL, artist.SpotifyID, artist.SpotifyURL,
+		})
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		a.logger.Warn("write artist export failed", "user_id", session.User.ID, "error", err)
+	}
 }
 
 func (a *App) resolveImport(ctx context.Context, userID int64, value string) store.ImportRow {

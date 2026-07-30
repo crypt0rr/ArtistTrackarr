@@ -12,8 +12,7 @@
   {{if .User}}<nav>
     <a href="/">Dashboard</a>
     <a href="/artists">Artists</a>
-    <a href="/artists/search">Add artist</a>
-    <a href="/imports">Bulk import</a>
+    <a href="/artists/search">Add artists</a>
     <a href="/destinations">Notifications</a>
     {{if eq .User.Role "admin"}}<a href="/admin">Admin</a>{{end}}
     <form method="post" action="/logout" class="inline"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link">Sign out</button></form>
