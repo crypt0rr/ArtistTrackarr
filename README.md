@@ -22,6 +22,9 @@ EPs and sends announcement and release-day notifications through
 Application data is stored in the `artist-tracker-data` Docker volume. The app
 supports a single running replica.
 
+Release-group artwork is loaded from the Cover Art Archive and cached alongside
+the database in the persistent data volume.
+
 ## Configuration
 
 | Variable | Required | Default | Description |

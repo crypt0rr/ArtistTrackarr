@@ -34,7 +34,7 @@
 <section class="panel">
   <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
   {{if .Releases}}<div class="release-grid">{{range .Releases}}
-  <a class="release-card" href="{{.MusicBrainzURL}}" rel="noreferrer"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span><small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</small></a>
+  <a class="release-card" href="{{.MusicBrainzURL}}" rel="noreferrer"><img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}"><span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span><small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</small></span></a>
   {{end}}</div>{{else}}<div class="empty">Releases appear after the first catalog sync.</div>{{end}}
 </section>
 <section class="panel">

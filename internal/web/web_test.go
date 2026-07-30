@@ -12,7 +12,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/security"
@@ -23,6 +25,15 @@ type fakeSender struct{}
 
 func (fakeSender) Validate(string) error                              { return nil }
 func (fakeSender) Send(context.Context, string, string, string) error { return nil }
+
+type fakeArtwork struct{}
+
+func (fakeArtwork) Get(context.Context, string) artwork.Asset {
+	return artwork.Asset{
+		Data: []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), ContentType: "image/svg+xml",
+		Status: "test", MaxAge: time.Minute,
+	}
+}
 
 func TestSetupLoginAndDashboard(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "web.db"))
@@ -38,7 +49,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	}
 	cipher, _ := security.NewCipher(cfg.EncryptionKey)
 	app, err := New(cfg, database, catalog.NewMusicBrainz("test@example.com"), nil,
-		fakeSender{}, cipher, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		fakeSender{}, cipher, fakeArtwork{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +74,42 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") {
 		t.Fatalf("dashboard status/body = %d, %q", response.StatusCode, body)
 	}
+
+	user, err := database.UserByEmail(context.Background(), "admin@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(context.Background(), user.ID, "Phone", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.PostForm(server.URL+"/destinations/1/rename", url.Values{"name": {"Without CSRF"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("rename without CSRF status = %d", response.StatusCode)
+	}
+	response.Body.Close()
+
+	csrf = getCSRF(t, client, server.URL+"/destinations")
+	response = postForm(t, client, server.URL+"/destinations/1/rename", url.Values{
+		"_csrf": {csrf}, "name": {"My phone"},
+	})
+	response.Body.Close()
+	destination, err := database.Destination(context.Background(), user.ID, 1)
+	if err != nil || destination.Name != "My phone" {
+		t.Fatalf("renamed destination = %#v, %v", destination, err)
+	}
+
+	response, err = client.Get(server.URL + "/art/release-group/6e335887-60ba-38f0-95af-fae7774336bf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Artwork-Status") != "test" ||
+		response.Header.Get("Content-Type") != "image/svg+xml" {
+		t.Fatalf("artwork response status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	response.Body.Close()
 }
 
 var csrfPattern = regexp.MustCompile(`name="_csrf" value="([^"]+)"`)

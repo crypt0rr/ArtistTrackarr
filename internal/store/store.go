@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -108,6 +109,11 @@ type ImportRow struct {
 	Status      string
 	ArtistName  string
 	Reason      string
+}
+
+type syncedRelease struct {
+	release Release
+	isNew   bool
 }
 
 func Open(path string) (*Store, error) {
@@ -475,11 +481,7 @@ func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []
 	if err != nil {
 		return err
 	}
-	type saved struct {
-		release Release
-		isNew   bool
-	}
-	var savedReleases []saved
+	var savedReleases []syncedRelease
 	for _, release := range releases {
 		secondary, _ := json.Marshal(release.SecondaryTypes)
 		var existed int
@@ -514,7 +516,7 @@ func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []
 			tx.Rollback()
 			return err
 		}
-		savedReleases = append(savedReleases, saved{release: release, isNew: existed == 0})
+		savedReleases = append(savedReleases, syncedRelease{release: release, isNew: existed == 0})
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at FROM follows WHERE artist_id=?`, artist.ID)
 	if err != nil {
@@ -539,33 +541,109 @@ func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []
 	}
 	rows.Close()
 	for _, follower := range followers {
-		for _, item := range savedReleases {
-			date, full := releaseDate(item.release.FirstReleaseDate)
-			eligible := false
-			if !follower.baseline {
-				eligible = full && date.After(dayUTC(observed))
-			} else if item.isNew && full {
-				eligible = !date.Before(dayUTC(observed).AddDate(0, 0, -7))
-			}
-			if eligible {
-				if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement",
-					"New release from "+artist.Name,
-					fmt.Sprintf("%s has announced %q for %s.", artist.Name, item.release.Title, item.release.FirstReleaseDate),
-					observed); err != nil {
+		if !follower.baseline {
+			if selected, eventType, ok := selectInitialRelease(savedReleases, observed); ok {
+				title, body := initialReleaseMessage(artist, selected.release, eventType, observed)
+				if err := enqueueEventTx(ctx, tx, follower.id, selected.release.ID, eventType, title, body, observed); err != nil {
 					tx.Rollback()
 					return err
 				}
 			}
-		}
-		if !follower.baseline {
 			if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
 				timeText(observed), follower.id, artist.ID); err != nil {
+				tx.Rollback()
+				return err
+			}
+			continue
+		}
+		for _, item := range savedReleases {
+			date, full := releaseDate(item.release.FirstReleaseDate)
+			if !item.isNew || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
+				continue
+			}
+			if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement",
+				"New release from "+artist.Name,
+				fmt.Sprintf("%s has announced %q for %s.\n%s", artist.Name, item.release.Title,
+					item.release.FirstReleaseDate, item.release.MusicBrainzURL),
+				observed); err != nil {
 				tx.Rollback()
 				return err
 			}
 		}
 	}
 	return tx.Commit()
+}
+
+func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
+	var zero syncedRelease
+	today := dayUTC(observed)
+	var upcoming syncedRelease
+	var upcomingStart time.Time
+	var latest syncedRelease
+	var latestStart time.Time
+	hasUpcoming, hasLatest := false, false
+	for _, item := range items {
+		release := item.release
+		start, valid := comparableReleaseDate(release.FirstReleaseDate)
+		if !valid {
+			continue
+		}
+		if start.After(today) {
+			if !hasUpcoming || start.Before(upcomingStart) ||
+				(start.Equal(upcomingStart) && release.MBID < upcoming.release.MBID) {
+				upcoming, upcomingStart, hasUpcoming = item, start, true
+			}
+			continue
+		}
+		if !hasLatest || start.After(latestStart) ||
+			(start.Equal(latestStart) && release.MBID < latest.release.MBID) {
+			latest, latestStart, hasLatest = item, start, true
+		}
+	}
+	if hasUpcoming {
+		return upcoming, "announcement", true
+	}
+	if !hasLatest {
+		return zero, "", false
+	}
+	release := latest.release
+	if release.DatePrecision == 3 && release.FirstReleaseDate == today.Format("2006-01-02") {
+		return latest, "release_day", true
+	}
+	return latest, "announcement", true
+}
+
+func initialReleaseMessage(artist Artist, release Release, eventType string, observed time.Time) (string, string) {
+	today := dayUTC(observed)
+	start, _ := comparableReleaseDate(release.FirstReleaseDate)
+	if eventType == "release_day" {
+		return "Released today: " + release.Title,
+			fmt.Sprintf("%s's %q is out today.\n%s", artist.Name, release.Title, release.MusicBrainzURL)
+	}
+	if start.After(today) {
+		return "Upcoming release from " + artist.Name,
+			fmt.Sprintf("%s's %q is expected %s.\n%s", artist.Name, release.Title,
+				release.FirstReleaseDate, release.MusicBrainzURL)
+	}
+	return "Latest release from " + artist.Name,
+		fmt.Sprintf("%s's latest known release is %q (%s).\n%s", artist.Name, release.Title,
+			release.FirstReleaseDate, release.MusicBrainzURL)
+}
+
+func comparableReleaseDate(value string) (time.Time, bool) {
+	layout := ""
+	switch len(value) {
+	case 4:
+		layout = "2006"
+	case 7:
+		layout = "2006-01"
+	case 10:
+		layout = "2006-01-02"
+	default:
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(layout, value)
+	return parsed, err == nil
 }
 
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
@@ -665,9 +743,44 @@ func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]
 }
 
 func (s *Store) AddDestination(ctx context.Context, userID int64, name, service string, encrypted []byte) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at)
-		VALUES(?,?,?,?,?)`, userID, strings.TrimSpace(name), service, encrypted, nowText())
+	name, err := destinationName(name)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at)
+		VALUES(?,?,?,?,?)`, userID, name, service, encrypted, nowText())
 	return err
+}
+
+func (s *Store) RenameDestination(ctx context.Context, userID, destinationID int64, name string) error {
+	name, err := destinationName(name)
+	if err != nil {
+		return err
+	}
+	result, err := s.DB.ExecContext(ctx, `UPDATE destinations SET name=? WHERE id=? AND user_id=?`,
+		name, destinationID, userID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func destinationName(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("destination name is required")
+	}
+	if utf8.RuneCountInString(value) > 80 {
+		return "", errors.New("destination name must be 80 characters or fewer")
+	}
+	return value, nil
 }
 
 func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, error) {

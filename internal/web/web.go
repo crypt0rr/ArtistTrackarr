@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
@@ -42,6 +44,7 @@ type App struct {
 	spotify   *catalog.Spotify
 	sender    notify.NotificationSender
 	cipher    *security.Cipher
+	artwork   artwork.Provider
 	jobs      *jobs.Runner
 	logger    *slog.Logger
 	templates *template.Template
@@ -70,7 +73,8 @@ type PageData struct {
 }
 
 func New(cfg config.Config, s *store.Store, mb *catalog.MusicBrainz, spotify *catalog.Spotify,
-	sender notify.NotificationSender, cipher *security.Cipher, runner *jobs.Runner, logger *slog.Logger) (*App, error) {
+	sender notify.NotificationSender, cipher *security.Cipher, art artwork.Provider,
+	runner *jobs.Runner, logger *slog.Logger) (*App, error) {
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"join": strings.Join,
 		"shortDate": func(v string) string {
@@ -92,7 +96,7 @@ func New(cfg config.Config, s *store.Store, mb *catalog.MusicBrainz, spotify *ca
 	}
 	return &App{
 		cfg: cfg, store: s, mb: mb, spotify: spotify, sender: sender,
-		cipher: cipher, jobs: runner, logger: logger, templates: tmpl,
+		cipher: cipher, artwork: art, jobs: runner, logger: logger, templates: tmpl,
 	}, nil
 }
 
@@ -124,8 +128,10 @@ func (a *App) Handler() http.Handler {
 		private.Get("/imports", a.importForm)
 		private.Post("/imports", a.importArtists)
 		private.Get("/imports/{id}", a.importResult)
+		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
 		private.Post("/destinations", a.addDestination)
+		private.Post("/destinations/{id}/rename", a.renameDestination)
 		private.Post("/destinations/{id}/test", a.testDestination)
 		private.Post("/destinations/{id}/delete", a.deleteDestination)
 		private.Post("/profile", a.profile)
@@ -521,6 +527,15 @@ func (a *App) destinations(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "destinations", d, http.StatusOK)
 }
 
+func (a *App) releaseGroupArt(w http.ResponseWriter, r *http.Request) {
+	asset := a.artwork.Get(r.Context(), chi.URLParam(r, "mbid"))
+	w.Header().Set("Content-Type", asset.ContentType)
+	w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", int(asset.MaxAge.Seconds())))
+	w.Header().Set("X-Artwork-Status", asset.Status)
+	w.Header().Set("Content-Length", strconv.Itoa(len(asset.Data)))
+	_, _ = w.Write(asset.Data)
+}
+
 func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	input := notify.DestinationInput{
@@ -566,6 +581,27 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/destinations?message=Test+sent", http.StatusSeeOther)
+}
+
+func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := a.store.RenameDestination(r.Context(), session.User.ID, id, r.FormValue("name")); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		d := a.data(r, "Notification destinations")
+		d.Error = err.Error()
+		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
+		a.render(w, "destinations", d, http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/destinations?message=Destination+renamed", http.StatusSeeOther)
 }
 
 func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
