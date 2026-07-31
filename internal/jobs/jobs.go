@@ -239,11 +239,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		var spotifyReleases []store.Release
 		var spotifyErr error
 		if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
-			since, err := r.store.LatestSpotifyReleaseDate(ctx, artist.ID)
-			if err != nil {
-				return err
-			}
-			spotifyReleases, spotifyErr = incremental.ArtistReleasesSince(ctx, artist.SpotifyID, since)
+			spotifyReleases, spotifyErr = incremental.ArtistReleasesSince(ctx, artist.SpotifyID, spotifyKnownDate)
 		} else {
 			spotifyReleases, spotifyErr = r.spotify.ArtistReleases(ctx, artist.SpotifyID)
 		}

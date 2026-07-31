@@ -327,6 +327,39 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 	}
 }
 
+func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
+	var albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		if request.URL.Path != "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums" {
+			http.NotFound(w, request)
+			return
+		}
+		albumRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("offset") == "0" {
+			_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"new","name":"New","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}]}`)
+			return
+		}
+		if request.URL.Query().Get("offset") != "10" {
+			t.Fatalf("unexpected offset: %s", request.URL.Query().Get("offset"))
+		}
+		_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"old","name":"Old","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-06-01","release_date_precision":"day"}]}`)
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	releases, err := spotify.ArtistReleasesSince(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF", "2026-07-01")
+	if err != nil || len(releases) != 2 || albumRequests.Load() != 2 {
+		t.Fatalf("requests=%d releases=%#v err=%v", albumRequests.Load(), releases, err)
+	}
+}
+
 func TestAlbumEPNormalizer(t *testing.T) {
 	input := []store.Release{
 		{MBID: "album", PrimaryType: "Album", SecondaryTypes: []string{"Live"}},
