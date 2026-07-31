@@ -14,15 +14,16 @@ import (
 )
 
 type Runner struct {
-	store      *store.Store
-	catalog    catalog.CatalogProvider
-	spotify    catalog.SpotifyReleaseProvider
-	normalizer catalog.ReleaseNormalizer
-	sender     notify.NotificationSender
-	cipher     *security.Cipher
-	interval   time.Duration
-	logger     *slog.Logger
-	syncMu     sync.Mutex
+	store           *store.Store
+	catalog         catalog.CatalogProvider
+	spotify         catalog.SpotifyReleaseProvider
+	normalizer      catalog.ReleaseNormalizer
+	sender          notify.NotificationSender
+	cipher          *security.Cipher
+	interval        time.Duration
+	spotifyInterval time.Duration
+	logger          *slog.Logger
+	syncMu          sync.Mutex
 }
 
 type Option func(*Runner)
@@ -31,12 +32,23 @@ func WithSpotify(provider catalog.SpotifyReleaseProvider) Option {
 	return func(r *Runner) { r.spotify = provider }
 }
 
+// WithSpotifyInterval controls the independent Spotify observation cadence.
+// Spotify is an enrichment source, so it defaults to a much slower cadence
+// than the canonical MusicBrainz sync.
+func WithSpotifyInterval(interval time.Duration) Option {
+	return func(r *Runner) {
+		if interval >= time.Hour {
+			r.spotifyInterval = interval
+		}
+	}
+}
+
 func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.ReleaseNormalizer,
 	sender notify.NotificationSender, cipher *security.Cipher, interval time.Duration, logger *slog.Logger,
 	options ...Option) *Runner {
 	runner := &Runner{
 		store: s, catalog: provider, normalizer: normalizer, sender: sender,
-		cipher: cipher, interval: interval, logger: logger,
+		cipher: cipher, interval: interval, spotifyInterval: 24 * time.Hour, logger: logger,
 	}
 	for _, option := range options {
 		option(runner)
@@ -59,17 +71,16 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 func (r *Runner) tick(ctx context.Context) {
-	if !r.syncMu.TryLock() {
-		return
+	if r.syncMu.TryLock() {
+		if err := r.resolveArtistResolutions(ctx, time.Now().UTC()); err != nil {
+			r.logger.Error("artist resolution failed", "error", err)
+		}
+		if err := r.syncArtists(ctx, time.Now().UTC()); err != nil {
+			r.logger.Error("catalog sync failed", "error", err)
+		}
+		r.syncMu.Unlock()
 	}
-	defer r.syncMu.Unlock()
 	now := time.Now().UTC()
-	if err := r.resolveArtistResolutions(ctx, now); err != nil {
-		r.logger.Error("artist resolution failed", "error", err)
-	}
-	if err := r.syncArtists(ctx, now); err != nil {
-		r.logger.Error("catalog sync failed", "error", err)
-	}
 	if err := r.store.QueueDueReleaseDays(ctx, now); err != nil {
 		r.logger.Error("release-day scheduling failed", "error", err)
 	}
@@ -190,6 +201,8 @@ func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.
 func (r *Runner) SyncArtistNow(ctx context.Context, artist store.Artist) error {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
+	// A manual sync is an explicit request to refresh both providers.
+	artist.SpotifyNextCheckAt = nil
 	return r.syncOne(ctx, artist, time.Now().UTC())
 }
 
@@ -211,6 +224,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	var batches []store.ReleaseBatch
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError
+	spotifyDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 	if err == nil {
 		batches = append(batches, store.ReleaseBatch{
@@ -220,8 +234,18 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		providerErrors = append(providerErrors, err)
 		r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
 	}
-	if artist.SpotifyID != "" && r.spotify != nil {
-		spotifyReleases, spotifyErr := r.spotify.ArtistReleases(ctx, artist.SpotifyID)
+	if spotifyDue && r.spotify != nil {
+		var spotifyReleases []store.Release
+		var spotifyErr error
+		if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
+			since, err := r.store.LatestSpotifyReleaseDate(ctx, artist.ID)
+			if err != nil {
+				return err
+			}
+			spotifyReleases, spotifyErr = incremental.ArtistReleasesSince(ctx, artist.SpotifyID, since)
+		} else {
+			spotifyReleases, spotifyErr = r.spotify.ArtistReleases(ctx, artist.SpotifyID)
+		}
 		if spotifyErr == nil {
 			batches = append(batches, store.ReleaseBatch{
 				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
@@ -244,12 +268,25 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	}
 	if len(batches) == 0 {
 		retryAt := now.Add(providerFailureRetryDelay(spotifyRateLimit, r.interval))
+		if spotifyRateLimit != nil {
+			providerErrors = append(providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID,
+				now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))))
+		}
 		return errors.Join(errors.Join(providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
 	}
 	if err := r.store.ApplyReleaseBatches(ctx, artist, batches, now); err != nil {
 		return err
 	}
-	return r.store.MarkArtistChecked(ctx, artist.ID, now, syncRetryDelay(spotifyRateLimit, r.interval))
+	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
+		return err
+	}
+	if spotifyDue {
+		if spotifyRateLimit != nil {
+			return r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval)))
+		}
+		return r.store.MarkSpotifyChecked(ctx, artist.ID, now, r.spotifyInterval)
+	}
+	return nil
 }
 
 func syncRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interval time.Duration) time.Duration {

@@ -309,6 +309,10 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	cached, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil || len(cached) != len(releases) {
+		t.Fatalf("cached releases=%#v err=%v", cached, err)
+	}
 	if tokenRequests.Load() != 1 || albumRequests.Load() != 1 || len(releases) != 3 {
 		t.Fatalf("token requests=%d album requests=%d releases=%#v",
 			tokenRequests.Load(), albumRequests.Load(), releases)

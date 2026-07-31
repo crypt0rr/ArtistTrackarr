@@ -63,6 +63,7 @@ password or personal access token is required.
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
 | `MUSICBRAINZ_CONTACT` | yes | — | Contact included in the required MusicBrainz User-Agent. |
 | `POLL_INTERVAL` | no | `6h` | Catalog polling interval; values below one hour are rejected. |
+| `SPOTIFY_POLL_INTERVAL` | no | `24h` | Independent Spotify observation interval; values below one hour are rejected. |
 | `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
 | `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
@@ -91,9 +92,11 @@ independently of MusicBrainz. Spotify entries classified as albums are tracked;
 items classified as singles are excluded, while multi-track releases with at
 least four tracks are treated as EPs.
 
-To keep Spotify Development Mode usage low, release observation reads only the
-newest Spotify artist-albums page. MusicBrainz supplies the complete release
-history and remains the source used for canonical tracking.
+To keep Spotify Development Mode usage low, release observation normally reads
+the newest Spotify artist-albums page and only walks older pages when the stored
+Spotify history has not yet been reached. Successful observations are cached for
+24 hours. MusicBrainz supplies the complete release history and remains the
+source used for canonical tracking.
 
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.

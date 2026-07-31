@@ -10,18 +10,19 @@ import (
 )
 
 type Config struct {
-	ListenAddr         string
-	PublicURL          *url.URL
-	DatabasePath       string
-	SetupToken         string
-	EncryptionKey      string
-	SessionSecret      string
-	MusicBrainzContact string
-	PollInterval       time.Duration
-	TrustProxy         bool
-	SpotifyClientID    string
-	SpotifySecret      string
-	SpotifyMarket      string
+	ListenAddr          string
+	PublicURL           *url.URL
+	DatabasePath        string
+	SetupToken          string
+	EncryptionKey       string
+	SessionSecret       string
+	MusicBrainzContact  string
+	PollInterval        time.Duration
+	SpotifyPollInterval time.Duration
+	TrustProxy          bool
+	SpotifyClientID     string
+	SpotifySecret       string
+	SpotifyMarket       string
 }
 
 func Load() (Config, error) {
@@ -33,19 +34,24 @@ func Load() (Config, error) {
 	if err != nil || interval < time.Hour {
 		return Config{}, errors.New("POLL_INTERVAL must be a duration of at least 1h")
 	}
+	spotifyInterval, err := time.ParseDuration(env("SPOTIFY_POLL_INTERVAL", "24h"))
+	if err != nil || spotifyInterval < time.Hour {
+		return Config{}, errors.New("SPOTIFY_POLL_INTERVAL must be a duration of at least 1h")
+	}
 	cfg := Config{
-		ListenAddr:         env("LISTEN_ADDR", ":8080"),
-		PublicURL:          publicURL,
-		DatabasePath:       env("DATABASE_PATH", "/data/artist-tracker.db"),
-		SetupToken:         secret("SETUP_TOKEN"),
-		EncryptionKey:      secret("APP_ENCRYPTION_KEY"),
-		SessionSecret:      secret("SESSION_SECRET"),
-		MusicBrainzContact: strings.TrimSpace(env("MUSICBRAINZ_CONTACT", "")),
-		PollInterval:       interval,
-		TrustProxy:         strings.EqualFold(env("TRUST_PROXY", "false"), "true"),
-		SpotifyClientID:    strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
-		SpotifySecret:      secret("SPOTIFY_CLIENT_SECRET"),
-		SpotifyMarket:      strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
+		ListenAddr:          env("LISTEN_ADDR", ":8080"),
+		PublicURL:           publicURL,
+		DatabasePath:        env("DATABASE_PATH", "/data/artist-tracker.db"),
+		SetupToken:          secret("SETUP_TOKEN"),
+		EncryptionKey:       secret("APP_ENCRYPTION_KEY"),
+		SessionSecret:       secret("SESSION_SECRET"),
+		MusicBrainzContact:  strings.TrimSpace(env("MUSICBRAINZ_CONTACT", "")),
+		PollInterval:        interval,
+		SpotifyPollInterval: spotifyInterval,
+		TrustProxy:          strings.EqualFold(env("TRUST_PROXY", "false"), "true"),
+		SpotifyClientID:     strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
+		SpotifySecret:       secret("SPOTIFY_CLIENT_SECRET"),
+		SpotifyMarket:       strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 	}
 	if len(cfg.EncryptionKey) < 32 || len(cfg.SessionSecret) < 32 {
 		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must each be at least 32 characters")
