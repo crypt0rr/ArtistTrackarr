@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.26
 FROM golang:1.24-alpine AS dependencies
 WORKDIR /src
 RUN apk add --no-cache ca-certificates tzdata
