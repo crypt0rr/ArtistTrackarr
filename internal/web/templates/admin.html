@@ -59,4 +59,10 @@
     {{if .AdminNextPage}}<a class="button secondary" href="/admin?page={{.AdminNextPage}}">Next</a>{{end}}
   </nav>{{end}}
 </section>
+<section class="panel admin-log app-log">
+  <div class="section-head"><div><p class="eyebrow">Application log</p><h2>Recent container events</h2></div><span class="badge">{{len .AppLogs}} entries</span></div>
+  {{if .AppLogs}}<div class="app-log-scroll" tabindex="0" aria-label="Recent application log entries">
+    {{range .AppLogs}}<div class="app-log-row"><time datetime="{{.Time.Format "2006-01-02T15:04:05Z07:00"}}">{{.Time.Format "2006-01-02 15:04:05"}}</time><span class="badge {{lower .Level}}">{{.Level}}</span><strong>{{.Message}}</strong>{{if .Attributes}}<span class="app-log-fields">{{range .Attributes}}{{.Key}}={{.Value}} {{end}}</span>{{end}}</div>{{end}}
+  </div>{{else}}<div class="empty">No application events have been recorded since startup.</div>{{end}}
+</section>
 {{template "foot" .}}

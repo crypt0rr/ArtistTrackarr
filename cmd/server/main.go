@@ -15,6 +15,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -28,7 +29,8 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	logHandler := logging.NewHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}), 200)
+	logger := slog.New(logHandler)
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
 		logger.Error("create data directory", "error", err)
 		os.Exit(1)

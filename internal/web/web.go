@@ -23,6 +23,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -68,6 +69,7 @@ type PageData struct {
 	Destinations     []store.Destination
 	History          []store.DeliveryHistory
 	AdminHistory     []store.AdminDeliveryHistory
+	AppLogs          []logging.Entry
 	AdminUsers       []store.AdminUser
 	FollowCount      int
 	AdminPage        int
@@ -87,7 +89,8 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 	sender notify.NotificationSender, cipher *security.Cipher, art artwork.Provider,
 	runner *jobs.Runner, logger *slog.Logger) (*App, error) {
 	tmpl, err := template.New("").Funcs(template.FuncMap{
-		"join": strings.Join,
+		"join":  strings.Join,
+		"lower": strings.ToLower,
 		"shortDate": func(v string) string {
 			if v == "" {
 				return "Date unknown"
@@ -845,6 +848,9 @@ func (a *App) adminData(r *http.Request) PageData {
 		page = pages
 	}
 	d := a.data(r, "Household administration")
+	if snapshotter, ok := a.logger.Handler().(interface{ Snapshot() []logging.Entry }); ok {
+		d.AppLogs = snapshotter.Snapshot()
+	}
 	d.AdminUsers, _ = a.store.AdminUsers(r.Context())
 	d.AdminHistory, _ = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
 	d.AdminPage, d.AdminPages = page, pages
