@@ -4,6 +4,13 @@ A self-hosted household dashboard that watches Spotify for new albums and EPs,
 using MusicBrainz for stable artist identity and optional enrichment, and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
 
+## Example dashboard
+
+The following screenshot shows how ArtistTrackarr can look in a production
+deployment:
+
+![ArtistTrackarr production dashboard](docs/images/artisttrackarr-production.png)
+
 ## Quick start
 
 1. Copy `.env.example` to `.env` and set `SETUP_TOKEN`,
