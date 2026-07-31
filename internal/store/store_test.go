@@ -486,6 +486,35 @@ func TestArtistResolutionLifecycleIsOwnerScoped(t *testing.T) {
 	}
 }
 
+func TestFollowedArtistsSortsByDisplayName(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artists := []Artist{
+		{MBID: "artist-z", Name: "zeta", SortName: "Zeta"},
+		{MBID: "artist-a", Name: "Alpha", SortName: "Alpha"},
+		{MBID: "artist-b", Name: "beta", SortName: "Beta"},
+	}
+	for _, artist := range artists {
+		saved, err := s.UpsertArtist(ctx, artist)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Follow(ctx, userID, saved.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	followed, err := s.FollowedArtists(ctx, userID)
+	if err != nil || len(followed) != 3 {
+		t.Fatalf("followed artists=%#v err=%v", followed, err)
+	}
+	for i, want := range []string{"Alpha", "beta", "zeta"} {
+		if followed[i].Name != want {
+			t.Fatalf("artist order=%#v, want %v first", followed, want)
+		}
+	}
+}
+
 func TestArtistResolutionRetryScheduling(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
