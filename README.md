@@ -55,11 +55,6 @@ Pin a deployment to a release by setting the Compose image before starting:
 ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.6.2 docker compose up -d
 ```
 
-The first workflow run creates the package. If anonymous Docker pulls are
-required, set the package visibility to **Public** once in the package settings
-on GitHub. The workflow uses the repository-scoped `GITHUB_TOKEN`; no registry
-password or personal access token is required.
-
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -172,3 +167,7 @@ ARTIST_TRACKARR_IMAGE=artist-trackarr:local docker compose up -d
 ```
 
 No Node.js toolchain or external asset CDN is required.
+
+## License
+
+- Licensed under the [MIT License](LICENSE).
