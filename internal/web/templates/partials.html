@@ -9,7 +9,7 @@
   <link rel="icon" href="/static/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-  <script>try{const t=localStorage.getItem("artist-trackarr-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
+  <script>try{const t=localStorage.getItem("artist-trackarr-theme");if(t==="dark")document.documentElement.dataset.theme="dark"}catch(e){}</script>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -24,15 +24,11 @@
       {{if eq .User.Role "admin"}}<a href="/admin">Admin</a>{{end}}
       <form method="post" action="/logout" class="inline"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link">Sign out</button></form>
     </nav>{{end}}
-    <label class="theme-picker" title="Color theme">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3 6.7 6.7 0 0 0 21 12.8Z"/></svg>
-      <span class="sr-only">Color theme</span>
-      <select data-theme-select aria-label="Color theme">
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </label>
+    <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
+      <span class="theme-icon theme-icon-moon" aria-hidden="true">☾</span>
+      <span class="theme-icon theme-icon-sun" aria-hidden="true">☀</span>
+      <span class="sr-only" data-theme-label>Switch to dark mode</span>
+    </button>
   </div>
 </header>
 <main class="shell">

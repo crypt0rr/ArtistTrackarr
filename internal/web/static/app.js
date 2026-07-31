@@ -1,20 +1,28 @@
 (() => {
-  const themeSelect = document.querySelector("[data-theme-select]");
-  if (themeSelect) {
+  const themeToggle = document.querySelector("[data-theme-toggle]");
+  if (themeToggle) {
     const key = "artist-trackarr-theme";
-    let saved = "system";
+    let saved = "light";
     try {
       const candidate = localStorage.getItem(key);
-      if (["system", "light", "dark"].includes(candidate)) saved = candidate;
+      if (["light", "dark"].includes(candidate)) saved = candidate;
     } catch (_) {}
     const applyTheme = (theme) => {
-      if (theme === "system") delete document.documentElement.dataset.theme;
-      else document.documentElement.dataset.theme = theme;
+      if (theme === "dark") document.documentElement.dataset.theme = "dark";
+      else delete document.documentElement.dataset.theme;
+      const nextTheme = theme === "dark" ? "light" : "dark";
+      const label = `Switch to ${nextTheme} mode`;
+      themeToggle.setAttribute("aria-label", label);
+      themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
+      themeToggle.setAttribute("title", label);
+      const labelNode = themeToggle.querySelector("[data-theme-label]");
+      if (labelNode) labelNode.textContent = label;
       try { localStorage.setItem(key, theme); } catch (_) {}
     };
-    themeSelect.value = saved;
     applyTheme(saved);
-    themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
+    themeToggle.addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
   }
 
   const form = document.querySelector("[data-destination-form]");
