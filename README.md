@@ -91,6 +91,10 @@ independently of MusicBrainz. Spotify entries classified as albums are tracked;
 items classified as singles are excluded, while multi-track releases with at
 least four tracks are treated as EPs.
 
+To keep Spotify Development Mode usage low, release observation reads only the
+newest Spotify artist-albums page. MusicBrainz supplies the complete release
+history and remains the source used for canonical tracking.
+
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.
 

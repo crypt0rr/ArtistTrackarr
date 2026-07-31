@@ -229,12 +229,14 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		} else {
 			providerErrors = append(providerErrors, spotifyErr)
 			if errors.As(spotifyErr, &spotifyRateLimit) {
-				r.logger.Warn("Spotify release observation rate limited",
-					"artist_id", artist.ID,
-					"reason", spotifyRateLimit.Reason,
-					"retry_after", spotifyRateLimit.RetryAfter,
-					"quota_exceeded", spotifyRateLimit.QuotaExceeded,
-				)
+				if !spotifyRateLimit.AlreadyBlocked {
+					r.logger.Warn("Spotify release observation rate limited",
+						"artist_id", artist.ID,
+						"reason", spotifyRateLimit.Reason,
+						"retry_after", spotifyRateLimit.RetryAfter.String(),
+						"quota_exceeded", spotifyRateLimit.QuotaExceeded,
+					)
+				}
 			} else {
 				r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
 			}
@@ -255,7 +257,7 @@ func syncRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interval time.Dura
 		return interval
 	}
 	if rateLimit.QuotaExceeded {
-		return interval
+		return max(rateLimit.RetryAfter, interval)
 	}
 	delay := max(rateLimit.RetryAfter, time.Minute)
 	return min(delay, interval)

@@ -371,11 +371,12 @@ type SpotifyArtist struct {
 }
 
 type SpotifyRateLimitError struct {
-	Operation     string
-	Status        int
-	Reason        string
-	RetryAfter    time.Duration
-	QuotaExceeded bool
+	Operation      string
+	Status         int
+	Reason         string
+	RetryAfter     time.Duration
+	QuotaExceeded  bool
+	AlreadyBlocked bool
 }
 
 func (e *SpotifyRateLimitError) Error() string {
@@ -529,64 +530,60 @@ func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.
 	if _, ok := SpotifyID(artistID); !ok {
 		return nil, errors.New("invalid Spotify artist ID")
 	}
+	// Spotify returns the artist album catalog newest-first. One page is enough
+	// for release discovery and avoids walking large back catalogues on every
+	// poll; MusicBrainz remains the complete canonical release source.
 	const pageSize = 10
-	var result []store.Release
+	endpoint := fmt.Sprintf(
+		"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=0",
+		s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize,
+	)
+	var page struct {
+		Items []struct {
+			ID            string            `json:"id"`
+			Name          string            `json:"name"`
+			AlbumType     string            `json:"album_type"`
+			AlbumGroup    string            `json:"album_group"`
+			TotalTracks   int               `json:"total_tracks"`
+			ReleaseDate   string            `json:"release_date"`
+			DatePrecision string            `json:"release_date_precision"`
+			ExternalURLs  map[string]string `json:"external_urls"`
+			Images        []struct {
+				URL   string `json:"url"`
+				Width int    `json:"width"`
+			} `json:"images"`
+		} `json:"items"`
+	}
+	if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+		return nil, err
+	}
+	result := make([]store.Release, 0, len(page.Items))
 	seen := make(map[string]bool)
-	for offset := 0; offset < 1000; {
-		endpoint := fmt.Sprintf(
-			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=%d",
-			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
+	for _, item := range page.Items {
+		if item.ID == "" || seen[item.ID] {
+			continue
+		}
+		primaryType, secondaryTypes, eligible := spotifyReleaseType(
+			item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
 		)
-		var page struct {
-			Total int `json:"total"`
-			Items []struct {
-				ID            string            `json:"id"`
-				Name          string            `json:"name"`
-				AlbumType     string            `json:"album_type"`
-				AlbumGroup    string            `json:"album_group"`
-				TotalTracks   int               `json:"total_tracks"`
-				ReleaseDate   string            `json:"release_date"`
-				DatePrecision string            `json:"release_date_precision"`
-				ExternalURLs  map[string]string `json:"external_urls"`
-				Images        []struct {
-					URL   string `json:"url"`
-					Width int    `json:"width"`
-				} `json:"images"`
-			} `json:"items"`
+		if !eligible {
+			continue
 		}
-		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
-			return nil, err
-		}
-		for _, item := range page.Items {
-			if item.ID == "" || seen[item.ID] {
-				continue
-			}
-			primaryType, secondaryTypes, eligible := spotifyReleaseType(
-				item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
-			)
-			if !eligible {
-				continue
-			}
-			seen[item.ID] = true
-			precision := spotifyDatePrecision(item.DatePrecision, item.ReleaseDate)
-			imageURL := spotifyReleaseImage(item.Images)
-			result = append(result, store.Release{
-				MBID:             "spotify:" + item.ID,
-				Title:            item.Name,
-				PrimaryType:      primaryType,
-				SecondaryTypes:   secondaryTypes,
-				FirstReleaseDate: item.ReleaseDate,
-				DatePrecision:    precision,
-				SpotifyID:        item.ID,
-				SpotifyURL:       item.ExternalURLs["spotify"],
-				SpotifyImageURL:  imageURL,
-				Source:           "spotify",
-			})
-		}
-		offset += len(page.Items)
-		if len(page.Items) == 0 || offset >= page.Total {
-			break
-		}
+		seen[item.ID] = true
+		precision := spotifyDatePrecision(item.DatePrecision, item.ReleaseDate)
+		imageURL := spotifyReleaseImage(item.Images)
+		result = append(result, store.Release{
+			MBID:             "spotify:" + item.ID,
+			Title:            item.Name,
+			PrimaryType:      primaryType,
+			SecondaryTypes:   secondaryTypes,
+			FirstReleaseDate: item.ReleaseDate,
+			DatePrecision:    precision,
+			SpotifyID:        item.ID,
+			SpotifyURL:       item.ExternalURLs["spotify"],
+			SpotifyImageURL:  imageURL,
+			Source:           "spotify",
+		})
 	}
 	return result, nil
 }
@@ -647,7 +644,7 @@ func (s *Spotify) waitUntilReady(ctx context.Context, operation string) error {
 		if remaining > s.maxInlineRetry || s.blockedQuota {
 			return &SpotifyRateLimitError{
 				Operation: operation, Status: http.StatusTooManyRequests, Reason: s.blockedReason,
-				RetryAfter: remaining, QuotaExceeded: s.blockedQuota,
+				RetryAfter: remaining, QuotaExceeded: s.blockedQuota, AlreadyBlocked: true,
 			}
 		}
 		if err := s.wait(ctx, remaining); err != nil {
