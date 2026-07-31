@@ -764,7 +764,8 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,f.baseline_synced_at
-		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE f.user_id=? ORDER BY a.sort_name,a.name`, userID)
+		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE f.user_id=?
+		ORDER BY lower(trim(a.name)), lower(trim(a.sort_name)), a.id`, userID)
 	if err != nil {
 		return nil, err
 	}
