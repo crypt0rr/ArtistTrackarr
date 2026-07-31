@@ -193,6 +193,37 @@ func TestSyncContinuesWithSpotifyWhenMusicBrainzFails(t *testing.T) {
 	}
 }
 
+func TestSpotifyIsPrimaryReleaseSourceWhenAvailable(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{
+		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	database.Follow(ctx, userID, artist.ID)
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "old-mbid", Title: "Old MusicBrainz Album", PrimaryType: "Album",
+		FirstReleaseDate: "2018-01-01", DatePrecision: 3,
+	}}}
+	spotify := &spotifyReleaseCatalog{releases: []store.Release{{
+		MBID: "spotify:new", SpotifyID: "new", Title: "New Spotify Album", PrimaryType: "Album",
+		FirstReleaseDate: "2026-07-31", DatePrecision: 3,
+		SpotifyURL: "https://open.spotify.com/album/new", Source: "spotify",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if mb.releaseCalls.Load() != 0 || spotify.calls.Load() != 1 {
+		t.Fatalf("MusicBrainz calls=%d Spotify calls=%d", mb.releaseCalls.Load(), spotify.calls.Load())
+	}
+	releases, err := database.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].Title != "New Spotify Album" {
+		t.Fatalf("primary releases=%#v err=%v", releases, err)
+	}
+}
+
 func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)

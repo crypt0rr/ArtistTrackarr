@@ -797,8 +797,10 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at
 		FROM artists a JOIN follows f ON f.artist_id=a.id
-		WHERE a.next_check_at IS NULL OR a.next_check_at<=? ORDER BY COALESCE(a.next_check_at,'') LIMIT ?`,
-		timeText(now), limit)
+		WHERE (a.next_check_at IS NULL OR a.next_check_at<=?)
+		   OR (a.spotify_id IS NOT NULL AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?))
+		ORDER BY COALESCE(a.next_check_at,a.spotify_next_check_at,'') LIMIT ?`,
+		timeText(now), timeText(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1263,10 +1265,10 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 }
 
 func releaseExternalURL(release Release) string {
-	if release.MusicBrainzURL != "" {
-		return release.MusicBrainzURL
+	if release.SpotifyURL != "" {
+		return release.SpotifyURL
 	}
-	return release.SpotifyURL
+	return release.MusicBrainzURL
 }
 
 func comparableReleaseDate(value string) (time.Time, bool) {
@@ -1391,11 +1393,14 @@ func (s *Store) DashboardReleases(
 		OR (rg.date_precision=1 AND length(rg.first_release_date)=4
 			AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
 	)`
+	const preferredProvider = `(a.spotify_id IS NULL OR rg.source IN ('spotify','both') OR NOT EXISTS (
+		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','both')
+	))`
 	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
 		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE f.user_id=? AND `+definitelyFuture+`
+		WHERE f.user_id=? AND `+preferredProvider+` AND `+definitelyFuture+`
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
 		userID, today, today, today, limit)
 	if err != nil {
@@ -1410,7 +1415,7 @@ func (s *Store) DashboardReleases(
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
 		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE f.user_id=? AND NOT COALESCE(`+definitelyFuture+`,0)
+		WHERE f.user_id=? AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
 		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
 		userID, today, today, today, limit)
 	if err != nil {
