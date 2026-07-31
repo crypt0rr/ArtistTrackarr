@@ -657,6 +657,20 @@ func TestAdminUsersAndDeleteUser(t *testing.T) {
 	}
 }
 
+func TestSpotifyPollDelayIsStableAndSpreadAcrossInterval(t *testing.T) {
+	interval := 24 * time.Hour
+	first := spotifyPollDelay(1, interval)
+	if first != spotifyPollDelay(1, interval) {
+		t.Fatal("Spotify poll delay is not stable")
+	}
+	if first < interval/2 || first >= interval+interval/2 {
+		t.Fatalf("Spotify poll delay=%s outside expected range", first)
+	}
+	if first == spotifyPollDelay(2, interval) {
+		t.Fatal("different artists unexpectedly received the same deterministic delay")
+	}
+}
+
 func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.db")
 	db, err := sql.Open("sqlite", path)

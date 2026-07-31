@@ -94,9 +94,12 @@ least four tracks are treated as EPs.
 
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored
-Spotify history has not yet been reached. Successful observations are cached for
-24 hours. MusicBrainz release polling is used as a fallback when Spotify is
-unavailable or not mapped; it does not override successful Spotify data.
+Spotify release history has not yet been reached. Known release IDs, dates, and
+provider observations are retained locally, and successful responses are cached
+for 24 hours. Artists are assigned stable polling offsets so a large watch list
+is spread across the day instead of queried in one burst. MusicBrainz release
+polling is used as a fallback when Spotify is unavailable or not mapped; it does
+not override successful Spotify data.
 
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.

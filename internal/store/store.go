@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -838,8 +839,21 @@ func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next ti
 
 func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`,
-		timeText(now.Add(interval)), artistID)
+		timeText(now.Add(spotifyPollDelay(artistID, interval))), artistID)
 	return err
+}
+
+// spotifyPollDelay spreads artists deterministically across the polling
+// interval. The offset is stable for an artist but does not need another
+// persisted column, so restarts retain the same distribution.
+func spotifyPollDelay(artistID int64, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return interval
+	}
+	sum := sha256.Sum256([]byte(strconv.FormatInt(artistID, 10)))
+	span := interval
+	offset := time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(span))
+	return interval/2 + offset
 }
 
 func (s *Store) ScheduleSpotifyCheck(ctx context.Context, artistID int64, next time.Time) error {
