@@ -35,8 +35,8 @@ app supports a single running replica. Docker Compose names that container
 Release-group artwork is loaded from the Cover Art Archive and cached alongside
 the database in the persistent data volume.
 
-The interface follows the operating-system color theme by default. Use the
-header theme control to select and remember an explicit light or dark mode.
+Use the moon/sun button in the header to switch between light and dark mode;
+your choice is remembered in the browser.
 The running application version and project repository are available in the
 footer.
 
