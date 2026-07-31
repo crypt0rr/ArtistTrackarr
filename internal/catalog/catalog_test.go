@@ -313,16 +313,18 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 	if err != nil || len(cached) != len(releases) {
 		t.Fatalf("cached releases=%#v err=%v", cached, err)
 	}
-	if tokenRequests.Load() != 1 || albumRequests.Load() != 1 || len(releases) != 3 {
+	if tokenRequests.Load() != 1 || albumRequests.Load() != 1 || len(releases) != 4 {
 		t.Fatalf("token requests=%d album requests=%d releases=%#v",
 			tokenRequests.Load(), albumRequests.Load(), releases)
 	}
 	if releases[0].PrimaryType != "Album" || releases[0].DatePrecision != 3 ||
 		releases[0].SpotifyImageURL != "https://i.scdn.co/300" ||
-		releases[1].PrimaryType != "EP" || releases[1].Title != "1. KRUIS" ||
-		releases[1].DatePrecision != 2 ||
-		releases[2].PrimaryType != "Album" || len(releases[2].SecondaryTypes) != 1 ||
-		releases[2].SecondaryTypes[0] != "Compilation" {
+		releases[1].PrimaryType != "Single" || releases[1].Title != "Single" ||
+		releases[1].DatePrecision != 1 ||
+		releases[2].PrimaryType != "EP" || releases[2].Title != "1. KRUIS" ||
+		releases[2].DatePrecision != 2 ||
+		releases[3].PrimaryType != "Album" || len(releases[3].SecondaryTypes) != 1 ||
+		releases[3].SecondaryTypes[0] != "Compilation" {
 		t.Fatalf("unexpected Spotify releases: %#v", releases)
 	}
 }
@@ -368,7 +370,7 @@ func TestAlbumEPNormalizer(t *testing.T) {
 		{MBID: "album", PrimaryType: "Album"},
 	}
 	got := (AlbumEPNormalizer{}).Normalize(input)
-	if len(got) != 2 || got[0].MBID != "album" || got[1].MBID != "ep" {
+	if len(got) != 3 || got[0].MBID != "album" || got[1].MBID != "ep" || got[2].MBID != "single" {
 		t.Fatalf("unexpected normalized releases: %#v", got)
 	}
 }

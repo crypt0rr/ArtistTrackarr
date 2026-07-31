@@ -294,7 +294,7 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 	var all []store.Release
 	offset := 0
 	for {
-		endpoint := fmt.Sprintf("%s/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep&release-group-status=website-default&limit=100&offset=%d",
+		endpoint := fmt.Sprintf("%s/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep%%7Csingle&release-group-status=website-default&limit=100&offset=%d",
 			m.baseURL, url.QueryEscape(mbid), offset)
 		var response struct {
 			Count         int `json:"release-group-count"`
@@ -339,7 +339,7 @@ func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
 	seen := make(map[string]bool)
 	output := make([]store.Release, 0, len(input))
 	for _, release := range input {
-		if release.PrimaryType != "Album" && release.PrimaryType != "EP" {
+		if release.PrimaryType != "Album" && release.PrimaryType != "EP" && release.PrimaryType != "Single" {
 			continue
 		}
 		if release.MBID == "" || seen[release.MBID] {
@@ -752,6 +752,8 @@ func spotifyReleaseType(albumType, albumGroup, title string, totalTracks int) (s
 		return "Album", nil, true
 	case kind == "single" && (totalTracks >= 4 || strings.Contains(strings.ToLower(title), " ep")):
 		return "EP", nil, true
+	case kind == "single":
+		return "Single", nil, true
 	default:
 		return "", nil, false
 	}

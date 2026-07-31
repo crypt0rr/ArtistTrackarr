@@ -88,9 +88,9 @@ Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
 example `NL`. Existing followed artists are silently baselined the first time
 Spotify release polling runs after an upgrade, preventing back-catalogue
 notification floods. New releases observed after that baseline can notify
-independently of MusicBrainz. Spotify entries classified as albums are tracked;
-items classified as singles are excluded, while multi-track releases with at
-least four tracks are treated as EPs.
+independently of MusicBrainz. Albums, EPs, and singles are all eligible release
+types; multi-track Spotify releases with at least four tracks are treated as
+EPs.
 
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored
