@@ -13,7 +13,7 @@ func TestHandlerKeepsBoundedRedactedSnapshot(t *testing.T) {
 	logger.Warn("second")
 	logger.Error("third", "destination_url", "https://example.test/private")
 	entries := h.Snapshot()
-	if len(entries) != 2 || entries[0].Message != "second" || entries[1].Message != "third" {
+	if len(entries) != 2 || entries[0].Message != "third" || entries[1].Message != "second" {
 		t.Fatalf("unexpected snapshot: %#v", entries)
 	}
 	if len(entries[1].Attributes) != 0 {

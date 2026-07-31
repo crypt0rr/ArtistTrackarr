@@ -111,5 +111,9 @@ func (r *ring) add(entry Entry) {
 func (r *ring) snapshot() []Entry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return append([]Entry(nil), r.entries...)
+	entries := make([]Entry, len(r.entries))
+	for i := range r.entries {
+		entries[len(r.entries)-1-i] = r.entries[i]
+	}
+	return entries
 }

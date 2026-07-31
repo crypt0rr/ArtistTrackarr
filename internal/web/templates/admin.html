@@ -2,7 +2,8 @@
 <section class="page-head"><p class="eyebrow">Administrator</p><h1>Household administration</h1><p>Manage household accounts, access links, reminder settings, and notification delivery history.</p></section>
 {{if .GeneratedURL}}<section class="panel highlight"><h2>{{.TokenKind}} for {{.TokenEmail}}</h2>
 <label>Secure link<input value="{{.GeneratedURL}}" readonly data-copy-value></label><button type="button" class="secondary" data-copy>Copy link</button></section>{{end}}
-<section class="panel narrow settings-panel">
+<div class="grid three admin-tools">
+<section class="panel settings-panel">
   <p class="eyebrow">Notifications</p><h2>Reminder settings</h2>
   <p>Set the timezone and local time used for your release-day reminders.</p>
   <form method="post" action="/admin/profile" class="stack compact">
@@ -12,6 +13,11 @@
     <button>Save settings</button>
   </form>
 </section>
+<section class="panel"><h2>Invite a member</h2><p>Invitation links expire after 48 hours.</p>
+<form method="post" action="/admin/invite" class="stack">{{template "csrf" .}}<label>Email<input name="email" type="email" required></label><button>Create invitation link</button></form></section>
+<section class="panel"><h2>Reset a password</h2><p>Reset links expire after one hour and revoke all sessions after use.</p>
+<form method="post" action="/admin/reset" class="stack">{{template "csrf" .}}<label>Member email<input name="email" type="email" required></label><button>Create reset link</button></form></section>
+</div>
 <section class="panel user-admin">
   <div class="section-head"><div><p class="eyebrow">Users</p><h2>Household accounts</h2></div><span class="badge">{{len .AdminUsers}} user{{if ne (len .AdminUsers) 1}}s{{end}}</span></div>
   <p>Deleting an account permanently removes its follows, notification destinations, pending artist identifications, sessions, and delivery history.</p>
@@ -32,12 +38,12 @@
     </table>
   </div>
 </section>
-<div class="grid two">
-<section class="panel"><h2>Invite a member</h2><p>Invitation links expire after 48 hours.</p>
-<form method="post" action="/admin/invite" class="stack">{{template "csrf" .}}<label>Email<input name="email" type="email" required></label><button>Create invitation link</button></form></section>
-<section class="panel"><h2>Reset a password</h2><p>Reset links expire after one hour and revoke all sessions after use.</p>
-<form method="post" action="/admin/reset" class="stack">{{template "csrf" .}}<label>Member email<input name="email" type="email" required></label><button>Create reset link</button></form></section>
-</div>
+<section class="panel admin-log app-log">
+  <div class="section-head"><div><p class="eyebrow">Application log</p><h2>Recent container events</h2></div><span class="badge">{{len .AppLogs}} entries</span></div>
+  {{if .AppLogs}}<div class="app-log-scroll" tabindex="0" aria-label="Recent application log entries">
+    {{range .AppLogs}}<div class="app-log-row"><time datetime="{{.Time.Format "2006-01-02T15:04:05Z07:00"}}">{{.Time.Format "2006-01-02 15:04:05"}}</time><span class="badge {{lower .Level}}">{{.Level}}</span><strong>{{.Message}}</strong>{{if .Attributes}}<span class="app-log-fields">{{range .Attributes}}{{.Key}}={{.Value}} {{end}}</span>{{end}}</div>{{end}}
+  </div>{{else}}<div class="empty">No application events have been recorded since startup.</div>{{end}}
+</section>
 <section class="panel admin-log">
   <div class="section-head"><div><p class="eyebrow">Delivery audit</p><h2>Household notification history</h2></div><span class="badge">Page {{.AdminPage}} of {{.AdminPages}}</span></div>
   {{if .AdminHistory}}<div class="table-scroll">
@@ -58,11 +64,5 @@
     <span>Page {{.AdminPage}} of {{.AdminPages}}</span>
     {{if .AdminNextPage}}<a class="button secondary" href="/admin?page={{.AdminNextPage}}">Next</a>{{end}}
   </nav>{{end}}
-</section>
-<section class="panel admin-log app-log">
-  <div class="section-head"><div><p class="eyebrow">Application log</p><h2>Recent container events</h2></div><span class="badge">{{len .AppLogs}} entries</span></div>
-  {{if .AppLogs}}<div class="app-log-scroll" tabindex="0" aria-label="Recent application log entries">
-    {{range .AppLogs}}<div class="app-log-row"><time datetime="{{.Time.Format "2006-01-02T15:04:05Z07:00"}}">{{.Time.Format "2006-01-02 15:04:05"}}</time><span class="badge {{lower .Level}}">{{.Level}}</span><strong>{{.Message}}</strong>{{if .Attributes}}<span class="app-log-fields">{{range .Attributes}}{{.Key}}={{.Value}} {{end}}</span>{{end}}</div>{{end}}
-  </div>{{else}}<div class="empty">No application events have been recorded since startup.</div>{{end}}
 </section>
 {{template "foot" .}}
