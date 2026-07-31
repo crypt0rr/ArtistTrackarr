@@ -242,6 +242,42 @@ func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
 	}
 }
 
+func TestQuotaCooldownDefersNextArtistCheckUntilProviderRetry(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{
+		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	database.Follow(ctx, userID, artist.ID)
+	providerRetry := 8 * time.Hour
+	runner := New(
+		database,
+		&resolutionCatalog{releases: []store.Release{{
+			MBID: "musicbrainz-release", Title: "Canonical Album", PrimaryType: "Album",
+			FirstReleaseDate: "2026-07-30", DatePrecision: 3,
+		}}},
+		catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithSpotify(&spotifyReleaseCatalog{err: &catalog.SpotifyRateLimitError{
+			Operation: "Spotify artist albums", Status: 429, Reason: "QUOTA_EXCEEDED",
+			RetryAfter: providerRetry, QuotaExceeded: true,
+		}}),
+	)
+	before := time.Now().UTC()
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	var nextCheck string
+	if err := database.DB.QueryRow(`SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextCheck)
+	if err != nil || next.Before(before.Add(providerRetry-time.Second)) || next.After(before.Add(providerRetry+time.Second)) {
+		t.Fatalf("quota retry=%q parsed=%v err=%v", nextCheck, next, err)
+	}
+}
+
 func TestTotalProviderFailureSchedulesBoundedRetry(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
@@ -277,6 +313,9 @@ func TestSpotifyRetrySchedulingBounds(t *testing.T) {
 	}
 	if got := syncRetryDelay(&catalog.SpotifyRateLimitError{QuotaExceeded: true, RetryAfter: time.Minute}, interval); got != interval {
 		t.Fatalf("quota retry delay=%s", got)
+	}
+	if got := syncRetryDelay(&catalog.SpotifyRateLimitError{QuotaExceeded: true, RetryAfter: 8 * time.Hour}, interval); got != 8*time.Hour {
+		t.Fatalf("quota retry delay ignored provider cooldown: %s", got)
 	}
 }
 

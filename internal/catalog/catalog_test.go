@@ -231,6 +231,7 @@ func TestSpotifyQuotaExceededCreatesSharedCooldown(t *testing.T) {
 	var firstLimit, secondLimit *SpotifyRateLimitError
 	if !errors.As(firstErr, &firstLimit) || !errors.As(secondErr, &secondLimit) ||
 		!firstLimit.QuotaExceeded || !secondLimit.QuotaExceeded ||
+		!secondLimit.AlreadyBlocked ||
 		firstLimit.Reason != "QUOTA_EXCEEDED" || requests.Load() != 1 ||
 		firstLimit.RetryAfter < 29*time.Minute {
 		t.Fatalf("requests=%d first=%#v second=%#v", requests.Load(), firstLimit, secondLimit)
@@ -264,7 +265,7 @@ func TestSpotifyRateLimitWaitHonorsContextCancellation(t *testing.T) {
 	}
 }
 
-func TestSpotifyArtistReleasesPaginatesAndFiltersAlbumsAndEPs(t *testing.T) {
+func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing.T) {
 	var tokenRequests, albumRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -280,8 +281,10 @@ func TestSpotifyArtistReleasesPaginatesAndFiltersAlbumsAndEPs(t *testing.T) {
 				t.Fatalf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			if request.URL.Query().Get("offset") == "0" {
-				_, _ = io.WriteString(w, `{"total":4,"items":[
+			if request.URL.Query().Get("offset") != "0" {
+				t.Fatalf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
+			}
+			_, _ = io.WriteString(w, `{"items":[
 					{"id":"album-id","name":"Album","album_type":"album","album_group":"album","total_tracks":10,
 					 "release_date":"2026-08-01","release_date_precision":"day",
 					 "external_urls":{"spotify":"https://open.spotify.com/album/album-id"},
@@ -289,17 +292,11 @@ func TestSpotifyArtistReleasesPaginatesAndFiltersAlbumsAndEPs(t *testing.T) {
 					{"id":"single-id","name":"Single","album_type":"single","album_group":"single","total_tracks":1,
 					 "release_date":"2026","release_date_precision":"year","external_urls":{"spotify":"https://open.spotify.com/album/single-id"}},
 					{"id":"ep-id","name":"1. KRUIS","album_type":"single","album_group":"single","total_tracks":6,
-					 "release_date":"2026-07","release_date_precision":"month","external_urls":{"spotify":"https://open.spotify.com/album/ep-id"}}
+					 "release_date":"2026-07","release_date_precision":"month","external_urls":{"spotify":"https://open.spotify.com/album/ep-id"}},
+					{"id":"compilation-id","name":"Collected","album_type":"compilation","album_group":"compilation","total_tracks":14,
+					 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}
 				]}`)
-				return
-			}
-			if request.URL.Query().Get("offset") != "3" {
-				t.Fatalf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
-			}
-			_, _ = io.WriteString(w, `{"total":4,"items":[
-				{"id":"compilation-id","name":"Collected","album_type":"compilation","album_group":"compilation","total_tracks":14,
-				 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}
-			]}`)
+			return
 		default:
 			http.NotFound(w, request)
 		}
@@ -312,7 +309,7 @@ func TestSpotifyArtistReleasesPaginatesAndFiltersAlbumsAndEPs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tokenRequests.Load() != 1 || albumRequests.Load() != 2 || len(releases) != 3 {
+	if tokenRequests.Load() != 1 || albumRequests.Load() != 1 || len(releases) != 3 {
 		t.Fatalf("token requests=%d album requests=%d releases=%#v",
 			tokenRequests.Load(), albumRequests.Load(), releases)
 	}
