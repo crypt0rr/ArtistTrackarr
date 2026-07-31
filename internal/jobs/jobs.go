@@ -225,16 +225,17 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError
 	spotifyDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
-	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
-	if err == nil {
-		batches = append(batches, store.ReleaseBatch{
-			Provider: "musicbrainz", Releases: r.normalizer.Normalize(releases),
-		})
-	} else {
-		providerErrors = append(providerErrors, err)
-		r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
+	spotifyKnownDate := ""
+	if artist.SpotifyID != "" && r.spotify != nil {
+		var err error
+		spotifyKnownDate, err = r.store.LatestSpotifyReleaseDate(ctx, artist.ID)
+		if err != nil {
+			return err
+		}
 	}
-	if spotifyDue && r.spotify != nil {
+	spotifyPrimary := artist.SpotifyID != "" && r.spotify != nil && (spotifyDue || spotifyKnownDate != "")
+	spotifySucceeded := false
+	if spotifyPrimary && spotifyDue {
 		var spotifyReleases []store.Release
 		var spotifyErr error
 		if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
@@ -247,6 +248,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			spotifyReleases, spotifyErr = r.spotify.ArtistReleases(ctx, artist.SpotifyID)
 		}
 		if spotifyErr == nil {
+			spotifySucceeded = true
 			batches = append(batches, store.ReleaseBatch{
 				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
 			})
@@ -265,6 +267,26 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 				r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
 			}
 		}
+	}
+	// Spotify is authoritative whenever it has a successful observation. If it
+	// is unavailable, MusicBrainz remains a temporary fallback so a provider
+	// outage does not stop canonical release tracking entirely.
+	if !spotifySucceeded && !(spotifyPrimary && !spotifyDue) {
+		releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
+		if err == nil {
+			batches = append(batches, store.ReleaseBatch{
+				Provider: "musicbrainz", Releases: r.normalizer.Normalize(releases),
+			})
+		} else {
+			providerErrors = append(providerErrors, err)
+			r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
+		}
+	}
+	if spotifyPrimary && !spotifyDue && spotifyKnownDate != "" {
+		if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
+			return err
+		}
+		return nil
 	}
 	if len(batches) == 0 {
 		retryAt := now.Add(providerFailureRetryDelay(spotifyRateLimit, r.interval))

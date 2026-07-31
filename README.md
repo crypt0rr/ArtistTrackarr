@@ -1,7 +1,7 @@
 # ArtistTrackarr
 
-A self-hosted household dashboard that watches MusicBrainz and, when configured,
-Spotify for new albums and EPs and sends announcement and release-day notifications through
+A self-hosted household dashboard that watches Spotify for new albums and EPs,
+using MusicBrainz for stable artist identity and optional enrichment, and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
 
 ## Quick start
@@ -77,12 +77,12 @@ Every secret also supports Docker's `*_FILE` convention, for example
 
 Create an application in the [Spotify developer dashboard](https://developer.spotify.com/dashboard),
 then set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`. When configured,
-Spotify supplies the primary artist search, images, links, and an independent
-album/EP observation feed. MusicBrainz remains the canonical artist and release
-identity whenever a release-group match is available. Spotify-only releases are
-stored under a stable provider identity and may generate notifications; they are
-promoted to the MusicBrainz release group later when a conservative title, type,
-and date match is found.
+Spotify supplies the primary artist search, images, links, and the authoritative
+album/EP observation feed. MusicBrainz remains the stable artist identity and
+optional enrichment source. Spotify-only releases are stored under their stable
+Spotify identity and can generate notifications immediately; they are promoted
+to a MusicBrainz release group later when a conservative title, type, and date
+match is found.
 
 Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
 example `NL`. Existing followed artists are silently baselined the first time
@@ -95,8 +95,8 @@ least four tracks are treated as EPs.
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored
 Spotify history has not yet been reached. Successful observations are cached for
-24 hours. MusicBrainz supplies the complete release history and remains the
-source used for canonical tracking.
+24 hours. MusicBrainz release polling is used as a fallback when Spotify is
+unavailable or not mapped; it does not override successful Spotify data.
 
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.
