@@ -687,6 +687,9 @@ func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=3`).Scan(&applied); err != nil || applied != 1 {
 		t.Fatalf("migration 3 applied=%d err=%v", applied, err)
 	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=4`).Scan(&applied); err != nil || applied != 1 {
+		t.Fatalf("migration 4 applied=%d err=%v", applied, err)
+	}
 	var table string
 	if err := s.DB.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='artist_resolutions'`).Scan(&table); err != nil {
 		t.Fatal(err)
@@ -698,6 +701,10 @@ func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT source,spotify_image_url FROM release_groups LIMIT 1`).
 		Scan(&source, &spotifyImage); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("unexpected release columns check error: %v", err)
+	}
+	var spotifyNext string
+	if err := s.DB.QueryRow(`SELECT spotify_next_check_at FROM artists LIMIT 1`).Scan(&spotifyNext); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unexpected artist scheduling check error: %v", err)
 	}
 }
 

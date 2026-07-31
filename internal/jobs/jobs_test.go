@@ -233,7 +233,7 @@ func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
 		t.Fatalf("preserved releases=%#v err=%v", releases, err)
 	}
 	var nextCheck string
-	if err := database.DB.QueryRow(`SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+	if err := database.DB.QueryRow(`SELECT spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
 		t.Fatal(err)
 	}
 	next, err := time.Parse(time.RFC3339Nano, nextCheck)
@@ -262,14 +262,14 @@ func TestQuotaCooldownDefersNextArtistCheckUntilProviderRetry(t *testing.T) {
 		WithSpotify(&spotifyReleaseCatalog{err: &catalog.SpotifyRateLimitError{
 			Operation: "Spotify artist albums", Status: 429, Reason: "QUOTA_EXCEEDED",
 			RetryAfter: providerRetry, QuotaExceeded: true,
-		}}),
+		}}), WithSpotifyInterval(time.Hour),
 	)
 	before := time.Now().UTC()
 	if err := runner.SyncArtistNow(ctx, artist); err != nil {
 		t.Fatal(err)
 	}
 	var nextCheck string
-	if err := database.DB.QueryRow(`SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+	if err := database.DB.QueryRow(`SELECT spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
 		t.Fatal(err)
 	}
 	next, err := time.Parse(time.RFC3339Nano, nextCheck)

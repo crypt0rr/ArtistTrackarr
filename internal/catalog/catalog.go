@@ -38,6 +38,11 @@ type SpotifyReleaseProvider interface {
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
+type SpotifyIncrementalReleaseProvider interface {
+	SpotifyReleaseProvider
+	ArtistReleasesSince(context.Context, string, string) ([]store.Release, error)
+}
+
 type ArtistResult struct {
 	MBID            string
 	Name            string
@@ -364,6 +369,15 @@ type Spotify struct {
 	retryBase        time.Duration
 	maxInlineRetry   time.Duration
 	wait             func(context.Context, time.Duration) error
+	cacheMu          sync.Mutex
+	releaseCache     map[string]spotifyReleaseCache
+	cacheTTL         time.Duration
+}
+
+type spotifyReleaseCache struct {
+	observedAt time.Time
+	oldestDate string
+	releases   []store.Release
 }
 
 type SpotifyArtist struct {
@@ -402,7 +416,7 @@ func NewSpotify(id, secret string, market ...string) *Spotify {
 		clientID: id, secret: secret, client: &http.Client{Timeout: 15 * time.Second},
 		accountsURL: "https://accounts.spotify.com", apiURL: "https://api.spotify.com", market: selectedMarket,
 		requestInterval: time.Second, retryBase: time.Second, maxInlineRetry: 30 * time.Second,
-		wait: waitContext,
+		wait: waitContext, releaseCache: make(map[string]spotifyReleaseCache), cacheTTL: 24 * time.Hour,
 	}
 }
 
@@ -524,68 +538,98 @@ func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) 
 }
 
 func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.Release, error) {
+	return s.ArtistReleasesSince(ctx, artistID, "")
+}
+
+func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since string) ([]store.Release, error) {
 	if s == nil {
 		return nil, errors.New("Spotify is not configured")
 	}
 	if _, ok := SpotifyID(artistID); !ok {
 		return nil, errors.New("invalid Spotify artist ID")
 	}
-	// Spotify returns the artist album catalog newest-first. One page is enough
-	// for release discovery and avoids walking large back catalogues on every
-	// poll; MusicBrainz remains the complete canonical release source.
+	if cached, ok := s.cachedReleases(artistID, since); ok {
+		return cached, nil
+	}
 	const pageSize = 10
-	endpoint := fmt.Sprintf(
-		"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=0",
-		s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize,
-	)
-	var page struct {
-		Items []struct {
-			ID            string            `json:"id"`
-			Name          string            `json:"name"`
-			AlbumType     string            `json:"album_type"`
-			AlbumGroup    string            `json:"album_group"`
-			TotalTracks   int               `json:"total_tracks"`
-			ReleaseDate   string            `json:"release_date"`
-			DatePrecision string            `json:"release_date_precision"`
-			ExternalURLs  map[string]string `json:"external_urls"`
-			Images        []struct {
-				URL   string `json:"url"`
-				Width int    `json:"width"`
-			} `json:"images"`
-		} `json:"items"`
-	}
-	if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
-		return nil, err
-	}
-	result := make([]store.Release, 0, len(page.Items))
+	var result []store.Release
 	seen := make(map[string]bool)
-	for _, item := range page.Items {
-		if item.ID == "" || seen[item.ID] {
-			continue
-		}
-		primaryType, secondaryTypes, eligible := spotifyReleaseType(
-			item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
+	for offset := 0; offset < 1000; offset += pageSize {
+		endpoint := fmt.Sprintf(
+			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=%d",
+			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
 		)
-		if !eligible {
-			continue
+		var page struct {
+			Total int `json:"total"`
+			Items []struct {
+				ID            string            `json:"id"`
+				Name          string            `json:"name"`
+				AlbumType     string            `json:"album_type"`
+				AlbumGroup    string            `json:"album_group"`
+				TotalTracks   int               `json:"total_tracks"`
+				ReleaseDate   string            `json:"release_date"`
+				DatePrecision string            `json:"release_date_precision"`
+				ExternalURLs  map[string]string `json:"external_urls"`
+				Images        []struct {
+					URL   string `json:"url"`
+					Width int    `json:"width"`
+				} `json:"images"`
+			} `json:"items"`
 		}
-		seen[item.ID] = true
-		precision := spotifyDatePrecision(item.DatePrecision, item.ReleaseDate)
-		imageURL := spotifyReleaseImage(item.Images)
-		result = append(result, store.Release{
-			MBID:             "spotify:" + item.ID,
-			Title:            item.Name,
-			PrimaryType:      primaryType,
-			SecondaryTypes:   secondaryTypes,
-			FirstReleaseDate: item.ReleaseDate,
-			DatePrecision:    precision,
-			SpotifyID:        item.ID,
-			SpotifyURL:       item.ExternalURLs["spotify"],
-			SpotifyImageURL:  imageURL,
-			Source:           "spotify",
-		})
+		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+			return nil, err
+		}
+		oldest := ""
+		for _, item := range page.Items {
+			if item.ReleaseDate != "" && (oldest == "" || item.ReleaseDate < oldest) {
+				oldest = item.ReleaseDate
+			}
+			if item.ID == "" || seen[item.ID] {
+				continue
+			}
+			primaryType, secondaryTypes, eligible := spotifyReleaseType(
+				item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
+			)
+			if !eligible {
+				continue
+			}
+			seen[item.ID] = true
+			result = append(result, store.Release{
+				MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
+				SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
+				DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
+				SpotifyID:     item.ID, SpotifyURL: item.ExternalURLs["spotify"],
+				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify",
+			})
+		}
+		if since == "" || oldest == "" || oldest <= since || len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
+			break
+		}
 	}
+	s.cacheReleases(artistID, result)
 	return result, nil
+}
+
+func (s *Spotify) cachedReleases(artistID, since string) ([]store.Release, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	cached, ok := s.releaseCache[artistID]
+	if !ok || time.Since(cached.observedAt) >= s.cacheTTL || (since != "" && (cached.oldestDate == "" || cached.oldestDate > since)) {
+		return nil, false
+	}
+	return append([]store.Release(nil), cached.releases...), true
+}
+
+func (s *Spotify) cacheReleases(artistID string, releases []store.Release) {
+	oldest := ""
+	for _, release := range releases {
+		if release.FirstReleaseDate != "" && (oldest == "" || release.FirstReleaseDate < oldest) {
+			oldest = release.FirstReleaseDate
+		}
+	}
+	s.cacheMu.Lock()
+	s.releaseCache[artistID] = spotifyReleaseCache{observedAt: time.Now(), oldestDate: oldest, releases: append([]store.Release(nil), releases...)}
+	s.cacheMu.Unlock()
 }
 
 func (s *Spotify) getAPIJSON(ctx context.Context, operation, endpoint string, target any) error {

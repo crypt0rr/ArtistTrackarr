@@ -59,6 +59,7 @@ func main() {
 	var runnerOptions []jobs.Option
 	if spotify != nil {
 		runnerOptions = append(runnerOptions, jobs.WithSpotify(spotify))
+		runnerOptions = append(runnerOptions, jobs.WithSpotifyInterval(cfg.SpotifyPollInterval))
 	}
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger,
 		runnerOptions...)

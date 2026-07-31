@@ -60,18 +60,19 @@ type Session struct {
 }
 
 type Artist struct {
-	ID              int64
-	MBID            string
-	Name            string
-	SortName        string
-	Type            string
-	Country         string
-	Disambiguation  string
-	SpotifyID       string
-	SpotifyURL      string
-	SpotifyImageURL string
-	LastCheckedAt   *time.Time
-	BaselineSynced  bool
+	ID                 int64
+	MBID               string
+	Name               string
+	SortName           string
+	Type               string
+	Country            string
+	Disambiguation     string
+	SpotifyID          string
+	SpotifyURL         string
+	SpotifyImageURL    string
+	LastCheckedAt      *time.Time
+	SpotifyNextCheckAt *time.Time
+	BaselineSynced     bool
 }
 
 type Release struct {
@@ -794,7 +795,7 @@ func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, err
 
 func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Artist, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
-		a.spotify_id,a.spotify_url,a.spotify_image_url
+		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at
 		FROM artists a JOIN follows f ON f.artist_id=a.id
 		WHERE a.next_check_at IS NULL OR a.next_check_at<=? ORDER BY COALESCE(a.next_check_at,'') LIMIT ?`,
 		timeText(now), limit)
@@ -805,14 +806,18 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	var result []Artist
 	for rows.Next() {
 		var a Artist
-		var spotifyID, spotifyURL, spotifyImage sql.NullString
+		var spotifyID, spotifyURL, spotifyImage, spotifyNext sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
-			&spotifyID, &spotifyURL, &spotifyImage,
+			&spotifyID, &spotifyURL, &spotifyImage, &spotifyNext,
 		); err != nil {
 			return nil, err
 		}
 		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImage.String
+		if spotifyNext.Valid {
+			t, _ := parseTime(spotifyNext.String)
+			a.SpotifyNextCheckAt = &t
+		}
 		result = append(result, a)
 	}
 	return result, rows.Err()
@@ -827,6 +832,24 @@ func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.
 func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
 	return err
+}
+
+func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`,
+		timeText(now.Add(interval)), artistID)
+	return err
+}
+
+func (s *Store) ScheduleSpotifyCheck(ctx context.Context, artistID int64, next time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, timeText(next), artistID)
+	return err
+}
+
+func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (string, error) {
+	var date sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT MAX(first_release_date) FROM release_groups
+		WHERE artist_id=? AND source IN ('spotify','both')`, artistID).Scan(&date)
+	return date.String, err
 }
 
 func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []Release, observed time.Time) error {
