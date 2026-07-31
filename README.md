@@ -76,6 +76,7 @@ password or personal access token is required.
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
+| `LOG_LEVEL` | no | `info` | JSON log threshold: `debug`, `info`, `warn`, or `error`. |
 
 Every secret also supports Docker's `*_FILE` convention, for example
 `APP_ENCRYPTION_KEY_FILE=/run/secrets/encryption_key`.

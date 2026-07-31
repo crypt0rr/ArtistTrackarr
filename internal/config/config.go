@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -23,6 +24,7 @@ type Config struct {
 	SpotifyClientID     string
 	SpotifySecret       string
 	SpotifyMarket       string
+	LogLevel            slog.Level
 }
 
 func Load() (Config, error) {
@@ -53,6 +55,10 @@ func Load() (Config, error) {
 		SpotifySecret:       secret("SPOTIFY_CLIENT_SECRET"),
 		SpotifyMarket:       strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 	}
+	cfg.LogLevel, err = parseLogLevel(env("LOG_LEVEL", "info"))
+	if err != nil {
+		return Config{}, err
+	}
 	if len(cfg.EncryptionKey) < 32 || len(cfg.SessionSecret) < 32 {
 		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must each be at least 32 characters")
 	}
@@ -68,6 +74,21 @@ func Load() (Config, error) {
 		return Config{}, errors.New("SPOTIFY_MARKET must be a two-letter ISO country code")
 	}
 	return cfg, nil
+}
+
+func parseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, or error")
+	}
 }
 
 func env(name, fallback string) string {

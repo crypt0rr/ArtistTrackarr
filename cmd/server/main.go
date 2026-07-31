@@ -22,12 +22,13 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := config.Load()
 	if err != nil {
+		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
 		logger.Error("create data directory", "error", err)
 		os.Exit(1)
