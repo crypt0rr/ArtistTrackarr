@@ -1789,7 +1789,7 @@ func (s *Store) InsertApplicationLog(ctx context.Context, entry logging.Entry) e
 	if level != "INFO" && level != "WARN" && level != "ERROR" {
 		return nil
 	}
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, timeText(entry.Time), level, entry.Message, string(attrs))
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, entry.Time.Format(time.RFC3339Nano), level, entry.Message, string(attrs))
 	return err
 }
 
@@ -1800,7 +1800,7 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 	if limit > 500 {
 		limit = 500
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT created_at,level,message,attributes_json FROM application_logs ORDER BY created_at DESC,id DESC LIMIT ?`, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT created_at,level,message,attributes_json FROM application_logs ORDER BY datetime(created_at) DESC,id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1812,7 +1812,12 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 			return nil, err
 		}
 		t, _ := parseTime(ts)
-		t = t.In(time.Local)
+		// Older rows were normalized to UTC before offsets were preserved. Convert
+		// those rows to the current process timezone; new rows retain their source
+		// offset so they match the JSON container log exactly.
+		if strings.HasSuffix(ts, "Z") || strings.HasSuffix(ts, "+00:00") {
+			t = t.In(time.Local)
+		}
 		var fields []logging.Field
 		_ = json.Unmarshal([]byte(attrs), &fields)
 		out = append(out, logging.Entry{Time: t, Level: level, Message: msg, Attributes: fields})
@@ -1821,7 +1826,7 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 }
 
 func (s *Store) PruneApplicationLogs(ctx context.Context, before time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM application_logs WHERE created_at < ?`, timeText(before))
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM application_logs WHERE datetime(created_at) < datetime(?)`, timeText(before))
 	return err
 }
 
