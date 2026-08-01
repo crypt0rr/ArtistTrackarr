@@ -40,7 +40,7 @@
 </section>
 <section class="panel admin-ops">
   <div class="section-head"><div><p class="eyebrow">Operations</p><h2>Provider health &amp; sync</h2></div><form method="post" action="/admin/sync/retry">{{template "csrf" .}}<button class="secondary">Retry due/failed artists</button></form></div>
-  <div class="grid two">
+  <div class="grid two admin-ops-grid">
     <div><h3>Providers</h3>{{if .ProviderHealth}}<div class="health-list">{{range .ProviderHealth}}<div class="health-row"><strong>{{.Provider}}</strong>{{if .LastSuccessAt}}<span class="badge sent">healthy</span>{{else}}<span class="badge failed">no success yet</span>{{end}}{{if .QuotaExceeded}}<small>Quota limited</small>{{else if .RateLimited}}<small>Rate limited</small>{{end}}{{if .LastError}}<small>{{.LastError}}</small>{{end}}</div>{{end}}</div>{{else}}<div class="empty">No provider health data yet.</div>{{end}}</div>
     <div><h3>Sync artists</h3>{{if .AdminArtists}}<div class="table-scroll"><table><thead><tr><th>Artist</th><th>Action</th></tr></thead><tbody>{{range .AdminArtists}}<tr><td>{{.Name}}</td><td><form method="post" action="/admin/sync/artists/{{.ID}}">{{template "csrf" $}}<button class="secondary">Queue sync</button></form></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No followed artists.</div>{{end}}</div>
   </div>
