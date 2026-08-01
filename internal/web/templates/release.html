@@ -1,0 +1,13 @@
+{{template "head" .}}
+{{with .ReleaseDetail}}
+<section class="page-head split-head"><div><p class="eyebrow">Release details</p><h1>{{.Title}}</h1><p>{{.ArtistName}} · {{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</p></div><a class="button secondary" href="/">Back to dashboard</a></section>
+<section class="grid two">
+  <section class="panel release-detail-card">
+    {{if and (eq .Source "spotify") .SpotifyImageURL}}<img class="release-detail-art" src="{{.SpotifyImageURL}}" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">{{else}}<img class="release-detail-art" src="/art/release-group/{{.MBID}}" alt="Cover art for {{.Title}}">{{end}}
+    <p class="date">{{shortDate .FirstReleaseDate}}</p><p>Observed {{formatTime .FirstObservedAt}}</p><p>Source: {{if eq .Source "both"}}MusicBrainz + Spotify{{else}}{{.Source}}{{end}}</p>
+    <div class="actions">{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}</div>
+  </section>
+  <section class="panel"><p class="eyebrow">Provider observations</p><h2>Release history</h2>{{if .Observations}}<div class="list">{{range .Observations}}<div class="list-row"><strong>{{.Provider}}</strong><small>{{.ProviderID}} · {{formatTime .ObservedAt}}</small></div>{{end}}</div>{{else}}<div class="empty">No provider observations recorded.</div>{{end}}</section>
+</section>
+{{end}}
+{{template "foot" .}}
