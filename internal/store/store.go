@@ -1812,6 +1812,7 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 			return nil, err
 		}
 		t, _ := parseTime(ts)
+		t = t.In(time.Local)
 		var fields []logging.Field
 		_ = json.Unmarshal([]byte(attrs), &fields)
 		out = append(out, logging.Entry{Time: t, Level: level, Message: msg, Attributes: fields})
