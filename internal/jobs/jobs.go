@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,10 @@ func (r *Runner) Run(ctx context.Context) {
 func (r *Runner) tick(ctx context.Context) {
 	tickStarted := time.Now()
 	if r.syncMu.TryLock() {
+		manualSummary := r.processManualSyncRequests(ctx, time.Now().UTC())
+		if manualSummary > 0 {
+			r.logger.Info("manual synchronization requests completed", "processed", manualSummary)
+		}
 		resolutionSummary, err := r.resolveArtistResolutions(ctx, time.Now().UTC())
 		if err != nil {
 			r.logger.Error("artist resolution failed", "error", err)
@@ -114,6 +119,9 @@ func (r *Runner) tick(ctx context.Context) {
 	} else {
 		r.logger.Debug("background tick skipped", "reason", "another synchronization is running")
 	}
+	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
+		r.logger.Debug("application log pruning failed", "error", err)
+	}
 	now := time.Now().UTC()
 	if err := r.store.QueueDueReleaseDays(ctx, now); err != nil {
 		r.logger.Error("release-day scheduling failed", "error", err)
@@ -129,6 +137,33 @@ func (r *Runner) tick(ctx context.Context) {
 			"failed", deliverySummary.Failed)
 	}
 	r.logger.Info("background tick completed", "duration", time.Since(tickStarted).String())
+}
+
+func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) int {
+	requests, err := r.store.ClaimManualSyncRequests(ctx, 3)
+	if err != nil {
+		r.logger.Warn("manual synchronization queue failed", "error", err)
+		return 0
+	}
+	for _, req := range requests {
+		var syncErr error
+		if req.Scope == "artist" && req.ArtistID != nil {
+			var artist store.Artist
+			artist, syncErr = r.store.ArtistByID(ctx, *req.ArtistID)
+			if syncErr == nil {
+				syncErr = r.syncOne(ctx, artist, now)
+			}
+		} else if req.Scope == "retry" {
+			syncErr = r.store.MarkAllArtistsDue(ctx)
+			if syncErr == nil {
+				_, syncErr = r.syncArtists(ctx, now)
+			}
+		}
+		if err := r.store.CompleteManualSyncRequest(ctx, req.ID, syncErr); err != nil {
+			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", err)
+		}
+	}
+	return len(requests)
 }
 
 func (r *Runner) ResolveArtistResolutionNow(ctx context.Context, resolution store.ArtistResolution) (string, error) {
@@ -304,10 +339,17 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 		if spotifyErr == nil {
 			spotifySucceeded = true
+			_ = r.store.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, "")
 			batches = append(batches, store.ReleaseBatch{
 				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
 			})
 		} else {
+			var retryAt *time.Time
+			if errors.As(spotifyErr, &spotifyRateLimit) {
+				t := now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))
+				retryAt = &t
+			}
+			_ = r.store.UpsertProviderHealth(ctx, "spotify", false, retryAt, spotifyRateLimit != nil, spotifyRateLimit != nil && spotifyRateLimit.QuotaExceeded, sanitizedProviderError(spotifyErr))
 			providerErrors = append(providerErrors, spotifyErr)
 			if errors.As(spotifyErr, &spotifyRateLimit) {
 				if !spotifyRateLimit.AlreadyBlocked {
@@ -329,10 +371,13 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	if !spotifySucceeded && !(spotifyPrimary && !spotifyDue) {
 		releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 		if err == nil {
+			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
 			batches = append(batches, store.ReleaseBatch{
 				Provider: "musicbrainz", Releases: r.normalizer.Normalize(releases),
 			})
 		} else {
+			t := now.Add(providerFailureRetryDelay(nil, r.interval))
+			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &t, false, false, sanitizedProviderError(err))
 			providerErrors = append(providerErrors, err)
 			r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
 		}
@@ -372,6 +417,19 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		return r.store.MarkSpotifyChecked(ctx, artist.ID, now, r.spotifyInterval)
 	}
 	return nil
+}
+
+func sanitizedProviderError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	msg = strings.ReplaceAll(msg, "https://", "[url]")
+	msg = strings.ReplaceAll(msg, "http://", "[url]")
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	return msg
 }
 
 func syncRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interval time.Duration) time.Duration {

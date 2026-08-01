@@ -41,6 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer database.Close()
+	logHandler.SetSink(func(entry logging.Entry) { _ = database.InsertApplicationLog(context.Background(), entry) })
 
 	cipher, err := security.NewCipher(cfg.EncryptionKey)
 	if err != nil {

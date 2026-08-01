@@ -71,6 +71,9 @@ type PageData struct {
 	AdminHistory     []store.AdminDeliveryHistory
 	AppLogs          []logging.Entry
 	AdminUsers       []store.AdminUser
+	AdminArtists     []store.AdminArtist
+	ProviderHealth   []store.ProviderHealth
+	ManualSyncs      []store.ManualSyncRequest
 	FollowCount      int
 	AdminPage        int
 	AdminPages       int
@@ -160,6 +163,8 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/invite", a.createInvite)
 			admin.Post("/admin/reset", a.createReset)
 			admin.Post("/admin/users/{id}/delete", a.deleteUser)
+			admin.Post("/admin/sync/retry", a.queueRetrySync)
+			admin.Post("/admin/sync/artists/{id}", a.queueArtistSync)
 		})
 	})
 	return r
@@ -848,10 +853,16 @@ func (a *App) adminData(r *http.Request) PageData {
 		page = pages
 	}
 	d := a.data(r, "Household administration")
-	if snapshotter, ok := a.logger.Handler().(interface{ Snapshot() []logging.Entry }); ok {
-		d.AppLogs = snapshotter.Snapshot()
+	d.AppLogs, _ = a.store.ApplicationLogs(r.Context(), 200)
+	if len(d.AppLogs) == 0 {
+		if snapshotter, ok := a.logger.Handler().(interface{ Snapshot() []logging.Entry }); ok {
+			d.AppLogs = snapshotter.Snapshot()
+		}
 	}
 	d.AdminUsers, _ = a.store.AdminUsers(r.Context())
+	d.AdminArtists, _ = a.store.AdminArtists(r.Context())
+	d.ProviderHealth, _ = a.store.ProviderHealth(r.Context())
+	d.ManualSyncs, _ = a.store.ManualSyncRequests(r.Context(), 20)
 	d.AdminHistory, _ = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
 	d.AdminPage, d.AdminPages = page, pages
 	if page > 1 {
@@ -861,6 +872,32 @@ func (a *App) adminData(r *http.Request) PageData {
 		d.AdminNextPage = page + 1
 	}
 	return d
+}
+
+func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "retry", nil); err != nil {
+		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/admin?message=Retry+sync+queued", http.StatusSeeOther)
+}
+func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err = a.store.ArtistByID(r.Context(), id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err = a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
+		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/admin?message=Artist+sync+queued", http.StatusSeeOther)
 }
 
 func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {

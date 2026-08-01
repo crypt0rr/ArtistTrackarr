@@ -25,6 +25,8 @@ type Handler struct {
 	next   slog.Handler
 	buffer *ring
 	attrs  []slog.Attr
+	sink   func(Entry)
+	sinkMu sync.RWMutex
 }
 
 type ring struct {
@@ -57,24 +59,33 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 			appendField(&fields, attr)
 			return true
 		})
-		h.buffer.add(Entry{
+		entry := Entry{
 			Time:       record.Time,
 			Level:      record.Level.String(),
 			Message:    record.Message,
 			Attributes: fields,
-		})
+		}
+		h.buffer.add(entry)
+		h.sinkMu.RLock()
+		sink := h.sink
+		h.sinkMu.RUnlock()
+		if sink != nil {
+			sink(entry)
+		}
 	}
 	return nil
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	child := &Handler{next: h.next.WithAttrs(attrs), buffer: h.buffer, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...)}
+	child := &Handler{next: h.next.WithAttrs(attrs), buffer: h.buffer, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...), sink: h.sink}
 	return child
 }
 
 func (h *Handler) WithGroup(name string) slog.Handler {
-	return &Handler{next: h.next.WithGroup(name), buffer: h.buffer, attrs: h.attrs}
+	return &Handler{next: h.next.WithGroup(name), buffer: h.buffer, attrs: h.attrs, sink: h.sink}
 }
+
+func (h *Handler) SetSink(sink func(Entry)) { h.sinkMu.Lock(); h.sink = sink; h.sinkMu.Unlock() }
 
 func (h *Handler) Snapshot() []Entry {
 	return h.buffer.snapshot()
