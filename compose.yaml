@@ -14,6 +14,7 @@ services:
       SPOTIFY_POLL_INTERVAL: "${SPOTIFY_POLL_INTERVAL:-24h}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      TZ: "${TZ:-UTC}"
       SETUP_TOKEN_FILE: /run/secrets/setup_token
       APP_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       SESSION_SECRET_FILE: /run/secrets/session_secret

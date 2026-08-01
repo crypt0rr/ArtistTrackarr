@@ -146,7 +146,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
 		!strings.Contains(string(loginBody), "v"+version.Current) ||
-		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/Artist-Trackarr") ||
+		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/ArtistTrackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-toggle`) ||
 		strings.Contains(string(loginBody), `data-theme-select`) ||
 		!strings.Contains(string(loginBody), "ArtistTrackarr") ||

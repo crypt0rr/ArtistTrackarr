@@ -21,6 +21,7 @@ FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S -g 10001 tracker && adduser -S -D -H -u 10001 -G tracker tracker && \
     mkdir /data && chown tracker:tracker /data
+ENV TZ=UTC
 COPY --from=build /out/artist-trackarr /usr/local/bin/artist-trackarr
 USER tracker
 EXPOSE 8080
