@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.7.0` publishes `0.7.0`, `0.7`, and `latest`.
+- Pushing a tag such as `v0.8.0` publishes `0.8.0`, `0.8`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.7.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.8.0 docker compose up -d
 ```
 
 ## Configuration
@@ -125,6 +125,11 @@ Users can add guided Email, Discord, Telegram, ntfy, Gotify, and generic
 webhook destinations. Any service supported by Shoutrrr can be added with its
 raw service URL. Credentials are encrypted in SQLite and redacted from the UI
 and logs. Use the **Send test** action after adding a destination.
+
+Users can choose whether albums, EPs, singles, announcements, and release-day
+reminders should be delivered. Followed artists show their last and next
+synchronization times, and **Sync now** queues a rate-limited refresh. Release
+details expose the stored provider observations and source history.
 
 ## Household administration
 

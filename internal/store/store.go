@@ -38,6 +38,15 @@ type User struct {
 	CreatedAt    time.Time
 }
 
+type NotificationPreferences struct {
+	UserID        int64
+	Albums        bool
+	EPs           bool
+	Singles       bool
+	Announcements bool
+	ReleaseDay    bool
+}
+
 type AdminUser struct {
 	ID               int64
 	Email            string
@@ -93,6 +102,17 @@ type Release struct {
 	SpotifyImageURL  string
 	Source           string
 	FirstObservedAt  time.Time
+}
+
+type ReleaseDetail struct {
+	Release
+	Observations []ReleaseObservation
+}
+
+type ReleaseObservation struct {
+	Provider   string
+	ProviderID string
+	ObservedAt time.Time
 }
 
 type ReleaseBatch struct {
@@ -793,7 +813,7 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 
 func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
-		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,f.baseline_synced_at
+		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,a.spotify_next_check_at,f.baseline_synced_at
 		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE f.user_id=?
 		ORDER BY lower(trim(a.name)), lower(trim(a.sort_name)), a.id`, userID)
 	if err != nil {
@@ -803,15 +823,19 @@ func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, er
 	var result []Artist
 	for rows.Next() {
 		var a Artist
-		var sid, surl, image, checked, baseline sql.NullString
+		var sid, surl, image, checked, spotifyNext, baseline sql.NullString
 		if err := rows.Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
-			&sid, &surl, &image, &checked, &baseline); err != nil {
+			&sid, &surl, &image, &checked, &spotifyNext, &baseline); err != nil {
 			return nil, err
 		}
 		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, image.String
 		if checked.Valid {
 			t, _ := parseTime(checked.String)
 			a.LastCheckedAt = &t
+		}
+		if spotifyNext.Valid {
+			t, _ := parseTime(spotifyNext.String)
+			a.SpotifyNextCheckAt = &t
 		}
 		a.BaselineSynced = baseline.Valid
 		result = append(result, a)
@@ -823,6 +847,12 @@ func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, err
 	var count int
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=?`, userID).Scan(&count)
 	return count, err
+}
+
+func (s *Store) IsFollowing(ctx context.Context, userID, artistID int64) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID).Scan(&n)
+	return n > 0, err
 }
 
 func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Artist, error) {
@@ -1394,6 +1424,16 @@ func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, event
 }
 
 func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
+	var p NotificationPreferences
+	var albums, eps, singles, announcements, releaseDay int
+	var primary string
+	err := tx.QueryRowContext(ctx, `SELECT p.albums,p.eps,p.singles,p.announcements,p.release_day,rg.primary_type FROM notification_preferences p JOIN release_groups rg ON rg.id=? WHERE p.user_id=?`, releaseID, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &primary)
+	if err == nil {
+		p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+		if !releaseTypeEnabled(p, primary) || (eventType == "announcement" && !p.Announcements) || (eventType == "release_day" && !p.ReleaseDay) {
+			return nil
+		}
+	}
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO notification_events
 		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
 		userID, releaseID, eventType, title, body, timeText(now))
@@ -2003,4 +2043,73 @@ func (s *Store) AdminArtists(ctx context.Context) ([]AdminArtist, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
+	var p NotificationPreferences
+	p.UserID = userID
+	var albums, eps, singles, announcements, releaseDay int
+	err := s.DB.QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay)
+	if err == sql.ErrNoRows {
+		_, err = s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
+		if err == nil {
+			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = true, true, true, true, true
+		}
+		return p, err
+	}
+	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+	return p, err
+}
+
+func (s *Store) UpdateNotificationPreferences(ctx context.Context, p NotificationPreferences) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,updated_at) VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,announcements=excluded.announcements,release_day=excluded.release_day,updated_at=excluded.updated_at`,
+		p.UserID, boolInt(p.Albums), boolInt(p.EPs), boolInt(p.Singles), boolInt(p.Announcements), boolInt(p.ReleaseDay), nowText())
+	return err
+}
+
+func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
+	switch strings.ToLower(strings.TrimSpace(primary)) {
+	case "album":
+		return p.Albums
+	case "ep":
+		return p.EPs
+	case "single":
+		return p.Singles
+	default:
+		return true
+	}
+}
+
+func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
+	var d ReleaseDetail
+	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
+	if err != nil {
+		return d, err
+	}
+	items, err := scanReleases(rows)
+	rows.Close()
+	if err != nil {
+		return d, err
+	}
+	if len(items) == 0 {
+		return d, sql.ErrNoRows
+	}
+	d.Release = items[0]
+	obs, err := s.DB.QueryContext(ctx, `SELECT provider,provider_id,observed_at FROM provider_observations WHERE release_group_id=? ORDER BY observed_at DESC`, releaseID)
+	if err != nil {
+		return d, err
+	}
+	defer obs.Close()
+	for obs.Next() {
+		var o ReleaseObservation
+		var ts string
+		if err := obs.Scan(&o.Provider, &o.ProviderID, &ts); err != nil {
+			return d, err
+		}
+		o.ObservedAt, _ = parseTime(ts)
+		d.Observations = append(d.Observations, o)
+	}
+	return d, obs.Err()
 }

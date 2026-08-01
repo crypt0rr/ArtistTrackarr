@@ -12,10 +12,11 @@
     <div class="artist-summary">
       {{if .SpotifyImageURL}}<img class="avatar" src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Name}}</span>{{end}}
       <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
-      <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}</small></span>
+      <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}{{if .LastCheckedAt}} · Last checked {{.LastCheckedAt.Format "2006-01-02 15:04"}}{{end}}{{if .SpotifyNextCheckAt}} · Next check {{.SpotifyNextCheckAt.Format "2006-01-02 15:04"}}{{end}}</small></span>
     </div>
     <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
     <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>
+    <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}<button class="secondary">Sync now</button></form>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
   </article>{{end}}</div>
   {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists</a>.</div>{{end}}

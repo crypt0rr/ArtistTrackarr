@@ -64,6 +64,8 @@ type PageData struct {
 	UpcomingReleases []store.Release
 	RecentReleases   []store.Release
 	ReleaseCount     int
+	Preferences      store.NotificationPreferences
+	ReleaseDetail    *store.ReleaseDetail
 	Resolutions      []store.ArtistResolution
 	Resolution       *store.ArtistResolution
 	Destinations     []store.Destination
@@ -140,18 +142,21 @@ func (a *App) Handler() http.Handler {
 		private.Get("/", a.dashboard)
 		private.Post("/logout", a.logout)
 		private.Get("/artists", a.artists)
+		private.Get("/releases/{id}", a.releaseDetail)
 		private.Get("/artists/search", a.search)
 		private.Post("/artists/follow", a.follow)
 		private.Post("/artists/follow/batch", a.followBatch)
 		private.Post("/artists/follow/spotify", a.followSpotify)
 		private.Post("/artists/follow/spotify/batch", a.followSpotifyBatch)
 		private.Post("/artists/{id}/delete", a.unfollow)
+		private.Post("/artists/{id}/sync", a.syncArtist)
 		private.Get("/artist-resolutions/{id}", a.artistResolution)
 		private.Post("/artist-resolutions/{id}", a.selectArtistResolution)
 		private.Post("/artist-resolutions/{id}/cancel", a.cancelArtistResolution)
 		private.Get("/artists/export", a.exportArtists)
 		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
+		private.Post("/preferences", a.updatePreferences)
 		private.Post("/destinations", a.addDestination)
 		private.Post("/destinations/{id}/rename", a.renameDestination)
 		private.Post("/destinations/{id}/test", a.testDestination)
@@ -382,7 +387,25 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	d.ReleaseCount = len(d.UpcomingReleases) + len(d.RecentReleases)
 	d.History, _ = a.store.DeliveryHistory(r.Context(), session.User.ID, 10)
 	d.Resolutions, _ = a.store.ArtistResolutions(r.Context(), session.User.ID)
+	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
 	a.render(w, "dashboard", d, http.StatusOK)
+}
+
+func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	d := a.data(r, "Release details")
+	detail, err := a.store.ReleaseDetail(r.Context(), session.User.ID, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	d.ReleaseDetail = &detail
+	a.render(w, "release", d, http.StatusOK)
 }
 
 func (a *App) artists(w http.ResponseWriter, r *http.Request) {
@@ -391,6 +414,25 @@ func (a *App) artists(w http.ResponseWriter, r *http.Request) {
 	d.Artists, _ = a.store.FollowedArtists(r.Context(), session.User.ID)
 	d.FollowCount = len(d.Artists)
 	a.render(w, "artists", d, http.StatusOK)
+}
+
+func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	following, err := a.store.IsFollowing(r.Context(), session.User.ID, id)
+	if err != nil || !following {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
+		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/artists?message=Synchronization+queued", http.StatusSeeOther)
 }
 
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
@@ -738,6 +780,7 @@ func (a *App) destinations(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	d := a.data(r, "Notification destinations")
 	d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
+	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
 	a.render(w, "destinations", d, http.StatusOK)
 }
 
@@ -832,6 +875,18 @@ func (a *App) profile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/admin?message=Reminder+settings+updated", http.StatusSeeOther)
+}
+
+func (a *App) updatePreferences(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	p := store.NotificationPreferences{UserID: session.User.ID,
+		Albums: r.FormValue("albums") == "on", EPs: r.FormValue("eps") == "on", Singles: r.FormValue("singles") == "on",
+		Announcements: r.FormValue("announcements") == "on", ReleaseDay: r.FormValue("release_day") == "on"}
+	if err := a.store.UpdateNotificationPreferences(r.Context(), p); err != nil {
+		http.Redirect(w, r, "/destinations?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/destinations?message=Notification+preferences+updated", http.StatusSeeOther)
 }
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {
