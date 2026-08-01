@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.8.0` publishes `0.8.0`, `0.8`, and `latest`.
+- Pushing a tag such as `v0.8.1` publishes `0.8.1`, `0.8`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.8.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.8.1 docker compose up -d
 ```
 
 ## Configuration
