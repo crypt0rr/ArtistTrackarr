@@ -1,7 +1,7 @@
 # ArtistTrackarr
 
-A self-hosted household dashboard that watches Spotify for new albums and EPs,
-using MusicBrainz for stable artist identity and optional enrichment, and sends announcement and release-day notifications through
+A self-hosted household dashboard that watches Spotify for new albums, EPs, and singles,
+using MusicBrainz for stable artist identity with Apple/iTunes fallback observations, and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
 
 ## Example dashboard
@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.10.0` publishes `0.10.0`, `0.10`, and `latest`.
+- Pushing a tag such as `v0.11.0` publishes `0.11.0`, `0.11`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.10.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.11.0 docker compose up -d
 ```
 
 ## Configuration
@@ -77,16 +77,11 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.10.0 docker compose up 
 Every secret also supports Docker's `*_FILE` convention, for example
 `APP_ENCRYPTION_KEY_FILE=/run/secrets/encryption_key`.
 
-## Spotify discovery and release observation
+## Spotify, Apple/iTunes, and MusicBrainz discovery and release observation
 
 Create an application in the [Spotify developer dashboard](https://developer.spotify.com/dashboard),
 then set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`. When configured,
-Spotify supplies the primary artist search, images, links, and the authoritative
-album/EP observation feed. MusicBrainz remains the stable artist identity and
-optional enrichment source. Spotify-only releases are stored under their stable
-Spotify identity and can generate notifications immediately; they are promoted
-to a MusicBrainz release group later when a conservative title, type, and date
-match is found.
+Spotify supplies the preferred artist search, images, links, and release observation feed. When Spotify is unavailable or returns no results, the application falls back to the public Apple iTunes Search API and then MusicBrainz. MusicBrainz remains the stable artist identity source. Spotify- and iTunes-only releases are stored under their stable provider identity and can generate notifications immediately; they are promoted to a MusicBrainz release group later when a conservative title, type, and date match is found.
 
 Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
 example `NL`. Existing followed artists are silently baselined the first time
@@ -106,8 +101,9 @@ also means selecting an artist directly from a recent search does not trigger a
 second lookup request. Batch follow actions use Spotify's multiple-artist
 endpoint when available. Artists are assigned stable polling offsets so a large
 watch list is spread across the day instead of queried in one burst.
-MusicBrainz release polling is used as a fallback when Spotify is unavailable
-or not mapped; it does not override successful Spotify data.
+Apple/iTunes release observations are best-effort and are matched by canonical artist name. Collections are classified as Album, EP, or Single using track-count/title heuristics; no iTunes artwork is retained. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
+
+iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `SPOTIFY_MARKET` (default `US`), and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.
 
 Successful Spotify checks also adapt per artist. A catalog change returns the
 artist to the configured `SPOTIFY_POLL_INTERVAL`; unchanged artists back off

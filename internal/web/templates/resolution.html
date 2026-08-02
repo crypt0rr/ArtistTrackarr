@@ -1,11 +1,11 @@
 {{template "head" .}}
 <section class="page-head"><p class="eyebrow">Artist identification</p><h1>Confirm {{.Resolution.DisplayName}}</h1>
-  <p>The Spotify artist must be matched to one MusicBrainz identity before release tracking begins.</p>
+  <p>The {{resolutionProviderLabel .Resolution.Provider}} artist must be matched to one MusicBrainz identity before release tracking begins.</p>
 </section>
 <section class="panel highlight">
   <div class="resolution-artist">
     {{if .Resolution.ImageURL}}<img class="avatar" src="{{.Resolution.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Resolution.DisplayName}}</span>{{end}}
-    <span><strong>{{.Resolution.DisplayName}}</strong><a href="{{.Resolution.ProviderURL}}" target="_blank" rel="noopener noreferrer">Open in Spotify</a></span>
+    <span><strong>{{.Resolution.DisplayName}}</strong><a href="{{.Resolution.ProviderURL}}" target="_blank" rel="noopener noreferrer">Open in {{resolutionProviderLabel .Resolution.Provider}}</a></span>
   </div>
 </section>
 {{if eq .Resolution.Status "review"}}

@@ -47,6 +47,71 @@ func TestMusicBrainzRetriesTransientTransportFailures(t *testing.T) {
 	}
 }
 
+func TestITunesSearchAndReleaseNormalization(t *testing.T) {
+	var searchRequests, releaseRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/search" {
+			searchRequests.Add(1)
+			if request.URL.Query().Get("country") != "NL" || request.URL.Query().Get("entity") != "musicArtist" {
+				t.Fatalf("unexpected iTunes search query: %s", request.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/nl/artist/example"}]}`)
+			return
+		}
+		if request.URL.Path == "/lookup" {
+			releaseRequests.Add(1)
+			if request.URL.Query().Get("entity") != "album" {
+				t.Fatalf("unexpected iTunes lookup query: %s", request.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"results":[
+				{"wrapperType":"artist","artistId":123,"artistName":"Example"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"One","collectionArtistName":"Example","trackCount":1,"releaseDate":"2026-01-02T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/one"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":2,"collectionName":"Short EP","collectionArtistName":"Example","trackCount":4,"releaseDate":"2025-02-01T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/ep"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":3,"collectionName":"Long","collectionArtistName":"Example","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":4,"collectionName":"Other Artist","collectionArtistName":"Other","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"}
+			]}`)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer server.Close()
+	itunes := NewITunes("NL")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	artists, err := itunes.SearchArtists(context.Background(), "Example")
+	if err != nil || len(artists) != 1 || artists[0].ID != "123" {
+		t.Fatalf("artists=%#v err=%v", artists, err)
+	}
+	first, err := itunes.ArtistReleases(context.Background(), "example")
+	if err != nil || len(first) != 3 || first[0].PrimaryType != "Single" || first[1].PrimaryType != "EP" || first[2].PrimaryType != "Album" {
+		t.Fatalf("releases=%#v err=%v", first, err)
+	}
+	second, err := itunes.ArtistReleases(context.Background(), "Example")
+	if err != nil || len(second) != len(first) || searchRequests.Load() != 1 || releaseRequests.Load() != 1 {
+		t.Fatalf("cached releases=%#v search=%d lookup=%d err=%v", second, searchRequests.Load(), releaseRequests.Load(), err)
+	}
+}
+
+func TestITunesRateLimitHonorsRetryAfterAndSharedCooldown(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	_, err := itunes.SearchArtists(context.Background(), "Limited")
+	var rateLimit *ITunesRateLimitError
+	if !errors.As(err, &rateLimit) || rateLimit.RetryAfter < 119*time.Second || requests.Load() != 1 {
+		t.Fatalf("rate limit=%#v requests=%d err=%v", rateLimit, requests.Load(), err)
+	}
+	_, err = itunes.SearchArtists(context.Background(), "Other")
+	if !errors.As(err, &rateLimit) || !rateLimit.AlreadyBlocked || requests.Load() != 1 {
+		t.Fatalf("shared cooldown=%#v requests=%d err=%v", rateLimit, requests.Load(), err)
+	}
+}
+
 func TestMusicBrainzReturnsAfterBoundedRetries(t *testing.T) {
 	var requests atomic.Int32
 	mb := NewMusicBrainz("test@example.com")

@@ -43,6 +43,7 @@ type App struct {
 	store     *store.Store
 	mb        catalog.CatalogProvider
 	spotify   catalog.SpotifyProvider
+	itunes    catalog.ITunesProvider
 	sender    notify.NotificationSender
 	cipher    *security.Cipher
 	artwork   artwork.Provider
@@ -62,6 +63,7 @@ type PageData struct {
 	Artists          []store.Artist
 	Results          []catalog.ArtistResult
 	SpotifyResults   []catalog.SpotifyArtist
+	ITunesResults    []catalog.ITunesArtist
 	UpcomingReleases []store.Release
 	RecentReleases   []store.Release
 	ReleaseCount     int
@@ -196,7 +198,7 @@ func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
 
 func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify catalog.SpotifyProvider,
 	sender notify.NotificationSender, cipher *security.Cipher, art artwork.Provider,
-	runner *jobs.Runner, logger *slog.Logger) (*App, error) {
+	runner *jobs.Runner, logger *slog.Logger, itunesProviders ...catalog.ITunesProvider) (*App, error) {
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"join":  strings.Join,
 		"lower": strings.ToLower,
@@ -212,6 +214,33 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"providerHealthStatus": providerHealthStatus,
 		"providerHealthClass":  providerHealthClass,
 		"providerHealthError":  providerHealthError,
+		"releaseURL": func(r store.Release) string {
+			if r.SpotifyURL != "" {
+				return r.SpotifyURL
+			}
+			if r.ITunesURL != "" {
+				return r.ITunesURL
+			}
+			return r.MusicBrainzURL
+		},
+		"sourceLabel": func(r store.Release) string {
+			switch r.Source {
+			case "spotify":
+				return "Spotify"
+			case "itunes":
+				return "iTunes"
+			case "both":
+				return "Multiple sources"
+			default:
+				return "MusicBrainz"
+			}
+		},
+		"resolutionProviderLabel": func(provider string) string {
+			if strings.EqualFold(provider, "itunes") {
+				return "Apple/iTunes"
+			}
+			return "Spotify"
+		},
 		"initial": func(v string) string {
 			for _, r := range v {
 				return string(r)
@@ -222,8 +251,13 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 	if err != nil {
 		return nil, err
 	}
+	var itunes catalog.ITunesProvider
+	if len(itunesProviders) > 0 {
+		itunes = itunesProviders[0]
+	}
 	return &App{
 		cfg: cfg, store: s, mb: mb, spotify: spotify, sender: sender,
+		itunes: itunes,
 		cipher: cipher, artwork: art, jobs: runner, logger: logger, templates: tmpl,
 	}, nil
 }
@@ -257,6 +291,8 @@ func (a *App) Handler() http.Handler {
 		private.Post("/artists/follow/batch", a.followBatch)
 		private.Post("/artists/follow/spotify", a.followSpotify)
 		private.Post("/artists/follow/spotify/batch", a.followSpotifyBatch)
+		private.Post("/artists/follow/itunes", a.followITunes)
+		private.Post("/artists/follow/itunes/batch", a.followITunesBatch)
 		private.Post("/artists/{id}/delete", a.unfollow)
 		private.Post("/artists/{id}/sync", a.syncArtist)
 		private.Get("/artist-resolutions/{id}", a.artistResolution)
@@ -560,9 +596,31 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 			}
 			if err != nil {
 				a.logger.Warn("Spotify artist search failed", "query", d.Query, "error", err)
-				d.ProviderNotice = "Spotify is temporarily unavailable; showing MusicBrainz results."
+				if a.itunes == nil {
+					d.ProviderNotice = "Spotify is temporarily unavailable; showing MusicBrainz results."
+				} else {
+					d.ProviderNotice = "Spotify is unavailable; trying Apple/iTunes discovery."
+				}
 			} else {
-				d.ProviderNotice = "No Spotify matches were found; showing MusicBrainz results."
+				if a.itunes == nil {
+					d.ProviderNotice = "No Spotify matches were found; showing MusicBrainz results."
+				} else {
+					d.ProviderNotice = "No Spotify matches were found; trying Apple/iTunes discovery."
+				}
+			}
+		}
+		if a.itunes != nil {
+			results, err := a.itunes.SearchArtists(r.Context(), d.Query)
+			if err == nil && len(results) > 0 {
+				d.ITunesResults = results
+				a.render(w, "search", d, http.StatusOK)
+				return
+			}
+			if err != nil {
+				a.logger.Warn("iTunes artist search failed", "query", d.Query, "error", err)
+				d.ProviderNotice = "Spotify and Apple/iTunes discovery are unavailable; showing MusicBrainz results."
+			} else {
+				d.ProviderNotice = "No Spotify or Apple/iTunes matches were found; showing MusicBrainz results."
 			}
 		}
 		results, err := a.mb.SearchArtists(r.Context(), d.Query, 10)
@@ -574,6 +632,97 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.render(w, "search", d, http.StatusOK)
+}
+
+func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	if a.itunes == nil {
+		http.Error(w, "iTunes is unavailable", http.StatusBadRequest)
+		return
+	}
+	itunesID := strings.TrimSpace(r.FormValue("itunes_id"))
+	if !validProviderID(itunesID) {
+		http.Error(w, "invalid iTunes artist ID", http.StatusBadRequest)
+		return
+	}
+	artist, err := a.itunes.Artist(r.Context(), itunesID)
+	if err != nil {
+		a.logger.Warn("iTunes artist lookup failed", "itunes_id", itunesID, "error", err)
+		http.Error(w, "iTunes artist could not be verified", http.StatusBadGateway)
+		return
+	}
+	resolution, created, err := a.store.CreateArtistResolution(
+		r.Context(), session.User.ID, "itunes", artist.ID, artist.Name, artist.URL, "",
+	)
+	if err != nil {
+		http.Error(w, "artist could not be queued", http.StatusInternalServerError)
+		return
+	}
+	if created && a.jobs != nil {
+		go a.resolveArtistBatch([]store.ArtistResolution{resolution})
+	}
+	message := "Artist queued for identification"
+	if !created {
+		message = "Artist is already queued"
+	}
+	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+}
+
+func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
+	if a.itunes == nil {
+		http.Error(w, "iTunes is unavailable", http.StatusBadRequest)
+		return
+	}
+	session, _ := currentSession(r)
+	values, err := selectedValues(r, "itunes_ids")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var queued, existing, failed int
+	var resolutions []store.ArtistResolution
+	for _, value := range values {
+		if !validProviderID(value) {
+			failed++
+			continue
+		}
+		artist, lookupErr := a.itunes.Artist(r.Context(), value)
+		if lookupErr != nil {
+			failed++
+			continue
+		}
+		resolution, created, createErr := a.store.CreateArtistResolution(
+			r.Context(), session.User.ID, "itunes", artist.ID, artist.Name, artist.URL, "",
+		)
+		if createErr != nil {
+			failed++
+			continue
+		}
+		if created {
+			queued++
+			resolutions = append(resolutions, resolution)
+		} else {
+			existing++
+		}
+	}
+	if len(resolutions) > 0 && a.jobs != nil {
+		go a.resolveArtistBatch(resolutions)
+	}
+	message := fmt.Sprintf("%d queued, %d already queued, %d failed", queued, existing, failed)
+	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+}
+
+func validProviderID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) followSpotify(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +848,10 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) resolveSpotifyBatch(resolutions []store.ArtistResolution) {
+	a.resolveArtistBatch(resolutions)
+}
+
+func (a *App) resolveArtistBatch(resolutions []store.ArtistResolution) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	for _, resolution := range resolutions {

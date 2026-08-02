@@ -56,6 +56,7 @@ func main() {
 	}
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret, cfg.SpotifyMarket)
+	itunes := catalog.NewITunes(cfg.SpotifyMarket)
 	var spotifyProvider catalog.SpotifyProvider
 	if spotify != nil {
 		spotifyProvider = spotify
@@ -71,15 +72,23 @@ func main() {
 			logger.Warn("restore Spotify provider cooldown failed", "error", healthErr)
 		}
 	}
+	if health, healthErr := database.ProviderHealthByName(context.Background(), "itunes"); healthErr == nil {
+		if health.NextCheckAt != nil && health.RateLimited {
+			itunes.RestoreCooldown(*health.NextCheckAt, health.LastError)
+		}
+	} else if !errors.Is(healthErr, sql.ErrNoRows) {
+		logger.Warn("restore iTunes provider cooldown failed", "error", healthErr)
+	}
 	sender := notify.ShoutrrrSender{}
 	var runnerOptions []jobs.Option
 	if spotify != nil {
 		runnerOptions = append(runnerOptions, jobs.WithSpotify(spotify))
 		runnerOptions = append(runnerOptions, jobs.WithSpotifyInterval(cfg.SpotifyPollInterval))
 	}
+	runnerOptions = append(runnerOptions, jobs.WithITunes(itunes))
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger,
 		runnerOptions...)
-	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger)
+	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger, itunes)
 	if err != nil {
 		logger.Error("initialize web application", "error", err)
 		os.Exit(1)

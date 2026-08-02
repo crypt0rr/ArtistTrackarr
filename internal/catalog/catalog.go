@@ -34,6 +34,14 @@ type SpotifyProvider interface {
 	Artist(context.Context, string) (SpotifyArtist, error)
 }
 
+// ITunesProvider exposes the small subset of Apple's iTunes Search API used
+// for fallback discovery. iTunes IDs are only provider identifiers; artists
+// still require a MusicBrainz identity before they can be followed.
+type ITunesProvider interface {
+	SearchArtists(context.Context, string) ([]ITunesArtist, error)
+	Artist(context.Context, string) (ITunesArtist, error)
+}
+
 // SpotifyBatchArtistProvider is implemented by providers that can resolve
 // several artist IDs with one Web API request. It is optional so callers can
 // continue to work with small test providers and other implementations.
@@ -48,6 +56,10 @@ type SpotifyReleaseProvider interface {
 type SpotifyIncrementalReleaseProvider interface {
 	SpotifyReleaseProvider
 	ArtistReleasesSince(context.Context, string, string) ([]store.Release, error)
+}
+
+type ITunesReleaseProvider interface {
+	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
 type ArtistResult struct {
