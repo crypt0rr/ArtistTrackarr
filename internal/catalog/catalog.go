@@ -433,6 +433,37 @@ type SpotifyRateLimitError struct {
 	AlreadyBlocked bool
 }
 
+// SpotifyAPIError describes a non-rate-limit response from the Spotify Web
+// API without retaining or exposing the complete response body. Spotify's
+// error payloads usually contain a useful message (for example, an invalid or
+// unavailable artist ID), which is safer and more actionable than a bare 400.
+type SpotifyAPIError struct {
+	Operation  string
+	Status     int
+	StatusText string
+	Reason     string
+	Message    string
+}
+
+func (e *SpotifyAPIError) Error() string {
+	message := fmt.Sprintf("%s returned %s", e.Operation, e.StatusText)
+	detail := strings.TrimSpace(strings.Join(nonEmptyStrings(e.Reason, e.Message), ": "))
+	if detail != "" {
+		message += " (" + detail + ")"
+	}
+	return message
+}
+
+func nonEmptyStrings(values ...string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func (e *SpotifyRateLimitError) Error() string {
 	message := e.Operation + " returned 429 Too Many Requests"
 	if e.Reason != "" {
@@ -989,7 +1020,7 @@ func (s *Spotify) getAPIJSON(ctx context.Context, operation, endpoint string, ta
 			return nil
 		}
 		if resp.StatusCode != http.StatusTooManyRequests {
-			return fmt.Errorf("%s returned %s", operation, resp.Status)
+			return spotifyAPIError(operation, resp, body)
 		}
 		rateErr := spotifyRateLimitError(operation, resp, body, attempt, s.retryBase)
 		s.blockedUntil = time.Now().Add(rateErr.RetryAfter)
@@ -1026,13 +1057,7 @@ func (s *Spotify) waitUntilReady(ctx context.Context, operation string) error {
 func spotifyRateLimitError(
 	operation string, response *http.Response, body []byte, attempt int, retryBase time.Duration,
 ) *SpotifyRateLimitError {
-	var payload struct {
-		Error struct {
-			Reason string `json:"reason"`
-		} `json:"error"`
-	}
-	_ = json.Unmarshal(body, &payload)
-	reason := strings.TrimSpace(payload.Error.Reason)
+	reason, _ := spotifyErrorDetails(body)
 	retryAfter := time.Duration(0)
 	hasRetryAfter := false
 	if seconds, err := strconv.Atoi(strings.TrimSpace(response.Header.Get("Retry-After"))); err == nil && seconds > 0 {
@@ -1049,6 +1074,40 @@ func spotifyRateLimitError(
 		Operation: operation, Status: response.StatusCode, Reason: reason, RetryAfter: retryAfter,
 		QuotaExceeded: quotaExceeded,
 	}
+}
+
+func spotifyAPIError(operation string, response *http.Response, body []byte) *SpotifyAPIError {
+	reason, message := spotifyErrorDetails(body)
+	return &SpotifyAPIError{
+		Operation: operation, Status: response.StatusCode, StatusText: response.Status,
+		Reason: reason, Message: message,
+	}
+}
+
+func spotifyErrorDetails(body []byte) (reason, message string) {
+	var payload struct {
+		Error struct {
+			Reason  string `json:"reason"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", ""
+	}
+	return cleanSpotifyDetail(payload.Error.Reason), cleanSpotifyDetail(payload.Error.Message)
+}
+
+func cleanSpotifyDetail(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value))
+	if len(value) > 160 {
+		value = value[:160]
+	}
+	return value
 }
 
 func waitContext(ctx context.Context, delay time.Duration) error {

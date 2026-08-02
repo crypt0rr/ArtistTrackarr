@@ -89,4 +89,109 @@
     sizeDeliveryLog();
     window.addEventListener("resize", sizeDeliveryLog);
   }
+
+  const providerHealth = document.querySelector("[data-provider-health]");
+  if (providerHealth) {
+    const refreshURL = providerHealth.dataset.refreshUrl;
+    const refreshStatus = document.querySelector("[data-health-refresh-status]");
+    let refreshTimer;
+    let countdownTimer;
+
+    const displayCountdown = (value) => {
+      if (!value) return "";
+      const remaining = new Date(value).getTime() - Date.now();
+      if (!Number.isFinite(remaining)) return "";
+      if (remaining <= 0) return "due now";
+      const seconds = Math.ceil(remaining / 1000);
+      if (seconds < 60) return `in ${seconds}s`;
+      const minutes = Math.ceil(seconds / 60);
+      if (minutes < 60) return `in ${minutes}m`;
+      const hours = Math.floor(minutes / 60);
+      const remainder = minutes % 60;
+      return remainder ? `in ${hours}h ${remainder}m` : `in ${hours}h`;
+    };
+
+    const updateCountdowns = () => {
+      providerHealth.querySelectorAll("[data-health-countdown]").forEach((node) => {
+        node.textContent = displayCountdown(node.dataset.healthCountdown);
+      });
+    };
+
+    const appendTimestamp = (row, label, iso, display, countdown) => {
+      if (!iso) return;
+      const detail = document.createElement("small");
+      detail.append(document.createTextNode(`${label} `));
+      const time = document.createElement("time");
+      time.dateTime = iso;
+      time.textContent = display || iso;
+      detail.append(time);
+      if (countdown) {
+        detail.append(document.createTextNode(" "));
+        const remaining = document.createElement("span");
+        remaining.dataset.healthCountdown = iso;
+        detail.append(remaining);
+      }
+      row.append(detail);
+    };
+
+    const render = (providers) => {
+      providerHealth.replaceChildren();
+      if (!providers.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No provider health data yet.";
+        providerHealth.append(empty);
+        return;
+      }
+      const allowedClasses = new Set(["sent", "ambiguous", "failed"]);
+      providers.forEach((provider) => {
+        const row = document.createElement("div");
+        row.className = "health-row";
+        const heading = document.createElement("div");
+        heading.className = "health-heading";
+        const name = document.createElement("strong");
+        name.textContent = provider.provider;
+        const badge = document.createElement("span");
+        badge.className = `badge ${allowedClasses.has(provider.status_class) ? provider.status_class : "failed"}`;
+        badge.dataset.healthStatus = "";
+        badge.textContent = provider.status;
+        heading.append(name, badge);
+        row.append(heading);
+        appendTimestamp(row, "Last success", provider.last_success_at, provider.last_success_display, false);
+        appendTimestamp(row, "Last failure", provider.last_failure_at, provider.last_failure_display, false);
+        appendTimestamp(row, "Next check", provider.next_check_at, provider.next_check_display, true);
+        if (provider.last_error) {
+          const error = document.createElement("small");
+          error.className = "health-error";
+          error.textContent = provider.last_error;
+          row.append(error);
+        }
+        appendTimestamp(row, "Updated", provider.updated_at, provider.updated_display, false);
+        providerHealth.append(row);
+      });
+      updateCountdowns();
+    };
+
+    const refresh = async () => {
+      try {
+        const response = await fetch(refreshURL, {
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`provider health request failed (${response.status})`);
+        render(await response.json());
+        if (refreshStatus) refreshStatus.textContent = "Updated just now";
+      } catch (_) {
+        if (refreshStatus) refreshStatus.textContent = "Live refresh unavailable";
+      }
+    };
+
+    refresh();
+    refreshTimer = window.setInterval(refresh, 30000);
+    countdownTimer = window.setInterval(updateCountdowns, 1000);
+    window.addEventListener("pagehide", () => {
+      window.clearInterval(refreshTimer);
+      window.clearInterval(countdownTimer);
+    }, { once: true });
+  }
 })();
