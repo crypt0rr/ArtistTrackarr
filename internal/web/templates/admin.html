@@ -9,7 +9,7 @@
   <form method="post" action="/admin/profile" class="stack compact">
     {{template "csrf" .}}
     <label>Timezone<input name="timezone" value="{{.User.Timezone}}" required></label>
-    <label>Release-day time<input type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
+    <label>Release-day time<input class="reminder-time" type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
     <button>Save settings</button>
   </form>
 </section>
