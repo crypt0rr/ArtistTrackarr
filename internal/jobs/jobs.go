@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,15 @@ type syncStats struct {
 	Due       int
 	Succeeded int
 	Failed    int
+	Changed   int
+	Unchanged int
+	Backoff   int
+}
+
+type syncOutcome struct {
+	SpotifyChanged   bool
+	SpotifyUnchanged bool
+	SpotifyBackoff   bool
 }
 
 type deliveryStats struct {
@@ -113,7 +123,8 @@ func (r *Runner) tick(ctx context.Context) {
 		} else {
 			r.logger.Info("catalog synchronization completed",
 				"due", syncSummary.Due, "succeeded", syncSummary.Succeeded,
-				"failed", syncSummary.Failed)
+				"failed", syncSummary.Failed, "changed", syncSummary.Changed,
+				"unchanged", syncSummary.Unchanged, "backoff", syncSummary.Backoff)
 		}
 		r.syncMu.Unlock()
 	} else {
@@ -151,7 +162,7 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 			var artist store.Artist
 			artist, syncErr = r.store.ArtistByID(ctx, *req.ArtistID)
 			if syncErr == nil {
-				syncErr = r.syncOne(ctx, artist, now)
+				_, syncErr = r.syncOne(ctx, artist, now)
 			}
 		} else if req.Scope == "retry" {
 			syncErr = r.store.MarkAllArtistsDue(ctx)
@@ -281,7 +292,7 @@ func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.
 		return "", err
 	}
 	if added {
-		if err := r.syncOne(ctx, artist, time.Now().UTC()); err != nil {
+		if _, err := r.syncOne(ctx, artist, time.Now().UTC()); err != nil {
 			r.logger.Warn("initial resolved artist sync failed", "artist_id", artist.ID, "error", err)
 		}
 	}
@@ -293,7 +304,8 @@ func (r *Runner) SyncArtistNow(ctx context.Context, artist store.Artist) error {
 	defer r.syncMu.Unlock()
 	// A manual sync is an explicit request to refresh both providers.
 	artist.SpotifyNextCheckAt = nil
-	return r.syncOne(ctx, artist, time.Now().UTC())
+	_, err := r.syncOne(ctx, artist, time.Now().UTC())
+	return err
 }
 
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {
@@ -304,17 +316,28 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, err
 	}
 	summary.Due = len(artists)
 	for _, artist := range artists {
-		if err := r.syncOne(ctx, artist, now); err != nil {
+		outcome, err := r.syncOne(ctx, artist, now)
+		if err != nil {
 			summary.Failed++
 			r.logger.Warn("artist sync failed", "artist_id", artist.ID, "mbid", artist.MBID, "error", err)
 			continue
 		}
 		summary.Succeeded++
+		if outcome.SpotifyChanged {
+			summary.Changed++
+		}
+		if outcome.SpotifyUnchanged {
+			summary.Unchanged++
+		}
+		if outcome.SpotifyBackoff {
+			summary.Backoff++
+		}
 	}
 	return summary, nil
 }
 
-func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) error {
+func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) (syncOutcome, error) {
+	var outcome syncOutcome
 	var batches []store.ReleaseBatch
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError
@@ -324,7 +347,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		var err error
 		spotifyKnownDate, err = r.store.LatestSpotifyReleaseDate(ctx, artist.ID)
 		if err != nil {
-			return err
+			return outcome, err
 		}
 	}
 	spotifyPrimary := artist.SpotifyID != "" && r.spotify != nil && (spotifyDue || spotifyKnownDate != "")
@@ -339,6 +362,12 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 		if spotifyErr == nil {
 			spotifySucceeded = true
+			changed, err := r.store.SpotifyBatchChanged(ctx, spotifyReleases)
+			if err != nil {
+				return outcome, err
+			}
+			outcome.SpotifyChanged = changed
+			outcome.SpotifyUnchanged = !changed
 			_ = r.store.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, "")
 			batches = append(batches, store.ReleaseBatch{
 				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
@@ -384,9 +413,9 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	}
 	if spotifyPrimary && !spotifyDue && spotifyKnownDate != "" {
 		if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
-			return err
+			return outcome, err
 		}
-		return nil
+		return outcome, nil
 	}
 	if len(batches) == 0 {
 		retryAt := now.Add(providerFailureRetryDelay(spotifyRateLimit, r.interval))
@@ -399,24 +428,57 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 		r.logger.Debug("artist sync retry scheduled", "artist_id", artist.ID,
 			"retry_after", providerFailureRetryDelay(spotifyRateLimit, r.interval).String())
-		return errors.Join(errors.Join(providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
+		return outcome, errors.Join(errors.Join(providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
 	}
 	if err := r.store.ApplyReleaseBatches(ctx, artist, batches, now); err != nil {
-		return err
+		return outcome, err
 	}
 	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
-		return err
+		return outcome, err
 	}
 	if spotifyDue {
 		if spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(spotifyRateLimit, r.spotifyInterval).String(),
 				"quota_exceeded", spotifyRateLimit.QuotaExceeded)
-			return r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval)))
+			return outcome, r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval)))
 		}
-		return r.store.MarkSpotifyChecked(ctx, artist.ID, now, r.spotifyInterval)
+		upcoming := false
+		for _, batch := range batches {
+			if batch.Provider != "spotify" {
+				continue
+			}
+			for _, release := range batch.Releases {
+				if isFutureRelease(release.FirstReleaseDate, now) {
+					upcoming = true
+					break
+				}
+			}
+		}
+		if err := r.store.MarkSpotifyCheckedAdaptive(ctx, artist.ID, now, r.spotifyInterval, outcome.SpotifyChanged, upcoming); err != nil {
+			return outcome, err
+		}
+		outcome.SpotifyBackoff = outcome.SpotifyUnchanged && !upcoming
 	}
-	return nil
+	return outcome, nil
+}
+
+func isFutureRelease(value string, now time.Time) bool {
+	date, precision := value, len(value)
+	if precision != 4 && precision != 7 && precision != 10 {
+		return false
+	}
+	today := now.UTC()
+	if precision == 4 {
+		year, err := strconv.Atoi(date)
+		return err == nil && year > today.Year()
+	}
+	if precision == 7 {
+		parsed, err := time.Parse("2006-01", date)
+		return err == nil && parsed.After(time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC))
+	}
+	parsed, err := time.Parse("2006-01-02", date)
+	return err == nil && parsed.After(time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC))
 }
 
 func sanitizedProviderError(err error) string {

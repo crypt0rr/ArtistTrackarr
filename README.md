@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.8.4` publishes `0.8.4`, `0.8`, and `latest`.
+- Pushing a tag such as `v0.9.0` publishes `0.9.0`, `0.9`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.8.4 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.9.0 docker compose up -d
 ```
 
 ## Configuration
@@ -104,6 +104,11 @@ for 24 hours. Artists are assigned stable polling offsets so a large watch list
 is spread across the day instead of queried in one burst. MusicBrainz release
 polling is used as a fallback when Spotify is unavailable or not mapped; it does
 not override successful Spotify data.
+
+Successful Spotify checks also adapt per artist. A catalog change returns the
+artist to the configured `SPOTIFY_POLL_INTERVAL`; unchanged artists back off
+progressively up to seven days, while artists with upcoming releases stay on the
+baseline interval. The backoff state is stored in SQLite and survives restarts.
 
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.

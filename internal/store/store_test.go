@@ -61,6 +61,77 @@ func TestReleaseBaselineAndExactlyOnce(t *testing.T) {
 	assertEventCount(t, s, userID, "announcement", 2)
 }
 
+func TestSpotifyAdaptivePollingPersistsAndBacksOff(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "adaptive-artist", Name: "Adaptive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	baseInterval := 24 * time.Hour
+	if err := s.MarkSpotifyCheckedAdaptive(ctx, artist.ID, now, baseInterval, true, false); err != nil {
+		t.Fatal(err)
+	}
+	for want := 1; want <= 4; want++ {
+		if err := s.MarkSpotifyCheckedAdaptive(ctx, artist.ID, now, baseInterval, false, false); err != nil {
+			t.Fatal(err)
+		}
+		state, err := s.SpotifyPollingState(ctx, artist.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.UnchangedChecks != want {
+			t.Fatalf("unchanged streak=%d, want %d", state.UnchangedChecks, want)
+		}
+	}
+	state, err := s.SpotifyPollingState(ctx, artist.ID)
+	if err != nil || state.LastChangeAt == nil || !state.LastChangeAt.Equal(now) {
+		t.Fatalf("adaptive state=%#v err=%v", state, err)
+	}
+	var next string
+	if err := s.DB.QueryRow(`SELECT spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	when, err := time.Parse(time.RFC3339Nano, next)
+	if err != nil || when.Before(now.Add(7*24*time.Hour)) || when.After(now.Add(8*24*time.Hour)) {
+		t.Fatalf("adaptive next check=%q parsed=%v", next, when)
+	}
+	if err := s.MarkSpotifyCheckedAdaptive(ctx, artist.ID, now, baseInterval, true, false); err != nil {
+		t.Fatal(err)
+	}
+	state, err = s.SpotifyPollingState(ctx, artist.ID)
+	if err != nil || state.UnchangedChecks != 0 {
+		t.Fatalf("change did not reset state=%#v err=%v", state, err)
+	}
+}
+
+func TestSpotifyBatchChangedDetectsNewAndUpdatedReleases(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "spotify-change-artist", Name: "Changes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := Release{MBID: "spotify:album-1", SpotifyID: "album-1", Title: "First", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3, SpotifyURL: "https://open.spotify.com/album/album-1"}
+	changed, err := s.SpotifyBatchChanged(ctx, []Release{release})
+	if err != nil || !changed {
+		t.Fatalf("new release changed=%v err=%v", changed, err)
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = s.SpotifyBatchChanged(ctx, []Release{release})
+	if err != nil || changed {
+		t.Fatalf("unchanged release changed=%v err=%v", changed, err)
+	}
+	release.Title = "First (Deluxe)"
+	changed, err = s.SpotifyBatchChanged(ctx, []Release{release})
+	if err != nil || !changed {
+		t.Fatalf("updated release changed=%v err=%v", changed, err)
+	}
+}
+
 func TestInitialSyncChoosesNearestUpcomingRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -748,6 +819,10 @@ func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	var spotifyNext string
 	if err := s.DB.QueryRow(`SELECT spotify_next_check_at FROM artists LIMIT 1`).Scan(&spotifyNext); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("unexpected artist scheduling check error: %v", err)
+	}
+	var unchanged int
+	if err := s.DB.QueryRow(`SELECT spotify_unchanged_checks FROM artists LIMIT 1`).Scan(&unchanged); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unexpected adaptive polling column check error: %v", err)
 	}
 }
 
