@@ -22,6 +22,115 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
+func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`); err != nil {
+		t.Fatal(err)
+	}
+	// Build a v7 database using the embedded migration files in order. The
+	// migration runner is then exercised against a real legacy schema.
+	for _, name := range []string{
+		"001_initial.sql", "002_artist_resolutions.sql", "003_spotify_releases.sql",
+		"004_provider_scheduling.sql", "005_reliability.sql", "006_notification_preferences.sql",
+		"007_adaptive_spotify_polling.sql",
+	} {
+		body, readErr := migrations.ReadFile("migrations/" + name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if _, err := db.ExecContext(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+		var version int
+		_, _ = fmt.Sscanf(name, "%03d_", &version)
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)`, version, nowText()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userResult, err := db.Exec(`INSERT INTO users(email,password_hash,role,created_at) VALUES('legacy@example.com','hash','member',?)`, nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, _ := userResult.LastInsertId()
+	artistResult, err := db.Exec(`INSERT INTO artists(mbid,name,created_at,updated_at) VALUES('artist-mbid','Legacy Artist',?,?)`, nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artistID, _ := artistResult.LastInsertId()
+	releaseResult, err := db.Exec(`INSERT INTO release_groups(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at,spotify_id,source) VALUES('spotify:legacy',?,'Legacy','Album','',0,'',?,?,?,'spotify')`, artistID, nowText(), nowText(), "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := releaseResult.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO provider_observations(provider,provider_id,release_group_id,payload_hash,observed_at) VALUES('spotify','legacy',?,'hash',?)`, releaseID, nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := (&Store{DB: db}).CreateArtistResolution(ctx, userID, "spotify-id", "Legacy", "https://open.spotify.com/artist/spotify-id", ""); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{DB: db}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var migrationsApplied int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var source, itunesID string
+	if err := db.QueryRow(`SELECT source,COALESCE(itunes_id,'') FROM release_groups WHERE id=?`, releaseID).Scan(&source, &itunesID); err != nil || source != "spotify" || itunesID != "" {
+		t.Fatalf("legacy release source=%q itunes=%q err=%v", source, itunesID, err)
+	}
+	if _, err := db.Exec(`INSERT INTO release_groups(mbid,artist_id,title,primary_type,musicbrainz_url,first_observed_at,updated_at,itunes_id,source) VALUES('itunes:new',?,'New','EP','',?,?,?,'itunes')`, artistID, nowText(), nowText(), "123"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "itunes@example.com", "hash", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "artist-mbid", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	itunesRelease := Release{MBID: "itunes:123", Title: "A Release", PrimaryType: "EP", FirstReleaseDate: "2026-08-01", DatePrecision: 3, ITunesID: "123", ITunesURL: "https://music.apple.com/us/album/a-release"}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{itunesRelease}}}, observed); err != nil {
+		t.Fatal(err)
+	}
+	musicBrainzRelease := Release{MBID: "mb-release", Title: "A Release", PrimaryType: "EP", FirstReleaseDate: "2026-08-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.org/release-group/mb-release"}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "musicbrainz", Releases: []Release{musicBrainzRelease}}}, observed.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := s.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].MBID != "mb-release" || releases[0].Source != "both" || releases[0].ITunesID != "123" {
+		t.Fatalf("merged releases=%#v err=%v", releases, err)
+	}
+	var observations, events int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM provider_observations WHERE release_group_id=?`, releases[0].ID).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 2 || events != 1 {
+		t.Fatalf("observations=%d events=%d", observations, events)
+	}
+}
+
 func TestReleaseBaselineAndExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

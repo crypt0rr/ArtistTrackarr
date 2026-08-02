@@ -100,6 +100,8 @@ type Release struct {
 	SpotifyID        string
 	SpotifyURL       string
 	SpotifyImageURL  string
+	ITunesID         string
+	ITunesURL        string
 	Source           string
 	FirstObservedAt  time.Time
 }
@@ -291,6 +293,15 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if version == 8 {
+			if err := s.migrateITunesFallback(ctx); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+			if _, err := s.DB.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText()); err != nil {
+				return err
+			}
+			continue
+		}
 		tx, err := s.DB.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -307,6 +318,104 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrateITunesFallback rebuilds the two tables whose provider CHECK
+// constraints need to accept iTunes. SQLite cannot alter CHECK constraints in
+// place, so the tables are copied while foreign-key enforcement is temporarily
+// disabled during application startup. The dependent tables keep their
+// release_groups foreign-key name and continue to point at the replacement.
+func (s *Store) migrateITunesFallback(ctx context.Context) error {
+	if _, err := s.DB.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	defer s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error { _ = tx.Rollback(); return err }
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE release_groups_itunes (
+		id INTEGER PRIMARY KEY,
+		mbid TEXT NOT NULL UNIQUE,
+		artist_id INTEGER NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+		title TEXT NOT NULL,
+		primary_type TEXT NOT NULL,
+		secondary_types TEXT NOT NULL DEFAULT '[]',
+		first_release_date TEXT NOT NULL DEFAULT '',
+		date_precision INTEGER NOT NULL DEFAULT 0,
+		musicbrainz_url TEXT NOT NULL,
+		spotify_url TEXT,
+		first_observed_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		spotify_id TEXT,
+		spotify_image_url TEXT NOT NULL DEFAULT '',
+		itunes_id TEXT,
+		itunes_url TEXT,
+		source TEXT NOT NULL DEFAULT 'musicbrainz' CHECK(source IN ('musicbrainz','spotify','itunes','both'))
+	)`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_groups_itunes
+		(id,mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_url,first_observed_at,updated_at,spotify_id,spotify_image_url,source)
+		SELECT id,mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_url,first_observed_at,updated_at,spotify_id,spotify_image_url,source
+		FROM release_groups`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE release_groups`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE release_groups_itunes RENAME TO release_groups`); err != nil {
+		return rollback(err)
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS releases_artist ON release_groups(artist_id)`,
+		`CREATE INDEX IF NOT EXISTS releases_date ON release_groups(first_release_date)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS release_groups_spotify_id ON release_groups(spotify_id) WHERE spotify_id IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS release_groups_itunes_id ON release_groups(itunes_id) WHERE itunes_id IS NOT NULL`,
+	} {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE artist_resolutions_itunes (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		provider TEXT NOT NULL CHECK(provider IN ('spotify','itunes')),
+		provider_id TEXT NOT NULL,
+		display_name TEXT NOT NULL,
+		provider_url TEXT NOT NULL,
+		image_url TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL CHECK(status IN ('pending','review')),
+		candidate_json TEXT NOT NULL DEFAULT '[]',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at TEXT,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(user_id, provider, provider_id)
+	)`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO artist_resolutions_itunes
+		(id,user_id,provider,provider_id,display_name,provider_url,image_url,status,candidate_json,
+		 attempts,next_attempt_at,last_error,created_at,updated_at)
+		SELECT id,user_id,provider,provider_id,display_name,provider_url,image_url,status,candidate_json,
+		 attempts,next_attempt_at,last_error,created_at,updated_at FROM artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE artist_resolutions_itunes RENAME TO artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE INDEX artist_resolutions_due ON artist_resolutions(status, next_attempt_at)`); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -619,16 +728,34 @@ func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
 	return err
 }
 
-func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, providerID, name, providerURL, imageURL string) (ArtistResolution, bool, error) {
+// CreateArtistResolution accepts the legacy Spotify argument list
+// (providerID, name, URL, imageURL) and the generalized provider-aware list
+// (provider, providerID, name, URL, imageURL). Keeping the legacy form
+// source-compatible lets existing integrations upgrade without a flag day.
+func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, args ...string) (ArtistResolution, bool, error) {
+	if len(args) == 4 {
+		return s.CreateArtistResolutionForProvider(ctx, userID, "spotify", args[0], args[1], args[2], args[3])
+	}
+	if len(args) == 5 {
+		return s.CreateArtistResolutionForProvider(ctx, userID, args[0], args[1], args[2], args[3], args[4])
+	}
+	return ArtistResolution{}, false, errors.New("artist resolution requires provider, ID, name, URL, and image")
+}
+
+func (s *Store) CreateArtistResolutionForProvider(ctx context.Context, userID int64, provider, providerID, name, providerURL, imageURL string) (ArtistResolution, bool, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	providerID, name, providerURL = strings.TrimSpace(providerID), strings.TrimSpace(name), strings.TrimSpace(providerURL)
+	if provider != "spotify" && provider != "itunes" {
+		return ArtistResolution{}, false, errors.New("unsupported artist resolution provider")
+	}
 	if providerID == "" || name == "" || providerURL == "" {
-		return ArtistResolution{}, false, errors.New("Spotify artist identity is incomplete")
+		return ArtistResolution{}, false, errors.New(provider + " artist identity is incomplete")
 	}
 	now := nowText()
 	result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO artist_resolutions
 		(user_id,provider,provider_id,display_name,provider_url,image_url,status,next_attempt_at,created_at,updated_at)
-		VALUES(?,'spotify',?,?,?,?, 'pending',?,?,?)`,
-		userID, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now)
+		VALUES(?,?,?,?,?,?,'pending',?,?,?)`,
+		userID, provider, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now)
 	if err != nil {
 		return ArtistResolution{}, false, err
 	}
@@ -636,7 +763,7 @@ func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provid
 	if err != nil {
 		return ArtistResolution{}, false, err
 	}
-	resolution, err := s.artistResolutionByProvider(ctx, userID, "spotify", providerID)
+	resolution, err := s.artistResolutionByProvider(ctx, userID, provider, providerID)
 	return resolution, changed > 0, err
 }
 
@@ -1037,6 +1164,8 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 				saved, err = saveMusicBrainzReleaseTx(ctx, tx, artist.ID, release, observed)
 			case "spotify":
 				saved, err = saveSpotifyReleaseTx(ctx, tx, artist.ID, release, observed)
+			case "itunes":
+				saved, err = saveITunesReleaseTx(ctx, tx, artist.ID, release, observed)
 			default:
 				err = fmt.Errorf("unsupported release provider %q", provider)
 			}
@@ -1165,7 +1294,7 @@ func saveMusicBrainzReleaseTx(
 			title=?,primary_type=?,secondary_types=?,
 			first_release_date=CASE WHEN ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=MAX(date_precision,?),musicbrainz_url=?,
-			source=CASE WHEN spotify_id IS NULL THEN 'musicbrainz' ELSE 'both' END,updated_at=?
+			source=CASE WHEN spotify_id IS NULL AND itunes_id IS NULL THEN 'musicbrainz' ELSE 'both' END,updated_at=?
 			WHERE id=?`,
 			release.Title, release.PrimaryType, string(secondary),
 			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision, release.MusicBrainzURL,
@@ -1225,7 +1354,7 @@ func saveSpotifyReleaseTx(
 			secondary_types=CASE WHEN source='spotify' THEN ? ELSE secondary_types END,
 			first_release_date=CASE WHEN source='spotify' AND ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=CASE WHEN source='spotify' THEN MAX(date_precision,?) ELSE date_precision END,
-			source=CASE WHEN source='musicbrainz' THEN 'both' ELSE source END,updated_at=?
+			source=CASE WHEN source IN ('musicbrainz','itunes') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,
 			release.SpotifyID, release.SpotifyURL, release.SpotifyImageURL,
 			release.Title, release.PrimaryType, string(secondary),
@@ -1242,12 +1371,71 @@ func saveSpotifyReleaseTx(
 	return syncedRelease{release: saved, isNew: !existed, provider: "spotify"}, err
 }
 
+func saveITunesReleaseTx(
+	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
+) (syncedRelease, error) {
+	if strings.TrimSpace(release.ITunesID) == "" {
+		return syncedRelease{}, errors.New("iTunes release ID is required")
+	}
+	var releaseID int64
+	existed := true
+	err := tx.QueryRowContext(ctx, `SELECT release_group_id FROM provider_observations
+		WHERE provider='itunes' AND provider_id=?`, release.ITunesID).Scan(&releaseID)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE itunes_id=?`, release.ITunesID).Scan(&releaseID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		releaseID, err = matchingReleaseIDTx(ctx, tx, artistID, release, false)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		existed, releaseID, err = false, 0, nil
+	}
+	if err != nil {
+		return syncedRelease{}, err
+	}
+	secondary, _ := json.Marshal(release.SecondaryTypes)
+	if releaseID == 0 {
+		result, insertErr := tx.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+			 musicbrainz_url,itunes_id,itunes_url,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?, 'itunes',?,?)`,
+			"itunes:"+release.ITunesID, artistID, release.Title, release.PrimaryType, string(secondary),
+			release.FirstReleaseDate, release.DatePrecision, "", release.ITunesID, release.ITunesURL,
+			timeText(observed), timeText(observed))
+		if insertErr != nil {
+			return syncedRelease{}, insertErr
+		}
+		releaseID, _ = result.LastInsertId()
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE release_groups SET
+			itunes_id=COALESCE(itunes_id,?),itunes_url=?,
+			title=CASE WHEN source='itunes' THEN ? ELSE title END,
+			primary_type=CASE WHEN source='itunes' THEN ? ELSE primary_type END,
+			secondary_types=CASE WHEN source='itunes' THEN ? ELSE secondary_types END,
+			first_release_date=CASE WHEN source='itunes' AND ?>=date_precision THEN ? ELSE first_release_date END,
+			date_precision=CASE WHEN source='itunes' THEN MAX(date_precision,?) ELSE date_precision END,
+			source=CASE WHEN source IN ('musicbrainz','spotify') THEN 'both' ELSE source END,updated_at=?
+			WHERE id=?`,
+			release.ITunesID, release.ITunesURL, release.Title, release.PrimaryType, string(secondary),
+			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision,
+			timeText(observed), releaseID)
+		if err != nil {
+			return syncedRelease{}, err
+		}
+	}
+	if err := upsertProviderObservationTx(ctx, tx, "itunes", release.ITunesID, releaseID, release, observed); err != nil {
+		return syncedRelease{}, err
+	}
+	saved, err := releaseByIDTx(ctx, tx, releaseID)
+	return syncedRelease{release: saved, isNew: !existed, provider: "itunes"}, err
+}
+
 func matchingReleaseIDTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, candidate Release, spotifyOnly bool,
 ) (int64, error) {
-	sourceClause := "source IN ('musicbrainz','spotify','both')"
+	sourceClause := "source IN ('musicbrainz','spotify','itunes','both')"
 	if spotifyOnly {
-		sourceClause = "source='spotify'"
+		sourceClause = "source IN ('spotify','itunes')"
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,title,primary_type,first_release_date,date_precision
 		FROM release_groups WHERE artist_id=? AND `+sourceClause, artistID)
@@ -1339,26 +1527,27 @@ func upsertProviderObservationTx(
 func releasePayloadHash(release Release) string {
 	secondary, _ := json.Marshal(release.SecondaryTypes)
 	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
-		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL))
+		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL + "\x00" + release.ITunesURL))
 	return fmt.Sprintf("%x", payloadHash)
 }
 
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
 	var release Release
 	var secondary, observed string
-	var spotifyID, spotifyURL sql.NullString
+	var spotifyID, spotifyURL, itunesID, itunesURL sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
 		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
-		source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
+		itunes_id,itunes_url,source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &release.SpotifyImageURL, &release.Source, &observed,
+		&spotifyID, &spotifyURL, &release.SpotifyImageURL, &itunesID, &itunesURL, &release.Source, &observed,
 	)
 	if err != nil {
 		return Release{}, err
 	}
 	_ = json.Unmarshal([]byte(secondary), &release.SecondaryTypes)
 	release.SpotifyID, release.SpotifyURL = spotifyID.String, spotifyURL.String
+	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
 	release.FirstObservedAt, _ = parseTime(observed)
 	return release, nil
 }
@@ -1424,6 +1613,9 @@ func releaseExternalURL(release Release) string {
 	if release.SpotifyURL != "" {
 		return release.SpotifyURL
 	}
+	if release.ITunesURL != "" {
+		return release.ITunesURL
+	}
 	return release.MusicBrainzURL
 }
 
@@ -1445,7 +1637,7 @@ func comparableReleaseDate(value string) (time.Time, bool) {
 
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
-		rg.first_release_date,rg.musicbrainz_url,rg.spotify_url
+		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url
 		FROM follows f JOIN users u ON u.id=f.user_id JOIN release_groups rg ON rg.artist_id=f.artist_id
 		JOIN artists a ON a.id=rg.artist_id WHERE rg.date_precision=3`)
 	if err != nil {
@@ -1456,14 +1648,14 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		timezone, reminder         string
 		artist, title, releaseDate string
 		musicBrainzURL             string
-		spotifyURL                 sql.NullString
+		spotifyURL, itunesURL      sql.NullString
 	}
 	var candidates []due
 	for rows.Next() {
 		var d due
 		if err := rows.Scan(
 			&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
-			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL,
+			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL,
 		); err != nil {
 			rows.Close()
 			return err
@@ -1481,7 +1673,7 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 			continue
 		}
 		body := fmt.Sprintf("%s's %q is out today.", d.artist, d.title)
-		if link := firstNonEmpty(d.musicBrainzURL, d.spotifyURL.String); link != "" {
+		if link := firstNonEmpty(d.spotifyURL.String, d.itunesURL.String, d.musicBrainzURL); link != "" {
 			body += "\n" + link
 		}
 		if err := s.EnqueueEvent(ctx, d.userID, d.releaseID, "release_day",
@@ -1537,7 +1729,7 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]Release, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC LIMIT ?`,
 		userID, limit)
@@ -1559,12 +1751,12 @@ func (s *Store) DashboardReleases(
 		OR (rg.date_precision=1 AND length(rg.first_release_date)=4
 			AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
 	)`
-	const preferredProvider = `(a.spotify_id IS NULL OR rg.source IN ('spotify','both') OR NOT EXISTS (
-		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','both')
+	const preferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (SELECT 1 FROM release_groups external_release WHERE external_release.artist_id=rg.artist_id AND external_release.source IN ('spotify','itunes','both'))) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
+		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','itunes','both')
 	))`
 	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND `+definitelyFuture+`
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
@@ -1579,7 +1771,7 @@ func (s *Store) DashboardReleases(
 	}
 	recentRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
 		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
@@ -1600,14 +1792,15 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 	for rows.Next() {
 		var r Release
 		var secondary, observed string
-		var spotifyID, spotifyURL sql.NullString
+		var spotifyID, spotifyURL, itunesID, itunesURL sql.NullString
 		if err := rows.Scan(&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 			&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-			&spotifyID, &spotifyURL, &r.SpotifyImageURL, &r.Source, &observed); err != nil {
+			&spotifyID, &spotifyURL, &r.SpotifyImageURL, &itunesID, &itunesURL, &r.Source, &observed); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(secondary), &r.SecondaryTypes)
 		r.SpotifyID, r.SpotifyURL = spotifyID.String, spotifyURL.String
+		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 		r.FirstObservedAt, _ = parseTime(observed)
 		result = append(result, r)
 	}
@@ -2209,7 +2402,7 @@ func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
 
 func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
 	var d ReleaseDetail
-	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.source,rg.first_observed_at
+	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
 	if err != nil {
 		return d, err

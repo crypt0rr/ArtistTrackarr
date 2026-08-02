@@ -20,6 +20,7 @@ type Runner struct {
 	store                 *store.Store
 	catalog               catalog.CatalogProvider
 	spotify               catalog.SpotifyReleaseProvider
+	itunes                catalog.ITunesReleaseProvider
 	normalizer            catalog.ReleaseNormalizer
 	sender                notify.NotificationSender
 	cipher                *security.Cipher
@@ -30,6 +31,8 @@ type Runner struct {
 	providerMu            sync.Mutex
 	spotifyCooldownLoaded bool
 	spotifyCooldownUntil  time.Time
+	itunesCooldownLoaded  bool
+	itunesCooldownUntil   time.Time
 }
 
 type Option func(*Runner)
@@ -65,6 +68,10 @@ type deliveryStats struct {
 
 func WithSpotify(provider catalog.SpotifyReleaseProvider) Option {
 	return func(r *Runner) { r.spotify = provider }
+}
+
+func WithITunes(provider catalog.ITunesReleaseProvider) Option {
+	return func(r *Runner) { r.itunes = provider }
 }
 
 // WithSpotifyInterval controls the independent Spotify observation cadence.
@@ -141,6 +148,54 @@ func (r *Runner) clearSpotifyProviderCooldown() {
 	r.providerMu.Lock()
 	r.spotifyCooldownUntil = time.Time{}
 	r.spotifyCooldownLoaded = true
+	r.providerMu.Unlock()
+}
+
+func (r *Runner) itunesProviderCooldown(ctx context.Context, now time.Time) (time.Time, error) {
+	r.providerMu.Lock()
+	if r.itunesCooldownLoaded {
+		until := r.itunesCooldownUntil
+		r.providerMu.Unlock()
+		if until.After(now) {
+			return until, nil
+		}
+		return time.Time{}, nil
+	}
+	r.providerMu.Unlock()
+	health, err := r.store.ProviderHealthByName(ctx, "itunes")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	var until time.Time
+	if err == nil && health.NextCheckAt != nil && health.RateLimited {
+		until = *health.NextCheckAt
+	}
+	r.providerMu.Lock()
+	r.itunesCooldownLoaded = true
+	r.itunesCooldownUntil = until
+	r.providerMu.Unlock()
+	if until.After(now) {
+		return until, nil
+	}
+	return time.Time{}, nil
+}
+
+func (r *Runner) setITunesProviderCooldown(until time.Time) {
+	if until.IsZero() {
+		return
+	}
+	r.providerMu.Lock()
+	if until.After(r.itunesCooldownUntil) {
+		r.itunesCooldownUntil = until
+	}
+	r.itunesCooldownLoaded = true
+	r.providerMu.Unlock()
+}
+
+func (r *Runner) clearITunesProviderCooldown() {
+	r.providerMu.Lock()
+	r.itunesCooldownUntil = time.Time{}
+	r.itunesCooldownLoaded = true
 	r.providerMu.Unlock()
 }
 
@@ -341,9 +396,11 @@ func resolutionCandidates(matches []catalog.ArtistResult) []store.ResolutionCand
 
 func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.ArtistResolution, match catalog.ArtistResult) (string, error) {
 	artist := match.StoreArtist()
-	artist.SpotifyID = resolution.ProviderID
-	artist.SpotifyURL = resolution.ProviderURL
-	artist.SpotifyImageURL = resolution.ImageURL
+	if resolution.Provider == "spotify" {
+		artist.SpotifyID = resolution.ProviderID
+		artist.SpotifyURL = resolution.ProviderURL
+		artist.SpotifyImageURL = resolution.ImageURL
+	}
 	artist, added, err := r.store.CompleteArtistResolution(ctx, resolution, artist)
 	if err != nil {
 		return "", err
@@ -398,6 +455,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	var batches []store.ReleaseBatch
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError
+	var itunesRateLimit *catalog.ITunesRateLimitError
 	spotifyWasDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
 	spotifySuppressed := false
 	var spotifyCooldownUntil time.Time
@@ -467,10 +525,48 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			}
 		}
 	}
+	itunesSucceeded := false
+	if !spotifySucceeded && !(spotifyPrimary && !spotifyWasDue) && r.itunes != nil {
+		cooldown, err := r.itunesProviderCooldown(ctx, now)
+		if err != nil {
+			return outcome, err
+		}
+		if cooldown.After(now) {
+			r.logger.Debug("iTunes check suppressed by provider cooldown", "artist_id", artist.ID,
+				"retry_after", cooldown.Sub(now).String())
+		} else {
+			releases, itunesErr := r.itunes.ArtistReleases(ctx, artist.Name)
+			if itunesErr == nil {
+				itunesSucceeded = true
+				r.clearITunesProviderCooldown()
+				_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
+				batches = append(batches, store.ReleaseBatch{
+					Provider: "itunes", Releases: r.normalizer.Normalize(releases),
+				})
+			} else {
+				var retryAt *time.Time
+				if errors.As(itunesErr, &itunesRateLimit) {
+					t := now.Add(max(itunesRateLimit.RetryAfter, time.Minute))
+					retryAt = &t
+					r.setITunesProviderCooldown(t)
+				}
+				_ = r.store.UpsertProviderHealth(ctx, "itunes", false, retryAt, itunesRateLimit != nil, false, sanitizedProviderError(itunesErr))
+				providerErrors = append(providerErrors, itunesErr)
+				if itunesRateLimit != nil {
+					if !itunesRateLimit.AlreadyBlocked {
+						r.logger.Warn("iTunes release observation rate limited", "artist_id", artist.ID,
+							"retry_after", itunesRateLimit.RetryAfter.String())
+					}
+				} else {
+					r.logger.Warn("iTunes release observation failed", "artist_id", artist.ID, "error", itunesErr)
+				}
+			}
+		}
+	}
 	// Spotify is authoritative whenever it has a successful observation. If it
-	// is unavailable, MusicBrainz remains a temporary fallback so a provider
-	// outage does not stop canonical release tracking entirely.
-	if !spotifySucceeded && !(spotifyPrimary && !spotifyWasDue) {
+	// is unavailable, iTunes is the first fallback. MusicBrainz remains the
+	// canonical fallback so a provider outage does not stop release tracking.
+	if !spotifySucceeded && !itunesSucceeded && !(spotifyPrimary && !spotifyWasDue) {
 		releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 		if err == nil {
 			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
@@ -576,6 +672,10 @@ func sanitizedProviderError(err error) string {
 			message += " (" + reason + ")"
 		}
 		return message
+	}
+	var itunesRateLimit *catalog.ITunesRateLimitError
+	if errors.As(err, &itunesRateLimit) {
+		return itunesRateLimit.Operation + " returned 429 Too Many Requests"
 	}
 	msg := strings.TrimSpace(err.Error())
 	msg = strings.ReplaceAll(msg, "https://", "[url]")

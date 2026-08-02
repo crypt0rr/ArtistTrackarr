@@ -1,0 +1,3 @@
+-- The iTunes fallback migration is applied by Store.migrateITunesFallback.
+-- SQLite requires table rebuilds to widen the provider CHECK constraints while
+-- preserving existing release observations and resolution rows.
