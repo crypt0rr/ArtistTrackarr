@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"strconv"
@@ -16,16 +17,19 @@ import (
 )
 
 type Runner struct {
-	store           *store.Store
-	catalog         catalog.CatalogProvider
-	spotify         catalog.SpotifyReleaseProvider
-	normalizer      catalog.ReleaseNormalizer
-	sender          notify.NotificationSender
-	cipher          *security.Cipher
-	interval        time.Duration
-	spotifyInterval time.Duration
-	logger          *slog.Logger
-	syncMu          sync.Mutex
+	store                 *store.Store
+	catalog               catalog.CatalogProvider
+	spotify               catalog.SpotifyReleaseProvider
+	normalizer            catalog.ReleaseNormalizer
+	sender                notify.NotificationSender
+	cipher                *security.Cipher
+	interval              time.Duration
+	spotifyInterval       time.Duration
+	logger                *slog.Logger
+	syncMu                sync.Mutex
+	providerMu            sync.Mutex
+	spotifyCooldownLoaded bool
+	spotifyCooldownUntil  time.Time
 }
 
 type Option func(*Runner)
@@ -85,6 +89,59 @@ func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.Re
 		option(runner)
 	}
 	return runner
+}
+
+// spotifyProviderCooldown loads the persisted provider-wide cooldown once per
+// process. Individual artist schedules still provide normal cadence, while a
+// quota response suppresses every other Spotify attempt until the same safe
+// retry time, including after a restart.
+func (r *Runner) spotifyProviderCooldown(ctx context.Context, now time.Time) (time.Time, error) {
+	r.providerMu.Lock()
+	if r.spotifyCooldownLoaded {
+		until := r.spotifyCooldownUntil
+		r.providerMu.Unlock()
+		if until.After(now) {
+			return until, nil
+		}
+		return time.Time{}, nil
+	}
+	r.providerMu.Unlock()
+
+	health, err := r.store.ProviderHealthByName(ctx, "spotify")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	var until time.Time
+	if err == nil && health.NextCheckAt != nil && (health.RateLimited || health.QuotaExceeded) {
+		until = *health.NextCheckAt
+	}
+	r.providerMu.Lock()
+	r.spotifyCooldownLoaded = true
+	r.spotifyCooldownUntil = until
+	r.providerMu.Unlock()
+	if until.After(now) {
+		return until, nil
+	}
+	return time.Time{}, nil
+}
+
+func (r *Runner) setSpotifyProviderCooldown(until time.Time) {
+	if until.IsZero() {
+		return
+	}
+	r.providerMu.Lock()
+	if until.After(r.spotifyCooldownUntil) {
+		r.spotifyCooldownUntil = until
+	}
+	r.spotifyCooldownLoaded = true
+	r.providerMu.Unlock()
+}
+
+func (r *Runner) clearSpotifyProviderCooldown() {
+	r.providerMu.Lock()
+	r.spotifyCooldownUntil = time.Time{}
+	r.spotifyCooldownLoaded = true
+	r.providerMu.Unlock()
 }
 
 func (r *Runner) Run(ctx context.Context) {
@@ -341,7 +398,21 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	var batches []store.ReleaseBatch
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError
-	spotifyDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
+	spotifyWasDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
+	spotifySuppressed := false
+	var spotifyCooldownUntil time.Time
+	if spotifyWasDue && r.spotify != nil {
+		cooldown, err := r.spotifyProviderCooldown(ctx, now)
+		if err != nil {
+			return outcome, err
+		}
+		if cooldown.After(now) {
+			spotifyCooldownUntil = cooldown
+			spotifySuppressed = true
+			r.logger.Debug("Spotify check suppressed by provider cooldown", "artist_id", artist.ID,
+				"retry_after", cooldown.Sub(now).String())
+		}
+	}
 	spotifyKnownDate := ""
 	if artist.SpotifyID != "" && r.spotify != nil {
 		var err error
@@ -350,9 +421,9 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			return outcome, err
 		}
 	}
-	spotifyPrimary := artist.SpotifyID != "" && r.spotify != nil && (spotifyDue || spotifyKnownDate != "")
+	spotifyPrimary := artist.SpotifyID != "" && r.spotify != nil && (spotifyWasDue || spotifyKnownDate != "")
 	spotifySucceeded := false
-	if spotifyPrimary && spotifyDue {
+	if spotifyPrimary && spotifyWasDue && !spotifySuppressed {
 		var spotifyReleases []store.Release
 		var spotifyErr error
 		if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
@@ -362,6 +433,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 		if spotifyErr == nil {
 			spotifySucceeded = true
+			r.clearSpotifyProviderCooldown()
 			changed, err := r.store.SpotifyBatchChanged(ctx, spotifyReleases)
 			if err != nil {
 				return outcome, err
@@ -377,6 +449,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			if errors.As(spotifyErr, &spotifyRateLimit) {
 				t := now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))
 				retryAt = &t
+				r.setSpotifyProviderCooldown(t)
 			}
 			_ = r.store.UpsertProviderHealth(ctx, "spotify", false, retryAt, spotifyRateLimit != nil, spotifyRateLimit != nil && spotifyRateLimit.QuotaExceeded, sanitizedProviderError(spotifyErr))
 			providerErrors = append(providerErrors, spotifyErr)
@@ -397,7 +470,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	// Spotify is authoritative whenever it has a successful observation. If it
 	// is unavailable, MusicBrainz remains a temporary fallback so a provider
 	// outage does not stop canonical release tracking entirely.
-	if !spotifySucceeded && !(spotifyPrimary && !spotifyDue) {
+	if !spotifySucceeded && !(spotifyPrimary && !spotifyWasDue) {
 		releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 		if err == nil {
 			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
@@ -411,7 +484,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
 		}
 	}
-	if spotifyPrimary && !spotifyDue && spotifyKnownDate != "" {
+	if spotifyPrimary && !spotifyWasDue && spotifyKnownDate != "" {
 		if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 			return outcome, err
 		}
@@ -425,6 +498,8 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 				"quota_exceeded", spotifyRateLimit.QuotaExceeded)
 			providerErrors = append(providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID,
 				now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))))
+		} else if spotifySuppressed {
+			providerErrors = append(providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID, spotifyCooldownUntil))
 		}
 		r.logger.Debug("artist sync retry scheduled", "artist_id", artist.ID,
 			"retry_after", providerFailureRetryDelay(spotifyRateLimit, r.interval).String())
@@ -436,7 +511,13 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 		return outcome, err
 	}
-	if spotifyDue {
+	if spotifySuppressed {
+		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, spotifyCooldownUntil); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+	if spotifyWasDue {
 		if spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(spotifyRateLimit, r.spotifyInterval).String(),

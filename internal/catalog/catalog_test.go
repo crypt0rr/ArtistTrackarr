@@ -147,6 +147,109 @@ func TestSpotifyArtistSearchUsesCurrentResultLimit(t *testing.T) {
 	}
 }
 
+func TestSpotifySearchAndArtistCachesAvoidDuplicateRequests(t *testing.T) {
+	var tokenRequests, searchRequests, artistRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/token":
+			tokenRequests.Add(1)
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+		case "/v1/search":
+			searchRequests.Add(1)
+			_, _ = io.WriteString(w, `{"artists":{"items":[{"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"Example","external_urls":{"spotify":"https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF"}}]}}`)
+		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF":
+			artistRequests.Add(1)
+			_, _ = io.WriteString(w, `{"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"Example"}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+
+	first, err := spotify.SearchArtists(context.Background(), "  Example  ")
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first search=%#v err=%v", first, err)
+	}
+	second, err := spotify.SearchArtists(context.Background(), "example")
+	if err != nil || len(second) != 1 {
+		t.Fatalf("cached search=%#v err=%v", second, err)
+	}
+	artist, err := spotify.Artist(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil || artist.Name != "Example" {
+		t.Fatalf("cached artist=%#v err=%v", artist, err)
+	}
+	if tokenRequests.Load() != 1 || searchRequests.Load() != 1 || artistRequests.Load() != 0 {
+		t.Fatalf("token=%d search=%d artist=%d", tokenRequests.Load(), searchRequests.Load(), artistRequests.Load())
+	}
+}
+
+func TestSpotifyArtistErrorsAreNotCached(t *testing.T) {
+	var artistRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/token":
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF":
+			if artistRequests.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			_, _ = io.WriteString(w, `{"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"Recovered"}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	if _, err := spotify.Artist(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF"); err == nil {
+		t.Fatal("first artist lookup unexpectedly succeeded")
+	}
+	artist, err := spotify.Artist(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil || artist.Name != "Recovered" || artistRequests.Load() != 2 {
+		t.Fatalf("artist=%#v requests=%d err=%v", artist, artistRequests.Load(), err)
+	}
+}
+
+func TestSpotifyBatchArtistLookupUsesOneRequest(t *testing.T) {
+	var tokenRequests, batchRequests, singleRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/token":
+			tokenRequests.Add(1)
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+		case "/v1/artists":
+			batchRequests.Add(1)
+			if request.URL.Query().Get("ids") != "0OdUWJ0sBjDrqHygGUXeCF,1OdUWJ0sBjDrqHygGUXeCG" {
+				t.Fatalf("unexpected batch IDs: %q", request.URL.Query().Get("ids"))
+			}
+			_, _ = io.WriteString(w, `{"artists":[{"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"First"},{"id":"1OdUWJ0sBjDrqHygGUXeCG","name":"Second"}]}`)
+		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF", "/v1/artists/1OdUWJ0sBjDrqHygGUXeCG":
+			singleRequests.Add(1)
+			http.NotFound(w, request)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	artists, err := spotify.Artists(context.Background(), []string{
+		"0OdUWJ0sBjDrqHygGUXeCF", "1OdUWJ0sBjDrqHygGUXeCG",
+	})
+	if err != nil || len(artists) != 2 || artists[0].Name != "First" || artists[1].Name != "Second" {
+		t.Fatalf("artists=%#v err=%v", artists, err)
+	}
+	if tokenRequests.Load() != 1 || batchRequests.Load() != 1 || singleRequests.Load() != 0 {
+		t.Fatalf("token=%d batch=%d single=%d", tokenRequests.Load(), batchRequests.Load(), singleRequests.Load())
+	}
+}
+
 func TestSpotifyRetriesRateLimitAfterRetryHeader(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -235,6 +338,25 @@ func TestSpotifyQuotaExceededCreatesSharedCooldown(t *testing.T) {
 		firstLimit.Reason != "QUOTA_EXCEEDED" || requests.Load() != 1 ||
 		firstLimit.RetryAfter < 29*time.Minute {
 		t.Fatalf("requests=%d first=%#v second=%#v", requests.Load(), firstLimit, secondLimit)
+	}
+}
+
+func TestSpotifyRestoredCooldownSuppressesSearchRequests(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	spotify.RestoreCooldown(time.Now().Add(time.Hour), "QUOTA_EXCEEDED", true)
+
+	_, err := spotify.SearchArtists(context.Background(), "Blocked")
+	var rateLimit *SpotifyRateLimitError
+	if !errors.As(err, &rateLimit) || !rateLimit.AlreadyBlocked || !rateLimit.QuotaExceeded || requests.Load() != 0 {
+		t.Fatalf("err=%#v requests=%d", rateLimit, requests.Load())
 	}
 }
 
