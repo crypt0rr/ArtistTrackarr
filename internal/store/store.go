@@ -120,6 +120,11 @@ type ReleaseBatch struct {
 	Releases []Release
 }
 
+type SpotifyPollingState struct {
+	UnchangedChecks int
+	LastChangeAt    *time.Time
+}
+
 type Destination struct {
 	ID           int64
 	UserID       int64
@@ -899,8 +904,54 @@ func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next ti
 }
 
 func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`,
-		timeText(now.Add(spotifyPollDelay(artistID, interval))), artistID)
+	return s.MarkSpotifyCheckedAdaptive(ctx, artistID, now, interval, true, false)
+
+}
+
+func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (SpotifyPollingState, error) {
+	var state SpotifyPollingState
+	var last sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).
+		Scan(&state.UnchangedChecks, &last)
+	if last.Valid {
+		t, parseErr := parseTime(last.String)
+		if parseErr == nil {
+			state.LastChangeAt = &t
+		}
+	}
+	return state, err
+}
+
+func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, now time.Time, interval time.Duration, changed, upcoming bool) error {
+	state, err := s.SpotifyPollingState(ctx, artistID)
+	if err != nil {
+		return err
+	}
+	streak := state.UnchangedChecks
+	lastChange := state.LastChangeAt
+	if changed {
+		streak = 0
+		t := now
+		lastChange = &t
+	} else {
+		streak++
+	}
+	delay := spotifyPollDelay(artistID, interval)
+	if !changed && !upcoming {
+		backoff := interval
+		for i := 0; i < min(streak, 3); i++ {
+			backoff *= 2
+		}
+		if backoff > 7*24*time.Hour {
+			backoff = 7 * 24 * time.Hour
+		}
+		delay = spotifyPollDelay(artistID, backoff)
+		if delay > backoff {
+			delay = backoff
+		}
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
+		timeText(now.Add(delay)), streak, nullableTime(lastChange), artistID)
 	return err
 }
 
@@ -927,6 +978,31 @@ func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (s
 	err := s.DB.QueryRowContext(ctx, `SELECT MAX(first_release_date) FROM release_groups
 		WHERE artist_id=? AND source IN ('spotify','both')`, artistID).Scan(&date)
 	return date.String, err
+}
+
+// SpotifyBatchChanged reports whether a successful provider response contains
+// a release that is new or has changed since it was last observed. It is
+// intentionally read before the release transaction so the scheduler can
+// persist its adaptive state together with the completed observation.
+func (s *Store) SpotifyBatchChanged(ctx context.Context, releases []Release) (bool, error) {
+	for _, release := range releases {
+		providerID := strings.TrimSpace(release.SpotifyID)
+		if providerID == "" {
+			continue
+		}
+		var hash string
+		err := s.DB.QueryRowContext(ctx, `SELECT payload_hash FROM provider_observations WHERE provider='spotify' AND provider_id=?`, providerID).Scan(&hash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if hash != releasePayloadHash(release) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []Release, observed time.Time) error {
@@ -1251,15 +1327,20 @@ func upsertProviderObservationTx(
 	ctx context.Context, tx *sql.Tx, provider, providerID string, releaseID int64,
 	release Release, observed time.Time,
 ) error {
-	secondary, _ := json.Marshal(release.SecondaryTypes)
-	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
-		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL))
+	payloadHash := releasePayloadHash(release)
 	_, err := tx.ExecContext(ctx, `INSERT INTO provider_observations
 		(provider,provider_id,release_group_id,payload_hash,observed_at) VALUES(?,?,?,?,?)
 		ON CONFLICT(provider,provider_id) DO UPDATE SET release_group_id=excluded.release_group_id,
 		payload_hash=excluded.payload_hash,observed_at=excluded.observed_at`,
-		provider, providerID, releaseID, fmt.Sprintf("%x", payloadHash), timeText(observed))
+		provider, providerID, releaseID, payloadHash, timeText(observed))
 	return err
+}
+
+func releasePayloadHash(release Release) string {
+	secondary, _ := json.Marshal(release.SecondaryTypes)
+	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
+		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL))
+	return fmt.Sprintf("%x", payloadHash)
 }
 
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
