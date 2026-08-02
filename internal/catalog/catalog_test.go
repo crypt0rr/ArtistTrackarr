@@ -341,6 +341,25 @@ func TestSpotifyQuotaExceededCreatesSharedCooldown(t *testing.T) {
 	}
 }
 
+func TestSpotifyRestoredCooldownSuppressesSearchRequests(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	spotify.RestoreCooldown(time.Now().Add(time.Hour), "QUOTA_EXCEEDED", true)
+
+	_, err := spotify.SearchArtists(context.Background(), "Blocked")
+	var rateLimit *SpotifyRateLimitError
+	if !errors.As(err, &rateLimit) || !rateLimit.AlreadyBlocked || !rateLimit.QuotaExceeded || requests.Load() != 0 {
+		t.Fatalf("err=%#v requests=%d", rateLimit, requests.Load())
+	}
+}
+
 func TestSpotifyRateLimitWaitHonorsContextCancellation(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

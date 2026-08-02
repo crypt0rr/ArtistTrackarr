@@ -309,6 +309,48 @@ func TestQuotaCooldownDefersNextArtistCheckUntilProviderRetry(t *testing.T) {
 	}
 }
 
+func TestPersistedSpotifyCooldownSkipsCallsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	artist, _ := database.UpsertArtist(ctx, store.Artist{
+		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	database.Follow(ctx, userID, artist.ID)
+	future := time.Now().UTC().Add(2 * time.Hour)
+	if err := database.UpsertProviderHealth(ctx, "spotify", false, &future, true, true, "quota limited"); err != nil {
+		t.Fatal(err)
+	}
+	spotify := &spotifyReleaseCatalog{releases: []store.Release{{
+		MBID: "spotify:should-not-fetch", SpotifyID: "should-not-fetch", Title: "Should not fetch", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-01", DatePrecision: 3, Source: "spotify",
+	}}}
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "musicbrainz-fallback", Title: "Fallback Album", PrimaryType: "Album",
+		FirstReleaseDate: "2026-07-30", DatePrecision: 3,
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify), WithSpotifyInterval(time.Hour))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if spotify.calls.Load() != 0 || mb.releaseCalls.Load() != 1 {
+		t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", spotify.calls.Load(), mb.releaseCalls.Load())
+	}
+	releases, err := database.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].Title != "Fallback Album" {
+		t.Fatalf("fallback releases=%#v err=%v", releases, err)
+	}
+	var nextCheck string
+	if err := database.DB.QueryRow(`SELECT spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextCheck)
+	if err != nil || next.Before(future.Add(-time.Second)) {
+		t.Fatalf("persisted cooldown retry=%q parsed=%v err=%v", nextCheck, next, err)
+	}
+}
+
 func TestTotalProviderFailureSchedulesBoundedRetry(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)

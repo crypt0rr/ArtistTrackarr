@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -58,6 +59,17 @@ func main() {
 	var spotifyProvider catalog.SpotifyProvider
 	if spotify != nil {
 		spotifyProvider = spotify
+		if health, healthErr := database.ProviderHealthByName(context.Background(), "spotify"); healthErr == nil {
+			if health.NextCheckAt != nil && (health.RateLimited || health.QuotaExceeded) {
+				reason := "RATE_LIMITED"
+				if health.QuotaExceeded {
+					reason = "QUOTA_EXCEEDED"
+				}
+				spotify.RestoreCooldown(*health.NextCheckAt, reason, health.QuotaExceeded)
+			}
+		} else if !errors.Is(healthErr, sql.ErrNoRows) {
+			logger.Warn("restore Spotify provider cooldown failed", "error", healthErr)
+		}
 	}
 	sender := notify.ShoutrrrSender{}
 	var runnerOptions []jobs.Option

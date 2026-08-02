@@ -113,6 +113,9 @@ Successful Spotify checks also adapt per artist. A catalog change returns the
 artist to the configured `SPOTIFY_POLL_INTERVAL`; unchanged artists back off
 progressively up to seven days, while artists with upcoming releases stay on the
 baseline interval. The backoff state is stored in SQLite and survives restarts.
+Spotify rate-limit cooldowns are stored at provider level as well, so a quota
+response suppresses background and search requests until the safe retry time
+even if the container is restarted.
 
 Selections that cannot be identified while MusicBrainz is unavailable remain
 pending and retry automatically.

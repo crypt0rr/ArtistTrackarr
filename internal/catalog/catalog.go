@@ -464,6 +464,22 @@ func NewSpotify(id, secret string, market ...string) *Spotify {
 	}
 }
 
+// RestoreCooldown rehydrates a provider-wide rate-limit cooldown persisted by
+// the scheduler. It is intentionally write-only from callers: the request
+// helper remains the single place that decides whether a Spotify call may run.
+func (s *Spotify) RestoreCooldown(until time.Time, reason string, quotaExceeded bool) {
+	if s == nil || !until.After(time.Now()) {
+		return
+	}
+	s.requestMu.Lock()
+	if until.After(s.blockedUntil) {
+		s.blockedUntil = until
+		s.blockedReason = strings.TrimSpace(reason)
+		s.blockedQuota = quotaExceeded
+	}
+	s.requestMu.Unlock()
+}
+
 func (s *Spotify) accessToken(ctx context.Context) (string, error) {
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()

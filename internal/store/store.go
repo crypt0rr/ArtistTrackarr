@@ -2062,6 +2062,45 @@ func boolInt(v bool) int {
 	}
 	return 0
 }
+
+// ProviderHealthByName returns the persisted state for one provider. The
+// scheduler uses the next check time to carry a provider-wide cooldown across
+// process restarts, so a quota response cannot cause a fresh burst of calls
+// after the container is recreated.
+func (s *Store) ProviderHealthByName(ctx context.Context, provider string) (ProviderHealth, error) {
+	var p ProviderHealth
+	var ls, lf, n, u sql.NullString
+	var rl, qe int
+	err := s.DB.QueryRowContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at
+		FROM provider_health WHERE provider=?`, provider).
+		Scan(&p.Provider, &ls, &lf, &p.LastError, &n, &rl, &qe, &u)
+	if err != nil {
+		return p, err
+	}
+	if ls.Valid {
+		v, parseErr := parseTime(ls.String)
+		if parseErr == nil {
+			p.LastSuccessAt = &v
+		}
+	}
+	if lf.Valid {
+		v, parseErr := parseTime(lf.String)
+		if parseErr == nil {
+			p.LastFailureAt = &v
+		}
+	}
+	if n.Valid {
+		v, parseErr := parseTime(n.String)
+		if parseErr == nil {
+			p.NextCheckAt = &v
+		}
+	}
+	p.RateLimited = rl != 0
+	p.QuotaExceeded = qe != 0
+	p.UpdatedAt, _ = parseTime(u.String)
+	return p, nil
+}
+
 func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at FROM provider_health ORDER BY provider`)
 	if err != nil {
