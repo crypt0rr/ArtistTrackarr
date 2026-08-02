@@ -34,6 +34,13 @@ type SpotifyProvider interface {
 	Artist(context.Context, string) (SpotifyArtist, error)
 }
 
+// SpotifyBatchArtistProvider is implemented by providers that can resolve
+// several artist IDs with one Web API request. It is optional so callers can
+// continue to work with small test providers and other implementations.
+type SpotifyBatchArtistProvider interface {
+	Artists(context.Context, []string) ([]SpotifyArtist, error)
+}
+
 type SpotifyReleaseProvider interface {
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
@@ -372,12 +379,45 @@ type Spotify struct {
 	cacheMu          sync.Mutex
 	releaseCache     map[string]spotifyReleaseCache
 	cacheTTL         time.Duration
+	searchCache      map[string]spotifySearchCache
+	artistCache      map[string]spotifyArtistCache
+	searchCalls      map[string]*spotifySearchCall
+	artistCalls      map[string]*spotifyArtistCall
+	searchCacheTTL   time.Duration
+	emptySearchTTL   time.Duration
+	artistCacheTTL   time.Duration
+	maxSearchCache   int
+	maxArtistCache   int
 }
 
 type spotifyReleaseCache struct {
 	observedAt time.Time
 	oldestDate string
 	releases   []store.Release
+}
+
+type spotifySearchCache struct {
+	observedAt time.Time
+	expiresAt  time.Time
+	results    []SpotifyArtist
+}
+
+type spotifyArtistCache struct {
+	observedAt time.Time
+	expiresAt  time.Time
+	artist     SpotifyArtist
+}
+
+type spotifySearchCall struct {
+	done    chan struct{}
+	results []SpotifyArtist
+	err     error
+}
+
+type spotifyArtistCall struct {
+	done   chan struct{}
+	artist SpotifyArtist
+	err    error
 }
 
 type SpotifyArtist struct {
@@ -417,6 +457,10 @@ func NewSpotify(id, secret string, market ...string) *Spotify {
 		accountsURL: "https://accounts.spotify.com", apiURL: "https://api.spotify.com", market: selectedMarket,
 		requestInterval: time.Second, retryBase: time.Second, maxInlineRetry: 30 * time.Second,
 		wait: waitContext, releaseCache: make(map[string]spotifyReleaseCache), cacheTTL: 24 * time.Hour,
+		searchCache: make(map[string]spotifySearchCache), artistCache: make(map[string]spotifyArtistCache),
+		searchCalls: make(map[string]*spotifySearchCall), artistCalls: make(map[string]*spotifyArtistCall),
+		searchCacheTTL: 10 * time.Minute, emptySearchTTL: 2 * time.Minute, artistCacheTTL: 24 * time.Hour,
+		maxSearchCache: 256, maxArtistCache: 512,
 	}
 }
 
@@ -453,6 +497,49 @@ func (s *Spotify) SearchArtists(ctx context.Context, query string) ([]SpotifyArt
 	if s == nil {
 		return nil, nil
 	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, errors.New("search query is required")
+	}
+	key := normalizeSpotifySearchQuery(query)
+	if cached, ok := s.cachedSearch(key); ok {
+		return cached, nil
+	}
+
+	// Search is user-driven and multiple browser requests can arrive at once
+	// (for example after a refresh). Coalesce an identical in-flight query so
+	// only the first request consumes a Spotify quota slot.
+	s.cacheMu.Lock()
+	if call, ok := s.searchCalls[key]; ok {
+		s.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return cloneSpotifyArtists(call.results), call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &spotifySearchCall{done: make(chan struct{})}
+	s.searchCalls[key] = call
+	s.cacheMu.Unlock()
+
+	result, err := s.searchArtists(ctx, query)
+	s.cacheMu.Lock()
+	delete(s.searchCalls, key)
+	call.results = cloneSpotifyArtists(result)
+	call.err = err
+	if err == nil {
+		s.cacheSearchLocked(key, result)
+		for _, artist := range result {
+			s.cacheArtistLocked(artist)
+		}
+	}
+	close(call.done)
+	s.cacheMu.Unlock()
+	return result, err
+}
+
+func (s *Spotify) searchArtists(ctx context.Context, query string) ([]SpotifyArtist, error) {
 	endpoint := s.apiURL + "/v1/search?type=artist&limit=10&q=" + url.QueryEscape(query)
 	var response struct {
 		Artists struct {
@@ -478,6 +565,243 @@ func (s *Spotify) SearchArtists(ctx context.Context, query string) ([]SpotifyArt
 		result = append(result, a)
 	}
 	return result, nil
+}
+
+func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) {
+	if s == nil {
+		return SpotifyArtist{}, errors.New("Spotify is not configured")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return SpotifyArtist{}, errors.New("Spotify artist ID is required")
+	}
+	if cached, ok := s.cachedArtist(id); ok {
+		return cached, nil
+	}
+
+	// A follow form normally arrives immediately after a search. Search
+	// results populate this cache, so verifying the selected artist does not
+	// issue a second request in the common path.
+	s.cacheMu.Lock()
+	if call, ok := s.artistCalls[id]; ok {
+		s.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return call.artist, call.err
+		case <-ctx.Done():
+			return SpotifyArtist{}, ctx.Err()
+		}
+	}
+	call := &spotifyArtistCall{done: make(chan struct{})}
+	s.artistCalls[id] = call
+	s.cacheMu.Unlock()
+
+	artist, err := s.artist(ctx, id)
+	s.cacheMu.Lock()
+	delete(s.artistCalls, id)
+	call.artist = artist
+	call.err = err
+	if err == nil {
+		s.cacheArtistLocked(artist)
+	}
+	close(call.done)
+	s.cacheMu.Unlock()
+	return artist, err
+}
+
+func (s *Spotify) artist(ctx context.Context, id string) (SpotifyArtist, error) {
+	var item spotifyArtistPayload
+	endpoint := s.apiURL + "/v1/artists/" + url.PathEscape(id)
+	if err := s.getAPIJSON(ctx, "Spotify artist lookup", endpoint, &item); err != nil {
+		return SpotifyArtist{}, err
+	}
+	return item.artist(), nil
+}
+
+// Artists resolves up to Spotify's batch endpoint limit. Cached IDs are
+// returned without a network request; only missing IDs are sent to Spotify.
+func (s *Spotify) Artists(ctx context.Context, ids []string) ([]SpotifyArtist, error) {
+	if s == nil {
+		return nil, errors.New("Spotify is not configured")
+	}
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return nil, errors.New("Spotify artist IDs are required")
+	}
+	if len(unique) > 50 {
+		return nil, errors.New("Spotify artist batch is limited to 50 IDs")
+	}
+
+	resultByID := make(map[string]SpotifyArtist, len(unique))
+	var missing []string
+	for _, id := range unique {
+		if artist, ok := s.cachedArtist(id); ok {
+			resultByID[id] = artist
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		endpoint := s.apiURL + "/v1/artists?ids=" + url.QueryEscape(strings.Join(missing, ","))
+		var response struct {
+			Artists []*spotifyArtistPayload `json:"artists"`
+		}
+		if err := s.getAPIJSON(ctx, "Spotify artist batch lookup", endpoint, &response); err != nil {
+			return nil, err
+		}
+		for _, payload := range response.Artists {
+			if payload == nil || payload.ID == "" {
+				continue
+			}
+			artist := payload.artist()
+			resultByID[artist.ID] = artist
+			s.cacheArtist(artist)
+		}
+	}
+	result := make([]SpotifyArtist, 0, len(resultByID))
+	for _, id := range unique {
+		if artist, ok := resultByID[id]; ok {
+			result = append(result, artist)
+		}
+	}
+	return result, nil
+}
+
+type spotifyArtistPayload struct {
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	ExternalURLs map[string]string `json:"external_urls"`
+	Images       []struct {
+		URL string `json:"url"`
+	} `json:"images"`
+}
+
+func (p spotifyArtistPayload) artist() SpotifyArtist {
+	artist := SpotifyArtist{ID: p.ID, Name: p.Name, URL: p.ExternalURLs["spotify"]}
+	if len(p.Images) > 0 {
+		artist.ImageURL = p.Images[len(p.Images)-1].URL
+	}
+	return artist
+}
+
+func normalizeSpotifySearchQuery(query string) string {
+	return strings.ToLower(strings.Join(strings.Fields(query), " "))
+}
+
+func cloneSpotifyArtists(input []SpotifyArtist) []SpotifyArtist {
+	return append([]SpotifyArtist(nil), input...)
+}
+
+func (s *Spotify) cachedSearch(key string) ([]SpotifyArtist, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	entry, ok := s.searchCache[key]
+	if !ok {
+		return nil, false
+	}
+	if !entry.expiresAt.IsZero() && !time.Now().Before(entry.expiresAt) {
+		delete(s.searchCache, key)
+		return nil, false
+	}
+	return cloneSpotifyArtists(entry.results), true
+}
+
+func (s *Spotify) cacheSearchLocked(key string, results []SpotifyArtist) {
+	if s.searchCache == nil {
+		s.searchCache = make(map[string]spotifySearchCache)
+	}
+	ttl := s.searchCacheTTL
+	if len(results) == 0 && s.emptySearchTTL > 0 {
+		ttl = s.emptySearchTTL
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	now := time.Now()
+	s.searchCache[key] = spotifySearchCache{
+		observedAt: now, expiresAt: now.Add(ttl), results: cloneSpotifyArtists(results),
+	}
+	s.evictSearchCacheLocked()
+}
+
+func (s *Spotify) evictSearchCacheLocked() {
+	maxEntries := s.maxSearchCache
+	if maxEntries <= 0 {
+		maxEntries = 256
+	}
+	for len(s.searchCache) > maxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for key, entry := range s.searchCache {
+			if oldestKey == "" || entry.observedAt.Before(oldest) {
+				oldestKey, oldest = key, entry.observedAt
+			}
+		}
+		delete(s.searchCache, oldestKey)
+	}
+}
+
+func (s *Spotify) cachedArtist(id string) (SpotifyArtist, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	entry, ok := s.artistCache[id]
+	if !ok {
+		return SpotifyArtist{}, false
+	}
+	if !entry.expiresAt.IsZero() && !time.Now().Before(entry.expiresAt) {
+		delete(s.artistCache, id)
+		return SpotifyArtist{}, false
+	}
+	return entry.artist, true
+}
+
+func (s *Spotify) cacheArtist(artist SpotifyArtist) {
+	s.cacheMu.Lock()
+	s.cacheArtistLocked(artist)
+	s.cacheMu.Unlock()
+}
+
+func (s *Spotify) cacheArtistLocked(artist SpotifyArtist) {
+	id := strings.TrimSpace(artist.ID)
+	if id == "" {
+		return
+	}
+	if s.artistCache == nil {
+		s.artistCache = make(map[string]spotifyArtistCache)
+	}
+	ttl := s.artistCacheTTL
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	now := time.Now()
+	s.artistCache[id] = spotifyArtistCache{observedAt: now, expiresAt: now.Add(ttl), artist: artist}
+	s.evictArtistCacheLocked()
+}
+
+func (s *Spotify) evictArtistCacheLocked() {
+	maxEntries := s.maxArtistCache
+	if maxEntries <= 0 {
+		maxEntries = 512
+	}
+	for len(s.artistCache) > maxEntries {
+		oldestID := ""
+		var oldest time.Time
+		for id, entry := range s.artistCache {
+			if oldestID == "" || entry.observedAt.Before(oldest) {
+				oldestID, oldest = id, entry.observedAt
+			}
+		}
+		delete(s.artistCache, oldestID)
+	}
 }
 
 func Enrich(results []ArtistResult, spotify []SpotifyArtist) {
@@ -512,29 +836,6 @@ func SpotifyID(value string) (string, bool) {
 		}
 	}
 	return value, true
-}
-
-func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) {
-	if s == nil {
-		return SpotifyArtist{}, errors.New("Spotify is not configured")
-	}
-	var item struct {
-		ID           string            `json:"id"`
-		Name         string            `json:"name"`
-		ExternalURLs map[string]string `json:"external_urls"`
-		Images       []struct {
-			URL string `json:"url"`
-		} `json:"images"`
-	}
-	endpoint := s.apiURL + "/v1/artists/" + url.PathEscape(id)
-	if err := s.getAPIJSON(ctx, "Spotify artist lookup", endpoint, &item); err != nil {
-		return SpotifyArtist{}, err
-	}
-	result := SpotifyArtist{ID: item.ID, Name: item.Name, URL: item.ExternalURLs["spotify"]}
-	if len(item.Images) > 0 {
-		result.ImageURL = item.Images[len(item.Images)-1].URL
-	}
-	return result, nil
 }
 
 func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.Release, error) {

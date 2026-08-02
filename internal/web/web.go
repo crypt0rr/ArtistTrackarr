@@ -519,17 +519,53 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	var queued, existing, failed int
 	var resolutions []store.ArtistResolution
+	var spotifyByID map[string]catalog.SpotifyArtist
+	batchLookupFailed := false
+	if batchProvider, ok := a.spotify.(catalog.SpotifyBatchArtistProvider); ok {
+		ids := make([]string, 0, len(values))
+		seen := make(map[string]bool, len(values))
+		for _, value := range values {
+			spotifyID, valid := catalog.SpotifyID(value)
+			if valid && !seen[spotifyID] {
+				seen[spotifyID] = true
+				ids = append(ids, spotifyID)
+			}
+		}
+		if len(ids) > 0 {
+			spotifyByID = make(map[string]catalog.SpotifyArtist, len(ids))
+			artists, lookupErr := batchProvider.Artists(r.Context(), ids)
+			if lookupErr != nil {
+				batchLookupFailed = true
+				a.logger.Warn("Spotify batch artist lookup failed", "count", len(ids), "error", lookupErr)
+			} else {
+				for _, artist := range artists {
+					spotifyByID[artist.ID] = artist
+				}
+			}
+		}
+	}
 	for _, value := range values {
 		spotifyID, ok := catalog.SpotifyID(value)
 		if !ok {
 			failed++
 			continue
 		}
-		spotifyArtist, lookupErr := a.spotify.Artist(r.Context(), spotifyID)
-		if lookupErr != nil {
-			a.logger.Warn("Spotify batch artist lookup failed", "spotify_id", spotifyID, "error", lookupErr)
-			failed++
-			continue
+		var spotifyArtist catalog.SpotifyArtist
+		if spotifyByID != nil {
+			var found bool
+			spotifyArtist, found = spotifyByID[spotifyID]
+			if batchLookupFailed || !found {
+				failed++
+				continue
+			}
+		} else {
+			var lookupErr error
+			spotifyArtist, lookupErr = a.spotify.Artist(r.Context(), spotifyID)
+			if lookupErr != nil {
+				a.logger.Warn("Spotify batch artist lookup failed", "spotify_id", spotifyID, "error", lookupErr)
+				failed++
+				continue
+			}
 		}
 		resolution, created, createErr := a.store.CreateArtistResolution(
 			r.Context(), session.User.ID, spotifyArtist.ID, spotifyArtist.Name, spotifyArtist.URL, spotifyArtist.ImageURL,

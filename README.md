@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.9.1` publishes `0.9.1`, `0.9`, and `latest`.
+- Pushing a tag such as `v0.10.0` publishes `0.10.0`, `0.10`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.9.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.10.0 docker compose up -d
 ```
 
 ## Configuration
@@ -99,11 +99,15 @@ EPs.
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored
 Spotify release history has not yet been reached. Known release IDs, dates, and
-provider observations are retained locally, and successful responses are cached
-for 24 hours. Artists are assigned stable polling offsets so a large watch list
-is spread across the day instead of queried in one burst. MusicBrainz release
-polling is used as a fallback when Spotify is unavailable or not mapped; it does
-not override successful Spotify data.
+provider observations are retained locally, and successful release responses
+are cached for 24 hours. Artist searches are cached briefly (with identical
+in-flight searches coalesced), and artist metadata is cached for 24 hours; this
+also means selecting an artist directly from a recent search does not trigger a
+second lookup request. Batch follow actions use Spotify's multiple-artist
+endpoint when available. Artists are assigned stable polling offsets so a large
+watch list is spread across the day instead of queried in one burst.
+MusicBrainz release polling is used as a fallback when Spotify is unavailable
+or not mapped; it does not override successful Spotify data.
 
 Successful Spotify checks also adapt per artist. A catalog change returns the
 artist to the configured `SPOTIFY_POLL_INTERVAL`; unchanged artists back off
