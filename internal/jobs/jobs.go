@@ -566,6 +566,17 @@ func sanitizedProviderError(err error) string {
 	if err == nil {
 		return ""
 	}
+	var rateLimit *catalog.SpotifyRateLimitError
+	if errors.As(err, &rateLimit) {
+		// Retry durations are persisted separately as next_check_at. Keeping
+		// them out of this message prevents the admin view from displaying a
+		// countdown that becomes stale after the first render.
+		message := rateLimit.Operation + " returned 429 Too Many Requests"
+		if reason := strings.TrimSpace(rateLimit.Reason); reason != "" {
+			message += " (" + reason + ")"
+		}
+		return message
+	}
 	msg := strings.TrimSpace(err.Error())
 	msg = strings.ReplaceAll(msg, "https://", "[url]")
 	msg = strings.ReplaceAll(msg, "http://", "[url]")

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -90,6 +91,109 @@ type PageData struct {
 	ProviderNotice   string
 }
 
+type providerHealthPayload struct {
+	Provider           string     `json:"provider"`
+	Status             string     `json:"status"`
+	StatusClass        string     `json:"status_class"`
+	LastSuccessAt      *time.Time `json:"last_success_at,omitempty"`
+	LastSuccessDisplay string     `json:"last_success_display,omitempty"`
+	LastFailureAt      *time.Time `json:"last_failure_at,omitempty"`
+	LastFailureDisplay string     `json:"last_failure_display,omitempty"`
+	LastError          string     `json:"last_error,omitempty"`
+	NextCheckAt        *time.Time `json:"next_check_at,omitempty"`
+	NextCheckDisplay   string     `json:"next_check_display,omitempty"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	UpdatedDisplay     string     `json:"updated_display"`
+	RateLimited        bool       `json:"rate_limited"`
+	QuotaExceeded      bool       `json:"quota_exceeded"`
+}
+
+func providerHealthStatus(p store.ProviderHealth) string {
+	latestFailure := p.LastFailureAt != nil &&
+		(p.LastSuccessAt == nil || !p.LastFailureAt.Before(*p.LastSuccessAt))
+	if latestFailure {
+		switch {
+		case p.QuotaExceeded:
+			return "quota limited"
+		case p.RateLimited:
+			return "rate limited"
+		default:
+			return "degraded"
+		}
+	}
+	if p.LastSuccessAt != nil {
+		return "healthy"
+	}
+	if p.LastFailureAt != nil {
+		return "unavailable"
+	}
+	return "no success yet"
+}
+
+func providerHealthClass(p store.ProviderHealth) string {
+	switch providerHealthStatus(p) {
+	case "healthy":
+		return "sent"
+	case "quota limited", "rate limited":
+		return "ambiguous"
+	default:
+		return "failed"
+	}
+}
+
+func providerHealthTime(value any) string {
+	t, ok := providerTimeValue(value)
+	if !ok || t.IsZero() {
+		return ""
+	}
+	return t.In(time.Local).Format("2006-01-02 15:04:05 MST")
+}
+
+func providerHealthTimeAttr(value any) string {
+	t, ok := providerTimeValue(value)
+	if !ok || t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
+func providerTimeValue(value any) (time.Time, bool) {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, true
+	case *time.Time:
+		if typed == nil {
+			return time.Time{}, false
+		}
+		return *typed, true
+	default:
+		return time.Time{}, false
+	}
+}
+
+func providerHealthError(p store.ProviderHealth) string {
+	message := strings.TrimSpace(p.LastError)
+	if p.RateLimited || p.QuotaExceeded {
+		lower := strings.ToLower(message)
+		if index := strings.Index(lower, "; retry after "); index >= 0 {
+			message = strings.TrimSpace(message[:index])
+		}
+	}
+	return message
+}
+
+func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
+	return providerHealthPayload{
+		Provider: p.Provider, Status: providerHealthStatus(p), StatusClass: providerHealthClass(p),
+		LastSuccessAt: p.LastSuccessAt, LastSuccessDisplay: providerHealthTime(p.LastSuccessAt),
+		LastFailureAt: p.LastFailureAt, LastFailureDisplay: providerHealthTime(p.LastFailureAt),
+		LastError: providerHealthError(p), NextCheckAt: p.NextCheckAt,
+		NextCheckDisplay: providerHealthTime(p.NextCheckAt), UpdatedAt: p.UpdatedAt,
+		UpdatedDisplay: providerHealthTime(&p.UpdatedAt), RateLimited: p.RateLimited,
+		QuotaExceeded: p.QuotaExceeded,
+	}
+}
+
 func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify catalog.SpotifyProvider,
 	sender notify.NotificationSender, cipher *security.Cipher, art artwork.Provider,
 	runner *jobs.Runner, logger *slog.Logger) (*App, error) {
@@ -102,7 +206,12 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			}
 			return v
 		},
-		"formatTime": func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"formatTime":           func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"formatProviderTime":   providerHealthTime,
+		"providerTimeAttr":     providerHealthTimeAttr,
+		"providerHealthStatus": providerHealthStatus,
+		"providerHealthClass":  providerHealthClass,
+		"providerHealthError":  providerHealthError,
 		"initial": func(v string) string {
 			for _, r := range v {
 				return string(r)
@@ -170,6 +279,7 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/users/{id}/delete", a.deleteUser)
 			admin.Post("/admin/sync/retry", a.queueRetrySync)
 			admin.Post("/admin/sync/artists/{id}", a.queueArtistSync)
+			admin.Get("/admin/provider-health", a.providerHealth)
 		})
 	})
 	return r
@@ -927,6 +1037,23 @@ func (a *App) updatePreferences(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "admin", a.adminData(r), http.StatusOK)
+}
+
+func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
+	health, err := a.store.ProviderHealth(r.Context())
+	if err != nil {
+		http.Error(w, "provider health unavailable", http.StatusInternalServerError)
+		return
+	}
+	response := make([]providerHealthPayload, 0, len(health))
+	for _, provider := range health {
+		response = append(response, providerHealthPayloadFor(provider))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		a.logger.Debug("provider health response interrupted", "error", err)
+	}
 }
 
 func (a *App) adminData(r *http.Request) PageData {

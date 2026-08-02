@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -796,6 +797,63 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") ||
 		strings.Contains(page, `href="/artists/search" target="_blank"`) {
 		t.Fatalf("Spotify release dashboard status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	if _, err := database.DB.Exec(`UPDATE users SET role='admin' WHERE id=?`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := database.CreateSession(context.Background(), user.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL, _ := url.Parse(server.URL)
+	client.Jar.SetCookies(serverURL, []*http.Cookie{{
+		Name: "artist_session", Value: security.SignedToken("the session secret has more than 32 bytes", raw), Path: "/",
+	}})
+	success := time.Now().UTC().Add(-10 * time.Minute)
+	failure := time.Now().UTC().Add(-time.Minute)
+	next := time.Now().UTC().Add(20 * time.Minute)
+	if err := database.UpsertProviderHealth(context.Background(), "spotify", true, nil, false, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Exec(`UPDATE provider_health SET last_success_at=?, last_failure_at=? WHERE provider=?`, success.Format(time.RFC3339Nano), failure.Format(time.RFC3339Nano), "spotify"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProviderHealth(context.Background(), "spotify", false, &next, true, true,
+		"Spotify artist albums returned 429 Too Many Requests (QUOTA_EXCEEDED); retry after 20m"); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/admin/provider-health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload []providerHealthPayload
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(payload) != 1 || payload[0].Status != "quota limited" ||
+		payload[0].StatusClass != "ambiguous" || payload[0].NextCheckAt == nil ||
+		strings.Contains(payload[0].LastError, "retry after") || payload[0].LastFailureAt == nil {
+		t.Fatalf("provider health response status=%d payload=%#v", response.StatusCode, payload)
+	}
+
+	response, err = client.Get(server.URL + "/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if !strings.Contains(page, "quota limited") || !strings.Contains(page, "Last failure") ||
+		!strings.Contains(page, "Next check") || !strings.Contains(page, `data-refresh-url="/admin/provider-health"`) ||
+		strings.Contains(page, "retry after 20m") {
+		t.Fatalf("provider health admin rendering missing live details: %q", page)
 	}
 }
 

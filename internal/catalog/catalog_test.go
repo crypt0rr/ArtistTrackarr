@@ -341,6 +341,29 @@ func TestSpotifyQuotaExceededCreatesSharedCooldown(t *testing.T) {
 	}
 }
 
+func TestSpotifyAPIErrorIncludesSafeResponseDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"status":400,"message":"invalid artist id","reason":"INVALID_ID"}}`)
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+
+	_, err := spotify.SearchArtists(context.Background(), "Invalid")
+	var apiErr *SpotifyAPIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest ||
+		apiErr.Reason != "INVALID_ID" || apiErr.Message != "invalid artist id" ||
+		!strings.Contains(err.Error(), "INVALID_ID: invalid artist id") {
+		t.Fatalf("api error=%#v err=%v", apiErr, err)
+	}
+}
+
 func TestSpotifyRestoredCooldownSuppressesSearchRequests(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
