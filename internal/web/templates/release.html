@@ -1,14 +1,18 @@
 {{template "head" .}}
+{{if .ReleaseUnavailable}}
+<section class="panel release-unavailable"><p class="eyebrow">Release details</p><h1>Release unavailable</h1><p>This release could not be found for your account. It may have been removed or is no longer available.</p><a class="button secondary" href="/">Back to dashboard</a></section>
+{{else if .ReleaseDetail}}
 {{with .ReleaseDetail}}
 <section class="page-head split-head"><div><p class="eyebrow">Release details</p><h1>{{.Title}}</h1><p>{{.ArtistName}} · {{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</p></div><a class="button secondary" href="/">Back to dashboard</a></section>
 <section class="grid two">
   <section class="panel release-detail-card">
-    <img class="release-detail-art" src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
-    {{if releaseUsesITunesArtwork .}}<p class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></p>{{end}}
-    <p class="date">{{shortDate .FirstReleaseDate}}</p><p>Observed {{formatTime .FirstObservedAt}}</p><p>Source: {{sourceLabel .}}</p>
+    <img class="release-detail-art" src="{{releaseArtwork .Release}}" data-artwork-fallback="{{releaseArtworkFallback .Release}}" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
+    {{if releaseUsesITunesArtwork .Release}}<p class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></p>{{end}}
+    <p class="date">{{shortDate .FirstReleaseDate}}</p><p>Observed {{formatTime .FirstObservedAt}}</p><p>Source: {{sourceLabel .Release}}</p>
 	<div class="actions">{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}{{if .ITunesURL}}<a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Apple Music</a>{{end}}</div>
   </section>
   <section class="panel"><p class="eyebrow">Provider observations</p><h2>Release history</h2>{{if .Observations}}<div class="list">{{range .Observations}}<div class="list-row"><strong>{{.Provider}}</strong><small>{{.ProviderID}} · {{formatTime .ObservedAt}}</small></div>{{end}}</div>{{else}}<div class="empty">No provider observations recorded.</div>{{end}}</section>
 </section>
+{{end}}
 {{end}}
 {{template "foot" .}}

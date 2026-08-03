@@ -53,45 +53,46 @@ type App struct {
 }
 
 type PageData struct {
-	Title            string
-	Version          string
-	User             *store.User
-	CSRF             string
-	Error            string
-	Message          string
-	SetupNeeded      bool
-	Artists          []store.Artist
-	Results          []catalog.ArtistResult
-	SpotifyResults   []catalog.SpotifyArtist
-	ITunesResults    []catalog.ITunesArtist
-	UpcomingReleases []store.Release
-	RecentReleases   []store.Release
-	ReleaseCount     int
-	Preferences      store.NotificationPreferences
-	ReleaseDetail    *store.ReleaseDetail
-	Resolutions      []store.ArtistResolution
-	Resolution       *store.ArtistResolution
-	Destinations     []store.Destination
-	History          []store.DeliveryHistory
-	AdminHistory     []store.AdminDeliveryHistory
-	AppLogs          []logging.Entry
-	AdminUsers       []store.AdminUser
-	AdminArtists     []store.AdminArtist
-	ProviderHealth   []store.ProviderHealth
-	ManualSyncs      []store.ManualSyncRequest
-	Import           *store.ImportJob
-	FollowCount      int
-	AdminPage        int
-	AdminPages       int
-	AdminPrevPage    int
-	AdminNextPage    int
-	Query            string
-	GeneratedURL     string
-	Token            string
-	TokenKind        string
-	TokenEmail       string
-	SpotifyOn        bool
-	ProviderNotice   string
+	Title              string
+	Version            string
+	User               *store.User
+	CSRF               string
+	Error              string
+	Message            string
+	SetupNeeded        bool
+	Artists            []store.Artist
+	Results            []catalog.ArtistResult
+	SpotifyResults     []catalog.SpotifyArtist
+	ITunesResults      []catalog.ITunesArtist
+	UpcomingReleases   []store.Release
+	RecentReleases     []store.Release
+	ReleaseCount       int
+	Preferences        store.NotificationPreferences
+	ReleaseDetail      *store.ReleaseDetail
+	ReleaseUnavailable bool
+	Resolutions        []store.ArtistResolution
+	Resolution         *store.ArtistResolution
+	Destinations       []store.Destination
+	History            []store.DeliveryHistory
+	AdminHistory       []store.AdminDeliveryHistory
+	AppLogs            []logging.Entry
+	AdminUsers         []store.AdminUser
+	AdminArtists       []store.AdminArtist
+	ProviderHealth     []store.ProviderHealth
+	ManualSyncs        []store.ManualSyncRequest
+	Import             *store.ImportJob
+	FollowCount        int
+	AdminPage          int
+	AdminPages         int
+	AdminPrevPage      int
+	AdminNextPage      int
+	Query              string
+	GeneratedURL       string
+	Token              string
+	TokenKind          string
+	TokenEmail         string
+	SpotifyOn          bool
+	ProviderNotice     string
 }
 
 type providerHealthPayload struct {
@@ -563,15 +564,19 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
+	d := a.data(r, "Release details")
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id < 1 {
-		http.NotFound(w, r)
+		a.logger.Debug("release detail unavailable", "release_id", chi.URLParam(r, "id"), "error", "invalid release ID")
+		d.ReleaseUnavailable = true
+		a.render(w, "release", d, http.StatusNotFound)
 		return
 	}
-	d := a.data(r, "Release details")
 	detail, err := a.store.ReleaseDetail(r.Context(), session.User.ID, id)
 	if err != nil {
-		http.NotFound(w, r)
+		a.logger.Debug("release detail unavailable", "release_id", id, "error", err)
+		d.ReleaseUnavailable = true
+		a.render(w, "release", d, http.StatusNotFound)
 		return
 	}
 	d.ReleaseDetail = &detail
