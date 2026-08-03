@@ -79,6 +79,7 @@ type PageData struct {
 	AdminArtists     []store.AdminArtist
 	ProviderHealth   []store.ProviderHealth
 	ManualSyncs      []store.ManualSyncRequest
+	Import           *store.ImportJob
 	FollowCount      int
 	AdminPage        int
 	AdminPages       int
@@ -299,6 +300,8 @@ func (a *App) Handler() http.Handler {
 		private.Post("/artist-resolutions/{id}", a.selectArtistResolution)
 		private.Post("/artist-resolutions/{id}/cancel", a.cancelArtistResolution)
 		private.Get("/artists/export", a.exportArtists)
+		private.Post("/artists/import", a.importArtists)
+		private.Get("/artists/imports/{id}", a.artistImport)
 		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
 		private.Post("/preferences", a.updatePreferences)
@@ -329,7 +332,7 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' https://i.scdn.co data:; style-src 'self'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -350,7 +353,13 @@ func (a *App) csrf(next http.Handler) http.Handler {
 			})
 		}
 		if r.Method == http.MethodPost {
-			if err := r.ParseForm(); err != nil || subtle.ConstantTimeCompare([]byte(r.FormValue("_csrf")), []byte(raw)) != 1 {
+			var err error
+			if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+				err = r.ParseMultipartForm(2 << 20)
+			} else {
+				err = r.ParseForm()
+			}
+			if err != nil || subtle.ConstantTimeCompare([]byte(r.FormValue("_csrf")), []byte(raw)) != 1 {
 				http.Error(w, "invalid CSRF token", http.StatusForbidden)
 				return
 			}

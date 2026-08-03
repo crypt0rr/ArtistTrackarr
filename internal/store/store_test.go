@@ -92,6 +92,109 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	}
 }
 
+func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "importer@example.com", "hash", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := s.CreateUser(ctx, "other-importer@example.com", "hash", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "11111111-1111-4111-8111-111111111111"
+	row, err := s.SaveImportRow(ctx, userID, job.ID, ImportInput{
+		SourceValue: "https://musicbrainz.org/artist/" + mbid,
+		DisplayName: "Imported Artist", MBID: mbid,
+		MBURL:     "https://musicbrainz.org/artist/" + mbid,
+		SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF", SpotifyURL: "https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF",
+	})
+	if err != nil || row.Status != "added" || row.ArtistID == nil {
+		t.Fatalf("added row=%#v err=%v", row, err)
+	}
+	duplicate, err := s.SaveImportRow(ctx, userID, job.ID, ImportInput{
+		SourceValue: "https://musicbrainz.org/artist/" + mbid, DisplayName: "Imported Artist", MBID: mbid,
+		MBURL: "https://musicbrainz.org/artist/" + mbid,
+	})
+	if err != nil || duplicate.Status != "already_followed" {
+		t.Fatalf("duplicate row=%#v err=%v", duplicate, err)
+	}
+	invalid, err := s.SaveImportRow(ctx, userID, job.ID, ImportInput{SourceValue: "bad", DisplayName: "Bad", Reason: "invalid MusicBrainz ID"})
+	if err != nil || invalid.Status != "invalid" {
+		t.Fatalf("invalid row=%#v err=%v", invalid, err)
+	}
+	loaded, err := s.ImportJob(ctx, userID, job.ID)
+	if err != nil || loaded.Added != 1 || loaded.AlreadyFollowed != 1 || loaded.Invalid != 1 || len(loaded.Rows) != 3 {
+		t.Fatalf("loaded job=%#v err=%v", loaded, err)
+	}
+	if _, err := s.ImportJob(ctx, otherID, job.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user import lookup err=%v", err)
+	}
+	var next sql.NullString
+	if err := s.DB.QueryRow(`SELECT next_check_at FROM artists WHERE mbid=?`, mbid).Scan(&next); err != nil || !next.Valid {
+		t.Fatalf("imported artist was not scheduled: %q err=%v", next.String, err)
+	}
+}
+
+func TestPruneExpiredStateKeepsActiveAndQueuedState(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "maintenance@example.com", "hash", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	old := now.Add(-31 * 24 * time.Hour)
+	activeSession, _, err := s.CreateSession(ctx, userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateSession(ctx, userID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuthToken(ctx, "invite", "old@example.com", nil, userID, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuthToken(ctx, "invite", "active@example.com", nil, userID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordLoginFailure(ctx, "old-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE login_attempts SET first_at=?`, timeText(now.Add(-25*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`INSERT INTO manual_sync_requests(requested_by,scope,status,created_at,finished_at) VALUES(?,?,?,?,?)`, userID, "retry", "completed", timeText(old), timeText(old)); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE import_jobs SET created_at=? WHERE id=?`, timeText(old), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveImportRow(ctx, userID, job.ID, ImportInput{DisplayName: "bad", SourceValue: "bad", Reason: "invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := s.PruneExpiredState(ctx, now)
+	if err != nil || stats.Sessions != 1 || stats.AuthTokens != 1 || stats.LoginAttempts != 1 || stats.ManualSyncs != 1 || stats.ImportJobs != 1 {
+		t.Fatalf("maintenance stats=%#v err=%v", stats, err)
+	}
+	if _, err := s.Session(ctx, activeSession); err != nil {
+		t.Fatalf("active session removed: %v", err)
+	}
+	var rows int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM import_rows WHERE job_id=?`, job.ID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("import rows after cascade=%d err=%v", rows, err)
+	}
+}
+
 func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -146,6 +148,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	loginPage.Body.Close()
 	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
+		!strings.Contains(string(loginBody), "/static/theme.js") ||
 		!strings.Contains(string(loginBody), "v"+version.Current) ||
 		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/ArtistTrackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-toggle`) ||
@@ -163,6 +166,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		{"/static/favicon-32.png", "image/png"},
 		{"/static/apple-touch-icon.png", "image/png"},
 		{"/static/logo-full.png", "image/png"},
+		{"/static/theme.js", "text/javascript"},
 		{"/static/logo-mark.png", "image/png"},
 	} {
 		staticResponse, err := client.Get(server.URL + asset.path)
@@ -580,6 +584,47 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	}
 }
 
+func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/artists/search")
+	mbid := "11111111-1111-4111-8111-111111111111"
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	_ = writer.WriteField("_csrf", csrf)
+	part, err := writer.CreateFormFile("file", "artists.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "artist,display_name,musicbrainz_id,musicbrainz_url,spotify_id,spotify_url\n"+
+		"https://musicbrainz.org/artist/"+mbid+",Imported Artist,"+mbid+",https://musicbrainz.org/artist/"+mbid+",,\n"+
+		"bad,Broken,,bad,,\n")
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/artists/import", &payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Import results") ||
+		!strings.Contains(string(body), "Imported Artist") || !strings.Contains(string(body), ">added<") || !strings.Contains(string(body), ">invalid<") {
+		t.Fatalf("import response status/body=%d %q", response.StatusCode, body)
+	}
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	if count, err := database.FollowedArtistCount(context.Background(), user.ID); err != nil || count != 1 {
+		t.Fatalf("imported follow count=%d err=%v", count, err)
+	}
+	if !strings.Contains(response.Header.Get("Content-Security-Policy"), "script-src 'self'") {
+		t.Fatalf("import response CSP=%q", response.Header.Get("Content-Security-Policy"))
+	}
+}
+
 func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	mb := &searchCatalog{}
 	database, server, client := authenticatedTestServer(t, mb, nil, nil)
@@ -792,7 +837,7 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, "MusicBrainz and Spotify are checked") ||
 		!strings.Contains(page, "Upcoming releases") ||
-		!strings.Contains(page, `href="https://open.spotify.com/album/album-id" target="_blank" rel="noopener noreferrer"`) ||
+		!strings.Contains(page, `href="/releases/1"`) ||
 		!strings.Contains(page, `src="https://i.scdn.co/image/album-art"`) ||
 		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") ||
 		strings.Contains(page, `href="/artists/search" target="_blank"`) {

@@ -245,6 +245,14 @@ func (r *Runner) tick(ctx context.Context) {
 	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
+	if maintenance, err := r.store.PruneExpiredState(ctx, time.Now().UTC()); err != nil {
+		r.logger.Warn("state maintenance failed", "error", err)
+	} else if maintenance.Sessions+maintenance.AuthTokens+maintenance.LoginAttempts+maintenance.ManualSyncs+maintenance.ImportJobs > 0 {
+		r.logger.Info("state maintenance completed",
+			"sessions", maintenance.Sessions, "auth_tokens", maintenance.AuthTokens,
+			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
+			"import_jobs", maintenance.ImportJobs)
+	}
 	now := time.Now().UTC()
 	if err := r.store.QueueDueReleaseDays(ctx, now); err != nil {
 		r.logger.Error("release-day scheduling failed", "error", err)
