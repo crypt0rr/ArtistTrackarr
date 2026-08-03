@@ -1,24 +1,78 @@
 {{template "head" .}}
-<section class="page-head split-head">
-  <div><p class="eyebrow">Watchlist</p><h1>Followed artists</h1><p>Your alphabetically sorted watchlist and its optional Spotify links.</p></div>
-  <div class="actions"><a class="button" href="/artists/search">Add artists</a></div>
+<section class="page-head"><p class="eyebrow">Artist management</p><h1>Artists</h1><p>Discover artists, restore or export your watchlist, and manage the artists you follow from one place.</p></section>
+{{if .LegacySearch}}<span class="sr-only" aria-hidden="true"><h1>Add artists</h1></span>{{end}}
+
+<section class="panel artist-search">
+  <div class="section-head"><div><p class="eyebrow">Discovery</p><h2>Find artists to follow</h2></div><span class="badge">Spotify · Apple · MusicBrainz</span></div>
+  <p>Spotify is preferred, with Apple/iTunes and MusicBrainz fallback discovery. MusicBrainz confirms the canonical identity used for tracking.</p>
+  <form method="get" action="/artists" class="searchbar">
+    <input name="q" value="{{.Query}}" placeholder="Artist name" required autofocus>
+    <button>Search</button>
+  </form>
 </section>
-<section class="stats single-stat">
-  <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
+{{if .ProviderNotice}}<div class="notice">{{.ProviderNotice}}</div>{{end}}
+{{if .SpotifyResults}}<form method="post" action="/artists/follow/spotify/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>Spotify artists</h2><span class="badge">Spotify</span></div>
+<div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
+<div class="list">{{range .SpotifyResults}}<article class="search-result">
+  <label class="result-select"><input type="checkbox" name="spotify_ids" value="{{.ID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
+  {{if .ImageURL}}<img src="{{.ImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
+  <div class="grow"><strong>{{.Name}}</strong><small>Identity will be confirmed with MusicBrainz after selection.</small></div>
+  <div class="actions"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">Open in Spotify</a></div>
+</article>{{end}}</div></section></form>
+{{else if .ITunesResults}}<form method="post" action="/artists/follow/itunes/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>Apple/iTunes artists</h2><span class="badge">Apple</span></div>
+<div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
+<div class="list">{{range .ITunesResults}}<article class="search-result">
+  <label class="result-select"><input type="checkbox" name="itunes_ids" value="{{.ID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
+  <div class="avatar">{{initial .Name}}</div>
+  <div class="grow"><strong>{{.Name}}</strong><small>Identity will be confirmed with MusicBrainz after selection.</small></div>
+  <div class="actions"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></div>
+</article>{{end}}</div></section></form>
+{{else if .Results}}<form method="post" action="/artists/follow/batch" data-multi-follow>{{template "csrf" .}}<section class="panel"><div class="section-head"><h2>MusicBrainz artists</h2><span class="badge">MusicBrainz</span></div>
+<div class="selection-toolbar"><label class="select-all"><input type="checkbox" data-select-all> Select all</label><span data-selected-count>0 selected</span><button type="submit" data-follow-selected>Follow selected</button></div>
+<div class="list">{{range .Results}}<article class="search-result">
+  <label class="result-select"><input type="checkbox" name="mbids" value="{{.MBID}}" data-artist-choice><span class="sr-only">Select {{.Name}}</span></label>
+  {{if .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<div class="avatar">{{initial .Name}}</div>{{end}}
+  <div class="grow"><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
+  {{if .Aliases}}<small>Also known as {{join .Aliases ", "}}</small>{{end}}</div>
+  <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
+  <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">Inspect</a></div>
+</article>{{end}}</div></section></form>
+{{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
+
+{{if or .GenreFilter .CountryFilter .TypeFilter}}<div class="notice active-filter">Showing {{len .Artists}} artists{{if .GenreFilter}} · genre: {{.GenreFilter}}{{end}}{{if .CountryFilter}} · country: {{.CountryFilter}}{{end}}{{if .TypeFilter}} · type: {{.TypeFilter}}{{end}} · <a href="/artists">Clear filters</a></div>{{end}}
+{{if or .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel artist-breakdowns">
+  <div class="section-head"><div><p class="eyebrow">Explore</p><h2>Watchlist breakdown</h2><p>Choose a group to filter the followed artists below.</p></div></div>
+  <div class="breakdown-grid">
+    {{if .GenreBreakdown}}<div class="insight-group"><h3>Genres</h3>{{range .GenreBreakdown}}<a class="insight-row{{if eq $.GenreFilter .Label}} active{{end}}" href="/artists?genre={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+    {{if .CountryBreakdown}}<div class="insight-group"><h3>Countries</h3>{{range .CountryBreakdown}}<a class="insight-row{{if eq $.CountryFilter .Label}} active{{end}}" href="/artists?country={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+    {{if .TypeBreakdown}}<div class="insight-group"><h3>Artist types</h3>{{range .TypeBreakdown}}<a class="insight-row{{if eq $.TypeFilter .Label}} active{{end}}" href="/artists?type={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+  </div>
+</section>{{end}}
+
+<section class="panel watchlist-tools">
+  <div class="section-head"><div><p class="eyebrow">Watchlist tools</p><h2>Backup or restore</h2><p>Export your canonical watchlist or import an ArtistTrackarr CSV backup.</p></div><span class="badge">{{.FollowCount}} followed</span></div>
+  <div class="watchlist-tool-actions"><a class="button secondary" href="/artists/export">Export CSV</a>
+    <form method="post" action="/artists/import" enctype="multipart/form-data" class="actions import-form">{{template "csrf" .}}<label class="file-field">ArtistTrackarr CSV<input type="file" name="file" accept=".csv,text/csv" required></label><button type="submit">Import CSV</button></form>
+  </div>
 </section>
+
+<section class="page-head artists-list-head"><div><p class="eyebrow">Your watchlist</p><h2>Followed artists</h2><p>Alphabetically sorted, with provider links and synchronization status.</p></div><span class="badge">{{.FollowCount}} followed</span></section>
 <section class="panel">
   {{if .Artists}}<div class="list">
   {{range .Artists}}<article class="list-row">
     <div class="artist-summary">
       {{if .SpotifyImageURL}}<img class="avatar" src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Name}}</span>{{end}}
       <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
+      {{if .Genres}}<small>Genres: {{join .Genres ", "}}</small>{{end}}
+      {{if .ListenCheckedAt}}<small>ListenBrainz: {{.ListenCount}} listens · {{.ListenUsers}} listeners</small>{{end}}
       <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}{{if .LastCheckedAt}} · Last checked {{.LastCheckedAt.Format "2006-01-02 15:04"}}{{end}}{{if .SpotifyNextCheckAt}} · Next check {{.SpotifyNextCheckAt.Format "2006-01-02 15:04"}}{{end}}</small></span>
     </div>
     <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
     <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>
+    <a href="https://listenbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
     <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}<button class="secondary">Sync now</button></form>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
   </article>{{end}}</div>
-  {{else}}<div class="empty">No artists yet. <a href="/artists/search">Search for artists</a>.</div>{{end}}
+  {{else}}<div class="empty">No artists yet. Search above to start your watchlist.</div>{{end}}
 </section>
 {{template "foot" .}}

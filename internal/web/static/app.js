@@ -36,6 +36,18 @@
     });
   }
 
+  document.querySelectorAll(".user-menu").forEach((menu) => {
+    document.addEventListener("click", (event) => {
+      if (!menu.contains(event.target)) menu.removeAttribute("open");
+    });
+    menu.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        menu.removeAttribute("open");
+        menu.querySelector("summary")?.focus();
+      }
+    });
+  });
+
   const form = document.querySelector("[data-destination-form]");
   if (form) {
     const visible = {

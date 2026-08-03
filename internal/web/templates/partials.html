@@ -19,11 +19,17 @@
     {{if .User}}<nav>
       <a href="/">Dashboard</a>
       <a href="/artists">Artists</a>
-      <a href="/artists/search">Add artists</a>
       <a href="/destinations">Notifications</a>
-      {{if eq .User.Role "admin"}}<a href="/admin">Admin</a>{{end}}
-      <form method="post" action="/logout" class="inline"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link">Sign out</button></form>
     </nav>{{end}}
+    {{if .User}}<details class="user-menu">
+      <summary aria-label="Open account menu" title="Account menu"><span class="user-avatar">{{initial .User.Email}}</span><span class="user-menu-label">{{.User.Email}}</span></summary>
+      <div class="user-menu-panel">
+        <strong>{{.User.Email}}</strong>
+        <a href="/settings">Settings</a>
+        {{if eq .User.Role "admin"}}<a href="/admin">Admin</a>{{end}}
+        <form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link">Sign out</button></form>
+      </div>
+    </details>{{end}}
     <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
       <span class="theme-icon theme-icon-moon" aria-hidden="true">☾</span>
       <span class="theme-icon theme-icon-sun" aria-hidden="true">☀</span>
