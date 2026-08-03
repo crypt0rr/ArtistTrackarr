@@ -921,14 +921,22 @@ func TestReleaseDetailRendersITunesReleaseWithProviderLinks(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 	page := string(body)
-	if response.StatusCode != http.StatusOK ||
-		!strings.Contains(page, "Release details") ||
-		!strings.Contains(page, "Detail Album") ||
-		!strings.Contains(page, "Source: iTunes") ||
-		!strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`) ||
-		!strings.Contains(page, `href="https://music.apple.com/us/album/detail-album" target="_blank" rel="noopener noreferrer"`) ||
-		strings.Contains(page, "Release unavailable") {
-		t.Fatalf("release detail status/body=%d %q", response.StatusCode, body)
+	checks := map[string]bool{
+		"status":    response.StatusCode == http.StatusOK,
+		"details":   strings.Contains(page, "Release details"),
+		"layout":    strings.Contains(page, `class="grid two release-layout"`),
+		"summary":   strings.Contains(page, `class="release-detail-summary"`),
+		"history":   strings.Contains(page, `release-history-panel`),
+		"title":     strings.Contains(page, "Detail Album"),
+		"source":    strings.Contains(page, "Source: iTunes"),
+		"art":       strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`),
+		"link":      strings.Contains(page, `href="https://music.apple.com/us/album/detail-album" target="_blank" rel="noopener noreferrer"`),
+		"available": !strings.Contains(page, "Release unavailable"),
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Fatalf("release detail check %s failed status/body=%d %q", name, response.StatusCode, body)
+		}
 	}
 }
 
