@@ -1671,19 +1671,19 @@ func releasePayloadHash(release Release) string {
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
 	var release Release
 	var secondary, observed string
-	var spotifyID, spotifyURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
+	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
 		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
 		itunes_id,itunes_url,itunes_artwork_url,source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &release.SpotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &release.Source, &observed,
+		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &release.Source, &observed,
 	)
 	if err != nil {
 		return Release{}, err
 	}
 	_ = json.Unmarshal([]byte(secondary), &release.SecondaryTypes)
-	release.SpotifyID, release.SpotifyURL = spotifyID.String, spotifyURL.String
+	release.SpotifyID, release.SpotifyURL, release.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
 	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
 	release.ITunesArtworkURL = itunesArtworkURL.String
 	release.FirstObservedAt, _ = parseTime(observed)
@@ -1865,10 +1865,7 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 }
 
 func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]Release, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
-		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC LIMIT ?`,
 		userID, limit)
 	if err != nil {
@@ -1892,10 +1889,7 @@ func (s *Store) DashboardReleases(
 	const preferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (SELECT 1 FROM release_groups external_release WHERE external_release.artist_id=rg.artist_id AND external_release.source IN ('spotify','itunes','both'))) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
 		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','itunes','both')
 	))`
-	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
-		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND `+definitelyFuture+`
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
 		userID, today, today, today, limit)
@@ -1907,10 +1901,7 @@ func (s *Store) DashboardReleases(
 	if err != nil {
 		return nil, nil, err
 	}
-	recentRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
-		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	recentRows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
 		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
 		userID, today, today, today, limit)
@@ -1930,14 +1921,14 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 	for rows.Next() {
 		var r Release
 		var secondary, observed string
-		var spotifyID, spotifyURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
+		var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 		if err := rows.Scan(&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 			&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-			&spotifyID, &spotifyURL, &r.SpotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed); err != nil {
+			&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(secondary), &r.SecondaryTypes)
-		r.SpotifyID, r.SpotifyURL = spotifyID.String, spotifyURL.String
+		r.SpotifyID, r.SpotifyURL, r.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
 		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 		r.ITunesArtworkURL = itunesArtworkURL.String
 		r.FirstObservedAt, _ = parseTime(observed)
@@ -1945,6 +1936,10 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 	}
 	return result, rows.Err()
 }
+
+const releaseSelectColumns = `rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
+	rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
+	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at`
 
 func (s *Store) AddDestination(ctx context.Context, userID int64, name, service string, encrypted []byte) error {
 	name, err := destinationName(name)
@@ -2541,8 +2536,7 @@ func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
 
 func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
 	var d ReleaseDetail
-	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
 	if err != nil {
 		return d, err
 	}

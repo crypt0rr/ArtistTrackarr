@@ -886,6 +886,161 @@ func TestDashboardRendersITunesArtworkWithAttribution(t *testing.T) {
 	}
 }
 
+func TestReleaseDetailRendersITunesReleaseWithProviderLinks(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "55555555-5555-4555-8555-555555555555", Name: "Detail Artist", SortName: "Detail Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	date := time.Now().UTC().AddDate(-1, 0, 0).Format("2006-01-02")
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:detail-123", ITunesID: "detail-123", Title: "Detail Album", PrimaryType: "Album",
+			FirstReleaseDate: date, DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/detail-album",
+			ITunesArtworkURL: "https://is1.mzstatic.com/image/250x250bb.jpg",
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := database.DB.QueryRow(`SELECT id FROM release_groups WHERE mbid=?`, "itunes:detail-123").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/releases/" + strconv.FormatInt(releaseID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(page, "Release details") ||
+		!strings.Contains(page, "Detail Album") ||
+		!strings.Contains(page, "Source: iTunes") ||
+		!strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`) ||
+		!strings.Contains(page, `href="https://music.apple.com/us/album/detail-album" target="_blank" rel="noopener noreferrer"`) ||
+		strings.Contains(page, "Release unavailable") {
+		t.Fatalf("release detail status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestReleaseDetailHandlesNullableProviderURLs(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "66666666-6666-4666-8666-666666666666", Name: "Nullable Artist", SortName: "Nullable Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:nullable-123", ITunesID: "nullable-123", Title: "Nullable Album", PrimaryType: "Album",
+			FirstReleaseDate: "2024-01-01", DatePrecision: 3,
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := database.DB.QueryRow(`SELECT id FROM release_groups WHERE mbid=?`, "itunes:nullable-123").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Exec(`UPDATE release_groups SET spotify_url=NULL,itunes_url=NULL WHERE id=?`, releaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/releases/" + strconv.FormatInt(releaseID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Nullable Album") {
+		t.Fatalf("nullable release detail status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestReleaseDetailUnavailableIsStyledAndOwnerScoped(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "77777777-7777-4777-8777-777777777777", Name: "Private Artist", SortName: "Private Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:private-123", ITunesID: "private-123", Title: "Private Album", PrimaryType: "Album",
+			FirstReleaseDate: "2024-01-01", DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/private-album",
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := database.DB.QueryRow(`SELECT id FROM release_groups WHERE mbid=?`, "itunes:private-123").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := database.CreateUser(context.Background(), "other-detail@example.com", "unused", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRaw, _, err := database.CreateSession(context.Background(), otherID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJar.SetCookies(serverURL, []*http.Cookie{{
+		Name: "artist_session", Value: security.SignedToken("the session secret has more than 32 bytes", otherRaw), Path: "/",
+	}})
+	otherClient := &http.Client{Jar: otherJar}
+
+	response, err := otherClient.Get(server.URL + "/releases/" + strconv.FormatInt(releaseID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusNotFound || !strings.Contains(page, "Release unavailable") ||
+		strings.Contains(page, "Private Album") || strings.Contains(page, "private-album") {
+		t.Fatalf("cross-user release detail status/body=%d %q", response.StatusCode, body)
+	}
+
+	response, err = client.Get(server.URL + "/releases/not-an-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound || !strings.Contains(string(body), "Release unavailable") {
+		t.Fatalf("invalid release detail status/body=%d %q", response.StatusCode, body)
+	}
+}
+
 func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
