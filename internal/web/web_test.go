@@ -300,6 +300,56 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 	}
 }
 
+func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	response, err := client.Get(server.URL + "/settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(page, `name="username"`) ||
+		!strings.Contains(page, "Your destinations") || !strings.Contains(page, "Notification preferences") ||
+		strings.Contains(page, `href="/destinations"`) {
+		t.Fatalf("settings page missing consolidated account controls: %q", page)
+	}
+
+	noFollow := *client
+	noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err = noFollow.Get(server.URL + "/destinations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != "/settings" {
+		t.Fatalf("destinations compatibility redirect status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
+	}
+
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	response = postForm(t, client, server.URL+"/settings/profile", url.Values{
+		"_csrf": {csrf}, "username": {"Listener"}, "timezone": {"UTC"}, "reminder_time": {"09:00"},
+	})
+	response.Body.Close()
+	user, err := database.UserByEmail(context.Background(), "member@example.com")
+	if err != nil || user.Username != "Listener" {
+		t.Fatalf("updated username=%q err=%v", user.Username, err)
+	}
+
+	response = postForm(t, client, server.URL+"/destinations", url.Values{
+		"_csrf": {csrf}, "name": {"Phone"}, "service": {"ntfy"}, "host": {"ntfy.sh"}, "topic": {"artisttrackarr"},
+	})
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("destination add status=%d", response.StatusCode)
+	}
+	pageBytes, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if !strings.Contains(string(pageBytes), "Phone") {
+		t.Fatalf("destination missing from settings response: %q", pageBytes)
+	}
+}
+
 func TestSearchFallsBackToMusicBrainz(t *testing.T) {
 	tests := []struct {
 		name    string

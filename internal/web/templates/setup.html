@@ -8,6 +8,7 @@
     {{template "csrf" .}}
     <label>Setup token<input name="setup_token" type="password" required autocomplete="off"></label>
     <label>Email<input name="email" type="email" required autocomplete="email"></label>
+    <label>Username<input name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9._-]{3,32}" autocomplete="username"><small>3–32 characters: letters, numbers, dots, underscores, or hyphens.</small></label>
     <label>Password<input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters.</small></label>
     <label>Timezone<input name="timezone" value="Europe/Amsterdam" required><small>Use an IANA timezone, for example Europe/Amsterdam.</small></label>
     <button>Create administrator</button>

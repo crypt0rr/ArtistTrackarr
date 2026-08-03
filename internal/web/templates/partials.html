@@ -19,12 +19,11 @@
     {{if .User}}<nav>
       <a href="/">Dashboard</a>
       <a href="/artists">Artists</a>
-      <a href="/destinations">Notifications</a>
     </nav>{{end}}
     {{if .User}}<details class="user-menu">
-      <summary aria-label="Open account menu" title="Account menu"><span class="user-avatar">{{initial .User.Email}}</span><span class="user-menu-label">{{.User.Email}}</span></summary>
+      <summary aria-label="Open account menu" title="Account menu"><span class="user-avatar">{{initial .User.Username}}</span><span class="user-menu-label">{{.User.Username}}</span></summary>
       <div class="user-menu-panel">
-        <strong>{{.User.Email}}</strong>
+        <strong>{{.User.Username}}<small>{{.User.Email}}</small></strong>
         <a href="/settings">Settings</a>
         {{if eq .User.Role "admin"}}<a href="/admin">Admin</a>{{end}}
         <form method="post" action="/logout"><input type="hidden" name="_csrf" value="{{.CSRF}}"><button class="link">Sign out</button></form>
@@ -44,3 +43,57 @@
 {{define "foot"}}</main><footer><div class="footer-inner"><span>Self-hosted · Music data by <a href="https://musicbrainz.org" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{if .SpotifyOn}} and <a href="https://spotify.com" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}} with Apple/iTunes fallback metadata.</span><span class="footer-meta"><span class="app-version">v{{.Version}}</span><a class="github-link" href="https://github.com/crypt0rr/ArtistTrackarr" target="_blank" rel="noopener noreferrer" aria-label="ArtistTrackarr on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.72.5.1.68-.22.68-.48v-1.7c-2.78.62-3.37-1.2-3.37-1.2-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .08 1.53 1.06 1.53 1.06.9 1.56 2.35 1.11 2.92.85.09-.66.35-1.11.64-1.37-2.22-.26-4.56-1.14-4.56-5.08 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.16 9.16 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.36.32.68.95.68 1.92v1.43c0 .27.18.59.69.48A10.27 10.27 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg><span>GitHub</span></a></span></div></footer><script src="/static/app.js"></script></body></html>{{end}}
 {{define "csrf"}}<input type="hidden" name="_csrf" value="{{.CSRF}}">{{end}}
 {{define "auth-logo"}}<img class="auth-logo" src="/static/logo-full.png" width="960" height="311" alt="ArtistTrackarr">{{end}}
+{{define "notification-settings"}}
+<section class="settings-notifications">
+  <section class="panel">
+    <div class="section-head"><div><p class="eyebrow">Delivery</p><h2>Your destinations</h2><p>Credentials are encrypted at rest. Send a test after adding a destination.</p></div><span class="badge">{{len .Destinations}} configured</span></div>
+    {{if .Destinations}}<div class="list">{{range .Destinations}}<article class="list-row">
+      <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span>
+        <details class="rename"><summary>Rename</summary>
+          <form method="post" action="/destinations/{{.ID}}/rename" class="rename-form">
+            {{template "csrf" $}}<label>New name<input name="name" value="{{.Name}}" maxlength="80" required></label><button class="secondary">Save</button>
+          </form>
+        </details>
+      </div>
+      <div class="actions"><form method="post" action="/destinations/{{.ID}}/test" class="inline">{{template "csrf" $}}<button class="secondary">Send test</button></form>
+      <form method="post" action="/destinations/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Delete</button></form></div>
+    </article>{{end}}</div>{{else}}<div class="empty">No destinations configured yet.</div>{{end}}
+  </section>
+  <section class="panel">
+    <p class="eyebrow">Add</p><h2>Add destination</h2>
+    <form method="post" action="/destinations" class="stack" data-destination-form>
+      {{template "csrf" .}}
+      <label>Name<input name="name" required placeholder="My phone"></label>
+      <label>Service<select name="service" data-service>
+        <option value="ntfy">ntfy</option><option value="email">Email / SMTP</option>
+        <option value="discord">Discord</option><option value="telegram">Telegram</option>
+        <option value="gotify">Gotify</option><option value="generic">Generic webhook</option>
+        <option value="advanced">Advanced Shoutrrr URL</option>
+      </select></label>
+      <div data-field="host"><label>Host<input name="host" placeholder="ntfy.sh"></label></div>
+      <div data-field="port"><label>Port<input name="port" placeholder="587"></label></div>
+      <div data-field="username"><label>Username<input name="username" autocomplete="off"></label></div>
+      <div data-field="password"><label>Password<input name="password" type="password" autocomplete="new-password"></label></div>
+      <div data-field="token"><label>Token<input name="token" type="password" autocomplete="off"></label></div>
+      <div data-field="target"><label>Target / chat / webhook URL<input name="target"></label></div>
+      <div data-field="topic"><label>Topic<input name="topic"></label></div>
+      <div data-field="from"><label>From address<input name="from" type="email"></label></div>
+      <div data-field="to"><label>Recipient(s)<input name="to" placeholder="person@example.com"></label></div>
+      <div data-field="raw_url"><label>Shoutrrr URL<input name="raw_url" type="password" autocomplete="off"></label></div>
+      <button>Add destination</button>
+    </form>
+  </section>
+  <section class="panel notification-preferences">
+    <p class="eyebrow">Alerts</p><h2>Notification preferences</h2><p>Choose which release types and notification moments should be delivered to your destinations.</p>
+    <form method="post" action="/settings/preferences" class="stack compact">
+      {{template "csrf" .}}
+      <label class="check"><input type="checkbox" name="albums" {{if .Preferences.Albums}}checked{{end}}> Albums</label>
+      <label class="check"><input type="checkbox" name="eps" {{if .Preferences.EPs}}checked{{end}}> EPs</label>
+      <label class="check"><input type="checkbox" name="singles" {{if .Preferences.Singles}}checked{{end}}> Singles</label>
+      <label class="check"><input type="checkbox" name="announcements" {{if .Preferences.Announcements}}checked{{end}}> New-release announcements</label>
+      <label class="check"><input type="checkbox" name="release_day" {{if .Preferences.ReleaseDay}}checked{{end}}> Release-day reminders</label>
+      <button>Save notification preferences</button>
+    </form>
+  </section>
+</section>
+{{end}}

@@ -26,7 +26,7 @@ deployment:
    ```
 
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
-   first administrator.
+   first administrator with a unique username.
 
 Application data is stored in the legacy-named `artist-tracker-data` Docker
 volume so existing installations can upgrade without moving their data. The
@@ -53,12 +53,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.15.0` publishes `0.15.0`, `0.15`, and `latest`.
+- Pushing a tag such as `v0.16.0` publishes `0.16.0`, `0.16`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.15.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.16.0 docker compose up -d
 ```
 
 ## Configuration
@@ -139,11 +139,15 @@ and scheduled for the normal baseline sync; invalid rows remain visible in the
 owner-only import results page and do not prevent valid rows from being
 applied. Provider calls are never made during the upload request.
 
-The account menu links to personal Settings, where each household member can
-set their own timezone, release-day reminder time, and notification
-preferences. Notifications remain available as a top-level destination
-management page, while household account administration remains restricted to
-the Admin page.
+The account menu shows each member's unique username and links to personal
+Settings, where they can update their username, timezone, release-day reminder
+time, notification preferences, and all notification destinations. The old
+`/destinations` address redirects to Settings for compatibility, while
+household account administration remains restricted to the Admin page.
+
+Usernames are case-insensitive, 3–32 characters, and may contain letters,
+numbers, dots, underscores, and hyphens. Existing accounts receive a
+deterministic username during the v0.16.0 migration and can change it later.
 
 Public [ListenBrainz popularity](https://listenbrainz.readthedocs.io/en/latest/users/api/popularity.html) is refreshed once per day for followed canonical
 artists. Artist pages show aggregate listen and listener counts when available;

@@ -25,7 +25,7 @@
     <table class="user-table">
       <thead><tr><th>Account</th><th>Reminders</th><th>Usage</th><th>Joined</th><th>Actions</th></tr></thead>
       <tbody>{{range .AdminUsers}}<tr>
-        <td><strong>{{.Email}}</strong><small>{{.Role}}{{if eq .ID $.User.ID}} · Current account{{end}}</small></td>
+        <td><strong>{{.Username}}</strong><small>{{.Email}} · {{.Role}}{{if eq .ID $.User.ID}} · Current account{{end}}</small></td>
         <td><strong>{{.ReminderTime}}</strong><small>{{.Timezone}}</small></td>
         <td><strong>{{.FollowCount}} artist{{if ne .FollowCount 1}}s{{end}}</strong><small>{{.DestinationCount}} destination{{if ne .DestinationCount 1}}s{{end}}</small></td>
         <td><small>{{formatTime .CreatedAt}}</small></td>

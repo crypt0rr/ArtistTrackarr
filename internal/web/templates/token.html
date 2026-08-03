@@ -4,6 +4,7 @@
   {{if eq .TokenKind "invite"}}<p class="eyebrow">Household invitation</p><h1>Create your account</h1>{{else}}<p class="eyebrow">Account recovery</p><h1>Choose a new password</h1>{{end}}
   <form method="post" action="/{{.TokenKind}}/{{.Token}}" class="stack">
     {{template "csrf" .}}
+    {{if eq .TokenKind "invite"}}<label>Username<input name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9._-]{3,32}" autocomplete="username"><small>3–32 characters: letters, numbers, dots, underscores, or hyphens.</small></label>{{end}}
     <label>New password<input name="password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters.</small></label>
     {{if eq .TokenKind "invite"}}<label>Timezone<input name="timezone" value="Europe/Amsterdam" required></label>{{end}}
     <button>{{if eq .TokenKind "invite"}}Create account{{else}}Update password{{end}}</button>

@@ -32,6 +32,7 @@ type Store struct{ DB *sql.DB }
 type User struct {
 	ID           int64
 	Email        string
+	Username     string
 	PasswordHash string
 	Role         string
 	Timezone     string
@@ -51,6 +52,7 @@ type NotificationPreferences struct {
 type AdminUser struct {
 	ID               int64
 	Email            string
+	Username         string
 	Role             string
 	Timezone         string
 	ReminderTime     string
@@ -63,6 +65,8 @@ var (
 	ErrAdminRequired    = errors.New("administrator access is required")
 	ErrCannotDeleteSelf = errors.New("you cannot delete your own account")
 	ErrLastAdmin        = errors.New("the last administrator cannot be deleted")
+	ErrInvalidUsername  = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
+	ErrUsernameTaken    = errors.New("that username is already in use")
 )
 
 type Session struct {
@@ -334,6 +338,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 			continue
 		}
+		if version == 11 {
+			if err := s.migrateUsernames(ctx, body); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+			continue
+		}
 		tx, err := s.DB.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -350,6 +360,58 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrateUsernames adds the required username column and deterministically
+// fills legacy rows before creating the case-insensitive uniqueness index.
+// It is kept as a Go migration because SQLite does not provide a portable way
+// to sanitize arbitrary email local-parts in a single ALTER TABLE statement.
+func (s *Store) migrateUsernames(ctx context.Context, body []byte) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(e error) error { _ = tx.Rollback(); return e }
+	if _, err = tx.ExecContext(ctx, string(body)); err != nil {
+		return rollback(err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,email FROM users ORDER BY id`)
+	if err != nil {
+		return rollback(err)
+	}
+	type legacyUser struct {
+		id    int64
+		email string
+	}
+	var users []legacyUser
+	for rows.Next() {
+		var user legacyUser
+		if err := rows.Scan(&user.id, &user.email); err != nil {
+			rows.Close()
+			return rollback(err)
+		}
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return rollback(err)
+	}
+	rows.Close()
+	taken := make(map[string]struct{}, len(users))
+	for _, user := range users {
+		name := derivedUsername(user.email, user.id, taken)
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET username=? WHERE id=?`, name, user.id); err != nil {
+			return rollback(err)
+		}
+		taken[strings.ToLower(name)] = struct{}{}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users(username COLLATE NOCASE)`); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(11,?)`, nowText()); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
 }
 
 // migrateITunesFallback rebuilds the two tables whose provider CHECK
@@ -462,7 +524,65 @@ func (s *Store) UserCount(ctx context.Context) (int, error) {
 	return n, s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 }
 
-func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone string) (int64, error) {
+func validateUsername(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || len(value) > 32 {
+		return "", ErrInvalidUsername
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return "", ErrInvalidUsername
+	}
+	return value, nil
+}
+
+func derivedUsername(email string, id int64, taken map[string]struct{}) string {
+	local := email
+	if at := strings.IndexByte(local, '@'); at >= 0 {
+		local = local[:at]
+	}
+	var b strings.Builder
+	lastSeparator := false
+	for _, r := range strings.ToLower(local) {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
+		if valid {
+			b.WriteRune(r)
+			lastSeparator = r == '.' || r == '_' || r == '-'
+		} else if !lastSeparator && b.Len() > 0 {
+			b.WriteByte('-')
+			lastSeparator = true
+		}
+	}
+	base := strings.Trim(b.String(), "._-")
+	if len(base) < 3 {
+		base = fmt.Sprintf("user-%d", id)
+	}
+	if len(base) > 32 {
+		base = base[:32]
+	}
+	for ordinal := 1; ; ordinal++ {
+		candidate := base
+		if ordinal > 1 {
+			suffix := fmt.Sprintf("-%d", ordinal)
+			candidate = base
+			if len(candidate)+len(suffix) > 32 {
+				candidate = candidate[:32-len(suffix)]
+			}
+			candidate += suffix
+		}
+		if _, exists := taken[strings.ToLower(candidate)]; !exists {
+			return candidate
+		}
+	}
+}
+
+// CreateUser accepts an optional username to keep internal callers and
+// integrations built against earlier versions source-compatible. When omitted
+// or empty, a deterministic username is generated from the email address.
+func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone string, usernames ...string) (int64, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, errors.New("a valid email address is required")
@@ -470,9 +590,50 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone stri
 	if _, err := time.LoadLocation(timezone); err != nil {
 		return 0, errors.New("invalid IANA timezone")
 	}
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO users(email,password_hash,role,timezone,created_at)
-		VALUES(?,?,?,?,?)`, email, hash, role, timezone, nowText())
+	username := ""
+	if len(usernames) > 0 {
+		username = strings.TrimSpace(usernames[0])
+	}
+	if username == "" {
+		var id int64
+		if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
+			return 0, err
+		}
+		var existing []string
+		rows, err := s.DB.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+		if err != nil {
+			return 0, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return 0, err
+			}
+			existing = append(existing, name)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		rows.Close()
+		taken := make(map[string]struct{}, len(existing))
+		for _, name := range existing {
+			taken[strings.ToLower(name)] = struct{}{}
+		}
+		username = derivedUsername(email, id, taken)
+	}
+	validatedUsername, err := validateUsername(username)
 	if err != nil {
+		return 0, err
+	}
+	username = validatedUsername
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
+		VALUES(?,?,?,?,?,?)`, email, username, hash, role, timezone, nowText())
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "users.username") || strings.Contains(strings.ToLower(err.Error()), "username") {
+			return 0, ErrUsernameTaken
+		}
 		return 0, err
 	}
 	return result.LastInsertId()
@@ -481,28 +642,28 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone stri
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var created string
-	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.Timezone, &u.ReminderTime, &created)
+	err := row.Scan(&u.ID, &u.Email, &u.Username, &u.PasswordHash, &u.Role, &u.Timezone, &u.ReminderTime, &created)
 	u.CreatedAt, _ = parseTime(created)
 	return u, err
 }
 
 func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,password_hash,role,timezone,reminder_time,created_at
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
 		FROM users WHERE email=?`, strings.ToLower(strings.TrimSpace(email))))
 }
 
 func (s *Store) UserByID(ctx context.Context, id int64) (User, error) {
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,password_hash,role,timezone,reminder_time,created_at
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
 		FROM users WHERE id=?`, id))
 }
 
 func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT u.id,u.email,u.role,u.timezone,u.reminder_time,u.created_at,
+	rows, err := s.DB.QueryContext(ctx, `SELECT u.id,u.email,u.username,u.role,u.timezone,u.reminder_time,u.created_at,
 		COUNT(DISTINCT f.artist_id),COUNT(DISTINCT d.id)
 		FROM users u
 		LEFT JOIN follows f ON f.user_id=u.id
 		LEFT JOIN destinations d ON d.user_id=u.id
-		GROUP BY u.id,u.email,u.role,u.timezone,u.reminder_time,u.created_at
+		GROUP BY u.id,u.email,u.username,u.role,u.timezone,u.reminder_time,u.created_at
 		ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END,lower(u.email)`)
 	if err != nil {
 		return nil, err
@@ -513,7 +674,7 @@ func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
 		var user AdminUser
 		var created string
 		if err := rows.Scan(
-			&user.ID, &user.Email, &user.Role, &user.Timezone, &user.ReminderTime, &created,
+			&user.ID, &user.Email, &user.Username, &user.Role, &user.Timezone, &user.ReminderTime, &created,
 			&user.FollowCount, &user.DestinationCount,
 		); err != nil {
 			return nil, err
@@ -581,15 +742,84 @@ func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) e
 	return tx.Commit()
 }
 
-func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, reminder string) error {
+func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, reminder string, usernames ...string) error {
 	if _, err := time.LoadLocation(timezone); err != nil {
 		return errors.New("invalid IANA timezone")
 	}
 	if _, err := time.Parse("15:04", reminder); err != nil {
 		return errors.New("reminder time must use HH:MM")
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE users SET timezone=?, reminder_time=? WHERE id=?`, timezone, reminder, userID)
+	if len(usernames) == 0 {
+		_, err := s.DB.ExecContext(ctx, `UPDATE users SET timezone=?, reminder_time=? WHERE id=?`, timezone, reminder, userID)
+		return err
+	}
+	username, err := validateUsername(usernames[0])
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, reminder, userID)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "username") {
+		return ErrUsernameTaken
+	}
 	return err
+}
+
+// CreateUserFromInvite consumes an invitation and creates its account in one
+// transaction. Validation and uniqueness failures therefore leave the token
+// available for correction and retry.
+func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, timezone string) error {
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return errors.New("invalid IANA timezone")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var email string
+	if err := tx.QueryRowContext(ctx, `SELECT email FROM auth_tokens WHERE token_hash=? AND kind='invite' AND used_at IS NULL AND expires_at>?`, security.Digest(raw), nowText()).Scan(&email); err != nil {
+		return err
+	}
+	if strings.TrimSpace(username) == "" {
+		var nextID int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&nextID); err != nil {
+			return err
+		}
+		taken := make(map[string]struct{})
+		rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return err
+			}
+			taken[strings.ToLower(name)] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		username = derivedUsername(email, nextID, taken)
+	}
+	username, err = validateUsername(username)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at) VALUES(?,?,?,'member',?,?)`, email, username, hash, timezone, nowText())
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "username") {
+			return ErrUsernameTaken
+		}
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=? AND kind='invite'`, nowText(), security.Digest(raw)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (raw, csrf string, err error) {
@@ -610,10 +840,10 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 func (s *Store) Session(ctx context.Context, raw string) (Session, error) {
 	var session Session
 	var expires, created string
-	err := s.DB.QueryRowContext(ctx, `SELECT u.id,u.email,u.password_hash,u.role,u.timezone,u.reminder_time,u.created_at,
+	err := s.DB.QueryRowContext(ctx, `SELECT u.id,u.email,u.username,u.password_hash,u.role,u.timezone,u.reminder_time,u.created_at,
 		s.csrf_token,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
 		WHERE s.token_hash=? AND s.expires_at>?`, security.Digest(raw), nowText()).Scan(
-		&session.User.ID, &session.User.Email, &session.User.PasswordHash, &session.User.Role,
+		&session.User.ID, &session.User.Email, &session.User.Username, &session.User.PasswordHash, &session.User.Role,
 		&session.User.Timezone, &session.User.ReminderTime, &created, &session.CSRFToken, &expires)
 	session.User.CreatedAt, _ = parseTime(created)
 	session.ExpiresAt, _ = parseTime(expires)

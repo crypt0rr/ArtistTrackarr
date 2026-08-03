@@ -86,6 +86,13 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=9`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("artwork migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=11`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("username migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var legacyUsername string
+	if err := db.QueryRow(`SELECT username FROM users WHERE id=?`, userID).Scan(&legacyUsername); err != nil || legacyUsername != "legacy" {
+		t.Fatalf("legacy username=%q err=%v", legacyUsername, err)
+	}
 	var artworkURL string
 	if err := db.QueryRow(`SELECT itunes_artwork_url FROM release_groups WHERE id=?`, releaseID).Scan(&artworkURL); err != nil || artworkURL != "" {
 		t.Fatalf("legacy artwork URL=%q err=%v", artworkURL, err)
@@ -1024,6 +1031,50 @@ func TestAdminUsersAndDeleteUser(t *testing.T) {
 	}
 	if err := s.DeleteUser(ctx, adminID, 99999); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing user delete error=%v", err)
+	}
+}
+
+func TestUsernamesAreValidatedUniqueAndEditable(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	firstID, err := s.CreateUser(ctx, "first@example.com", "hash", "member", "UTC", "Household.User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateUser(ctx, "second@example.com", "hash", "member", "UTC", "household.user"); !errors.Is(err, ErrUsernameTaken) {
+		t.Fatalf("duplicate username error=%v", err)
+	}
+	if _, err := s.CreateUser(ctx, "invalid@example.com", "hash", "member", "UTC", "no spaces"); !errors.Is(err, ErrInvalidUsername) {
+		t.Fatalf("invalid username error=%v", err)
+	}
+	if err := s.UpdateProfile(ctx, firstID, "Europe/Amsterdam", "08:30", "New.Name"); err != nil {
+		t.Fatal(err)
+	}
+	user, err := s.UserByID(ctx, firstID)
+	if err != nil || user.Username != "New.Name" || user.Timezone != "Europe/Amsterdam" || user.ReminderTime != "08:30" {
+		t.Fatalf("updated user=%#v err=%v", user, err)
+	}
+}
+
+func TestInviteUsernameFailureDoesNotConsumeToken(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	adminID, err := s.CreateUser(ctx, "admin@example.com", "hash", "admin", "UTC", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateAuthToken(ctx, "invite", "member@example.com", nil, adminID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUserFromInvite(ctx, token, "hash", "bad name", "UTC"); !errors.Is(err, ErrInvalidUsername) {
+		t.Fatalf("invalid invite username error=%v", err)
+	}
+	if err := s.CreateUserFromInvite(ctx, token, "hash", "member", "UTC"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserByEmail(ctx, "member@example.com"); err != nil {
+		t.Fatal(err)
 	}
 }
 
