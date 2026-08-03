@@ -47,12 +47,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.11.0` publishes `0.11.0`, `0.11`, and `latest`.
+- Pushing a tag such as `v0.12.0` publishes `0.12.0`, `0.12`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.11.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.12.0 docker compose up -d
 ```
 
 ## Configuration
@@ -124,9 +124,14 @@ client-credentials search and release-observation flow.
 ## Artist management
 
 The **Add artists** page combines individual search, multi-select following,
-and watchlist export. Exports contain canonical MusicBrainz URLs and IDs plus
-optional Spotify identifiers for backups and external processing. Bulk import
-is not currently available.
+watchlist export, and ArtistTrackarr CSV import. An export can be uploaded
+unchanged for a round trip: the six exported columns are required (in any
+order), while unknown future columns are ignored. Imports are limited to 1 MiB
+and 500 data rows, validate canonical MusicBrainz and optional Spotify
+identities locally, and process rows independently. Added rows are followed
+and scheduled for the normal baseline sync; invalid rows remain visible in the
+owner-only import results page and do not prevent valid rows from being
+applied. Provider calls are never made during the upload request.
 
 ## Notification destinations
 
@@ -139,6 +144,13 @@ Users can choose whether albums, EPs, singles, announcements, and release-day
 reminders should be delivered. Followed artists show their last and next
 synchronization times, and **Sync now** queues a rate-limited refresh. Release
 details expose the stored provider observations and source history.
+
+Expired sessions and authentication tokens are removed during periodic state
+maintenance. Login-attempt records older than 24 hours and completed or failed
+manual sync requests older than 30 days are removed. Import jobs older than 30
+days (including their rows) are removed; notification and delivery history is
+retained, application logs keep their existing seven-day window, and recent
+queued work is not deleted.
 
 ## Household administration
 

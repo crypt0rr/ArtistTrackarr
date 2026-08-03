@@ -41,4 +41,12 @@
     <div class="actions"><span class="badge">{{.FollowCount}} followed</span><a class="button secondary" href="/artists/export">Export CSV</a></div>
   </div>
 </section>
+<section class="panel watchlist-import">
+  <div class="section-head"><div><p class="eyebrow">Watchlist restore</p><h2>Import followed artists</h2><p>Upload an ArtistTrackarr CSV export. Files are limited to 1 MiB and 500 data rows; valid rows are applied even when others need attention.</p></div></div>
+  <form method="post" action="/artists/import" enctype="multipart/form-data" class="actions import-form">
+    {{template "csrf" .}}
+    <label class="file-field">ArtistTrackarr CSV<input type="file" name="file" accept=".csv,text/csv" required></label>
+    <button type="submit">Import CSV</button>
+  </form>
+</section>
 {{template "foot" .}}
