@@ -23,25 +23,29 @@
 {{if .UpcomingReleases}}<section class="panel release-section">
   <p class="eyebrow">Coming soon</p><h2>Upcoming releases</h2>
   <div class="release-grid">{{range .UpcomingReleases}}
-  <a class="release-card" href="/releases/{{.ID}}">
-    {{if and (eq .Source "spotify") .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
-    {{else}}<img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}">{{end}}
-    <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-      <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
-    </span>
-  </a>
+  <article class="release-card">
+    <a class="release-card-link" href="/releases/{{.ID}}">
+      <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
+      <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
+      </span>
+    </a>
+    {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}
+  </article>
   {{end}}</div>
 </section>{{end}}
 <section class="panel release-section">
   <p class="eyebrow">Catalog</p><h2>Latest known releases</h2>
   {{if .RecentReleases}}<div class="release-grid">{{range .RecentReleases}}
-  <a class="release-card" href="/releases/{{.ID}}">
-    {{if and (eq .Source "spotify") .SpotifyImageURL}}<img src="{{.SpotifyImageURL}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
-    {{else}}<img src="/art/release-group/{{.MBID}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}">{{end}}
-    <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-      <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
-    </span>
-  </a>
+  <article class="release-card">
+    <a class="release-card-link" href="/releases/{{.ID}}">
+      <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
+      <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
+      </span>
+    </a>
+    {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}
+  </article>
   {{end}}</div>{{else}}<div class="empty">Past releases appear after the first catalog sync.</div>{{end}}
 </section>
 <section class="panel">

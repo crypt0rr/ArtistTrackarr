@@ -620,7 +620,9 @@ func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 	if count, err := database.FollowedArtistCount(context.Background(), user.ID); err != nil || count != 1 {
 		t.Fatalf("imported follow count=%d err=%v", count, err)
 	}
-	if !strings.Contains(response.Header.Get("Content-Security-Policy"), "script-src 'self'") {
+	if !strings.Contains(response.Header.Get("Content-Security-Policy"), "script-src 'self'") ||
+		!strings.Contains(response.Header.Get("Content-Security-Policy"), "https://*.mzstatic.com") ||
+		!strings.Contains(response.Header.Get("Content-Security-Policy"), "https://*.itunes.apple.com") {
 		t.Fatalf("import response CSP=%q", response.Header.Get("Content-Security-Policy"))
 	}
 }
@@ -842,6 +844,45 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 		!strings.Contains(page, "1. KRUIS") || !strings.Contains(page, "EP · Spotify") ||
 		strings.Contains(page, `href="/artists/search" target="_blank"`) {
 		t.Fatalf("Spotify release dashboard status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestDashboardRendersITunesArtworkWithAttribution(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, _ := database.UserByEmail(context.Background(), "member@example.com")
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "44444444-4444-4444-8444-444444444444", Name: "Example iTunes", SortName: "Example iTunes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	date := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02")
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:987", ITunesID: "987", Title: "Apple Release", PrimaryType: "Album",
+			FirstReleaseDate: date, DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/apple-release",
+			ITunesArtworkURL: "https://is1.mzstatic.com/image/250x250bb.jpg",
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK ||
+		!strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`) ||
+		!strings.Contains(page, "Artwork provided courtesy of iTunes") ||
+		!strings.Contains(page, `href="https://music.apple.com/us/album/apple-release" target="_blank" rel="noopener noreferrer"`) ||
+		!strings.Contains(page, `data-artwork-fallback="/art/release-group/itunes:987"`) {
+		t.Fatalf("iTunes artwork dashboard status/body=%d %q", response.StatusCode, body)
 	}
 }
 

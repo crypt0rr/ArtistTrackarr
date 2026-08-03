@@ -65,7 +65,7 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, `{"results":[
 				{"wrapperType":"artist","artistId":123,"artistName":"Example"},
-				{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"One","collectionArtistName":"Example","trackCount":1,"releaseDate":"2026-01-02T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/one"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"One","collectionArtistName":"Example","trackCount":1,"releaseDate":"2026-01-02T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/one","artworkUrl100":"http://is1-ssl.mzstatic.com/image/thumb/Features/100x100bb.jpg"},
 				{"wrapperType":"collection","collectionType":"Album","collectionId":2,"collectionName":"Short EP","collectionArtistName":"Example","trackCount":4,"releaseDate":"2025-02-01T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/ep"},
 				{"wrapperType":"collection","collectionType":"Album","collectionId":3,"collectionName":"Long","collectionArtistName":"Example","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"},
 				{"wrapperType":"collection","collectionType":"Album","collectionId":4,"collectionName":"Other Artist","collectionArtistName":"Other","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"}
@@ -85,9 +85,30 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 	if err != nil || len(first) != 3 || first[0].PrimaryType != "Single" || first[1].PrimaryType != "EP" || first[2].PrimaryType != "Album" {
 		t.Fatalf("releases=%#v err=%v", first, err)
 	}
+	if first[0].ITunesArtworkURL != "https://is1-ssl.mzstatic.com/image/thumb/Features/250x250bb.jpg" {
+		t.Fatalf("normalized artwork=%q", first[0].ITunesArtworkURL)
+	}
 	second, err := itunes.ArtistReleases(context.Background(), "Example")
 	if err != nil || len(second) != len(first) || searchRequests.Load() != 1 || releaseRequests.Load() != 1 {
 		t.Fatalf("cached releases=%#v search=%d lookup=%d err=%v", second, searchRequests.Load(), releaseRequests.Load(), err)
+	}
+}
+
+func TestNormalizeITunesArtworkURLRejectsUntrustedHosts(t *testing.T) {
+	valid := normalizeITunesArtworkURL("http://is2.mzstatic.com/image/100x100bb.jpg")
+	if valid != "https://is2.mzstatic.com/image/250x250bb.jpg" {
+		t.Fatalf("valid artwork=%q", valid)
+	}
+	for _, value := range []string{
+		"https://example.com/image/100x100.jpg",
+		"https://mzstatic.com/image.jpg?token=secret",
+		"https://is1.mzstatic.com:8443/image.jpg",
+		"javascript:alert(1)",
+		"https://itunes.apple.com/image.jpg#fragment",
+	} {
+		if got := normalizeITunesArtworkURL(value); got != "" {
+			t.Fatalf("artwork %q normalized to untrusted %q", value, got)
+		}
 	}
 }
 

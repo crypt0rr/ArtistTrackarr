@@ -32,8 +32,13 @@ volume so existing installations can upgrade without moving their data. The
 app supports a single running replica. Docker Compose names that container
 `artist-trackarr` for predictable logs and administration commands.
 
-Release-group artwork is loaded from the Cover Art Archive and cached alongside
-the database in the persistent data volume.
+Release-group artwork follows a validated cascade: Spotify artwork first,
+then direct Apple/iTunes artwork, then Cover Art Archive artwork for real
+MusicBrainz IDs, and finally a local placeholder. Apple artwork is loaded
+directly by the browser and is never stored, cached, or proxied by the app;
+the dashboard labels it with Apple attribution and an Apple Music link. A
+bounded background backfill gradually fills artwork on existing iTunes
+releases without creating releases or notifications.
 
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
@@ -47,12 +52,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.12.0` publishes `0.12.0`, `0.12`, and `latest`.
+- Pushing a tag such as `v0.12.1` publishes `0.12.1`, `0.12`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.12.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.12.1 docker compose up -d
 ```
 
 ## Configuration
@@ -101,7 +106,7 @@ also means selecting an artist directly from a recent search does not trigger a
 second lookup request. Batch follow actions use Spotify's multiple-artist
 endpoint when available. Artists are assigned stable polling offsets so a large
 watch list is spread across the day instead of queried in one burst.
-Apple/iTunes release observations are best-effort and are matched by canonical artist name. Collections are classified as Album, EP, or Single using track-count/title heuristics; no iTunes artwork is retained. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
+Apple/iTunes release observations are best-effort and are matched by canonical artist name. Collections are classified as Album, EP, or Single using track-count/title heuristics. Apple artwork URLs are accepted only from Apple hosts, loaded directly with attribution, and never downloaded or retained as image bytes. Existing artwork gaps are backfilled one artist at a time using the same conservative limiter. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
 
 iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `SPOTIFY_MARKET` (default `US`), and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.
 

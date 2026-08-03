@@ -83,6 +83,13 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=9`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("artwork migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var artworkURL string
+	if err := db.QueryRow(`SELECT itunes_artwork_url FROM release_groups WHERE id=?`, releaseID).Scan(&artworkURL); err != nil || artworkURL != "" {
+		t.Fatalf("legacy artwork URL=%q err=%v", artworkURL, err)
+	}
 	var source, itunesID string
 	if err := db.QueryRow(`SELECT source,COALESCE(itunes_id,'') FROM release_groups WHERE id=?`, releaseID).Scan(&source, &itunesID); err != nil || source != "spotify" || itunesID != "" {
 		t.Fatalf("legacy release source=%q itunes=%q err=%v", source, itunesID, err)
@@ -210,7 +217,7 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	observed := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	itunesRelease := Release{MBID: "itunes:123", Title: "A Release", PrimaryType: "EP", FirstReleaseDate: "2026-08-01", DatePrecision: 3, ITunesID: "123", ITunesURL: "https://music.apple.com/us/album/a-release"}
+	itunesRelease := Release{MBID: "itunes:123", Title: "A Release", PrimaryType: "EP", FirstReleaseDate: "2026-08-01", DatePrecision: 3, ITunesID: "123", ITunesURL: "https://music.apple.com/us/album/a-release", ITunesArtworkURL: "https://is1.mzstatic.com/image/250x250bb.jpg"}
 	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{itunesRelease}}}, observed); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +226,7 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	releases, err := s.RecentReleases(ctx, userID, 10)
-	if err != nil || len(releases) != 1 || releases[0].MBID != "mb-release" || releases[0].Source != "both" || releases[0].ITunesID != "123" {
+	if err != nil || len(releases) != 1 || releases[0].MBID != "mb-release" || releases[0].Source != "both" || releases[0].ITunesID != "123" || releases[0].ITunesArtworkURL == "" {
 		t.Fatalf("merged releases=%#v err=%v", releases, err)
 	}
 	var observations, events int
@@ -231,6 +238,57 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 	}
 	if observations != 2 || events != 1 {
 		t.Fatalf("observations=%d events=%d", observations, events)
+	}
+}
+
+func TestITunesArtworkBackfillDoesNotCreateNotifications(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "artwork@example.com", "hash", "member", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "artwork-artist", Name: "Artwork Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{{
+		MBID: "itunes:456", Title: "No Art Yet", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+		ITunesID: "456", ITunesURL: "https://music.apple.com/us/album/no-art",
+	}}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`UPDATE release_groups SET itunes_artwork_next_check_at=? WHERE itunes_id=?`, timeText(now.Add(-time.Minute)), "456"); err != nil {
+		t.Fatal(err)
+	}
+	artistDue, ok, err := s.DueITunesArtworkArtist(ctx, now)
+	if err != nil || !ok || artistDue.ID != artist.ID {
+		t.Fatalf("due artist=%#v ok=%v err=%v", artistDue, ok, err)
+	}
+	checked, updated, err := s.ApplyITunesArtworkBackfill(ctx, artist.ID, []Release{{
+		ITunesID: "456", ITunesArtworkURL: "https://is2.mzstatic.com/image/250x250bb.jpg",
+	}}, now.Add(time.Minute))
+	if err != nil || checked != 1 || updated != 1 {
+		t.Fatalf("backfill checked=%d updated=%d err=%v", checked, updated, err)
+	}
+	releases, err := s.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].ITunesArtworkURL == "" {
+		t.Fatalf("backfilled releases=%#v err=%v", releases, err)
+	}
+	var after int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("backfill notification count changed from %d to %d", before, after)
 	}
 }
 

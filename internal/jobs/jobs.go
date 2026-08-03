@@ -66,6 +66,12 @@ type deliveryStats struct {
 	Failed    int
 }
 
+type artworkBackfillStats struct {
+	ArtistID int64
+	Checked  int
+	Updated  int
+}
+
 func WithSpotify(provider catalog.SpotifyReleaseProvider) Option {
 	return func(r *Runner) { r.spotify = provider }
 }
@@ -238,6 +244,12 @@ func (r *Runner) tick(ctx context.Context) {
 				"failed", syncSummary.Failed, "changed", syncSummary.Changed,
 				"unchanged", syncSummary.Unchanged, "backoff", syncSummary.Backoff)
 		}
+		if artworkSummary, err := r.backfillITunesArtwork(ctx, time.Now().UTC()); err != nil {
+			r.logger.Warn("iTunes artwork backfill failed", "error", err)
+		} else if artworkSummary != nil {
+			r.logger.Info("iTunes artwork backfill completed", "artist_id", artworkSummary.ArtistID,
+				"checked", artworkSummary.Checked, "updated", artworkSummary.Updated)
+		}
 		r.syncMu.Unlock()
 	} else {
 		r.logger.Debug("background tick skipped", "reason", "another synchronization is running")
@@ -268,6 +280,58 @@ func (r *Runner) tick(ctx context.Context) {
 			"failed", deliverySummary.Failed)
 	}
 	r.logger.Info("background tick completed", "duration", time.Since(tickStarted).String())
+}
+
+// backfillITunesArtwork fills artwork on existing iTunes rows only. It is
+// intentionally one artist per tick: the provider request is rate limited and
+// this work must never create release records or notification events.
+func (r *Runner) backfillITunesArtwork(ctx context.Context, now time.Time) (*artworkBackfillStats, error) {
+	if r.itunes == nil {
+		return nil, nil
+	}
+	artist, ok, err := r.store.DueITunesArtworkArtist(ctx, now)
+	if err != nil || !ok {
+		return nil, err
+	}
+	if cooldown, err := r.itunesProviderCooldown(ctx, now); err != nil {
+		return nil, err
+	} else if cooldown.After(now) {
+		r.logger.Debug("iTunes artwork backfill suppressed by provider cooldown",
+			"artist_id", artist.ID, "retry_after", cooldown.Sub(now).String())
+		return nil, nil
+	}
+	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
+	if err != nil {
+		var rateLimit *catalog.ITunesRateLimitError
+		if errors.As(err, &rateLimit) {
+			delay := min(max(rateLimit.RetryAfter, time.Minute), 6*time.Hour)
+			next := now.Add(delay)
+			r.setITunesProviderCooldown(next)
+			_ = r.store.UpsertProviderHealth(ctx, "itunes", false, &next, true, false, sanitizedProviderError(err))
+			if retryErr := r.store.ScheduleITunesArtworkRetry(ctx, artist.ID, next); retryErr != nil {
+				return nil, errors.Join(err, retryErr)
+			}
+			if !rateLimit.AlreadyBlocked {
+				r.logger.Warn("iTunes artwork backfill rate limited", "artist_id", artist.ID,
+					"retry_after", delay.String())
+			}
+			return nil, nil
+		}
+		delay := artistResolutionRetryDelay(artist.Attempts + 1)
+		next := now.Add(delay)
+		_ = r.store.UpsertProviderHealth(ctx, "itunes", false, &next, false, false, sanitizedProviderError(err))
+		if retryErr := r.store.ScheduleITunesArtworkRetry(ctx, artist.ID, next); retryErr != nil {
+			return nil, errors.Join(err, retryErr)
+		}
+		return nil, nil
+	}
+	r.clearITunesProviderCooldown()
+	_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
+	checked, updated, err := r.store.ApplyITunesArtworkBackfill(ctx, artist.ID, releases, now)
+	if err != nil {
+		return nil, err
+	}
+	return &artworkBackfillStats{ArtistID: artist.ID, Checked: checked, Updated: updated}, nil
 }
 
 func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) int {
