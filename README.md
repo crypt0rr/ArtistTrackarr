@@ -1,7 +1,8 @@
 # ArtistTrackarr
 
 A self-hosted household dashboard that watches Spotify for new albums, EPs, and singles,
-using MusicBrainz for stable artist identity with Apple/iTunes fallback observations, and sends announcement and release-day notifications through
+using MusicBrainz for stable artist identity with Apple/iTunes fallback observations,
+public ListenBrainz artist popularity, and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
 
 ## Example dashboard
@@ -52,12 +53,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.12.1` publishes `0.12.1`, `0.12`, and `latest`.
+- Pushing a tag such as `v0.15.0` publishes `0.15.0`, `0.15`, and `latest`.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.12.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.15.0 docker compose up -d
 ```
 
 ## Configuration
@@ -128,7 +129,7 @@ client-credentials search and release-observation flow.
 
 ## Artist management
 
-The **Add artists** page combines individual search, multi-select following,
+The **Artists** page combines individual search, multi-select following,
 watchlist export, and ArtistTrackarr CSV import. An export can be uploaded
 unchanged for a round trip: the six exported columns are required (in any
 order), while unknown future columns are ignored. Imports are limited to 1 MiB
@@ -137,6 +138,19 @@ identities locally, and process rows independently. Added rows are followed
 and scheduled for the normal baseline sync; invalid rows remain visible in the
 owner-only import results page and do not prevent valid rows from being
 applied. Provider calls are never made during the upload request.
+
+The account menu links to personal Settings, where each household member can
+set their own timezone, release-day reminder time, and notification
+preferences. Notifications remain available as a top-level destination
+management page, while household account administration remains restricted to
+the Admin page.
+
+Public [ListenBrainz popularity](https://listenbrainz.readthedocs.io/en/latest/users/api/popularity.html) is refreshed once per day for followed canonical
+artists. Artist pages show aggregate listen and listener counts when available;
+these statistics are informational only and never create release observations
+or notifications. The dashboard and Artists page also provide compact
+breakdowns by genre, country, and artist type with owner-scoped drill-down
+filters. Genres come from MusicBrainz tags and are normalized locally.
 
 ## Notification destinations
 

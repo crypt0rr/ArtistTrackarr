@@ -2,13 +2,21 @@
 <section class="hero">
   <div><p class="eyebrow">Your music watchlist</p><h1>Never miss the next record.</h1>
   <p>MusicBrainz and Spotify are checked for new albums, EPs, and singles; Apple/iTunes provides fallback observations when they are unavailable. Release-day reminders follow at your local reminder time.</p></div>
-  <a class="button" href="/artists/search">Add artists</a>
 </section>
 <section class="stats">
   <article><strong>{{.FollowCount}}</strong><span>followed artists</span></article>
   <article><strong>{{.ReleaseCount}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
+{{if or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel insights-panel">
+  <div class="section-head"><div><p class="eyebrow">Watchlist insights</p><h2>Explore your artists</h2></div><a href="/artists">View all artists</a></div>
+  <div class="insights-grid">
+    {{if .ListenBrainzArtists}}<div class="insight-group"><h3>ListenBrainz popularity</h3>{{range .ListenBrainzArtists}}<a class="insight-row" href="/artists?q={{query .Name}}"><span>{{.Name}}</span><strong>{{.ListenCount}}</strong></a>{{end}}<small>Public aggregate listening counts, refreshed daily.</small></div>{{end}}
+    {{if .GenreBreakdown}}<div class="insight-group"><h3>Genres</h3>{{range .GenreBreakdown}}<a class="insight-row" href="/artists?genre={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+    {{if .CountryBreakdown}}<div class="insight-group"><h3>Countries</h3>{{range .CountryBreakdown}}<a class="insight-row" href="/artists?country={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+    {{if .TypeBreakdown}}<div class="insight-group"><h3>Artist types</h3>{{range .TypeBreakdown}}<a class="insight-row" href="/artists?type={{query .Label}}"><span>{{.Label}}</span><strong>{{.Count}}</strong></a>{{end}}</div>{{end}}
+  </div>
+</section>{{end}}
 {{if .Resolutions}}<section class="panel highlight">
   <div class="section-head"><div><p class="eyebrow">Identification</p><h2>Artists waiting for MusicBrainz</h2></div><span class="badge">{{len .Resolutions}} pending</span></div>
   <div class="list">{{range .Resolutions}}<article class="list-row">

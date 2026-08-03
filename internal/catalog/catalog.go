@@ -62,6 +62,13 @@ type ITunesReleaseProvider interface {
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
+// ListenBrainzProvider exposes public, aggregate artist popularity statistics.
+// It is intentionally separate from release providers so it can never create
+// release observations or notification events.
+type ListenBrainzProvider interface {
+	Popularity(context.Context, []string) (map[string]ListenBrainzArtistStats, error)
+}
+
 type ArtistResult struct {
 	MBID            string
 	Name            string
@@ -73,6 +80,7 @@ type ArtistResult struct {
 	SpotifyID       string
 	SpotifyURL      string
 	SpotifyImageURL string
+	Genres          []string
 	Score           int
 }
 
@@ -81,6 +89,7 @@ func (a ArtistResult) StoreArtist() store.Artist {
 		MBID: a.MBID, Name: a.Name, SortName: a.SortName, Type: a.Type,
 		Country: a.Country, Disambiguation: a.Disambiguation,
 		SpotifyID: a.SpotifyID, SpotifyURL: a.SpotifyURL, SpotifyImageURL: a.SpotifyImageURL,
+		Genres: append([]string(nil), a.Genres...),
 	}
 }
 
@@ -205,7 +214,7 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 	if limit < 1 || limit > 25 {
 		limit = 10
 	}
-	endpoint := m.baseURL + "/ws/2/artist?fmt=json&limit=" +
+	endpoint := m.baseURL + "/ws/2/artist?fmt=json&inc=genres&limit=" +
 		fmt.Sprint(limit) + "&query=" + url.QueryEscape(query)
 	var response struct {
 		Artists []struct {
@@ -219,6 +228,10 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 			Aliases        []struct {
 				Name string `json:"name"`
 			} `json:"aliases"`
+			Genres []struct {
+				Name  string `json:"name"`
+				Count int    `json:"count"`
+			} `json:"genres"`
 		} `json:"artists"`
 	}
 	if err := m.getJSON(ctx, endpoint, &response); err != nil {
@@ -236,6 +249,14 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 			}
 			a.Aliases = append(a.Aliases, alias.Name)
 		}
+		for _, genre := range item.Genres {
+			if strings.TrimSpace(genre.Name) != "" {
+				a.Genres = append(a.Genres, genre.Name)
+			}
+			if len(a.Genres) >= 10 {
+				break
+			}
+		}
 		result = append(result, a)
 	}
 	return result, nil
@@ -246,7 +267,7 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 	if !validMBID(mbid) {
 		return ArtistResult{}, errors.New("invalid MusicBrainz artist ID")
 	}
-	endpoint := m.baseURL + "/ws/2/artist/" + url.PathEscape(mbid) + "?fmt=json&inc=aliases"
+	endpoint := m.baseURL + "/ws/2/artist/" + url.PathEscape(mbid) + "?fmt=json&inc=aliases+genres"
 	var item struct {
 		ID             string `json:"id"`
 		Name           string `json:"name"`
@@ -257,14 +278,23 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 		Aliases        []struct {
 			Name string `json:"name"`
 		} `json:"aliases"`
+		Genres []struct {
+			Name string `json:"name"`
+		} `json:"genres"`
 	}
 	if err := m.getJSON(ctx, endpoint, &item); err != nil {
 		return ArtistResult{}, err
 	}
-	return ArtistResult{
+	result := ArtistResult{
 		MBID: item.ID, Name: item.Name, SortName: item.SortName, Type: item.Type,
 		Country: item.Country, Disambiguation: item.Disambiguation,
-	}, nil
+	}
+	for _, genre := range item.Genres {
+		if strings.TrimSpace(genre.Name) != "" && len(result.Genres) < 10 {
+			result.Genres = append(result.Genres, genre.Name)
+		}
+	}
+	return result, nil
 }
 
 func (m *MusicBrainz) ResolveExternalArtist(ctx context.Context, externalURL string) ([]ArtistResult, error) {
@@ -434,6 +464,7 @@ type spotifyArtistCall struct {
 
 type SpotifyArtist struct {
 	ID, Name, URL, ImageURL string
+	Genres                  []string
 }
 
 type SpotifyRateLimitError struct {
@@ -609,6 +640,7 @@ func (s *Spotify) searchArtists(ctx context.Context, query string) ([]SpotifyArt
 				Images       []struct {
 					URL string `json:"url"`
 				} `json:"images"`
+				Genres []string `json:"genres"`
 			} `json:"items"`
 		} `json:"artists"`
 	}
@@ -617,7 +649,7 @@ func (s *Spotify) searchArtists(ctx context.Context, query string) ([]SpotifyArt
 	}
 	var result []SpotifyArtist
 	for _, item := range response.Artists.Items {
-		a := SpotifyArtist{ID: item.ID, Name: item.Name, URL: item.ExternalURLs["spotify"]}
+		a := SpotifyArtist{ID: item.ID, Name: item.Name, URL: item.ExternalURLs["spotify"], Genres: append([]string(nil), item.Genres...)}
 		if len(item.Images) > 0 {
 			a.ImageURL = item.Images[len(item.Images)-1].URL
 		}
@@ -742,10 +774,11 @@ type spotifyArtistPayload struct {
 	Images       []struct {
 		URL string `json:"url"`
 	} `json:"images"`
+	Genres []string `json:"genres"`
 }
 
 func (p spotifyArtistPayload) artist() SpotifyArtist {
-	artist := SpotifyArtist{ID: p.ID, Name: p.Name, URL: p.ExternalURLs["spotify"]}
+	artist := SpotifyArtist{ID: p.ID, Name: p.Name, URL: p.ExternalURLs["spotify"], Genres: append([]string(nil), p.Genres...)}
 	if len(p.Images) > 0 {
 		artist.ImageURL = p.Images[len(p.Images)-1].URL
 	}
@@ -870,6 +903,9 @@ func Enrich(results []ArtistResult, spotify []SpotifyArtist) {
 				results[i].SpotifyID = candidate.ID
 				results[i].SpotifyURL = candidate.URL
 				results[i].SpotifyImageURL = candidate.ImageURL
+				if len(results[i].Genres) == 0 {
+					results[i].Genres = append([]string(nil), candidate.Genres...)
+				}
 				break
 			}
 		}

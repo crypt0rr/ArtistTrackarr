@@ -53,46 +53,54 @@ type App struct {
 }
 
 type PageData struct {
-	Title              string
-	Version            string
-	User               *store.User
-	CSRF               string
-	Error              string
-	Message            string
-	SetupNeeded        bool
-	Artists            []store.Artist
-	Results            []catalog.ArtistResult
-	SpotifyResults     []catalog.SpotifyArtist
-	ITunesResults      []catalog.ITunesArtist
-	UpcomingReleases   []store.Release
-	RecentReleases     []store.Release
-	ReleaseCount       int
-	Preferences        store.NotificationPreferences
-	ReleaseDetail      *store.ReleaseDetail
-	ReleaseUnavailable bool
-	Resolutions        []store.ArtistResolution
-	Resolution         *store.ArtistResolution
-	Destinations       []store.Destination
-	History            []store.DeliveryHistory
-	AdminHistory       []store.AdminDeliveryHistory
-	AppLogs            []logging.Entry
-	AdminUsers         []store.AdminUser
-	AdminArtists       []store.AdminArtist
-	ProviderHealth     []store.ProviderHealth
-	ManualSyncs        []store.ManualSyncRequest
-	Import             *store.ImportJob
-	FollowCount        int
-	AdminPage          int
-	AdminPages         int
-	AdminPrevPage      int
-	AdminNextPage      int
-	Query              string
-	GeneratedURL       string
-	Token              string
-	TokenKind          string
-	TokenEmail         string
-	SpotifyOn          bool
-	ProviderNotice     string
+	Title               string
+	Version             string
+	User                *store.User
+	CSRF                string
+	Error               string
+	Message             string
+	SetupNeeded         bool
+	Artists             []store.Artist
+	Results             []catalog.ArtistResult
+	SpotifyResults      []catalog.SpotifyArtist
+	ITunesResults       []catalog.ITunesArtist
+	UpcomingReleases    []store.Release
+	RecentReleases      []store.Release
+	ReleaseCount        int
+	Preferences         store.NotificationPreferences
+	ReleaseDetail       *store.ReleaseDetail
+	ReleaseUnavailable  bool
+	Resolutions         []store.ArtistResolution
+	Resolution          *store.ArtistResolution
+	Destinations        []store.Destination
+	History             []store.DeliveryHistory
+	AdminHistory        []store.AdminDeliveryHistory
+	AppLogs             []logging.Entry
+	AdminUsers          []store.AdminUser
+	AdminArtists        []store.AdminArtist
+	ProviderHealth      []store.ProviderHealth
+	ManualSyncs         []store.ManualSyncRequest
+	Import              *store.ImportJob
+	FollowCount         int
+	ListenBrainzArtists []store.Artist
+	GenreBreakdown      []store.ArtistBreakdown
+	CountryBreakdown    []store.ArtistBreakdown
+	TypeBreakdown       []store.ArtistBreakdown
+	GenreFilter         string
+	CountryFilter       string
+	TypeFilter          string
+	AdminPage           int
+	AdminPages          int
+	AdminPrevPage       int
+	AdminNextPage       int
+	Query               string
+	GeneratedURL        string
+	Token               string
+	TokenKind           string
+	TokenEmail          string
+	SpotifyOn           bool
+	ProviderNotice      string
+	LegacySearch        bool
 }
 
 type providerHealthPayload struct {
@@ -204,6 +212,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"join":  strings.Join,
 		"lower": strings.ToLower,
+		"query": url.QueryEscape,
 		"shortDate": func(v string) string {
 			if v == "" {
 				return "Date unknown"
@@ -304,6 +313,9 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artists", a.artists)
 		private.Get("/releases/{id}", a.releaseDetail)
 		private.Get("/artists/search", a.search)
+		private.Get("/settings", a.settings)
+		private.Post("/settings/profile", a.settingsProfile)
+		private.Post("/settings/preferences", a.settingsPreferences)
 		private.Post("/artists/follow", a.follow)
 		private.Post("/artists/follow/batch", a.followBatch)
 		private.Post("/artists/follow/spotify", a.followSpotify)
@@ -559,6 +571,10 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	d.History, _ = a.store.DeliveryHistory(r.Context(), session.User.ID, 10)
 	d.Resolutions, _ = a.store.ArtistResolutions(r.Context(), session.User.ID)
 	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+	d.ListenBrainzArtists, _ = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)
+	d.GenreBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
+	d.CountryBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
+	d.TypeBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
 	a.render(w, "dashboard", d, http.StatusOK)
 }
 
@@ -585,8 +601,17 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) artists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	d := a.data(r, "Followed artists")
-	d.Artists, _ = a.store.FollowedArtists(r.Context(), session.User.ID)
+	d := a.data(r, "Artists")
+	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
+	d.LegacySearch = r.URL.Query().Get("legacy") == "1"
+	a.populateSearch(r.Context(), &d)
+	d.GenreFilter = strings.TrimSpace(r.URL.Query().Get("genre"))
+	d.CountryFilter = strings.TrimSpace(r.URL.Query().Get("country"))
+	d.TypeFilter = strings.TrimSpace(r.URL.Query().Get("type"))
+	d.Artists, _ = a.store.FollowedArtistsFiltered(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter)
+	d.GenreBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
+	d.CountryBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
+	d.TypeBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
 	d.FollowCount = len(d.Artists)
 	a.render(w, "artists", d, http.StatusOK)
 }
@@ -611,56 +636,60 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
-	d := a.data(r, "Add artists")
-	d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
-	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
-	if d.Query != "" {
-		if a.spotify != nil {
-			results, err := a.spotify.SearchArtists(r.Context(), d.Query)
-			if err == nil && len(results) > 0 {
-				d.SpotifyResults = results
-				a.render(w, "search", d, http.StatusOK)
-				return
-			}
-			if err != nil {
-				a.logger.Warn("Spotify artist search failed", "query", d.Query, "error", err)
-				if a.itunes == nil {
-					d.ProviderNotice = "Spotify is temporarily unavailable; showing MusicBrainz results."
-				} else {
-					d.ProviderNotice = "Spotify is unavailable; trying Apple/iTunes discovery."
-				}
-			} else {
-				if a.itunes == nil {
-					d.ProviderNotice = "No Spotify matches were found; showing MusicBrainz results."
-				} else {
-					d.ProviderNotice = "No Spotify matches were found; trying Apple/iTunes discovery."
-				}
-			}
+	target := "/artists"
+	if query := strings.TrimSpace(r.URL.Query().Get("q")); query != "" {
+		target += "?q=" + url.QueryEscape(query) + "&legacy=1"
+	} else {
+		target += "?legacy=1"
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+// populateSearch keeps provider discovery in one place now that the Artists
+// page is the single entry point for both discovery and the followed list.
+func (a *App) populateSearch(ctx context.Context, d *PageData) {
+	if d.Query == "" {
+		return
+	}
+	if a.spotify != nil {
+		results, err := a.spotify.SearchArtists(ctx, d.Query)
+		if err == nil && len(results) > 0 {
+			d.SpotifyResults = results
+			return
 		}
-		if a.itunes != nil {
-			results, err := a.itunes.SearchArtists(r.Context(), d.Query)
-			if err == nil && len(results) > 0 {
-				d.ITunesResults = results
-				a.render(w, "search", d, http.StatusOK)
-				return
-			}
-			if err != nil {
-				a.logger.Warn("iTunes artist search failed", "query", d.Query, "error", err)
-				d.ProviderNotice = "Spotify and Apple/iTunes discovery are unavailable; showing MusicBrainz results."
-			} else {
-				d.ProviderNotice = "No Spotify or Apple/iTunes matches were found; showing MusicBrainz results."
-			}
-		}
-		results, err := a.mb.SearchArtists(r.Context(), d.Query, 10)
 		if err != nil {
-			a.logger.Warn("artist search failed", "query", d.Query, "error", err)
-			d.Error = "MusicBrainz is temporarily unavailable. Please try your search again in a moment."
+			a.logger.Warn("Spotify artist search failed", "query", d.Query, "error", err)
+			if a.itunes == nil {
+				d.ProviderNotice = "Spotify is temporarily unavailable; showing MusicBrainz results."
+			} else {
+				d.ProviderNotice = "Spotify is unavailable; trying Apple/iTunes discovery."
+			}
+		} else if a.itunes == nil {
+			d.ProviderNotice = "No Spotify matches were found; showing MusicBrainz results."
 		} else {
-			d.Results = results
+			d.ProviderNotice = "No Spotify matches were found; trying Apple/iTunes discovery."
 		}
 	}
-	a.render(w, "search", d, http.StatusOK)
+	if a.itunes != nil {
+		results, err := a.itunes.SearchArtists(ctx, d.Query)
+		if err == nil && len(results) > 0 {
+			d.ITunesResults = results
+			return
+		}
+		if err != nil {
+			a.logger.Warn("iTunes artist search failed", "query", d.Query, "error", err)
+			d.ProviderNotice = "Spotify and Apple/iTunes discovery are unavailable; showing MusicBrainz results."
+		} else {
+			d.ProviderNotice = "No Spotify or Apple/iTunes matches were found; showing MusicBrainz results."
+		}
+	}
+	results, err := a.mb.SearchArtists(ctx, d.Query, 10)
+	if err != nil {
+		a.logger.Warn("artist search failed", "query", d.Query, "error", err)
+		d.Error = "MusicBrainz is temporarily unavailable. Please try your search again in a moment."
+	} else {
+		d.Results = results
+	}
 }
 
 func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
@@ -1205,16 +1234,46 @@ func (a *App) profile(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?message=Reminder+settings+updated", http.StatusSeeOther)
 }
 
+func (a *App) settings(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	d := a.data(r, "Settings")
+	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+	a.render(w, "settings", d, http.StatusOK)
+}
+
+func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	if err := a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time")); err != nil {
+		d := a.data(r, "Settings")
+		d.Error = err.Error()
+		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+		a.render(w, "settings", d, http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/settings?message=Settings+updated", http.StatusSeeOther)
+}
+
+func (a *App) settingsPreferences(w http.ResponseWriter, r *http.Request) {
+	if err := a.savePreferences(w, r, "/settings"); err != nil {
+		return
+	}
+}
+
 func (a *App) updatePreferences(w http.ResponseWriter, r *http.Request) {
+	a.savePreferences(w, r, "/destinations")
+}
+
+func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPath string) error {
 	session, _ := currentSession(r)
 	p := store.NotificationPreferences{UserID: session.User.ID,
 		Albums: r.FormValue("albums") == "on", EPs: r.FormValue("eps") == "on", Singles: r.FormValue("singles") == "on",
 		Announcements: r.FormValue("announcements") == "on", ReleaseDay: r.FormValue("release_day") == "on"}
 	if err := a.store.UpdateNotificationPreferences(r.Context(), p); err != nil {
-		http.Redirect(w, r, "/destinations?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
-		return
+		http.Redirect(w, r, redirectPath+"?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return err
 	}
-	http.Redirect(w, r, "/destinations?message=Notification+preferences+updated", http.StatusSeeOther)
+	http.Redirect(w, r, redirectPath+"?message=Notification+preferences+updated", http.StatusSeeOther)
+	return nil
 }
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {

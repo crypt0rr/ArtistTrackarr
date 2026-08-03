@@ -21,6 +21,7 @@ type Runner struct {
 	catalog               catalog.CatalogProvider
 	spotify               catalog.SpotifyReleaseProvider
 	itunes                catalog.ITunesReleaseProvider
+	listenbrainz          catalog.ListenBrainzProvider
 	normalizer            catalog.ReleaseNormalizer
 	sender                notify.NotificationSender
 	cipher                *security.Cipher
@@ -78,6 +79,10 @@ func WithSpotify(provider catalog.SpotifyReleaseProvider) Option {
 
 func WithITunes(provider catalog.ITunesReleaseProvider) Option {
 	return func(r *Runner) { r.itunes = provider }
+}
+
+func WithListenBrainz(provider catalog.ListenBrainzProvider) Option {
+	return func(r *Runner) { r.listenbrainz = provider }
 }
 
 // WithSpotifyInterval controls the independent Spotify observation cadence.
@@ -250,6 +255,11 @@ func (r *Runner) tick(ctx context.Context) {
 			r.logger.Info("iTunes artwork backfill completed", "artist_id", artworkSummary.ArtistID,
 				"checked", artworkSummary.Checked, "updated", artworkSummary.Updated)
 		}
+		if statsSummary, err := r.refreshListenBrainz(ctx, time.Now().UTC()); err != nil {
+			r.logger.Warn("ListenBrainz statistics refresh failed", "error", err)
+		} else if statsSummary > 0 {
+			r.logger.Info("ListenBrainz statistics refresh completed", "artists", statsSummary)
+		}
 		r.syncMu.Unlock()
 	} else {
 		r.logger.Debug("background tick skipped", "reason", "another synchronization is running")
@@ -334,6 +344,50 @@ func (r *Runner) backfillITunesArtwork(ctx context.Context, now time.Time) (*art
 	return &artworkBackfillStats{ArtistID: artist.ID, Checked: checked, Updated: updated}, nil
 }
 
+func (r *Runner) refreshListenBrainz(ctx context.Context, now time.Time) (int, error) {
+	if r.listenbrainz == nil {
+		return 0, nil
+	}
+	artists, err := r.store.DueListenBrainzArtists(ctx, now, 50)
+	if err != nil || len(artists) == 0 {
+		return 0, err
+	}
+	mbids := make([]string, 0, len(artists))
+	ids := make([]int64, 0, len(artists))
+	eligible := make([]store.Artist, 0, len(artists))
+	for _, artist := range artists {
+		if strings.TrimSpace(artist.MBID) == "" {
+			continue
+		}
+		mbids = append(mbids, artist.MBID)
+		ids = append(ids, artist.ID)
+		eligible = append(eligible, artist)
+	}
+	if len(mbids) == 0 {
+		return 0, nil
+	}
+	values, err := r.listenbrainz.Popularity(ctx, mbids)
+	if err != nil {
+		next := now.Add(6 * time.Hour)
+		_ = r.store.ScheduleListenBrainzRetry(ctx, ids, next, sanitizedProviderError(err))
+		_ = r.store.UpsertProviderHealth(ctx, "listenbrainz", false, &next, false, false, sanitizedProviderError(err))
+		return 0, err
+	}
+	byID := make(map[int64]store.ListenBrainzStats, len(ids))
+	for _, artist := range eligible {
+		stats, ok := values[strings.ToLower(strings.TrimSpace(artist.MBID))]
+		if !ok {
+			stats = catalog.ListenBrainzArtistStats{MBID: artist.MBID}
+		}
+		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: stats.TotalListenCount, TotalUserCount: stats.TotalUserCount}
+	}
+	if err := r.store.SaveListenBrainzStats(ctx, byID, now, now.Add(24*time.Hour)); err != nil {
+		return 0, err
+	}
+	_ = r.store.UpsertProviderHealth(ctx, "listenbrainz", true, nil, false, false, "")
+	return len(byID), nil
+}
+
 func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) int {
 	requests, err := r.store.ClaimManualSyncRequests(ctx, 3)
 	if err != nil {
@@ -373,7 +427,7 @@ func (r *Runner) SelectArtistResolution(ctx context.Context, resolution store.Ar
 	return r.completeArtistResolution(ctx, resolution, catalog.ArtistResult{
 		MBID: candidate.MBID, Name: candidate.Name, SortName: candidate.SortName,
 		Type: candidate.Type, Country: candidate.Country, Disambiguation: candidate.Disambiguation,
-		Aliases: candidate.Aliases, Score: candidate.Score,
+		Aliases: candidate.Aliases, Genres: candidate.Genres, Score: candidate.Score,
 	})
 }
 
@@ -461,6 +515,7 @@ func resolutionCandidates(matches []catalog.ArtistResult) []store.ResolutionCand
 		result = append(result, store.ResolutionCandidate{
 			MBID: match.MBID, Name: match.Name, SortName: match.SortName, Type: match.Type,
 			Country: match.Country, Disambiguation: match.Disambiguation, Aliases: match.Aliases, Score: match.Score,
+			Genres: match.Genres,
 		})
 	}
 	return result
@@ -524,6 +579,13 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, err
 
 func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) (syncOutcome, error) {
 	var outcome syncOutcome
+	if genres, genreErr := r.store.ArtistGenres(ctx, artist.ID); genreErr == nil && len(genres) == 0 {
+		if metadata, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID); resolveErr == nil && len(metadata.Genres) > 0 {
+			if saveErr := r.store.SaveArtistGenres(ctx, artist.ID, metadata.Genres); saveErr != nil {
+				r.logger.Debug("artist genre metadata save failed", "artist_id", artist.ID, "error", saveErr)
+			}
+		}
+	}
 	var batches []store.ReleaseBatch
 	var providerErrors []error
 	var spotifyRateLimit *catalog.SpotifyRateLimitError

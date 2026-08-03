@@ -1,9 +1,9 @@
 {{template "head" .}}
-<section class="page-head"><p class="eyebrow">Artist management</p><h1>Add artists</h1><p>Search for artists to follow or export your current watchlist.</p></section>
+<section class="page-head"><p class="eyebrow">Artist management</p><h1>Artists</h1><p>Search for artists to follow or export your current watchlist.</p></section>
 <section class="panel artist-search">
 <div class="section-head"><div><p class="eyebrow">Discovery</p><h2>Search by artist name</h2></div><span class="badge">Spotify · Apple · MusicBrainz</span></div>
 <p>Spotify is preferred, with Apple/iTunes and MusicBrainz fallback discovery. MusicBrainz confirms the canonical identity used for tracking.</p>
-<form method="get" action="/artists/search" class="searchbar">
+<form method="get" action="/artists" class="searchbar">
   <input name="q" value="{{.Query}}" placeholder="Artist name" required autofocus>
   <button>Search</button>
 </form>

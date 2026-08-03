@@ -57,6 +57,7 @@ func main() {
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret, cfg.SpotifyMarket)
 	itunes := catalog.NewITunes(cfg.SpotifyMarket)
+	listenBrainz := catalog.NewListenBrainz()
 	var spotifyProvider catalog.SpotifyProvider
 	if spotify != nil {
 		spotifyProvider = spotify
@@ -86,6 +87,7 @@ func main() {
 		runnerOptions = append(runnerOptions, jobs.WithSpotifyInterval(cfg.SpotifyPollInterval))
 	}
 	runnerOptions = append(runnerOptions, jobs.WithITunes(itunes))
+	runnerOptions = append(runnerOptions, jobs.WithListenBrainz(listenBrainz))
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger,
 		runnerOptions...)
 	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger, itunes)
