@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -206,6 +207,33 @@ func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
 	}
 }
 
+// compactCount makes large aggregate counts easier to scan while the exact
+// value remains available through the surrounding element's title/label.
+func compactCount(value int64) string {
+	if value == 0 {
+		return "0"
+	}
+	sign := ""
+	amount := float64(value)
+	if amount < 0 {
+		sign, amount = "-", -amount
+	}
+	units := []string{"", "k", "M", "B", "T"}
+	unit := 0
+	for amount >= 1000 && unit < len(units)-1 {
+		amount /= 1000
+		unit++
+	}
+	rounded := math.Round(amount*10) / 10
+	if rounded >= 1000 && unit < len(units)-1 {
+		amount /= 1000
+		unit++
+		rounded = math.Round(amount*10) / 10
+	}
+	formatted := strconv.FormatFloat(rounded, 'f', -1, 64)
+	return sign + formatted + units[unit]
+}
+
 func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify catalog.SpotifyProvider,
 	sender notify.NotificationSender, cipher *security.Cipher, art artwork.Provider,
 	runner *jobs.Runner, logger *slog.Logger, itunesProviders ...catalog.ITunesProvider) (*App, error) {
@@ -220,6 +248,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			return v
 		},
 		"formatTime":           func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"compactCount":         compactCount,
 		"formatProviderTime":   providerHealthTime,
 		"providerTimeAttr":     providerHealthTimeAttr,
 		"providerHealthStatus": providerHealthStatus,

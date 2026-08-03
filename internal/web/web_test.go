@@ -1156,6 +1156,24 @@ func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.
 	}
 }
 
+func TestCompactCount(t *testing.T) {
+	tests := map[int64]string{
+		0:         "0",
+		999:       "999",
+		1000:      "1k",
+		1234:      "1.2k",
+		100000:    "100k",
+		143570475: "143.6M",
+		51965204:  "52M",
+		-1234:     "-1.2k",
+	}
+	for value, want := range tests {
+		if got := compactCount(value); got != want {
+			t.Errorf("compactCount(%d) = %q, want %q", value, got, want)
+		}
+	}
+}
+
 func authenticatedTestServer(
 	t *testing.T,
 	mb catalog.CatalogProvider,

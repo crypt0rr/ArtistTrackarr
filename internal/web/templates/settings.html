@@ -2,11 +2,21 @@
 <section class="page-head"><p class="eyebrow">Account</p><h1>Settings</h1><p>Manage your local reminder schedule and the release notifications sent to your destinations.</p></section>
 <div class="settings-grid">
   <section class="panel settings-panel">
-    <p class="eyebrow">Reminders</p><h2>Release-day reminders</h2>
-    <p>Your username appears in the account menu. Reminder time is interpreted in your selected timezone.</p>
+    <p class="eyebrow">Profile</p><h2>Account profile</h2>
+    <p>Choose the name shown in the account menu. Your email remains the login and recovery address.</p>
     <form method="post" action="/settings/profile" class="stack compact">
       {{template "csrf" .}}
+      <input type="hidden" name="timezone" value="{{.User.Timezone}}">
+      <input type="hidden" name="reminder_time" value="{{.User.ReminderTime}}">
       <label>Username<input name="username" value="{{.User.Username}}" required minlength="3" maxlength="32" pattern="[A-Za-z0-9._-]{3,32}" autocomplete="username"><small>3–32 characters: letters, numbers, dots, underscores, or hyphens.</small></label>
+      <button>Save profile</button>
+    </form>
+  </section>
+  <section class="panel settings-panel">
+    <p class="eyebrow">Reminders</p><h2>Release-day reminders</h2>
+    <p>Reminder time is interpreted in your selected timezone.</p>
+    <form method="post" action="/settings/profile" class="stack compact">
+      {{template "csrf" .}}
       <label>Timezone<input name="timezone" value="{{.User.Timezone}}" required></label>
       <label>Release-day time<input class="reminder-time" type="time" name="reminder_time" value="{{.User.ReminderTime}}" required></label>
       <button>Save reminder settings</button>

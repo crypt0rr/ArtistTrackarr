@@ -64,7 +64,7 @@
       {{if .SpotifyImageURL}}<img class="avatar" src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Name}}</span>{{end}}
       <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
       {{if .Genres}}<small>Genres: {{join .Genres ", "}}</small>{{end}}
-      {{if .ListenCheckedAt}}<small>ListenBrainz: {{.ListenCount}} listens · {{.ListenUsers}} listeners</small>{{end}}
+      {{if .ListenCheckedAt}}<small title="Exact counts: {{.ListenCount}} listens, {{.ListenUsers}} listeners">ListenBrainz: {{compactCount .ListenCount}} listens · {{compactCount .ListenUsers}} listeners</small>{{end}}
       <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}{{if .LastCheckedAt}} · Last checked {{.LastCheckedAt.Format "2006-01-02 15:04"}}{{end}}{{if .SpotifyNextCheckAt}} · Next check {{.SpotifyNextCheckAt.Format "2006-01-02 15:04"}}{{end}}</small></span>
     </div>
     <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
