@@ -506,7 +506,7 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
 		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums":
 			albumRequests.Add(1)
-			if request.URL.Query().Get("limit") != "50" || request.URL.Query().Get("market") != "NL" ||
+			if request.URL.Query().Get("limit") != "10" || request.URL.Query().Get("market") != "NL" ||
 				request.URL.Query().Get("include_groups") != "album,single,compilation" ||
 				request.Header.Get("Authorization") != "Bearer test-token" {
 				t.Fatalf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
@@ -578,7 +578,7 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 			_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"new","name":"New","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}]}`)
 			return
 		}
-		if request.URL.Query().Get("offset") != "50" {
+		if request.URL.Query().Get("offset") != "10" {
 			t.Fatalf("unexpected offset: %s", request.URL.Query().Get("offset"))
 		}
 		_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"old","name":"Old","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-06-01","release_date_precision":"day"}]}`)
