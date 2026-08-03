@@ -947,10 +947,10 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	if cached, ok := s.cachedReleases(artistID, since); ok {
 		return cached, nil
 	}
-	// Spotify permits up to 50 items per artist-albums page. Using the largest
-	// page keeps local-history walks cheap and reduces pressure on the rolling
-	// API quota without changing the result set.
-	const pageSize = 50
+	// Spotify currently permits at most 10 items per artist-albums page. Keep
+	// pagination aligned with the provider's limit so a sync is not rejected
+	// with a 400 Invalid limit response.
+	const pageSize = 10
 	var result []store.Release
 	seen := make(map[string]bool)
 	for offset := 0; offset < 1000; offset += pageSize {
