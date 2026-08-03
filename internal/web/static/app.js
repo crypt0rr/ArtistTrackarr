@@ -1,4 +1,15 @@
 (() => {
+  document.querySelectorAll("img[data-artwork-fallback]").forEach((image) => {
+    image.addEventListener("error", () => {
+      if (image.dataset.artworkFallbackApplied) return;
+      const fallback = image.dataset.artworkFallback;
+      if (!fallback || image.currentSrc === fallback || image.src === fallback) return;
+      image.dataset.artworkFallbackApplied = "true";
+      image.removeAttribute("srcset");
+      image.src = fallback;
+    }, { once: false });
+  });
+
   const themeToggle = document.querySelector("[data-theme-toggle]");
   if (themeToggle) {
     const key = "artist-trackarr-theme";

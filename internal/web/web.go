@@ -224,6 +224,21 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			}
 			return r.MusicBrainzURL
 		},
+		"releaseArtwork": func(r store.Release) string {
+			if strings.TrimSpace(r.SpotifyImageURL) != "" {
+				return r.SpotifyImageURL
+			}
+			if strings.TrimSpace(r.ITunesArtworkURL) != "" {
+				return r.ITunesArtworkURL
+			}
+			return "/art/release-group/" + url.PathEscape(r.MBID)
+		},
+		"releaseArtworkFallback": func(r store.Release) string {
+			return "/art/release-group/" + url.PathEscape(r.MBID)
+		},
+		"releaseUsesITunesArtwork": func(r store.Release) bool {
+			return strings.TrimSpace(r.SpotifyImageURL) == "" && strings.TrimSpace(r.ITunesArtworkURL) != ""
+		},
 		"sourceLabel": func(r store.Release) string {
 			switch r.Source {
 			case "spotify":
@@ -332,7 +347,7 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co https://*.mzstatic.com https://*.itunes.apple.com data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

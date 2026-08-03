@@ -108,6 +108,8 @@ type itunesResult struct {
 	CollectionID         int64  `json:"collectionId"`
 	CollectionName       string `json:"collectionName"`
 	CollectionViewURL    string `json:"collectionViewUrl"`
+	ArtworkURL100        string `json:"artworkUrl100"`
+	ArtworkURL60         string `json:"artworkUrl60"`
 	TrackCount           int    `json:"trackCount"`
 	ReleaseDate          string `json:"releaseDate"`
 }
@@ -348,10 +350,50 @@ func (i *ITunes) artistReleases(ctx context.Context, artistName string) ([]store
 			DatePrecision:    precision,
 			ITunesID:         id,
 			ITunesURL:        releaseURL,
+			ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
 			Source:           "itunes",
 		})
 	}
 	return result, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// normalizeITunesArtworkURL keeps only Apple-hosted artwork metadata. The
+// image itself is loaded by the browser and is never downloaded or cached by
+// ArtistTrackarr.
+func normalizeITunesArtworkURL(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Hostname() == "" || parsed.Path == "" || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "mzstatic.com" && !strings.HasSuffix(host, ".mzstatic.com") &&
+		host != "itunes.apple.com" && !strings.HasSuffix(host, ".itunes.apple.com") {
+		return ""
+	}
+	parsed.Scheme = "https"
+	parsed.User = nil
+	// iTunes artwork paths commonly contain a 60x60 or 100x100 size token.
+	// Request a larger rendition when the provider exposes that convention,
+	// while keeping the original URL for other valid Apple paths.
+	for _, size := range []string{"100x100", "60x60"} {
+		if strings.Contains(parsed.Path, size) {
+			parsed.Path = strings.Replace(parsed.Path, size, "250x250", 1)
+			break
+		}
+	}
+	return parsed.String()
 }
 
 func (i *ITunes) getJSON(ctx context.Context, operation, endpoint string, target any) error {

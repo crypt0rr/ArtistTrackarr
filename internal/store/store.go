@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +103,7 @@ type Release struct {
 	SpotifyImageURL  string
 	ITunesID         string
 	ITunesURL        string
+	ITunesArtworkURL string
 	Source           string
 	FirstObservedAt  time.Time
 }
@@ -120,6 +122,15 @@ type ReleaseObservation struct {
 type ReleaseBatch struct {
 	Provider string
 	Releases []Release
+}
+
+// ITunesArtworkArtist identifies one artist whose existing iTunes releases
+// are due for an artwork-only refresh. Artwork backfills deliberately operate
+// on existing rows and never create releases or notification events.
+type ITunesArtworkArtist struct {
+	ID       int64
+	Name     string
+	Attempts int
 }
 
 type SpotifyPollingState struct {
@@ -1107,6 +1118,109 @@ func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (s
 	return date.String, err
 }
 
+// DueITunesArtworkArtist returns at most one artist per call so the background
+// runner can spread artwork requests over time and respect Apple's limiter.
+func (s *Store) DueITunesArtworkArtist(ctx context.Context, now time.Time) (ITunesArtworkArtist, bool, error) {
+	var artist ITunesArtworkArtist
+	err := s.DB.QueryRowContext(ctx, `SELECT a.id,a.name,MAX(rg.itunes_artwork_attempts)
+		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
+		WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
+			AND (rg.itunes_artwork_next_check_at IS NULL OR rg.itunes_artwork_next_check_at<=?)
+		GROUP BY a.id,a.name
+		ORDER BY MIN(COALESCE(rg.itunes_artwork_next_check_at,'')),a.id LIMIT 1`, timeText(now)).Scan(
+		&artist.ID, &artist.Name, &artist.Attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ITunesArtworkArtist{}, false, nil
+	}
+	if err != nil {
+		return ITunesArtworkArtist{}, false, err
+	}
+	return artist, true, nil
+}
+
+// ApplyITunesArtworkBackfill updates only already persisted release rows. A
+// successful response without artwork receives a long negative-cache period;
+// it does not affect normal catalog scheduling or notifications.
+func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, releases []Release, observed time.Time) (checked, updated int, err error) {
+	byID := make(map[string]string, len(releases))
+	for _, release := range releases {
+		id := strings.TrimSpace(release.ITunesID)
+		artworkURL := strings.TrimSpace(release.ITunesArtworkURL)
+		if id != "" && validITunesArtworkURL(artworkURL) {
+			byID[id] = artworkURL
+		}
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	rows, err := tx.QueryContext(ctx, `SELECT id,itunes_id FROM release_groups
+		WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`, artistID)
+	if err != nil {
+		return 0, 0, err
+	}
+	type candidate struct {
+		id       int64
+		itunesID string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.itunesID); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
+	rows.Close()
+	checkedAt := timeText(observed)
+	negativeNext := timeText(observed.Add(30 * 24 * time.Hour))
+	for _, item := range candidates {
+		checked++
+		artworkURL := byID[item.itunesID]
+		if artworkURL != "" {
+			result, execErr := tx.ExecContext(ctx, `UPDATE release_groups SET
+				itunes_artwork_url=?,itunes_artwork_checked_at=?,itunes_artwork_next_check_at=NULL,
+				itunes_artwork_attempts=0,updated_at=? WHERE id=?`, artworkURL, checkedAt, checkedAt, item.id)
+			if execErr != nil {
+				return 0, 0, execErr
+			}
+			n, _ := result.RowsAffected()
+			updated += int(n)
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE release_groups SET
+			itunes_artwork_checked_at=?,itunes_artwork_next_check_at=?,
+			itunes_artwork_attempts=itunes_artwork_attempts+1,updated_at=? WHERE id=?`,
+			checkedAt, negativeNext, checkedAt, item.id); err != nil {
+			return 0, 0, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return checked, updated, nil
+}
+
+// ScheduleITunesArtworkRetry applies a bounded durable retry time to all
+// existing artwork gaps for an artist after a transient provider failure.
+func (s *Store) ScheduleITunesArtworkRetry(ctx context.Context, artistID int64, next time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE release_groups SET
+		itunes_artwork_next_check_at=?,itunes_artwork_attempts=itunes_artwork_attempts+1
+		WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`,
+		timeText(next), artistID)
+	return err
+}
+
 // SpotifyBatchChanged reports whether a successful provider response contains
 // a release that is new or has changed since it was last observed. It is
 // intentionally read before the release transaction so the scheduler can
@@ -1377,6 +1491,10 @@ func saveITunesReleaseTx(
 	if strings.TrimSpace(release.ITunesID) == "" {
 		return syncedRelease{}, errors.New("iTunes release ID is required")
 	}
+	artworkURL := strings.TrimSpace(release.ITunesArtworkURL)
+	if !validITunesArtworkURL(artworkURL) {
+		artworkURL = ""
+	}
 	var releaseID int64
 	existed := true
 	err := tx.QueryRowContext(ctx, `SELECT release_group_id FROM provider_observations
@@ -1397,10 +1515,12 @@ func saveITunesReleaseTx(
 	if releaseID == 0 {
 		result, insertErr := tx.ExecContext(ctx, `INSERT INTO release_groups
 			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
-			 musicbrainz_url,itunes_id,itunes_url,source,first_observed_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?, 'itunes',?,?)`,
+			 musicbrainz_url,itunes_id,itunes_url,itunes_artwork_url,itunes_artwork_checked_at,
+			 itunes_artwork_next_check_at,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'itunes',?,?)`,
 			"itunes:"+release.ITunesID, artistID, release.Title, release.PrimaryType, string(secondary),
 			release.FirstReleaseDate, release.DatePrecision, "", release.ITunesID, release.ITunesURL,
+			artworkURL, timeText(observed), timeText(observed.Add(30*24*time.Hour)),
 			timeText(observed), timeText(observed))
 		if insertErr != nil {
 			return syncedRelease{}, insertErr
@@ -1409,6 +1529,9 @@ func saveITunesReleaseTx(
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE release_groups SET
 			itunes_id=COALESCE(itunes_id,?),itunes_url=?,
+			itunes_artwork_url=CASE WHEN ?>'' THEN ? ELSE itunes_artwork_url END,
+			itunes_artwork_checked_at=?,
+			itunes_artwork_next_check_at=CASE WHEN ?>'' THEN NULL ELSE ? END,
 			title=CASE WHEN source='itunes' THEN ? ELSE title END,
 			primary_type=CASE WHEN source='itunes' THEN ? ELSE primary_type END,
 			secondary_types=CASE WHEN source='itunes' THEN ? ELSE secondary_types END,
@@ -1416,7 +1539,9 @@ func saveITunesReleaseTx(
 			date_precision=CASE WHEN source='itunes' THEN MAX(date_precision,?) ELSE date_precision END,
 			source=CASE WHEN source IN ('musicbrainz','spotify') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,
-			release.ITunesID, release.ITunesURL, release.Title, release.PrimaryType, string(secondary),
+			release.ITunesID, release.ITunesURL, artworkURL, artworkURL,
+			timeText(observed), artworkURL, timeText(observed.Add(30*24*time.Hour)),
+			release.Title, release.PrimaryType, string(secondary),
 			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision,
 			timeText(observed), releaseID)
 		if err != nil {
@@ -1428,6 +1553,17 @@ func saveITunesReleaseTx(
 	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
 	return syncedRelease{release: saved, isNew: !existed, provider: "itunes"}, err
+}
+
+func validITunesArtworkURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.Path == "" || parsed.Port() != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "mzstatic.com" || strings.HasSuffix(host, ".mzstatic.com") ||
+		host == "itunes.apple.com" || strings.HasSuffix(host, ".itunes.apple.com")
 }
 
 func matchingReleaseIDTx(
@@ -1527,20 +1663,21 @@ func upsertProviderObservationTx(
 func releasePayloadHash(release Release) string {
 	secondary, _ := json.Marshal(release.SecondaryTypes)
 	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
-		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL + "\x00" + release.ITunesURL))
+		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL + "\x00" +
+		release.ITunesURL + "\x00" + release.ITunesArtworkURL))
 	return fmt.Sprintf("%x", payloadHash)
 }
 
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
 	var release Release
 	var secondary, observed string
-	var spotifyID, spotifyURL, itunesID, itunesURL sql.NullString
+	var spotifyID, spotifyURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
 		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
-		itunes_id,itunes_url,source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
+		itunes_id,itunes_url,itunes_artwork_url,source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &release.SpotifyImageURL, &itunesID, &itunesURL, &release.Source, &observed,
+		&spotifyID, &spotifyURL, &release.SpotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &release.Source, &observed,
 	)
 	if err != nil {
 		return Release{}, err
@@ -1548,6 +1685,7 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	_ = json.Unmarshal([]byte(secondary), &release.SecondaryTypes)
 	release.SpotifyID, release.SpotifyURL = spotifyID.String, spotifyURL.String
 	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
+	release.ITunesArtworkURL = itunesArtworkURL.String
 	release.FirstObservedAt, _ = parseTime(observed)
 	return release, nil
 }
@@ -1729,7 +1867,7 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]Release, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC LIMIT ?`,
 		userID, limit)
@@ -1756,7 +1894,7 @@ func (s *Store) DashboardReleases(
 	))`
 	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND `+definitelyFuture+`
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
@@ -1771,7 +1909,7 @@ func (s *Store) DashboardReleases(
 	}
 	recentRows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 		rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
+		rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
 		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
@@ -1792,15 +1930,16 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 	for rows.Next() {
 		var r Release
 		var secondary, observed string
-		var spotifyID, spotifyURL, itunesID, itunesURL sql.NullString
+		var spotifyID, spotifyURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 		if err := rows.Scan(&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 			&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-			&spotifyID, &spotifyURL, &r.SpotifyImageURL, &itunesID, &itunesURL, &r.Source, &observed); err != nil {
+			&spotifyID, &spotifyURL, &r.SpotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(secondary), &r.SecondaryTypes)
 		r.SpotifyID, r.SpotifyURL = spotifyID.String, spotifyURL.String
 		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
+		r.ITunesArtworkURL = itunesArtworkURL.String
 		r.FirstObservedAt, _ = parseTime(observed)
 		result = append(result, r)
 	}
@@ -2402,7 +2541,7 @@ func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
 
 func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
 	var d ReleaseDetail
-	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.source,rg.first_observed_at
+	rows, err := s.DB.QueryContext(ctx, `SELECT rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
 	if err != nil {
 		return d, err
