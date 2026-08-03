@@ -489,7 +489,12 @@ func (a *App) setup(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, err := security.HashPassword(r.FormValue("password"))
 	if err == nil {
-		_, err = a.store.CreateUser(r.Context(), r.FormValue("email"), hash, "admin", r.FormValue("timezone"))
+		username := strings.TrimSpace(r.FormValue("username"))
+		if _, supplied := r.Form["username"]; supplied && username == "" {
+			err = store.ErrInvalidUsername
+		} else {
+			_, err = a.store.CreateUser(r.Context(), r.FormValue("email"), hash, "admin", r.FormValue("timezone"), username)
+		}
 	}
 	if err != nil {
 		d := a.data(r, "Create administrator")
@@ -1134,11 +1139,12 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) destinations(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
-	d := a.data(r, "Notification destinations")
-	d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-	a.render(w, "destinations", d, http.StatusOK)
+	query := r.URL.Query()
+	location := "/settings"
+	if encoded := query.Encode(); encoded != "" {
+		location += "?" + encoded
+	}
+	http.Redirect(w, r, location, http.StatusSeeOther)
 }
 
 func (a *App) releaseGroupArt(w http.ResponseWriter, r *http.Request) {
@@ -1170,13 +1176,14 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 		err = a.store.AddDestination(r.Context(), session.User.ID, r.FormValue("name"), input.Service, encrypted)
 	}
 	if err != nil {
-		d := a.data(r, "Notification destinations")
+		d := a.data(r, "Settings")
 		d.Error = err.Error()
 		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-		a.render(w, "destinations", d, http.StatusBadRequest)
+		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+		a.render(w, "settings", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/destinations?message=Destination+added", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?message=Destination+added", http.StatusSeeOther)
 }
 
 func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
@@ -1191,10 +1198,10 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		http.Redirect(w, r, "/destinations?message="+url.QueryEscape("Test failed: "+err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/settings?message="+url.QueryEscape("Test failed: "+err.Error()), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/destinations?message=Test+sent", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?message=Test+sent", http.StatusSeeOther)
 }
 
 func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
@@ -1209,20 +1216,21 @@ func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		d := a.data(r, "Notification destinations")
+		d := a.data(r, "Settings")
 		d.Error = err.Error()
 		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-		a.render(w, "destinations", d, http.StatusBadRequest)
+		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+		a.render(w, "settings", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/destinations?message=Destination+renamed", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?message=Destination+renamed", http.StatusSeeOther)
 }
 
 func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	_ = a.store.DeleteDestination(r.Context(), session.User.ID, id)
-	http.Redirect(w, r, "/destinations?message=Destination+deleted", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?message=Destination+deleted", http.StatusSeeOther)
 }
 
 func (a *App) profile(w http.ResponseWriter, r *http.Request) {
@@ -1238,15 +1246,23 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	d := a.data(r, "Settings")
 	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+	d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
 	a.render(w, "settings", d, http.StatusOK)
 }
 
 func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	if err := a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time")); err != nil {
+	var err error
+	if _, supplied := r.Form["username"]; supplied {
+		err = a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time"), r.FormValue("username"))
+	} else {
+		err = a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time"))
+	}
+	if err != nil {
 		d := a.data(r, "Settings")
 		d.Error = err.Error()
 		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
+		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
 		a.render(w, "settings", d, http.StatusBadRequest)
 		return
 	}
@@ -1260,7 +1276,7 @@ func (a *App) settingsPreferences(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) updatePreferences(w http.ResponseWriter, r *http.Request) {
-	a.savePreferences(w, r, "/destinations")
+	a.savePreferences(w, r, "/settings")
 }
 
 func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPath string) error {
@@ -1435,10 +1451,11 @@ func (a *App) tokenForm(kind string) http.HandlerFunc {
 func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	hash, err := security.HashPassword(r.FormValue("password"))
 	if err == nil {
-		var email string
-		email, _, err = a.store.ConsumeAuthToken(r.Context(), chi.URLParam(r, "token"), "invite")
-		if err == nil {
-			_, err = a.store.CreateUser(r.Context(), email, hash, "member", r.FormValue("timezone"))
+		username := strings.TrimSpace(r.FormValue("username"))
+		if _, supplied := r.Form["username"]; supplied && username == "" {
+			err = store.ErrInvalidUsername
+		} else {
+			err = a.store.CreateUserFromInvite(r.Context(), chi.URLParam(r, "token"), hash, username, r.FormValue("timezone"))
 		}
 	}
 	if err != nil {
