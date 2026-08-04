@@ -646,25 +646,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			}
 		}
 	}
-	var batches []store.ReleaseBatch
-	var providerErrors []error
-	var spotifyRateLimit *catalog.SpotifyRateLimitError
-	var itunesRateLimit *catalog.ITunesRateLimitError
 	spotifyWasDue := artist.SpotifyID != "" && (artist.SpotifyNextCheckAt == nil || !artist.SpotifyNextCheckAt.After(now))
-	spotifySuppressed := false
-	var spotifyCooldownUntil time.Time
-	if spotifyWasDue && r.spotify != nil {
-		cooldown, err := r.spotifyProviderCooldown(ctx, now)
-		if err != nil {
-			return outcome, err
-		}
-		if cooldown.After(now) {
-			spotifyCooldownUntil = cooldown
-			spotifySuppressed = true
-			r.logger.Debug("Spotify check suppressed by provider cooldown", "artist_id", artist.ID,
-				"retry_after", cooldown.Sub(now).String())
-		}
-	}
 	spotifyKnownDate := ""
 	if artist.SpotifyID != "" && r.spotify != nil {
 		var err error
@@ -674,148 +656,54 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 	}
 	spotifyPrimary := artist.SpotifyID != "" && r.spotify != nil && (spotifyWasDue || spotifyKnownDate != "")
-	spotifySucceeded := false
-	if spotifyPrimary && spotifyWasDue && !spotifySuppressed {
-		var spotifyReleases []store.Release
-		var spotifyErr error
-		if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
-			spotifyReleases, spotifyErr = incremental.ArtistReleasesSince(ctx, artist.SpotifyID, spotifyKnownDate)
-		} else {
-			spotifyReleases, spotifyErr = r.spotify.ArtistReleases(ctx, artist.SpotifyID)
-		}
-		if spotifyErr == nil {
-			spotifySucceeded = true
-			r.clearSpotifyProviderCooldown()
-			changed, err := r.store.SpotifyBatchChanged(ctx, spotifyReleases)
-			if err != nil {
-				return outcome, err
-			}
-			outcome.SpotifyChanged = changed
-			outcome.SpotifyUnchanged = !changed
-			_ = r.store.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, "")
-			batches = append(batches, store.ReleaseBatch{
-				Provider: "spotify", Releases: r.normalizer.Normalize(spotifyReleases),
-			})
-		} else {
-			var retryAt *time.Time
-			if errors.As(spotifyErr, &spotifyRateLimit) {
-				t := now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))
-				retryAt = &t
-				r.setSpotifyProviderCooldown(t)
-			}
-			_ = r.store.UpsertProviderHealth(ctx, "spotify", false, retryAt, spotifyRateLimit != nil, spotifyRateLimit != nil && spotifyRateLimit.QuotaExceeded, sanitizedProviderError(spotifyErr))
-			providerErrors = append(providerErrors, spotifyErr)
-			if errors.As(spotifyErr, &spotifyRateLimit) {
-				if !spotifyRateLimit.AlreadyBlocked {
-					r.logger.Warn("Spotify release observation rate limited",
-						"artist_id", artist.ID,
-						"reason", spotifyRateLimit.Reason,
-						"retry_after", spotifyRateLimit.RetryAfter.String(),
-						"quota_exceeded", spotifyRateLimit.QuotaExceeded,
-					)
-				}
-			} else {
-				r.logger.Warn("Spotify release observation failed", "artist_id", artist.ID, "error", spotifyErr)
-			}
-		}
+	strategy, err := r.observeReleaseProviders(ctx, artist, now, spotifyKnownDate, spotifyWasDue, spotifyPrimary)
+	if err != nil {
+		return outcome, err
 	}
-	itunesSucceeded := false
-	if !spotifySucceeded && !(spotifyPrimary && !spotifyWasDue) && r.itunes != nil {
-		cooldown, err := r.itunesProviderCooldown(ctx, now)
-		if err != nil {
-			return outcome, err
-		}
-		if cooldown.After(now) {
-			r.logger.Debug("iTunes check suppressed by provider cooldown", "artist_id", artist.ID,
-				"retry_after", cooldown.Sub(now).String())
-		} else {
-			releases, itunesErr := r.itunes.ArtistReleases(ctx, artist.Name)
-			if itunesErr == nil {
-				itunesSucceeded = true
-				r.clearITunesProviderCooldown()
-				_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
-				batches = append(batches, store.ReleaseBatch{
-					Provider: "itunes", Releases: r.normalizer.Normalize(releases),
-				})
-			} else {
-				var retryAt *time.Time
-				if errors.As(itunesErr, &itunesRateLimit) {
-					t := now.Add(max(itunesRateLimit.RetryAfter, time.Minute))
-					retryAt = &t
-					r.setITunesProviderCooldown(t)
-				}
-				_ = r.store.UpsertProviderHealth(ctx, "itunes", false, retryAt, itunesRateLimit != nil, false, sanitizedProviderError(itunesErr))
-				providerErrors = append(providerErrors, itunesErr)
-				if itunesRateLimit != nil {
-					if !itunesRateLimit.AlreadyBlocked {
-						r.logger.Warn("iTunes release observation rate limited", "artist_id", artist.ID,
-							"retry_after", itunesRateLimit.RetryAfter.String())
-					}
-				} else {
-					r.logger.Warn("iTunes release observation failed", "artist_id", artist.ID, "error", itunesErr)
-				}
-			}
-		}
-	}
-	// Spotify is authoritative whenever it has a successful observation. If it
-	// is unavailable, iTunes is the first fallback. MusicBrainz remains the
-	// canonical fallback so a provider outage does not stop release tracking.
-	if !spotifySucceeded && !itunesSucceeded && !(spotifyPrimary && !spotifyWasDue) {
-		releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
-		if err == nil {
-			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
-			batches = append(batches, store.ReleaseBatch{
-				Provider: "musicbrainz", Releases: r.normalizer.Normalize(releases),
-			})
-		} else {
-			t := now.Add(providerFailureRetryDelay(nil, r.interval))
-			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &t, false, false, sanitizedProviderError(err))
-			providerErrors = append(providerErrors, err)
-			r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
-		}
-	}
-	if spotifyPrimary && !spotifyWasDue && spotifyKnownDate != "" {
+	outcome.SpotifyChanged = strategy.spotifyChanged
+	outcome.SpotifyUnchanged = strategy.spotifyUnchanged
+	if strategy.spotifyDeferred {
 		if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 			return outcome, err
 		}
 		return outcome, nil
 	}
-	if len(batches) == 0 {
-		retryAt := now.Add(providerFailureRetryDelay(spotifyRateLimit, r.interval))
-		if spotifyRateLimit != nil {
+	if len(strategy.batches) == 0 {
+		retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
+		if strategy.spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
-				"retry_after", syncRetryDelay(spotifyRateLimit, r.spotifyInterval).String(),
-				"quota_exceeded", spotifyRateLimit.QuotaExceeded)
-			providerErrors = append(providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID,
-				now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval))))
-		} else if spotifySuppressed {
-			providerErrors = append(providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID, spotifyCooldownUntil))
+				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
+				"quota_exceeded", strategy.spotifyRateLimit.QuotaExceeded)
+			strategy.providerErrors = append(strategy.providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID,
+				now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))))
+		} else if strategy.spotifySuppressed {
+			strategy.providerErrors = append(strategy.providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown))
 		}
 		r.logger.Debug("artist sync retry scheduled", "artist_id", artist.ID,
-			"retry_after", providerFailureRetryDelay(spotifyRateLimit, r.interval).String())
-		return outcome, errors.Join(errors.Join(providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
+			"retry_after", providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval).String())
+		return outcome, errors.Join(errors.Join(strategy.providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
 	}
-	if err := r.store.ApplyReleaseBatches(ctx, artist, batches, now); err != nil {
+	if err := r.store.ApplyReleaseBatches(ctx, artist, strategy.batches, now); err != nil {
 		return outcome, err
 	}
 	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 		return outcome, err
 	}
-	if spotifySuppressed {
-		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, spotifyCooldownUntil); err != nil {
+	if strategy.spotifySuppressed {
+		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); err != nil {
 			return outcome, err
 		}
 		return outcome, nil
 	}
 	if spotifyWasDue {
-		if spotifyRateLimit != nil {
+		if strategy.spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
-				"retry_after", syncRetryDelay(spotifyRateLimit, r.spotifyInterval).String(),
-				"quota_exceeded", spotifyRateLimit.QuotaExceeded)
-			return outcome, r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(spotifyRateLimit, r.spotifyInterval)))
+				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
+				"quota_exceeded", strategy.spotifyRateLimit.QuotaExceeded)
+			return outcome, r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval)))
 		}
 		upcoming := false
-		for _, batch := range batches {
+		for _, batch := range strategy.batches {
 			if batch.Provider != "spotify" {
 				continue
 			}
