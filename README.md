@@ -44,13 +44,19 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.17.0`.
+footer. The current release is `v0.18.0`.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
 error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
+
+The scheduler checks due synchronization and release-day work once per minute,
+delivers notifications every ten seconds, and runs transient-state maintenance
+hourly. Up to four notification deliveries may run at the same time; SQLite
+keeps one serialized writer and a small read-only pool so dashboard queries do
+not queue behind provider work.
 
 ## Container images
 

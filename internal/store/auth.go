@@ -15,7 +15,7 @@ import (
 
 func (s *Store) UserCount(ctx context.Context) (int, error) {
 	var n int
-	return n, s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 }
 func validateUsername(value string) (string, error) {
 	value = strings.TrimSpace(value)
@@ -132,15 +132,15 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	return u, err
 }
 func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
+	return scanUser(s.readerDB().QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
 		FROM users WHERE email=?`, strings.ToLower(strings.TrimSpace(email))))
 }
 func (s *Store) UserByID(ctx context.Context, id int64) (User, error) {
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
+	return scanUser(s.readerDB().QueryRowContext(ctx, `SELECT id,email,username,password_hash,role,timezone,reminder_time,created_at
 		FROM users WHERE id=?`, id))
 }
 func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT u.id,u.email,u.username,u.role,u.timezone,u.reminder_time,u.created_at,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,u.email,u.username,u.role,u.timezone,u.reminder_time,u.created_at,
 		COUNT(DISTINCT f.artist_id),COUNT(DISTINCT d.id)
 		FROM users u
 		LEFT JOIN follows f ON f.user_id=u.id
@@ -170,7 +170,7 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 	if actingAdminID == userID {
 		return ErrCannotDeleteSelf
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -208,7 +208,7 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 	return tx.Commit()
 }
 func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -246,7 +246,7 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 	if _, err := time.LoadLocation(timezone); err != nil {
 		return errors.New("invalid IANA timezone")
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -313,7 +313,7 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 func (s *Store) Session(ctx context.Context, raw string) (Session, error) {
 	var session Session
 	var expires, created string
-	err := s.DB.QueryRowContext(ctx, `SELECT u.id,u.email,u.username,u.password_hash,u.role,u.timezone,u.reminder_time,u.created_at,
+	err := s.readerDB().QueryRowContext(ctx, `SELECT u.id,u.email,u.username,u.password_hash,u.role,u.timezone,u.reminder_time,u.created_at,
 		s.csrf_token,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
 		WHERE s.token_hash=? AND s.expires_at>?`, security.Digest(raw), nowText()).Scan(
 		&session.User.ID, &session.User.Email, &session.User.Username, &session.User.PasswordHash, &session.User.Role,
@@ -338,7 +338,7 @@ func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID 
 	return raw, err
 }
 func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email string, userID *int64, err error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return "", nil, err
 	}
@@ -364,7 +364,7 @@ func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email s
 }
 func (s *Store) LoginAllowed(ctx context.Context, key string) (bool, error) {
 	var blocked sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT blocked_until FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&blocked)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT blocked_until FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&blocked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}

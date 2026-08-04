@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,6 +21,71 @@ func testStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func TestStoreUsesWriterAndReadOnlyPool(t *testing.T) {
+	s := testStore(t)
+	if s.Reader == nil {
+		t.Fatal("reader pool is nil")
+	}
+	if got := s.DB.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("writer max connections=%d, want 1", got)
+	}
+	if got := s.Reader.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("reader max connections=%d, want 4", got)
+	}
+	if _, err := s.Reader.Exec(`CREATE TABLE should_not_write (id INTEGER)`); err == nil {
+		t.Fatal("read-only pool accepted a write")
+	}
+}
+
+func TestStoreConcurrentReadsDuringWrites(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "concurrent@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "concurrent-artist", Name: "Concurrent Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	readErrs := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for j := 0; j < 10; j++ {
+				if _, err := s.FollowedArtists(ctx, userID); err != nil {
+					readErrs <- err
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		if err := s.ScheduleArtistCheck(ctx, artist.ID, time.Now().UTC().Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wait.Wait()
+	close(readErrs)
+	for err := range readErrs {
+		t.Fatalf("concurrent read failed: %v", err)
+	}
+}
+
+func TestSQLiteBusyClassification(t *testing.T) {
+	if !sqliteBusy(errors.New("database is locked")) || !sqliteBusy(errors.New("database table is locked")) {
+		t.Fatal("lock errors were not classified as retryable")
+	}
+	if sqliteBusy(errors.New("constraint failed")) {
+		t.Fatal("non-lock error was classified as retryable")
+	}
 }
 
 func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {

@@ -3,14 +3,18 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/notify"
+	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
 
@@ -58,6 +62,37 @@ type itunesReleaseCatalog struct {
 	calls    atomic.Int32
 }
 
+type parallelTestSender struct {
+	active atomic.Int32
+	max    atomic.Int32
+	calls  atomic.Int32
+	delay  time.Duration
+}
+
+var _ notify.NotificationSender = (*parallelTestSender)(nil)
+
+func (s *parallelTestSender) Validate(string) error { return nil }
+
+func (s *parallelTestSender) Send(ctx context.Context, _, _, _ string) error {
+	active := s.active.Add(1)
+	defer s.active.Add(-1)
+	s.calls.Add(1)
+	for {
+		current := s.max.Load()
+		if active <= current || s.max.CompareAndSwap(current, active) {
+			break
+		}
+	}
+	timer := time.NewTimer(s.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (f *itunesReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
 	f.calls.Add(1)
 	return f.releases, f.err
@@ -78,6 +113,139 @@ func testRunner(database *store.Store, provider catalog.CatalogProvider) *Runner
 		database, provider, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+}
+
+func TestWakeIsCoalesced(t *testing.T) {
+	runner := &Runner{}
+	runner.initLifecycle()
+	for range 100 {
+		runner.Wake()
+	}
+	select {
+	case <-runner.wake:
+	default:
+		t.Fatal("Wake did not enqueue a signal")
+	}
+	select {
+	case <-runner.wake:
+		t.Fatal("Wake queued more than one signal")
+	default:
+	}
+}
+
+func TestBackgroundTaskGuardPreventsOverlap(t *testing.T) {
+	runner := &Runner{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var guard sync.Mutex
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	runner.startTask(context.Background(), "test", &guard, func(context.Context) {
+		calls.Add(1)
+		close(started)
+		<-release
+	})
+	<-started
+	runner.startTask(context.Background(), "test", &guard, func(context.Context) { calls.Add(1) })
+	close(release)
+	runner.tasks.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("task calls=%d, want 1", got)
+	}
+}
+
+func TestRunnerShutdownWaitsForTrackedTasks(t *testing.T) {
+	runner := testRunner(resolutionTestStore(t), &resolutionCatalog{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var guard sync.Mutex
+	started := make(chan struct{})
+	runner.startTask(ctx, "shutdown-test", &guard, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+	})
+	go runner.Run(ctx)
+	<-started
+	cancel()
+	select {
+	case <-runner.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not finish tracked work during shutdown")
+	}
+}
+
+func TestDeliveryUsesBoundedWorkerPool(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "delivery@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "delivery-artist", Name: "Delivery Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("delivery test secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test://destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Test", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	for i := range 8 {
+		releaseResult, err := database.DB.Exec(`INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`, fmt.Sprintf("delivery-release-%d", i), artist.ID,
+			fmt.Sprintf("Release %d", i), "Album", "[]", "2026-01-01", 3,
+			"https://musicbrainz.org/release-group/example", base.Format(time.RFC3339Nano), base.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseID, _ := releaseResult.LastInsertId()
+		eventResult, err := database.DB.Exec(`INSERT INTO notification_events
+			(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+			userID, releaseID, "announcement", fmt.Sprintf("Event %d", i), "body", base.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventID, _ := eventResult.LastInsertId()
+		if _, err := database.DB.Exec(`INSERT INTO deliveries
+			(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+			eventID, destinations[0].ID, "pending", 0, base.Format(time.RFC3339Nano), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sender := &parallelTestSender{delay: 40 * time.Millisecond}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	summary, err := runner.deliver(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Attempted != 8 || summary.Sent != 8 || summary.Failed != 0 {
+		t.Fatalf("delivery summary=%#v", summary)
+	}
+	if sender.max.Load() < 2 || sender.max.Load() > 4 || sender.calls.Load() != 8 {
+		t.Fatalf("sender concurrency max=%d calls=%d", sender.max.Load(), sender.calls.Load())
+	}
+	var pending int
+	if err := database.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE status='pending'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending deliveries=%d", pending)
+	}
 }
 
 func TestExactSpotifyResolutionCreatesFollowAndOnboardingEvent(t *testing.T) {

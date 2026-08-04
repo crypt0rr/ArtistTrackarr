@@ -37,7 +37,7 @@ func (s *Store) RenameDestination(ctx context.Context, userID, destinationID int
 	return nil
 }
 func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled
 		FROM destinations WHERE user_id=? ORDER BY name`, userID)
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, 
 }
 func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination, error) {
 	var d Destination
-	err := s.DB.QueryRowContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled
 		FROM destinations WHERE user_id=? AND id=?`, userID, id).Scan(
 		&d.ID, &d.UserID, &d.Name, &d.Service, &d.EncryptedURL, &d.Enabled)
 	return d, err
@@ -65,7 +65,7 @@ func (s *Store) DeleteDestination(ctx context.Context, userID, id int64) error {
 	return changedOrNotFound(result, err)
 }
 func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT d.id,d.event_id,d.attempts,d.next_attempt_at,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,d.event_id,d.attempts,d.next_attempt_at,
 		dst.id,dst.user_id,dst.name,dst.service,dst.encrypted_url,dst.enabled,
 		e.title,e.body,e.event_type,rg.title
 		FROM deliveries d JOIN destinations dst ON dst.id=d.destination_id
@@ -109,7 +109,7 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, id int64, attempts int, 
 	return err
 }
 func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([]DeliveryHistory, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT e.title,e.event_type,dst.name,d.status,d.attempts,d.last_error,e.created_at,d.sent_at
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT e.title,e.event_type,dst.name,d.status,d.attempts,d.last_error,e.created_at,d.sent_at
 		FROM notification_events e LEFT JOIN deliveries d ON d.event_id=e.id
 		LEFT JOIN destinations dst ON dst.id=d.destination_id WHERE e.user_id=?
 		ORDER BY e.created_at DESC,d.id DESC LIMIT ?`, userID, limit)
@@ -143,7 +143,7 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 }
 func (s *Store) AdminDeliveryHistoryCount(ctx context.Context) (int, error) {
 	var count int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events e
+	err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events e
 		LEFT JOIN deliveries d ON d.event_id=e.id`).Scan(&count)
 	return count, err
 }
@@ -154,7 +154,7 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT u.email,e.title,e.body,e.event_type,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT u.email,e.title,e.body,e.event_type,
 		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
 		FROM notification_events e
 		JOIN users u ON u.id=e.user_id

@@ -42,7 +42,7 @@ func (s *Store) ArtistByMBID(ctx context.Context, mbid string) (Artist, error) {
 	var a Artist
 	var sid, surl, image sql.NullString
 	var checked sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,
 		spotify_id,spotify_url,spotify_image_url,last_checked_at FROM artists WHERE mbid=?`, mbid).Scan(
 		&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
 		&sid, &surl, &image, &checked)
@@ -54,7 +54,7 @@ func (s *Store) ArtistByMBID(ctx context.Context, mbid string) (Artist, error) {
 	return a, err
 }
 func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -136,15 +136,15 @@ func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution
 	return resolution, nil
 }
 func (s *Store) artistResolutionByProvider(ctx context.Context, userID int64, provider, providerID string) (ArtistResolution, error) {
-	return scanArtistResolution(s.DB.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+	return scanArtistResolution(s.readerDB().QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
 		FROM artist_resolutions WHERE user_id=? AND provider=? AND provider_id=?`, userID, provider, providerID))
 }
 func (s *Store) ArtistResolution(ctx context.Context, userID, resolutionID int64) (ArtistResolution, error) {
-	return scanArtistResolution(s.DB.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+	return scanArtistResolution(s.readerDB().QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
 		FROM artist_resolutions WHERE id=? AND user_id=?`, resolutionID, userID))
 }
 func (s *Store) ArtistResolutions(ctx context.Context, userID int64) ([]ArtistResolution, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+artistResolutionColumns+`
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+artistResolutionColumns+`
 		FROM artist_resolutions WHERE user_id=? ORDER BY created_at`, userID)
 	if err != nil {
 		return nil, err
@@ -161,7 +161,7 @@ func (s *Store) ArtistResolutions(ctx context.Context, userID int64) ([]ArtistRe
 	return result, rows.Err()
 }
 func (s *Store) DueArtistResolutions(ctx context.Context, now time.Time, limit int) ([]ArtistResolution, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+artistResolutionColumns+`
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+artistResolutionColumns+`
 		FROM artist_resolutions WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
 		ORDER BY COALESCE(next_attempt_at,'') LIMIT ?`, timeText(now), limit)
 	if err != nil {
@@ -200,7 +200,7 @@ func (s *Store) CancelArtistResolution(ctx context.Context, userID, resolutionID
 	return changedOrNotFound(result, err)
 }
 func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistResolution, artist Artist) (Artist, bool, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return Artist{}, false, err
 	}
@@ -295,7 +295,7 @@ func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre
 			args = append(args, strings.TrimSpace(artistType))
 		}
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,a.spotify_next_check_at,f.baseline_synced_at
 		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE `+strings.Join(where, " AND ")+`
 		ORDER BY lower(trim(a.name)), lower(trim(a.sort_name)), a.id`, args...)
@@ -333,14 +333,14 @@ func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre
 }
 func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, error) {
 	var count int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=?`, userID).Scan(&count)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=?`, userID).Scan(&count)
 	return count, err
 }
 func (s *Store) replaceArtistGenres(ctx context.Context, artistID int64, genres []string, source string) error {
 	return replaceArtistGenresExec(ctx, s.DB, artistID, genres, source)
 }
 func (s *Store) ArtistGenres(ctx context.Context, artistID int64) ([]string, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT genre FROM artist_genres WHERE artist_id=? ORDER BY weight DESC,genre`, artistID)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT genre FROM artist_genres WHERE artist_id=? ORDER BY weight DESC,genre`, artistID)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +376,7 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 			args[index] = ids[index]
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		rows, err := s.DB.QueryContext(ctx, `SELECT artist_id,genre FROM artist_genres WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,weight DESC,genre`, args...)
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,genre FROM artist_genres WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,weight DESC,genre`, args...)
 		if err != nil {
 			return err
 		}
@@ -395,7 +395,7 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 		}
 		rows.Close()
 
-		statsRows, err := s.DB.QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
+		statsRows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return err
 		}
@@ -439,7 +439,7 @@ func (s *Store) DueListenBrainzArtists(ctx context.Context, now time.Time, limit
 	if limit < 1 || limit > 100 {
 		limit = 50
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url
 		FROM artists a JOIN follows f ON f.artist_id=a.id LEFT JOIN artist_listenbrainz_stats ls ON ls.artist_id=a.id
 		WHERE ls.artist_id IS NULL OR ls.next_check_at IS NULL OR ls.next_check_at<=?
 		ORDER BY COALESCE(ls.next_check_at,''),a.id LIMIT ?`, timeText(now), limit)
@@ -460,7 +460,7 @@ func (s *Store) DueListenBrainzArtists(ctx context.Context, now time.Time, limit
 	return result, rows.Err()
 }
 func (s *Store) SaveListenBrainzStats(ctx context.Context, stats map[int64]ListenBrainzStats, now, next time.Time) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -484,7 +484,7 @@ func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit 
 	if limit < 1 || limit > 20 {
 		limit = 5
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url,ls.total_listen_count,ls.total_user_count,ls.checked_at
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url,ls.total_listen_count,ls.total_user_count,ls.checked_at
 		FROM follows f JOIN artists a ON a.id=f.artist_id JOIN artist_listenbrainz_stats ls ON ls.artist_id=a.id WHERE f.user_id=? ORDER BY ls.total_listen_count DESC,a.name LIMIT ?`, userID, limit)
 	if err != nil {
 		return nil, err
@@ -518,7 +518,7 @@ func (s *Store) FollowedBreakdown(ctx context.Context, userID int64, dimension s
 	default:
 		return nil, errors.New("unsupported artist breakdown")
 	}
-	rows, err := s.DB.QueryContext(ctx, query, userID)
+	rows, err := s.readerDB().QueryContext(ctx, query, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -535,11 +535,11 @@ func (s *Store) FollowedBreakdown(ctx context.Context, userID int64, dimension s
 }
 func (s *Store) IsFollowing(ctx context.Context, userID, artistID int64) (bool, error) {
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID).Scan(&n)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID).Scan(&n)
 	return n > 0, err
 }
 func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Artist, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at
 		FROM artists a JOIN follows f ON f.artist_id=a.id
 		WHERE (a.next_check_at IS NULL OR a.next_check_at<=?)
@@ -585,7 +585,7 @@ func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time
 func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (SpotifyPollingState, error) {
 	var state SpotifyPollingState
 	var last sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).
+	err := s.readerDB().QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).
 		Scan(&state.UnchangedChecks, &last)
 	if last.Valid {
 		t, parseErr := parseTime(last.String)
@@ -633,7 +633,7 @@ func (s *Store) ScheduleSpotifyCheck(ctx context.Context, artistID int64, next t
 }
 func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (string, error) {
 	var date sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT MAX(first_release_date) FROM release_groups
+	err := s.readerDB().QueryRowContext(ctx, `SELECT MAX(first_release_date) FROM release_groups
 		WHERE artist_id=? AND source IN ('spotify','both')`, artistID).Scan(&date)
 	return date.String, err
 }
@@ -642,7 +642,7 @@ func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (s
 // runner can spread artwork requests over time and respect Apple's limiter.
 func (s *Store) DueITunesArtworkArtist(ctx context.Context, now time.Time) (ITunesArtworkArtist, bool, error) {
 	var artist ITunesArtworkArtist
-	err := s.DB.QueryRowContext(ctx, `SELECT a.id,a.name,MAX(rg.itunes_artwork_attempts)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT a.id,a.name,MAX(rg.itunes_artwork_attempts)
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
 		WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
 			AND (rg.itunes_artwork_next_check_at IS NULL OR rg.itunes_artwork_next_check_at<=?)
@@ -670,7 +670,7 @@ func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, 
 			byID[id] = artworkURL
 		}
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -752,7 +752,7 @@ func (s *Store) SpotifyBatchChanged(ctx context.Context, releases []Release) (bo
 			continue
 		}
 		var hash string
-		err := s.DB.QueryRowContext(ctx, `SELECT payload_hash FROM provider_observations WHERE provider='spotify' AND provider_id=?`, providerID).Scan(&hash)
+		err := s.readerDB().QueryRowContext(ctx, `SELECT payload_hash FROM provider_observations WHERE provider='spotify' AND provider_id=?`, providerID).Scan(&hash)
 		if errors.Is(err, sql.ErrNoRows) {
 			return true, nil
 		}

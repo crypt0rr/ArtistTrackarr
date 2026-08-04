@@ -23,7 +23,8 @@ func (c ResolutionCandidate) Artist() Artist {
 	}
 }
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	dsn := "file:" + path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -42,6 +43,22 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Open the reader pool only after migrations have completed. The read-only
+	// URI prevents accidental writes from production query paths and keeps the
+	// writer connection available for migrations and transactions.
+	reader, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	reader.SetMaxOpenConns(4)
+	reader.SetMaxIdleConns(4)
+	if err := reader.Ping(); err != nil {
+		reader.Close()
+		db.Close()
+		return nil, err
+	}
+	s.Reader = reader
 	return s, nil
 }
 func (s *Store) migrate(ctx context.Context) error {
@@ -252,10 +269,24 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	}
 	return tx.Commit()
 }
-func (s *Store) Close() error { return s.DB.Close() }
+func (s *Store) Close() error {
+	var readerErr error
+	if s.Reader != nil {
+		readerErr = s.Reader.Close()
+		s.Reader = nil
+	}
+	if s.DB == nil {
+		return readerErr
+	}
+	writerErr := s.DB.Close()
+	if writerErr != nil {
+		return writerErr
+	}
+	return readerErr
+}
 func (s *Store) Healthy(ctx context.Context) error {
 	var one int
-	return s.DB.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+	return s.readerDB().QueryRowContext(ctx, `SELECT 1`).Scan(&one)
 }
 func changedOrNotFound(result sql.Result, err error) error {
 	if err != nil {
