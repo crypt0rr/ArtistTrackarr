@@ -1,6 +1,7 @@
 package web
 
 import (
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -228,11 +229,14 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) renderImportError(w http.ResponseWriter, r *http.Request, message string) {
-	d := a.data(r, "Add artists")
-	session, _ := currentSession(r)
-	d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
+	d := a.data(r, "Artists")
+	pageFailed := a.loadArtistsData(r, &d)
 	d.Error = message
-	a.render(w, "search", d, http.StatusBadRequest)
+	status := http.StatusBadRequest
+	if pageFailed {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "artists", d, status)
 }
 
 func (a *App) artistImport(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +248,13 @@ func (a *App) artistImport(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := a.store.ImportJob(r.Context(), session.User.ID, id)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		d := a.data(r, "Artist import results")
+		a.pageStoreError(r, &d, "Artist import results", "import job", err)
+		a.render(w, "import", d, http.StatusInternalServerError)
 		return
 	}
 	d := a.data(r, "Artist import results")

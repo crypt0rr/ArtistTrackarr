@@ -44,7 +44,13 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer.
+footer. The current patch release is `v0.16.5`.
+
+Background synchronization and application-log persistence shut down in an
+orderly fashion before SQLite is closed. Routine page loads return a generic
+error when a data lookup fails, while the detailed cause remains in structured
+logs. Static assets use immutable, version-stamped URLs and continue to serve
+their unversioned paths for compatibility.
 
 ## Container images
 

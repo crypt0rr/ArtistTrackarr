@@ -986,18 +986,35 @@ func (s *Store) ArtistByMBID(ctx context.Context, mbid string) (Artist, error) {
 }
 
 func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error) {
-	result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
-		userID, artistID, nowText())
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	n, _ := result.RowsAffected()
+	defer tx.Rollback()
+	now := nowText()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
+		userID, artistID, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return n > 0, nil
 }
 
 func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
-	return err
+	result, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
+	return changedOrNotFound(result, err)
 }
 
 // CreateArtistResolution accepts the legacy Spotify argument list
@@ -1352,32 +1369,75 @@ func replaceArtistGenresExec(ctx context.Context, exec interface {
 }
 
 func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) error {
-	for index := range artists {
-		rows, err := s.DB.QueryContext(ctx, `SELECT genre FROM artist_genres WHERE artist_id=? ORDER BY weight DESC,genre`, artists[index].ID)
+	if len(artists) == 0 {
+		return nil
+	}
+	genresByArtist := make(map[int64][]string, len(artists))
+	statsByArtist := make(map[int64]ListenBrainzStats, len(artists))
+	for start := 0; start < len(artists); start += 500 {
+		end := min(start+500, len(artists))
+		ids := make([]int64, end-start)
+		args := make([]any, end-start)
+		for index := range ids {
+			ids[index] = artists[start+index].ID
+			args[index] = ids[index]
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		rows, err := s.DB.QueryContext(ctx, `SELECT artist_id,genre FROM artist_genres WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,weight DESC,genre`, args...)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
+			var artistID int64
 			var genre string
-			if err := rows.Scan(&genre); err != nil {
+			if err := rows.Scan(&artistID, &genre); err != nil {
 				rows.Close()
 				return err
 			}
-			artists[index].Genres = append(artists[index].Genres, genre)
+			genresByArtist[artistID] = append(genresByArtist[artistID], genre)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return err
 		}
 		rows.Close()
-		var stats ListenBrainzStats
-		var checked, next sql.NullString
-		if err := s.DB.QueryRowContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id=?`, artists[index].ID).Scan(&stats.ArtistID, &stats.TotalListenCount, &stats.TotalUserCount, &checked, &next, &stats.LastError); err == nil {
-			artists[index].ListenCount, artists[index].ListenUsers = stats.TotalListenCount, stats.TotalUserCount
-			if checked.Valid {
-				value, _ := parseTime(checked.String)
-				artists[index].ListenCheckedAt = &value
+
+		statsRows, err := s.DB.QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return err
+		}
+		for statsRows.Next() {
+			var stats ListenBrainzStats
+			var checked, next sql.NullString
+			if err := statsRows.Scan(&stats.ArtistID, &stats.TotalListenCount, &stats.TotalUserCount, &checked, &next, &stats.LastError); err != nil {
+				statsRows.Close()
+				return err
 			}
+			if checked.Valid {
+				value, parseErr := parseTime(checked.String)
+				if parseErr == nil {
+					stats.CheckedAt = &value
+				}
+			}
+			if next.Valid {
+				value, parseErr := parseTime(next.String)
+				if parseErr == nil {
+					stats.NextCheckAt = &value
+				}
+			}
+			statsByArtist[stats.ArtistID] = stats
+		}
+		if err := statsRows.Err(); err != nil {
+			statsRows.Close()
+			return err
+		}
+		statsRows.Close()
+	}
+	for index := range artists {
+		artists[index].Genres = genresByArtist[artists[index].ID]
+		if stats, ok := statsByArtist[artists[index].ID]; ok {
+			artists[index].ListenCount, artists[index].ListenUsers = stats.TotalListenCount, stats.TotalUserCount
+			artists[index].ListenCheckedAt = stats.CheckedAt
 		}
 	}
 	return nil
@@ -2268,10 +2328,14 @@ func comparableReleaseDate(value string) (time.Time, bool) {
 }
 
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
+	today := dayUTC(now)
+	from := today.AddDate(0, 0, -1).Format("2006-01-02")
+	to := today.AddDate(0, 0, 1).Format("2006-01-02")
 	rows, err := s.DB.QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
 		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url
 		FROM follows f JOIN users u ON u.id=f.user_id JOIN release_groups rg ON rg.artist_id=f.artist_id
-		JOIN artists a ON a.id=rg.artist_id WHERE rg.date_precision=3`)
+		JOIN artists a ON a.id=rg.artist_id
+		WHERE rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
 	if err != nil {
 		return err
 	}
@@ -2503,8 +2567,8 @@ func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination,
 }
 
 func (s *Store) DeleteDestination(ctx context.Context, userID, id int64) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM destinations WHERE user_id=? AND id=?`, userID, id)
-	return err
+	result, err := s.DB.ExecContext(ctx, `DELETE FROM destinations WHERE user_id=? AND id=?`, userID, id)
+	return changedOrNotFound(result, err)
 }
 
 func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
@@ -2837,7 +2901,8 @@ func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSync
 	for rows.Next() {
 		var r ManualSyncRequest
 		var aid sql.NullInt64
-		var c, st, ft string
+		var c string
+		var st, ft sql.NullString
 		if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &r.Status, &c, &st, &ft, &r.LastError); err != nil {
 			return nil, err
 		}
@@ -2846,12 +2911,12 @@ func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSync
 			v := aid.Int64
 			r.ArtistID = &v
 		}
-		if st != "" {
-			v, _ := parseTime(st)
+		if st.Valid {
+			v, _ := parseTime(st.String)
 			r.StartedAt = &v
 		}
-		if ft != "" {
-			v, _ := parseTime(ft)
+		if ft.Valid {
+			v, _ := parseTime(ft.String)
 			r.FinishedAt = &v
 		}
 		out = append(out, r)
@@ -2963,7 +3028,7 @@ func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
 func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {
 	var a Artist
 	var sid, surl, simg, checked, next sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url,last_checked_at,spotify_next_check_at,baseline_synced FROM artists WHERE id=?`, id).Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation, &sid, &surl, &simg, &checked, &next, &a.BaselineSynced)
+	err := s.DB.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url,last_checked_at,spotify_next_check_at FROM artists WHERE id=?`, id).Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation, &sid, &surl, &simg, &checked, &next)
 	a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, simg.String
 	if checked.Valid {
 		t, _ := parseTime(checked.String)

@@ -25,8 +25,12 @@ type Handler struct {
 	next   slog.Handler
 	buffer *ring
 	attrs  []slog.Attr
-	sink   func(Entry)
-	sinkMu sync.RWMutex
+	sink   *sinkState
+}
+
+type sinkState struct {
+	mu sync.RWMutex
+	fn func(Entry)
 }
 
 type ring struct {
@@ -39,7 +43,7 @@ func NewHandler(next slog.Handler, limit int) *Handler {
 	if limit < 1 {
 		limit = 200
 	}
-	return &Handler{next: next, buffer: &ring{limit: limit}}
+	return &Handler{next: next, buffer: &ring{limit: limit}, sink: &sinkState{}}
 }
 
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -66,9 +70,12 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 			Attributes: fields,
 		}
 		h.buffer.add(entry)
-		h.sinkMu.RLock()
-		sink := h.sink
-		h.sinkMu.RUnlock()
+		var sink func(Entry)
+		if h.sink != nil {
+			h.sink.mu.RLock()
+			sink = h.sink.fn
+			h.sink.mu.RUnlock()
+		}
 		if sink != nil {
 			sink(entry)
 		}
@@ -85,7 +92,14 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{next: h.next.WithGroup(name), buffer: h.buffer, attrs: h.attrs, sink: h.sink}
 }
 
-func (h *Handler) SetSink(sink func(Entry)) { h.sinkMu.Lock(); h.sink = sink; h.sinkMu.Unlock() }
+func (h *Handler) SetSink(sink func(Entry)) {
+	if h.sink == nil {
+		h.sink = &sinkState{}
+	}
+	h.sink.mu.Lock()
+	h.sink.fn = sink
+	h.sink.mu.Unlock()
+}
 
 func (h *Handler) Snapshot() []Entry {
 	return h.buffer.snapshot()

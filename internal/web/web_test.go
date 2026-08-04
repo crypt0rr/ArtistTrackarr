@@ -581,7 +581,7 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
-		!strings.Contains(page, "<h1>Add artists</h1>") ||
+		!strings.Contains(page, "<h1>Artists</h1>") ||
 		!strings.Contains(page, `href="/artists/export"`) ||
 		!strings.Contains(page, "Export CSV") ||
 		strings.Contains(page, `action="/imports"`) ||
