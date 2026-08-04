@@ -6,15 +6,15 @@
   <meta name="theme-color" content="#f4f1e9" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
   <title>{{.Title}} · ArtistTrackarr</title>
-  <link rel="icon" href="/static/favicon.ico" sizes="any">
-  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-  <script src="/static/theme.js"></script>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="{{staticURL "favicon.ico"}}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{staticURL "favicon-32.png"}}">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{staticURL "apple-touch-icon.png"}}">
+  <script src="{{staticURL "theme.js"}}"></script>
+  <link rel="stylesheet" href="{{staticURL "app.css"}}">
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="/"><img src="/static/logo-mark.png" width="44" height="44" alt=""><span>ArtistTrackarr</span></a>
+  <a class="brand" href="/"><img src="{{staticURL "logo-mark.png"}}" width="44" height="44" alt=""><span>ArtistTrackarr</span></a>
   <div class="topbar-actions">
     {{if .User}}<button class="mobile-menu-toggle" type="button" data-mobile-menu-toggle aria-expanded="false" aria-controls="site-navigation" aria-label="Open navigation menu" title="Open navigation menu"><span class="mobile-menu-icon" data-mobile-menu-icon aria-hidden="true">☰</span><span class="sr-only" data-mobile-menu-label>Open navigation menu</span></button>
     <nav id="site-navigation" aria-label="Main navigation">
@@ -41,9 +41,9 @@
   {{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 {{end}}
-{{define "foot"}}</main><footer><div class="footer-inner"><span>Self-hosted · Music data by <a href="https://musicbrainz.org" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{if .SpotifyOn}} and <a href="https://spotify.com" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}} with Apple/iTunes fallback metadata.</span><span class="footer-meta"><span class="app-version">v{{.Version}}</span><a class="github-link" href="https://github.com/crypt0rr/ArtistTrackarr" target="_blank" rel="noopener noreferrer" aria-label="ArtistTrackarr on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.72.5.1.68-.22.68-.48v-1.7c-2.78.62-3.37-1.2-3.37-1.2-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .08 1.53 1.06 1.53 1.06.9 1.56 2.35 1.11 2.92.85.09-.66.35-1.11.64-1.37-2.22-.26-4.56-1.14-4.56-5.08 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.16 9.16 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.36.32.68.95.68 1.92v1.43c0 .27.18.59.69.48A10.27 10.27 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg><span>GitHub</span></a></span></div></footer><script src="/static/app.js"></script></body></html>{{end}}
+{{define "foot"}}</main><footer><div class="footer-inner"><span>Self-hosted · Music data by <a href="https://musicbrainz.org" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{if .SpotifyOn}} and <a href="https://spotify.com" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}} with Apple/iTunes fallback metadata.</span><span class="footer-meta"><span class="app-version">v{{.Version}}</span><a class="github-link" href="https://github.com/crypt0rr/ArtistTrackarr" target="_blank" rel="noopener noreferrer" aria-label="ArtistTrackarr on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.72.5.1.68-.22.68-.48v-1.7c-2.78.62-3.37-1.2-3.37-1.2-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .08 1.53 1.06 1.53 1.06.9 1.56 2.35 1.11 2.92.85.09-.66.35-1.11.64-1.37-2.22-.26-4.56-1.14-4.56-5.08 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.16 9.16 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.36.32.68.95.68 1.92v1.43c0 .27.18.59.69.48A10.27 10.27 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z"/></svg><span>GitHub</span></a></span></div></footer><script src="{{staticURL "app.js"}}"></script></body></html>{{end}}
 {{define "csrf"}}<input type="hidden" name="_csrf" value="{{.CSRF}}">{{end}}
-{{define "auth-logo"}}<img class="auth-logo" src="/static/logo-full.png" width="960" height="311" alt="ArtistTrackarr">{{end}}
+{{define "auth-logo"}}<img class="auth-logo" src="{{staticURL "logo-full.png"}}" width="960" height="311" alt="ArtistTrackarr">{{end}}
 {{define "notification-settings"}}
 <section class="settings-notifications">
   <section class="panel">

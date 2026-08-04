@@ -101,7 +101,6 @@ type PageData struct {
 	TokenEmail          string
 	SpotifyOn           bool
 	ProviderNotice      string
-	LegacySearch        bool
 }
 
 type providerHealthPayload struct {
@@ -241,6 +240,9 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"join":  strings.Join,
 		"lower": strings.ToLower,
 		"query": url.QueryEscape,
+		"staticURL": func(path string) string {
+			return "/static/" + strings.TrimLeft(path, "/") + "?v=" + url.QueryEscape(version.Current)
+		},
 		"shortDate": func(v string) string {
 			if v == "" {
 				return "Date unknown"
@@ -319,13 +321,17 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.Recoverer)
+	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5))
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	r.Get("/readyz", a.ready)
-	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles))))
+	staticHandler := http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles)))
+	r.Handle("/static/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		staticHandler.ServeHTTP(w, r)
+	}))
 	r.Get("/setup", a.setupForm)
 	r.Post("/setup", a.setup)
 	r.Get("/login", a.loginForm)
@@ -396,6 +402,10 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 
 func (a *App) csrf(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		const name = "artist_csrf"
 		var raw string
 		if cookie, err := r.Cookie(name); err == nil {
@@ -479,6 +489,60 @@ func (a *App) data(r *http.Request, title string) PageData {
 	return d
 }
 
+// pageStoreError keeps database/provider details in structured logs while
+// giving the user a stable, non-sensitive page-level error. The caller uses
+// the return value to send an HTTP 500 for incomplete page loads.
+func (a *App) pageStoreError(r *http.Request, d *PageData, page, operation string, err error) bool {
+	if err == nil {
+		return false
+	}
+	a.logger.Error("page data lookup failed", "page", page, "operation", operation,
+		"path", r.URL.Path, "request_id", middleware.GetReqID(r.Context()), "error", err)
+	if d.Error == "" {
+		d.Error = "We couldn't load this page right now. Please try again."
+	}
+	return true
+}
+
+func (a *App) loadSettingsData(r *http.Request, d *PageData) bool {
+	session, ok := currentSession(r)
+	if !ok {
+		return false
+	}
+	failed := false
+	var err error
+	d.Preferences, err = a.store.NotificationPreferences(r.Context(), session.User.ID)
+	failed = a.pageStoreError(r, d, "Settings", "notification preferences", err) || failed
+	d.Destinations, err = a.store.Destinations(r.Context(), session.User.ID)
+	failed = a.pageStoreError(r, d, "Settings", "notification destinations", err) || failed
+	return failed
+}
+
+func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
+	session, ok := currentSession(r)
+	if !ok {
+		return false
+	}
+	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
+	a.populateSearch(r.Context(), d)
+	d.GenreFilter = strings.TrimSpace(r.URL.Query().Get("genre"))
+	d.CountryFilter = strings.TrimSpace(r.URL.Query().Get("country"))
+	d.TypeFilter = strings.TrimSpace(r.URL.Query().Get("type"))
+	failed := false
+	var err error
+	d.Artists, err = a.store.FollowedArtistsFiltered(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter)
+	failed = a.pageStoreError(r, d, "Artists", "followed artist list", err) || failed
+	d.FollowCount, err = a.store.FollowedArtistCount(r.Context(), session.User.ID)
+	failed = a.pageStoreError(r, d, "Artists", "followed artist count", err) || failed
+	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
+	failed = a.pageStoreError(r, d, "Artists", "genre breakdown", err) || failed
+	d.CountryBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
+	failed = a.pageStoreError(r, d, "Artists", "country breakdown", err) || failed
+	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
+	failed = a.pageStoreError(r, d, "Artists", "artist type breakdown", err) || failed
+	return failed
+}
+
 func (a *App) render(w http.ResponseWriter, name string, data PageData, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
@@ -496,7 +560,13 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
-	count, _ := a.store.UserCount(r.Context())
+	count, err := a.store.UserCount(r.Context())
+	if err != nil {
+		d := a.data(r, "Create administrator")
+		a.pageStoreError(r, &d, "Create administrator", "user count", err)
+		a.render(w, "setup", d, http.StatusInternalServerError)
+		return
+	}
 	if count > 0 {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
@@ -505,7 +575,12 @@ func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) setup(w http.ResponseWriter, r *http.Request) {
-	count, _ := a.store.UserCount(r.Context())
+	count, err := a.store.UserCount(r.Context())
+	if err != nil {
+		a.logger.Error("setup user count failed", "page", "Create administrator", "path", r.URL.Path, "error", err)
+		http.Error(w, "could not load setup", http.StatusInternalServerError)
+		return
+	}
 	if count > 0 {
 		http.Error(w, "setup has already completed", http.StatusConflict)
 		return
@@ -539,8 +614,13 @@ func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	count, _ := a.store.UserCount(r.Context())
+	count, err := a.store.UserCount(r.Context())
 	d := a.data(r, "Sign in")
+	if err != nil {
+		a.pageStoreError(r, &d, "Sign in", "user count", err)
+		a.render(w, "login", d, http.StatusInternalServerError)
+		return
+	}
 	d.SetupNeeded = count == 0
 	a.render(w, "login", d, http.StatusOK)
 }
@@ -548,7 +628,12 @@ func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	key := a.clientIP(r) + "|" + email
-	allowed, _ := a.store.LoginAllowed(r.Context(), key)
+	allowed, err := a.store.LoginAllowed(r.Context(), key)
+	if err != nil {
+		a.logger.Error("login throttling lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
+		http.Error(w, "could not sign in", http.StatusInternalServerError)
+		return
+	}
 	if !allowed {
 		d := a.data(r, "Sign in")
 		d.Error = "Too many attempts. Try again in 15 minutes."
@@ -556,6 +641,11 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		a.logger.Error("login user lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
+		http.Error(w, "could not sign in", http.StatusInternalServerError)
+		return
+	}
 	if err != nil || !security.CheckPassword(user.PasswordHash, r.FormValue("password")) {
 		_ = a.store.RecordLoginFailure(r.Context(), key)
 		time.Sleep(250 * time.Millisecond)
@@ -592,24 +682,39 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	d := a.data(r, "Dashboard")
-	d.FollowCount, _ = a.store.FollowedArtistCount(r.Context(), session.User.ID)
+	pageFailed := false
+	var err error
+	d.FollowCount, err = a.store.FollowedArtistCount(r.Context(), session.User.ID)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "followed artist count", err) || pageFailed
 	location, err := time.LoadLocation(session.User.Timezone)
 	if err != nil {
 		location = time.UTC
 	}
 	today := time.Now().In(location).Format("2006-01-02")
-	d.UpcomingReleases, d.RecentReleases, _ = a.store.DashboardReleases(
+	d.UpcomingReleases, d.RecentReleases, err = a.store.DashboardReleases(
 		r.Context(), session.User.ID, today, 20,
 	)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release catalog", err) || pageFailed
 	d.ReleaseCount = len(d.UpcomingReleases) + len(d.RecentReleases)
-	d.History, _ = a.store.DeliveryHistory(r.Context(), session.User.ID, 10)
-	d.Resolutions, _ = a.store.ArtistResolutions(r.Context(), session.User.ID)
-	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-	d.ListenBrainzArtists, _ = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)
-	d.GenreBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
-	d.CountryBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
-	d.TypeBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
-	a.render(w, "dashboard", d, http.StatusOK)
+	d.History, err = a.store.DeliveryHistory(r.Context(), session.User.ID, 10)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "delivery history", err) || pageFailed
+	d.Resolutions, err = a.store.ArtistResolutions(r.Context(), session.User.ID)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist resolutions", err) || pageFailed
+	d.Preferences, err = a.store.NotificationPreferences(r.Context(), session.User.ID)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification preferences", err) || pageFailed
+	d.ListenBrainzArtists, err = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "ListenBrainz popularity", err) || pageFailed
+	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "genre breakdown", err) || pageFailed
+	d.CountryBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "country breakdown", err) || pageFailed
+	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist type breakdown", err) || pageFailed
+	status := http.StatusOK
+	if pageFailed {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "dashboard", d, status)
 }
 
 func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
@@ -626,7 +731,12 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.logger.Debug("release detail unavailable", "release_id", id, "error", err)
 		d.ReleaseUnavailable = true
-		a.render(w, "release", d, http.StatusNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			a.render(w, "release", d, http.StatusNotFound)
+		} else {
+			a.pageStoreError(r, &d, "Release details", "release lookup", err)
+			a.render(w, "release", d, http.StatusInternalServerError)
+		}
 		return
 	}
 	d.ReleaseDetail = &detail
@@ -634,20 +744,13 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) artists(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
 	d := a.data(r, "Artists")
-	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
-	d.LegacySearch = r.URL.Query().Get("legacy") == "1"
-	a.populateSearch(r.Context(), &d)
-	d.GenreFilter = strings.TrimSpace(r.URL.Query().Get("genre"))
-	d.CountryFilter = strings.TrimSpace(r.URL.Query().Get("country"))
-	d.TypeFilter = strings.TrimSpace(r.URL.Query().Get("type"))
-	d.Artists, _ = a.store.FollowedArtistsFiltered(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter)
-	d.GenreBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
-	d.CountryBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
-	d.TypeBreakdown, _ = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
-	d.FollowCount = len(d.Artists)
-	a.render(w, "artists", d, http.StatusOK)
+	pageFailed := a.loadArtistsData(r, &d)
+	status := http.StatusOK
+	if pageFailed {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "artists", d, status)
 }
 
 func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
@@ -658,7 +761,12 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	following, err := a.store.IsFollowing(r.Context(), session.User.ID, id)
-	if err != nil || !following {
+	if err != nil {
+		a.logger.Error("artist follow lookup failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "artist_id", id, "error", err)
+		http.Error(w, "could not load this artist", http.StatusInternalServerError)
+		return
+	}
+	if !following {
 		http.NotFound(w, r)
 		return
 	}
@@ -666,15 +774,16 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
 		return
 	}
+	if a.jobs != nil {
+		a.jobs.Wake()
+	}
 	http.Redirect(w, r, "/artists?message=Synchronization+queued", http.StatusSeeOther)
 }
 
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
 	target := "/artists"
 	if query := strings.TrimSpace(r.URL.Query().Get("q")); query != "" {
-		target += "?q=" + url.QueryEscape(query) + "&legacy=1"
-	} else {
-		target += "?legacy=1"
+		target += "?q=" + url.QueryEscape(query)
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
@@ -743,7 +852,7 @@ func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "iTunes artist could not be verified", http.StatusBadGateway)
 		return
 	}
-	resolution, created, err := a.store.CreateArtistResolution(
+	_, created, err := a.store.CreateArtistResolution(
 		r.Context(), session.User.ID, "itunes", artist.ID, artist.Name, artist.URL, "",
 	)
 	if err != nil {
@@ -751,7 +860,7 @@ func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created && a.jobs != nil {
-		go a.resolveArtistBatch([]store.ArtistResolution{resolution})
+		a.jobs.Wake()
 	}
 	message := "Artist queued for identification"
 	if !created {
@@ -772,7 +881,6 @@ func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var queued, existing, failed int
-	var resolutions []store.ArtistResolution
 	for _, value := range values {
 		if !validProviderID(value) {
 			failed++
@@ -783,7 +891,7 @@ func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
 			failed++
 			continue
 		}
-		resolution, created, createErr := a.store.CreateArtistResolution(
+		_, created, createErr := a.store.CreateArtistResolution(
 			r.Context(), session.User.ID, "itunes", artist.ID, artist.Name, artist.URL, "",
 		)
 		if createErr != nil {
@@ -792,13 +900,12 @@ func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if created {
 			queued++
-			resolutions = append(resolutions, resolution)
 		} else {
 			existing++
 		}
 	}
-	if len(resolutions) > 0 && a.jobs != nil {
-		go a.resolveArtistBatch(resolutions)
+	if queued > 0 && a.jobs != nil {
+		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d queued, %d already queued, %d failed", queued, existing, failed)
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
@@ -834,21 +941,15 @@ func (a *App) followSpotify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Spotify artist could not be verified", http.StatusBadGateway)
 		return
 	}
-	resolution, created, err := a.store.CreateArtistResolution(
+	_, created, err := a.store.CreateArtistResolution(
 		r.Context(), session.User.ID, spotifyArtist.ID, spotifyArtist.Name, spotifyArtist.URL, spotifyArtist.ImageURL,
 	)
 	if err != nil {
 		http.Error(w, "artist could not be queued", http.StatusInternalServerError)
 		return
 	}
-	if created {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			if _, err := a.jobs.ResolveArtistResolutionNow(ctx, resolution); err != nil {
-				a.logger.Warn("immediate artist resolution failed", "resolution_id", resolution.ID, "error", err)
-			}
-		}()
+	if created && a.jobs != nil {
+		a.jobs.Wake()
 	}
 	message := "Artist queued for identification"
 	if !created {
@@ -869,7 +970,6 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var queued, existing, failed int
-	var resolutions []store.ArtistResolution
 	var spotifyByID map[string]catalog.SpotifyArtist
 	batchLookupFailed := false
 	if batchProvider, ok := a.spotify.(catalog.SpotifyBatchArtistProvider); ok {
@@ -918,7 +1018,7 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		resolution, created, createErr := a.store.CreateArtistResolution(
+		_, created, createErr := a.store.CreateArtistResolution(
 			r.Context(), session.User.ID, spotifyArtist.ID, spotifyArtist.Name, spotifyArtist.URL, spotifyArtist.ImageURL,
 		)
 		if createErr != nil {
@@ -927,33 +1027,15 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if created {
 			queued++
-			resolutions = append(resolutions, resolution)
 		} else {
 			existing++
 		}
 	}
-	if len(resolutions) > 0 && a.jobs != nil {
-		go a.resolveSpotifyBatch(resolutions)
+	if queued > 0 && a.jobs != nil {
+		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d queued, %d already queued, %d failed", queued, existing, failed)
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
-}
-
-func (a *App) resolveSpotifyBatch(resolutions []store.ArtistResolution) {
-	a.resolveArtistBatch(resolutions)
-}
-
-func (a *App) resolveArtistBatch(resolutions []store.ArtistResolution) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	for _, resolution := range resolutions {
-		if _, err := a.jobs.ResolveArtistResolutionNow(ctx, resolution); err != nil {
-			a.logger.Warn("batch artist resolution failed", "resolution_id", resolution.ID, "error", err)
-		}
-		if ctx.Err() != nil {
-			return
-		}
-	}
 }
 
 func (a *App) follow(w http.ResponseWriter, r *http.Request) {
@@ -979,13 +1061,7 @@ func (a *App) follow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if added && a.jobs != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			if err := a.jobs.SyncArtistNow(ctx, artist); err != nil {
-				a.logger.Warn("initial artist sync failed", "artist_id", artist.ID, "error", err)
-			}
-		}()
+		a.jobs.Wake()
 	}
 	message := "Artist added"
 	if !added {
@@ -1002,7 +1078,6 @@ func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var added, existing, failed int
-	var artists []store.Artist
 	for _, mbid := range values {
 		result, resolveErr := a.mb.ResolveArtist(r.Context(), mbid)
 		if resolveErr != nil {
@@ -1027,29 +1102,15 @@ func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if created {
 			added++
-			artists = append(artists, artist)
 		} else {
 			existing++
 		}
 	}
-	if len(artists) > 0 && a.jobs != nil {
-		go a.syncArtistBatch(artists)
+	if added > 0 && a.jobs != nil {
+		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d added, %d already followed, %d failed", added, existing, failed)
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
-}
-
-func (a *App) syncArtistBatch(artists []store.Artist) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	for _, artist := range artists {
-		if err := a.jobs.SyncArtistNow(ctx, artist); err != nil {
-			a.logger.Warn("initial batch artist sync failed", "artist_id", artist.ID, "error", err)
-		}
-		if ctx.Err() != nil {
-			return
-		}
-	}
 }
 
 func selectedValues(r *http.Request, name string) ([]string, error) {
@@ -1074,8 +1135,20 @@ func selectedValues(r *http.Request, name string) ([]string, error) {
 
 func (a *App) unfollow(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	_ = a.store.Unfollow(r.Context(), session.User.ID, id)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	if err := a.store.Unfollow(r.Context(), session.User.ID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("unfollow artist failed", "user_id", session.User.ID, "artist_id", id, "error", err)
+		http.Error(w, "artist could not be removed", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/artists?message=Artist+removed", http.StatusSeeOther)
 }
 
@@ -1088,7 +1161,13 @@ func (a *App) artistResolution(w http.ResponseWriter, r *http.Request) {
 	}
 	resolution, err := a.store.ArtistResolution(r.Context(), session.User.ID, id)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		d := a.data(r, "Review artist")
+		a.pageStoreError(r, &d, "Review artist", "artist resolution", err)
+		a.render(w, "resolution", d, http.StatusInternalServerError)
 		return
 	}
 	d := a.data(r, "Review artist")
@@ -1105,7 +1184,12 @@ func (a *App) selectArtistResolution(w http.ResponseWriter, r *http.Request) {
 	}
 	resolution, err := a.store.ArtistResolution(r.Context(), session.User.ID, id)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("artist resolution lookup failed", "page", "Review artist", "path", r.URL.Path, "resolution_id", id, "error", err)
+		http.Error(w, "could not load this resolution", http.StatusInternalServerError)
 		return
 	}
 	var selected *store.ResolutionCandidate
@@ -1119,7 +1203,7 @@ func (a *App) selectArtistResolution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "select one of the reviewed MusicBrainz artists", http.StatusBadRequest)
 		return
 	}
-	if _, err := a.jobs.SelectArtistResolution(r.Context(), resolution, *selected); err != nil {
+	if _, err := a.jobs.QueueSelectedArtistResolution(r.Context(), resolution, *selected); err != nil {
 		http.Error(w, "artist could not be followed", http.StatusInternalServerError)
 		return
 	}
@@ -1134,7 +1218,12 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.store.CancelArtistResolution(r.Context(), session.User.ID, id); err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("cancel artist resolution failed", "path", r.URL.Path, "user_id", session.User.ID, "resolution_id", id, "error", err)
+		http.Error(w, "could not cancel this resolution", http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, "/?message=Pending+artist+cancelled", http.StatusSeeOther)
@@ -1144,6 +1233,7 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	artists, err := a.store.FollowedArtists(r.Context(), session.User.ID)
 	if err != nil {
+		a.logger.Error("artist export lookup failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "error", err)
 		http.Error(w, "could not export followed artists", http.StatusInternalServerError)
 		return
 	}
@@ -1207,9 +1297,11 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		d := a.data(r, "Settings")
 		d.Error = err.Error()
-		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-		a.render(w, "settings", d, http.StatusBadRequest)
+		if a.loadSettingsData(r, &d) {
+			a.render(w, "settings", d, http.StatusInternalServerError)
+		} else {
+			a.render(w, "settings", d, http.StatusBadRequest)
+		}
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Destination+added", http.StatusSeeOther)
@@ -1217,8 +1309,16 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, parseErr := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if parseErr != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
 	destination, err := a.store.Destination(r.Context(), session.User.ID, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
 	if err == nil {
 		var serviceURL string
 		serviceURL, err = a.cipher.Decrypt(destination.EncryptedURL)
@@ -1247,9 +1347,11 @@ func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 		}
 		d := a.data(r, "Settings")
 		d.Error = err.Error()
-		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-		a.render(w, "settings", d, http.StatusBadRequest)
+		if a.loadSettingsData(r, &d) {
+			a.render(w, "settings", d, http.StatusInternalServerError)
+		} else {
+			a.render(w, "settings", d, http.StatusBadRequest)
+		}
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Destination+renamed", http.StatusSeeOther)
@@ -1257,8 +1359,20 @@ func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	_ = a.store.DeleteDestination(r.Context(), session.User.ID, id)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	if err := a.store.DeleteDestination(r.Context(), session.User.ID, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("delete destination failed", "user_id", session.User.ID, "destination_id", id, "error", err)
+		http.Error(w, "destination could not be deleted", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/settings?message=Destination+deleted", http.StatusSeeOther)
 }
 
@@ -1272,11 +1386,12 @@ func (a *App) profile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) settings(w http.ResponseWriter, r *http.Request) {
-	session, _ := currentSession(r)
 	d := a.data(r, "Settings")
-	d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-	d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-	a.render(w, "settings", d, http.StatusOK)
+	status := http.StatusOK
+	if a.loadSettingsData(r, &d) {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "settings", d, status)
 }
 
 func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
@@ -1290,9 +1405,11 @@ func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		d := a.data(r, "Settings")
 		d.Error = err.Error()
-		d.Preferences, _ = a.store.NotificationPreferences(r.Context(), session.User.ID)
-		d.Destinations, _ = a.store.Destinations(r.Context(), session.User.ID)
-		a.render(w, "settings", d, http.StatusBadRequest)
+		if a.loadSettingsData(r, &d) {
+			a.render(w, "settings", d, http.StatusInternalServerError)
+		} else {
+			a.render(w, "settings", d, http.StatusBadRequest)
+		}
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Settings+updated", http.StatusSeeOther)
@@ -1322,12 +1439,18 @@ func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPa
 }
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {
-	a.render(w, "admin", a.adminData(r), http.StatusOK)
+	d := a.adminData(r)
+	status := http.StatusOK
+	if d.Error != "" {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "admin", d, status)
 }
 
 func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 	health, err := a.store.ProviderHealth(r.Context())
 	if err != nil {
+		a.logger.Error("provider health lookup failed", "page", "Household administration", "operation", "provider health", "path", r.URL.Path, "error", err)
 		http.Error(w, "provider health unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -1348,7 +1471,10 @@ func (a *App) adminData(r *http.Request) PageData {
 	if page < 1 {
 		page = 1
 	}
-	count, _ := a.store.AdminDeliveryHistoryCount(r.Context())
+	d := a.data(r, "Household administration")
+	failed := false
+	count, err := a.store.AdminDeliveryHistoryCount(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "delivery history count", err) || failed
 	pages := (count + pageSize - 1) / pageSize
 	if pages < 1 {
 		pages = 1
@@ -1356,18 +1482,26 @@ func (a *App) adminData(r *http.Request) PageData {
 	if page > pages {
 		page = pages
 	}
-	d := a.data(r, "Household administration")
-	d.AppLogs, _ = a.store.ApplicationLogs(r.Context(), 200)
+	d.AppLogs, err = a.store.ApplicationLogs(r.Context(), 200)
+	failed = a.pageStoreError(r, &d, "Household administration", "application logs", err) || failed
 	if len(d.AppLogs) == 0 {
 		if snapshotter, ok := a.logger.Handler().(interface{ Snapshot() []logging.Entry }); ok {
 			d.AppLogs = snapshotter.Snapshot()
 		}
 	}
-	d.AdminUsers, _ = a.store.AdminUsers(r.Context())
-	d.AdminArtists, _ = a.store.AdminArtists(r.Context())
-	d.ProviderHealth, _ = a.store.ProviderHealth(r.Context())
-	d.ManualSyncs, _ = a.store.ManualSyncRequests(r.Context(), 20)
-	d.AdminHistory, _ = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
+	d.AdminUsers, err = a.store.AdminUsers(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "household users", err) || failed
+	d.AdminArtists, err = a.store.AdminArtists(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "followed artists", err) || failed
+	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
+	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
+	failed = a.pageStoreError(r, &d, "Household administration", "manual sync history", err) || failed
+	d.AdminHistory, err = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
+	failed = a.pageStoreError(r, &d, "Household administration", "delivery audit", err) || failed
+	if failed && d.Error == "" {
+		d.Error = "We couldn't load this page right now. Please try again."
+	}
 	d.AdminPage, d.AdminPages = page, pages
 	if page > 1 {
 		d.AdminPrevPage = page - 1
@@ -1384,6 +1518,9 @@ func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
 		return
 	}
+	if a.jobs != nil {
+		a.jobs.Wake()
+	}
 	http.Redirect(w, r, "/admin?message=Retry+sync+queued", http.StatusSeeOther)
 }
 func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
@@ -1394,12 +1531,20 @@ func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err = a.store.ArtistByID(r.Context(), id); err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("admin artist lookup failed", "page", "Household administration", "path", r.URL.Path, "artist_id", id, "error", err)
+		http.Error(w, "could not load this artist", http.StatusInternalServerError)
 		return
 	}
 	if _, err = a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
 		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
 		return
+	}
+	if a.jobs != nil {
+		a.jobs.Wake()
 	}
 	http.Redirect(w, r, "/admin?message=Artist+sync+queued", http.StatusSeeOther)
 }
@@ -1439,6 +1584,10 @@ func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.store.UserByEmail(r.Context(), email); err == nil {
 		http.Error(w, "that user already exists", http.StatusConflict)
 		return
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		a.logger.Error("invite user lookup failed", "page", "Household administration", "path", r.URL.Path, "error", err)
+		http.Error(w, "could not create invitation", http.StatusInternalServerError)
+		return
 	}
 	raw, err := a.store.CreateAuthToken(r.Context(), "invite", email, nil, session.User.ID, 48*time.Hour)
 	if err != nil {
@@ -1448,14 +1597,23 @@ func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/invite/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Invitation", strings.TrimSpace(r.FormValue("email"))
-	a.render(w, "admin", d, http.StatusOK)
+	status := http.StatusOK
+	if d.Error != "" {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "admin", d, status)
 }
 
 func (a *App) createReset(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	user, err := a.store.UserByEmail(r.Context(), r.FormValue("email"))
 	if err != nil {
-		http.Error(w, "user not found", http.StatusNotFound)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		a.logger.Error("reset user lookup failed", "page", "Household administration", "path", r.URL.Path, "error", err)
+		http.Error(w, "could not create reset", http.StatusInternalServerError)
 		return
 	}
 	raw, err := a.store.CreateAuthToken(r.Context(), "reset", user.Email, &user.ID, session.User.ID, time.Hour)
@@ -1466,7 +1624,11 @@ func (a *App) createReset(w http.ResponseWriter, r *http.Request) {
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/reset/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Password reset", user.Email
-	a.render(w, "admin", d, http.StatusOK)
+	status := http.StatusOK
+	if d.Error != "" {
+		status = http.StatusInternalServerError
+	}
+	a.render(w, "admin", d, status)
 }
 
 func (a *App) tokenForm(kind string) http.HandlerFunc {

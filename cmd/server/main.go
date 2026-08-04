@@ -24,12 +24,13 @@ import (
 )
 
 func main() {
+	stdoutLogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := config.Load()
 	if err != nil {
-		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		logger.Error("invalid configuration", "error", err)
+		stdoutLogger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
+	stdoutLogger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	logHandler := logging.NewHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}), 200)
 	logger := slog.New(logHandler)
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
@@ -41,8 +42,16 @@ func main() {
 		logger.Error("open database", "error", err)
 		os.Exit(1)
 	}
-	defer database.Close()
-	logHandler.SetSink(func(entry logging.Entry) { _ = database.InsertApplicationLog(context.Background(), entry) })
+	databaseClosed := false
+	defer func() {
+		if !databaseClosed {
+			_ = database.Close()
+		}
+	}()
+	applicationLogs := logging.NewAsyncSink(256, func(entry logging.Entry) error {
+		return database.InsertApplicationLog(context.Background(), entry)
+	})
+	logHandler.SetSink(applicationLogs.Enqueue)
 
 	cipher, err := security.NewCipher(cfg.EncryptionKey)
 	if err != nil {
@@ -108,7 +117,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go runner.Run(ctx)
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		logger.Info("server listening", "address", cfg.ListenAddr, "public_url", cfg.PublicURL.String())
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server failed", "error", err)
@@ -121,5 +132,44 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
-	logger.Info("server stopped")
+	serverStopped := false
+	select {
+	case <-serverDone:
+		serverStopped = true
+	case <-shutdownCtx.Done():
+		stdoutLogger.Error("http server did not stop before shutdown deadline")
+	}
+	select {
+	case <-runner.Done():
+	case <-shutdownCtx.Done():
+		stdoutLogger.Error("background runner did not stop before shutdown deadline")
+	}
+	runnerStopped := false
+	select {
+	case <-runner.Done():
+		runnerStopped = true
+	case <-shutdownCtx.Done():
+	}
+	logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	logErr := applicationLogs.Close(logDrainCtx)
+	cancelLogDrain()
+	if logErr != nil || !serverStopped || !runnerStopped {
+		stdoutLogger.Error("background work did not drain before database shutdown",
+			"server_stopped", serverStopped, "runner_stopped", runnerStopped, "log_sink_error", logErr)
+		// Do not close SQLite while a runner or log writer can still use it. The
+		// process is about to exit, so the operating system will reclaim it.
+		databaseClosed = true
+		return
+	}
+	if dropped := applicationLogs.Dropped(); dropped > 0 {
+		stdoutLogger.Warn("application log records dropped", "count", dropped)
+	}
+	if sinkErrors := applicationLogs.Errors(); sinkErrors > 0 {
+		stdoutLogger.Warn("application log persistence failed", "count", sinkErrors)
+	}
+	stdoutLogger.Info("server stopped")
+	databaseClosed = true
+	if err := database.Close(); err != nil {
+		stdoutLogger.Error("close database", "error", err)
+	}
 }

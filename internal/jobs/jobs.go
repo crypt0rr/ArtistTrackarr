@@ -29,6 +29,9 @@ type Runner struct {
 	spotifyInterval       time.Duration
 	logger                *slog.Logger
 	syncMu                sync.Mutex
+	lifecycleOnce         sync.Once
+	wake                  chan struct{}
+	done                  chan struct{}
 	providerMu            sync.Mutex
 	spotifyCooldownLoaded bool
 	spotifyCooldownUntil  time.Time
@@ -103,10 +106,22 @@ func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.Re
 		store: s, catalog: provider, normalizer: normalizer, sender: sender,
 		cipher: cipher, interval: interval, spotifyInterval: 24 * time.Hour, logger: logger,
 	}
+	runner.initLifecycle()
 	for _, option := range options {
 		option(runner)
 	}
 	return runner
+}
+
+func (r *Runner) initLifecycle() {
+	r.lifecycleOnce.Do(func() {
+		if r.wake == nil {
+			r.wake = make(chan struct{}, 1)
+		}
+		if r.done == nil {
+			r.done = make(chan struct{})
+		}
+	})
 }
 
 // spotifyProviderCooldown loads the persisted provider-wide cooldown once per
@@ -211,7 +226,11 @@ func (r *Runner) clearITunesProviderCooldown() {
 }
 
 func (r *Runner) Run(ctx context.Context) {
-	r.tick(ctx)
+	r.initLifecycle()
+	defer close(r.done)
+	if ctx.Err() == nil {
+		r.tick(ctx)
+	}
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -219,9 +238,35 @@ func (r *Runner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			r.tick(ctx)
+		case <-r.wake:
+			if ctx.Err() != nil {
+				return
+			}
 			r.tick(ctx)
 		}
 	}
+}
+
+// Wake asks the background runner to process due work promptly. The signal is
+// coalesced so a multi-follow request cannot create an unbounded goroutine or
+// wake-up backlog.
+func (r *Runner) Wake() {
+	r.initLifecycle()
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Done closes when Run has stopped and no background tick can access the
+// store anymore.
+func (r *Runner) Done() <-chan struct{} {
+	r.initLifecycle()
+	return r.done
 }
 
 func (r *Runner) tick(ctx context.Context) {
@@ -428,7 +473,22 @@ func (r *Runner) SelectArtistResolution(ctx context.Context, resolution store.Ar
 		MBID: candidate.MBID, Name: candidate.Name, SortName: candidate.SortName,
 		Type: candidate.Type, Country: candidate.Country, Disambiguation: candidate.Disambiguation,
 		Aliases: candidate.Aliases, Genres: candidate.Genres, Score: candidate.Score,
-	})
+	}, true)
+}
+
+// QueueSelectedArtistResolution completes a reviewed mapping without doing
+// provider work in the HTTP request. The Follow operation brings the artist
+// due immediately; Wake lets the runner perform the initial sync.
+func (r *Runner) QueueSelectedArtistResolution(ctx context.Context, resolution store.ArtistResolution, candidate store.ResolutionCandidate) (string, error) {
+	status, err := r.completeArtistResolution(ctx, resolution, catalog.ArtistResult{
+		MBID: candidate.MBID, Name: candidate.Name, SortName: candidate.SortName,
+		Type: candidate.Type, Country: candidate.Country, Disambiguation: candidate.Disambiguation,
+		Aliases: candidate.Aliases, Genres: candidate.Genres, Score: candidate.Score,
+	}, false)
+	if err == nil {
+		r.Wake()
+	}
+	return status, err
 }
 
 func (r *Runner) resolveArtistResolutions(ctx context.Context, now time.Time) (resolutionStats, error) {
@@ -465,7 +525,7 @@ func (r *Runner) resolveArtistResolution(ctx context.Context, resolution store.A
 		return "pending", r.retryArtistResolution(ctx, resolution, now, "MusicBrainz is temporarily unavailable.")
 	}
 	if len(matches) == 1 {
-		return r.completeArtistResolution(ctx, resolution, matches[0])
+		return r.completeArtistResolution(ctx, resolution, matches[0], true)
 	}
 	if len(matches) > 1 {
 		candidates := resolutionCandidates(matches)
@@ -521,7 +581,7 @@ func resolutionCandidates(matches []catalog.ArtistResult) []store.ResolutionCand
 	return result
 }
 
-func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.ArtistResolution, match catalog.ArtistResult) (string, error) {
+func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.ArtistResolution, match catalog.ArtistResult, syncInitial bool) (string, error) {
 	artist := match.StoreArtist()
 	if resolution.Provider == "spotify" {
 		artist.SpotifyID = resolution.ProviderID
@@ -532,7 +592,7 @@ func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.
 	if err != nil {
 		return "", err
 	}
-	if added {
+	if added && syncInitial {
 		if _, err := r.syncOne(ctx, artist, time.Now().UTC()); err != nil {
 			r.logger.Warn("initial resolved artist sync failed", "artist_id", artist.ID, "error", err)
 		}
