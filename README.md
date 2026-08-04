@@ -44,8 +44,10 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.19.0`. Local builds that do not provide a
-release build argument show `dev` instead.
+footer. The current release is `v0.20.0`. Local builds that do not provide a
+release build argument show `dev` instead. Operational timestamps are stored
+in UTC and rendered in the configured system timezone; existing databases are
+normalized automatically during the v0.20.0 migration.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
@@ -55,9 +57,16 @@ their unversioned paths for compatibility.
 
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
-hourly. Up to four notification deliveries may run at the same time; SQLite
-keeps one serialized writer and a small read-only pool so dashboard queries do
-not queue behind provider work.
+hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
+files, removing stale and oldest entries first. Up to four notification
+deliveries may run at the same time; SQLite keeps one serialized writer and a
+small read-only pool so dashboard queries do not queue behind provider work.
+
+When `PUBLIC_URL` uses HTTPS, the application sends HSTS and a restrictive
+Permissions-Policy header. With `LOG_LEVEL=debug`, sanitized request-completion
+records include the request ID, route pattern, status, duration, and response
+size; request paths, query strings, bodies, credentials, and destination URLs
+are never logged.
 
 ## Container images
 
@@ -66,7 +75,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.19.0` publishes `0.19.0`, `0.19`, and `latest`.
+- Pushing a tag such as `v0.20.0` publishes `0.20.0`, `0.20`, and `latest`.
 
 Release images receive their semantic version at build time. Local Docker
 builds default to `dev`; set `APP_VERSION` when building a custom image if a
@@ -75,7 +84,7 @@ different display version is needed.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.19.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.20.0 docker compose up -d
 ```
 
 ## Configuration

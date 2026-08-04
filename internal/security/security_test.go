@@ -18,6 +18,15 @@ func TestPasswordRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDummyPasswordHashIsValid(t *testing.T) {
+	if !CheckPassword(DummyPasswordHash, "artisttrackarr-invalid-password") {
+		t.Fatal("dummy password hash did not follow the Argon2id verification path")
+	}
+	if CheckPassword(DummyPasswordHash, "") {
+		t.Fatal("dummy password hash accepted an empty password")
+	}
+}
+
 func TestCipherRoundTripAndTamper(t *testing.T) {
 	cipher, err := NewCipher("this is at least thirty two characters long")
 	if err != nil {

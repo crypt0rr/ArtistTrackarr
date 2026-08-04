@@ -221,7 +221,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 }
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5))
+	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), a.requestLogging)
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
@@ -294,8 +294,32 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=()")
+		if a.cfg.PublicURL != nil && strings.EqualFold(a.cfg.PublicURL.Scheme, "https") {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co https://*.mzstatic.com https://*.itunes.apple.com data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *App) requestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(wrapped, r)
+		route := "unknown"
+		if routeContext := chi.RouteContext(r.Context()); routeContext != nil {
+			if pattern := routeContext.RoutePattern(); pattern != "" {
+				route = pattern
+			}
+		}
+		if a.logger != nil {
+			a.logger.Debug("http request completed",
+				"request_id", middleware.GetReqID(r.Context()),
+				"method", r.Method, "route", route, "status", wrapped.Status(),
+				"bytes", wrapped.BytesWritten(), "duration", time.Since(started).String())
+		}
 	})
 }
 func (a *App) csrf(next http.Handler) http.Handler {

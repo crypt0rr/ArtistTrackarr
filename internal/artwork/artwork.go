@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,20 @@ type Asset struct {
 	ContentType string
 	Status      string
 	MaxAge      time.Duration
+}
+
+const (
+	// DefaultMaxCacheBytes and DefaultMaxCacheFiles keep the persistent
+	// artwork cache bounded for household deployments without adding another
+	// required runtime setting.
+	DefaultMaxCacheBytes int64 = 1 << 30
+	DefaultMaxCacheFiles       = 25_000
+)
+
+type PruneStats struct {
+	RemovedFiles int
+	RemovedBytes int64
+	StaleFiles   int
 }
 
 type Provider interface {
@@ -62,6 +77,7 @@ type Cache struct {
 	semaphore chan struct{}
 	mu        sync.Mutex
 	inflight  map[string]*call
+	pruneMu   sync.Mutex
 }
 
 func NewCache(root string, options ...Option) (*Cache, error) {
@@ -174,6 +190,101 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	}
 	_ = os.Remove(missingPath)
 	return Asset{Data: data, ContentType: contentType, Status: "fetched", MaxAge: successTTL}
+}
+
+// Prune removes stale entries and then oldest entries until both cache limits
+// are satisfied. Files are written atomically by refresh, so a directory
+// snapshot is safe to inspect while a fetch is in progress. Temporary files
+// are deliberately ignored and are cleaned up by their writer.
+func (c *Cache) Prune(ctx context.Context, maxBytes int64, maxFiles int) (PruneStats, error) {
+	select {
+	case <-ctx.Done():
+		return PruneStats{}, ctx.Err()
+	default:
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxCacheBytes
+	}
+	if maxFiles <= 0 {
+		maxFiles = DefaultMaxCacheFiles
+	}
+	c.pruneMu.Lock()
+	defer c.pruneMu.Unlock()
+	entries, err := os.ReadDir(c.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return PruneStats{}, nil
+		}
+		return PruneStats{}, err
+	}
+	type cacheFile struct {
+		path    string
+		modTime time.Time
+		size    int64
+		stale   bool
+	}
+	files := make([]cacheFile, 0, len(entries))
+	now := c.now()
+	var totalBytes int64
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".img") && !strings.HasSuffix(entry.Name(), ".missing")) {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return PruneStats{}, ctx.Err()
+		default:
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if errors.Is(infoErr, os.ErrNotExist) {
+				continue
+			}
+			return PruneStats{}, infoErr
+		}
+		ttl := successTTL
+		if strings.HasSuffix(entry.Name(), ".missing") {
+			ttl = missingTTL
+		}
+		age := now.Sub(info.ModTime())
+		stale := age >= ttl
+		files = append(files, cacheFile{path: filepath.Join(c.root, entry.Name()), modTime: info.ModTime(), size: info.Size(), stale: stale})
+		totalBytes += info.Size()
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+	stats := PruneStats{}
+	remove := func(index int) error {
+		file := files[index]
+		if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		stats.RemovedFiles++
+		stats.RemovedBytes += file.size
+		if file.stale {
+			stats.StaleFiles++
+		}
+		totalBytes -= file.size
+		files = append(files[:index], files[index+1:]...)
+		return nil
+	}
+	for index := 0; index < len(files); {
+		if !files[index].stale {
+			index++
+			continue
+		}
+		if err := remove(index); err != nil {
+			return stats, err
+		}
+	}
+	for len(files) > maxFiles || totalBytes > maxBytes {
+		if len(files) == 0 {
+			break
+		}
+		if err := remove(0); err != nil {
+			return stats, err
+		}
+	}
+	return stats, nil
 }
 
 func (c *Cache) paths(mbid string) (string, string) {

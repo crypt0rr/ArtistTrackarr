@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
@@ -22,6 +23,7 @@ type Runner struct {
 	spotify               catalog.SpotifyReleaseProvider
 	itunes                catalog.ITunesReleaseProvider
 	listenbrainz          catalog.ListenBrainzProvider
+	artwork               *artwork.Cache
 	normalizer            catalog.ReleaseNormalizer
 	sender                notify.NotificationSender
 	cipher                *security.Cipher
@@ -103,6 +105,10 @@ func WithITunes(provider catalog.ITunesReleaseProvider) Option {
 
 func WithListenBrainz(provider catalog.ListenBrainzProvider) Option {
 	return func(r *Runner) { r.listenbrainz = provider }
+}
+
+func WithArtworkCache(cache *artwork.Cache) Option {
+	return func(r *Runner) { r.artwork = cache }
 }
 
 // WithSpotifyInterval controls the independent Spotify observation cadence.
@@ -393,6 +399,16 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 			"sessions", maintenance.Sessions, "auth_tokens", maintenance.AuthTokens,
 			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
 			"import_jobs", maintenance.ImportJobs)
+	}
+	if r.artwork != nil {
+		stats, err := r.artwork.Prune(ctx, artwork.DefaultMaxCacheBytes, artwork.DefaultMaxCacheFiles)
+		if err != nil {
+			r.logger.Warn("artwork cache pruning failed", "error", err)
+		} else if stats.RemovedFiles > 0 {
+			r.logger.Info("artwork cache pruning completed",
+				"removed_files", stats.RemovedFiles, "removed_bytes", stats.RemovedBytes,
+				"stale_files", stats.StaleFiles)
+		}
 	}
 }
 

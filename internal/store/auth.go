@@ -79,14 +79,19 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 	if _, err := time.LoadLocation(timezone); err != nil {
 		return 0, errors.New("invalid IANA timezone")
 	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	username = strings.TrimSpace(username)
 	if username == "" {
 		var id int64
-		if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
 			return 0, err
 		}
 		var existing []string
-		rows, err := s.DB.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+		rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
 		if err != nil {
 			return 0, err
 		}
@@ -114,15 +119,41 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 		return 0, err
 	}
 	username = validatedUsername
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
-		VALUES(?,?,?,?,?,?)`, email, username, hash, role, timezone, nowText())
+	taken, err := usernameTakenTx(ctx, tx, username, 0)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "users.username") || strings.Contains(strings.ToLower(err.Error()), "username") {
-			return 0, ErrUsernameTaken
-		}
 		return 0, err
 	}
-	return result.LastInsertId()
+	if taken {
+		return 0, ErrUsernameTaken
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
+		VALUES(?,?,?,?,?,?)`, email, username, hash, role, timezone, nowText())
+	if err != nil {
+		return 0, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func usernameTakenTx(ctx context.Context, tx *sql.Tx, username string, exceptID int64) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM users WHERE username COLLATE NOCASE=?`
+	args := []any{username}
+	if exceptID > 0 {
+		query += ` AND id<>?`
+		args = append(args, exceptID)
+	}
+	query += `)`
+	var taken int
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&taken); err != nil {
+		return false, err
+	}
+	return taken != 0, nil
 }
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
@@ -232,11 +263,22 @@ func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, remin
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, reminder, userID)
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "username") {
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	taken, err := usernameTakenTx(ctx, tx, username, userID)
+	if err != nil {
+		return err
+	}
+	if taken {
 		return ErrUsernameTaken
 	}
-	return err
+	if _, err = tx.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, reminder, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CreateUserFromInvite consumes an invitation and creates its account in one
@@ -284,11 +326,15 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 	if err != nil {
 		return err
 	}
+	taken, err := usernameTakenTx(ctx, tx, username, 0)
+	if err != nil {
+		return err
+	}
+	if taken {
+		return ErrUsernameTaken
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at) VALUES(?,?,?,'member',?,?)`, email, username, hash, timezone, nowText())
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "username") {
-			return ErrUsernameTaken
-		}
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=? AND kind='invite'`, nowText(), security.Digest(raw)); err != nil {

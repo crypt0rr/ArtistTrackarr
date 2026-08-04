@@ -193,11 +193,11 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 		args  []any
 		out   *int64
 	}{
-		{`DELETE FROM sessions WHERE datetime(expires_at) < datetime(?)`, []any{timeText(now)}, &stats.Sessions},
-		{`DELETE FROM auth_tokens WHERE datetime(expires_at) < datetime(?) OR used_at IS NOT NULL`, []any{timeText(now)}, &stats.AuthTokens},
-		{`DELETE FROM login_attempts WHERE datetime(first_at) < datetime(?)`, []any{timeText(cutoff)}, &stats.LoginAttempts},
-		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND datetime(finished_at) < datetime(?)`, []any{timeText(manualCutoff)}, &stats.ManualSyncs},
-		{`DELETE FROM import_jobs WHERE datetime(created_at) < datetime(?)`, []any{timeText(manualCutoff)}, &stats.ImportJobs},
+		{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}, &stats.Sessions},
+		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &stats.AuthTokens},
+		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(cutoff)}, &stats.LoginAttempts},
+		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(manualCutoff)}, &stats.ManualSyncs},
+		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(manualCutoff)}, &stats.ImportJobs},
 	}
 	for _, statement := range statements {
 		result, err := s.DB.ExecContext(ctx, statement.query, statement.args...)

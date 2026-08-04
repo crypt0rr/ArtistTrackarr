@@ -1,0 +1,2 @@
+-- Timestamp normalization is implemented by the Go migration runner so
+-- legacy RFC3339 offsets and SQLite datetime() values can be parsed safely.
