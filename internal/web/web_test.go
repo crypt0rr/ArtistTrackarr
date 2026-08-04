@@ -985,6 +985,30 @@ func TestCoverageSyncQueuesOnlyOwnedArtists(t *testing.T) {
 	}
 }
 
+func TestCoverageManageArtistsUsesSharedButtonStyles(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	user, err := database.UserByEmail(context.Background(), "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: "coverage-button-artist", Name: "Coverage Button Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/coverage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `<a class="button secondary button-link" href="/artists">Manage artists</a>`) {
+		t.Fatalf("coverage Manage artists button status/body=%d %q", response.StatusCode, body)
+	}
+}
+
 func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, &fakeSpotify{}, nil)
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
