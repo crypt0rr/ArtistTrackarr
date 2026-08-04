@@ -170,6 +170,10 @@ type Release struct {
 	ITunesURL        string
 	ITunesArtworkURL string
 	Source           string
+	SourceCount      int
+	Sources          []string
+	Confidence       string
+	LastObservedAt   *time.Time
 	FirstObservedAt  time.Time
 }
 
@@ -187,6 +191,44 @@ type ReleaseObservation struct {
 type ReleaseBatch struct {
 	Provider string
 	Releases []Release
+}
+
+// ArtistProviderStatus records the last known state of one provider for one
+// followed artist. It is intentionally separate from provider_health, which
+// describes the process-wide provider cooldown and not an individual artist.
+type ArtistProviderStatus struct {
+	ArtistID      int64
+	Provider      string
+	Status        string
+	LastAttemptAt *time.Time
+	LastSuccessAt *time.Time
+	LastFailureAt *time.Time
+	NextCheckAt   *time.Time
+	ReleaseCount  int
+	LastError     string
+	UpdatedAt     time.Time
+}
+
+type ArtistCoverage struct {
+	Artist               Artist
+	OverallStatus        string
+	ProviderStatuses     []ArtistProviderStatus
+	ReleaseCount         int
+	ConfirmedReleases    int
+	SingleSourceReleases int
+	FallbackReleases     int
+	LastObservedAt       *time.Time
+	NextCheckAt          *time.Time
+}
+
+type CoverageSummary struct {
+	Artists              int
+	FreshArtists         int
+	AttentionArtists     int
+	PendingArtists       int
+	ConfirmedReleases    int
+	SingleSourceReleases int
+	FallbackReleases     int
 }
 
 // ITunesArtworkArtist identifies one artist whose existing iTunes releases
@@ -319,4 +361,7 @@ const artistResolutionColumns = `id,user_id,provider,provider_id,display_name,pr
 
 const releaseSelectColumns = `rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 	rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at`
+	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at,
+	(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
+	(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
+	(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=rg.id)`

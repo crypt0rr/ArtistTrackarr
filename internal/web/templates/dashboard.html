@@ -8,6 +8,10 @@
   <article><strong>{{.ReleaseCount}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
+{{if .CoverageSummary.Artists}}<section class="panel trust-overview">
+  <div class="section-head"><div><p class="eyebrow">Release trust</p><h2>Know what is confirmed</h2><p>Provider coverage for your followed artists at a glance.</p></div><a href="/coverage">Open Trust Center</a></div>
+  <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div></div>
+</section>{{end}}
 {{if or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel insights-panel">
   <div class="section-head insights-heading"><div><p class="eyebrow">Watchlist insights</p><h2>Explore your artists</h2><p>Quick patterns from your followed artists, with one-click filters.</p></div><div class="insights-heading-actions"><span class="badge">{{.FollowCount}} artists</span><a href="/artists">View all artists</a></div></div>
   <div class="insights-grid">
@@ -35,7 +39,7 @@
     <a class="release-card-link" href="/releases/{{.ID}}">
       <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
       <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseConfidenceClass .}}">{{releaseConfidenceLabel .}}</span></small>
       </span>
     </a>
     {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}
@@ -49,7 +53,7 @@
     <a class="release-card-link" href="/releases/{{.ID}}">
       <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
       <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}}</small>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseConfidenceClass .}}">{{releaseConfidenceLabel .}}</span></small>
       </span>
     </a>
     {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}

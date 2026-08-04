@@ -609,9 +609,22 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	return result, rows.Err()
 }
 func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET last_checked_at=?,next_check_at=? WHERE id=?`,
-		timeText(now), timeText(now.Add(interval)), artistID)
-	return err
+	next := now.Add(interval)
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artists SET last_checked_at=?,next_check_at=? WHERE id=?`,
+		timeText(now), timeText(next), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider IN ('itunes','musicbrainz')`,
+		timeText(next), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
@@ -662,13 +675,38 @@ func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, 
 			delay = backoff
 		}
 	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
-		timeText(now.Add(delay)), streak, nullableTime(lastChange), artistID)
-	return err
+	next := now.Add(delay)
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
+		timeText(next), streak, nullableTime(lastChange), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
+		timeText(next), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) ScheduleSpotifyCheck(ctx context.Context, artistID int64, next time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, timeText(next), artistID)
-	return err
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, timeText(next), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
+		timeText(next), artistID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (string, error) {
 	var date sql.NullString

@@ -161,6 +161,78 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"providerHealthStatus": providerHealthStatus,
 		"providerHealthClass":  providerHealthClass,
 		"providerHealthError":  providerHealthError,
+		"coverageStatusLabel": func(status string) string {
+			switch status {
+			case "fresh":
+				return "Fresh"
+			case "confirmed":
+				return "Confirmed"
+			case "fallback":
+				return "Fallback only"
+			case "attention":
+				return "Needs attention"
+			default:
+				return "Pending"
+			}
+		},
+		"coverageStatusClass": func(status string) string {
+			switch status {
+			case "fresh", "confirmed":
+				return "sent"
+			case "fallback":
+				return "ambiguous"
+			case "attention":
+				return "failed"
+			default:
+				return "pending"
+			}
+		},
+		"providerStatusClass": func(status string) string {
+			switch status {
+			case "healthy":
+				return "sent"
+			case "failed", "cooldown":
+				return "failed"
+			case "not_configured":
+				return "pending"
+			default:
+				return "ambiguous"
+			}
+		},
+		"providerLabel": func(provider string) string {
+			switch strings.ToLower(provider) {
+			case "spotify":
+				return "Spotify"
+			case "itunes":
+				return "iTunes"
+			default:
+				return "MusicBrainz"
+			}
+		},
+		"releaseConfidenceLabel": func(r store.Release) string {
+			switch r.Confidence {
+			case "confirmed":
+				return "Confirmed"
+			case "canonical":
+				return "Canonical"
+			case "spotify":
+				return "Spotify only"
+			case "itunes":
+				return "iTunes only"
+			default:
+				return "Unconfirmed"
+			}
+		},
+		"releaseConfidenceClass": func(r store.Release) string {
+			switch r.Confidence {
+			case "confirmed", "canonical":
+				return "sent"
+			case "spotify", "itunes":
+				return "ambiguous"
+			default:
+				return "pending"
+			}
+		},
 		"releaseURL": func(r store.Release) string {
 			if r.SpotifyURL != "" {
 				return r.SpotifyURL
@@ -246,6 +318,8 @@ func (a *App) Handler() http.Handler {
 		private.Get("/", a.dashboard)
 		private.Post("/logout", a.logout)
 		private.Get("/artists", a.artists)
+		private.Get("/coverage", a.coverage)
+		private.Post("/coverage/artists/{id}/sync", a.queueCoverageSync)
 		private.Get("/releases/{id}", a.releaseDetail)
 		private.Get("/artists/search", a.search)
 		private.Get("/settings", a.settings)

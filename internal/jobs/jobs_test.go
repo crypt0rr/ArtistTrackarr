@@ -444,6 +444,10 @@ func TestSyncContinuesWithSpotifyWhenMusicBrainzFails(t *testing.T) {
 		releases[0].SpotifyID != "album-id" || spotify.calls.Load() != 1 {
 		t.Fatalf("releases=%#v Spotify calls=%d err=%v", releases, spotify.calls.Load(), err)
 	}
+	var providerStatus string
+	if err := database.DB.QueryRow(`SELECT status FROM artist_provider_status WHERE artist_id=? AND provider='spotify'`, artist.ID).Scan(&providerStatus); err != nil || providerStatus != "healthy" {
+		t.Fatalf("Spotify coverage status=%q err=%v", providerStatus, err)
+	}
 }
 
 func TestSpotifyIsPrimaryReleaseSourceWhenAvailable(t *testing.T) {
@@ -509,6 +513,13 @@ func TestSpotifyFailureFallsBackToITunesBeforeMusicBrainz(t *testing.T) {
 	releases, err := database.RecentReleases(ctx, userID, 10)
 	if err != nil || len(releases) != 1 || releases[0].Source != "itunes" || releases[0].Title != "iTunes release" {
 		t.Fatalf("iTunes fallback releases=%#v err=%v", releases, err)
+	}
+	var spotifyStatus, itunesStatus string
+	if err := database.DB.QueryRow(`SELECT status FROM artist_provider_status WHERE artist_id=? AND provider='spotify'`, artist.ID).Scan(&spotifyStatus); err != nil || spotifyStatus != "failed" {
+		t.Fatalf("Spotify fallback status=%q err=%v", spotifyStatus, err)
+	}
+	if err := database.DB.QueryRow(`SELECT status FROM artist_provider_status WHERE artist_id=? AND provider='itunes'`, artist.ID).Scan(&itunesStatus); err != nil || itunesStatus != "healthy" {
+		t.Fatalf("iTunes fallback status=%q err=%v", itunesStatus, err)
 	}
 }
 
