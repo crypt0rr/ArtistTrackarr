@@ -77,6 +77,16 @@ type PageData struct {
 	AdminPages          int
 	AdminPrevPage       int
 	AdminNextPage       int
+	ArtistPage          int
+	ArtistPages         int
+	ArtistPrevPage      int
+	ArtistNextPage      int
+	ArtistPrevURL       string
+	ArtistNextURL       string
+	ArtistPageLinks     []PaginationLink
+	ArtistPageStart     int
+	ArtistPageEnd       int
+	FilteredArtistCount int
 	Query               string
 	GeneratedURL        string
 	Token               string
@@ -84,6 +94,12 @@ type PageData struct {
 	TokenEmail          string
 	SpotifyOn           bool
 	ProviderNotice      string
+}
+
+type PaginationLink struct {
+	Number  int
+	URL     string
+	Current bool
 }
 
 type providerHealthPayload struct {

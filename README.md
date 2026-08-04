@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.20.0`. Local builds that do not provide a
+footer. The current release is `v0.21.0`. Local builds that do not provide a
 release build argument show `dev` instead. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -54,6 +54,10 @@ orderly fashion before SQLite is closed. Routine page loads return a generic
 error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
+
+The Artists page uses 50-item, page-number navigation for followed artists.
+Genre, country, artist-type, and search filters remain in the page URL while
+browsing, and the watchlist total stays separate from the filtered result count.
 
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
@@ -75,7 +79,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.20.0` publishes `0.20.0`, `0.20`, and `latest`.
+- Pushing a tag such as `v0.21.0` publishes `0.21.0`, `0.21`, and `latest`.
 
 Release images receive their semantic version at build time. Local Docker
 builds default to `dev`; set `APP_VERSION` when building a custom image if a
@@ -84,7 +88,7 @@ different display version is needed.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.20.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.21.0 docker compose up -d
 ```
 
 ## Configuration

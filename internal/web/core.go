@@ -440,17 +440,55 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	if !ok {
 		return false
 	}
+	const pageSize = 50
 	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
 	a.populateSearch(r.Context(), d)
 	d.GenreFilter = strings.TrimSpace(r.URL.Query().Get("genre"))
 	d.CountryFilter = strings.TrimSpace(r.URL.Query().Get("country"))
 	d.TypeFilter = strings.TrimSpace(r.URL.Query().Get("type"))
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
 	failed := false
 	var err error
-	d.Artists, err = a.store.FollowedArtistsFiltered(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter)
-	failed = a.pageStoreError(r, d, "Artists", "followed artist list", err) || failed
 	d.FollowCount, err = a.store.FollowedArtistCount(r.Context(), session.User.ID)
 	failed = a.pageStoreError(r, d, "Artists", "followed artist count", err) || failed
+	d.FilteredArtistCount, err = a.store.FollowedArtistsFilteredCount(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter)
+	failed = a.pageStoreError(r, d, "Artists", "filtered artist count", err) || failed
+	pages := (d.FilteredArtistCount + pageSize - 1) / pageSize
+	if pages < 1 {
+		pages = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	d.ArtistPage, d.ArtistPages = page, pages
+	if page > 1 {
+		d.ArtistPrevPage = page - 1
+		d.ArtistPrevURL = artistsPageURL(r, page-1)
+	}
+	if page < pages {
+		d.ArtistNextPage = page + 1
+		d.ArtistNextURL = artistsPageURL(r, page+1)
+	}
+	if d.FilteredArtistCount > 0 {
+		d.ArtistPageStart = (page-1)*pageSize + 1
+		d.ArtistPageEnd = page * pageSize
+		if d.ArtistPageEnd > d.FilteredArtistCount {
+			d.ArtistPageEnd = d.FilteredArtistCount
+		}
+	}
+	if pages > 1 {
+		d.ArtistPageLinks = make([]PaginationLink, 0, pages)
+		for number := 1; number <= pages; number++ {
+			d.ArtistPageLinks = append(d.ArtistPageLinks, PaginationLink{
+				Number: number, URL: artistsPageURL(r, number), Current: number == page,
+			})
+		}
+	}
+	d.Artists, err = a.store.FollowedArtistsFilteredPage(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter, pageSize, (page-1)*pageSize)
+	failed = a.pageStoreError(r, d, "Artists", "followed artist list", err) || failed
 	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
 	failed = a.pageStoreError(r, d, "Artists", "genre breakdown", err) || failed
 	d.CountryBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
@@ -458,6 +496,17 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
 	failed = a.pageStoreError(r, d, "Artists", "artist type breakdown", err) || failed
 	return failed
+}
+
+func artistsPageURL(r *http.Request, page int) string {
+	values := make(url.Values)
+	for _, key := range []string{"q", "genre", "country", "type"} {
+		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+			values.Set(key, value)
+		}
+	}
+	values.Set("page", strconv.Itoa(page))
+	return "/artists?" + values.Encode()
 }
 func (a *App) render(w http.ResponseWriter, name string, data PageData, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
