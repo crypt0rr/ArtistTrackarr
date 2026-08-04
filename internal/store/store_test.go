@@ -72,7 +72,7 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO provider_observations(provider,provider_id,release_group_id,payload_hash,observed_at) VALUES('spotify','legacy',?,'hash',?)`, releaseID, nowText()); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := (&Store{DB: db}).CreateArtistResolution(ctx, userID, "spotify-id", "Legacy", "https://open.spotify.com/artist/spotify-id", ""); err != nil {
+	if _, _, err := (&Store{DB: db}).CreateArtistResolution(ctx, userID, "spotify", "spotify-id", "Legacy", "https://open.spotify.com/artist/spotify-id", ""); err != nil {
 		t.Fatal(err)
 	}
 	s := &Store{DB: db}
@@ -109,11 +109,11 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "importer@example.com", "hash", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "importer@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherID, err := s.CreateUser(ctx, "other-importer@example.com", "hash", "member", "UTC")
+	otherID, err := s.CreateUser(ctx, "other-importer@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 func TestPruneExpiredStateKeepsActiveAndQueuedState(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "maintenance@example.com", "hash", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "maintenance@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestPruneExpiredStateKeepsActiveAndQueuedState(t *testing.T) {
 func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "itunes@example.com", "hash", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "itunes@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 func TestITunesArtworkBackfillDoesNotCreateNotifications(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "artwork@example.com", "hash", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "artwork@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestITunesArtworkBackfillDoesNotCreateNotifications(t *testing.T) {
 func TestReleaseBaselineAndExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestSpotifyBatchChangedDetectsNewAndUpdatedReleases(t *testing.T) {
 func TestInitialSyncChoosesNearestUpcomingRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	if err := s.AddDestination(ctx, userID, "Phone", "ntfy", []byte("encrypted-one")); err != nil {
@@ -452,7 +452,7 @@ func TestInitialSyncChoosesNearestUpcomingRelease(t *testing.T) {
 func TestInitialSyncChoosesLatestPastAndSkipsUndated(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
@@ -478,7 +478,7 @@ func TestInitialSyncChoosesLatestPastAndSkipsUndated(t *testing.T) {
 func TestInitialSyncWithOnlyUndatedReleasesCreatesNoEvent(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	if err := s.ApplyReleaseSync(ctx, artist, []Release{{MBID: "undated", Title: "Mystery", PrimaryType: "Album"}}, time.Now()); err != nil {
@@ -490,7 +490,7 @@ func TestInitialSyncWithOnlyUndatedReleasesCreatesNoEvent(t *testing.T) {
 func TestInitialMultiSourceSyncCanChooseSpotifyRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{
 		MBID: "artist-id", Name: "Pjotr", SortName: "Pjotr", SpotifyID: "spotify-artist",
 	})
@@ -527,7 +527,7 @@ func TestInitialMultiSourceSyncCanChooseSpotifyRelease(t *testing.T) {
 func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{
 		MBID: "artist-id", Name: "Example", SortName: "Example", SpotifyID: "spotify-artist",
 	})
@@ -568,7 +568,7 @@ func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *tes
 func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
 	s.Follow(ctx, userID, artist.ID)
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
@@ -613,7 +613,7 @@ func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {
 func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
 	s.Follow(ctx, userID, artist.ID)
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
@@ -650,7 +650,7 @@ func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
 func TestDashboardReleasesSeparatesDefinitelyFutureDates(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	releases := []Release{
@@ -682,7 +682,7 @@ func TestDashboardReleasesSeparatesDefinitelyFutureDates(t *testing.T) {
 func TestScheduleArtistCheckDefersDueArtist(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
@@ -711,7 +711,7 @@ func assertReleaseMBIDs(t *testing.T, releases []Release, want []string) {
 func TestSessionRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, err := s.CreateUser(ctx, "listener@example.com", "hash", "member", "UTC")
+	userID, err := s.CreateUser(ctx, "listener@example.com", "hash", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -731,7 +731,7 @@ func TestSessionRoundTrip(t *testing.T) {
 func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "Europe/Amsterdam")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "Europe/Amsterdam", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
 	s.Follow(ctx, userID, artist.ID)
 	now := time.Date(2026, 7, 30, 7, 1, 0, 0, time.UTC) // 09:01 in Amsterdam.
@@ -754,8 +754,8 @@ func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 func TestRenameDestinationIsOwnerScopedAndPreservesCredentials(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	ownerID, _ := s.CreateUser(ctx, "owner@example.com", "unused", "member", "UTC")
-	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	ownerID, _ := s.CreateUser(ctx, "owner@example.com", "unused", "member", "UTC", "")
+	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC", "")
 	encrypted := []byte("encrypted destination URL")
 	if err := s.AddDestination(ctx, ownerID, "  Phone  ", "ntfy", encrypted); err != nil {
 		t.Fatal(err)
@@ -788,17 +788,13 @@ func TestRenameDestinationIsOwnerScopedAndPreservesCredentials(t *testing.T) {
 func TestArtistResolutionLifecycleIsOwnerScoped(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	ownerID, _ := s.CreateUser(ctx, "owner@example.com", "unused", "member", "UTC")
-	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
-	resolution, created, err := s.CreateArtistResolution(
-		ctx, ownerID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example",
-	)
+	ownerID, _ := s.CreateUser(ctx, "owner@example.com", "unused", "member", "UTC", "")
+	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC", "")
+	resolution, created, err := s.CreateArtistResolution(ctx, ownerID, "spotify", "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example")
 	if err != nil || !created {
 		t.Fatalf("create resolution = %#v, %v, created=%v", resolution, err, created)
 	}
-	duplicate, created, err := s.CreateArtistResolution(
-		ctx, ownerID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "",
-	)
+	duplicate, created, err := s.CreateArtistResolution(ctx, ownerID, "spotify", "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "")
 	if err != nil || created || duplicate.ID != resolution.ID {
 		t.Fatalf("duplicate resolution = %#v, %v, created=%v", duplicate, err, created)
 	}
@@ -837,7 +833,7 @@ func TestArtistResolutionLifecycleIsOwnerScoped(t *testing.T) {
 func TestFollowedArtistsSortsByDisplayName(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artists := []Artist{
 		{MBID: "artist-z", Name: "zeta", SortName: "Zeta"},
 		{MBID: "artist-a", Name: "Alpha", SortName: "Alpha"},
@@ -866,10 +862,8 @@ func TestFollowedArtistsSortsByDisplayName(t *testing.T) {
 func TestArtistResolutionRetryScheduling(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
-	resolution, _, _ := s.CreateArtistResolution(
-		ctx, userID, "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "",
-	)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
+	resolution, _, _ := s.CreateArtistResolution(ctx, userID, "spotify", "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "")
 	now := time.Now().UTC()
 	if err := s.RetryArtistResolution(ctx, userID, resolution.ID, 2, now.Add(time.Hour), "try later"); err != nil {
 		t.Fatal(err)
@@ -887,8 +881,8 @@ func TestArtistResolutionRetryScheduling(t *testing.T) {
 func TestFollowedArtistCount(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
-	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
+	otherID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC", "")
 	for i := range 2 {
 		artist, err := s.UpsertArtist(ctx, Artist{
 			MBID: fmt.Sprintf("artist-%d", i), Name: fmt.Sprintf("Artist %d", i), SortName: fmt.Sprintf("Artist %d", i),
@@ -912,7 +906,7 @@ func TestFollowedArtistCount(t *testing.T) {
 func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC")
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "audit-artist", Name: "Audit Artist", SortName: "Audit Artist"})
 	if err := s.AddDestination(ctx, userID, "Phone", "ntfy", []byte("encrypted-secret")); err != nil {
 		t.Fatal(err)
@@ -966,9 +960,9 @@ func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 func TestAdminUsersAndDeleteUser(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	adminID, _ := s.CreateUser(ctx, "admin@example.com", "unused", "admin", "Europe/Amsterdam")
-	memberID, _ := s.CreateUser(ctx, "member@example.com", "unused", "member", "UTC")
-	otherMemberID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	adminID, _ := s.CreateUser(ctx, "admin@example.com", "unused", "admin", "Europe/Amsterdam", "")
+	memberID, _ := s.CreateUser(ctx, "member@example.com", "unused", "member", "UTC", "")
+	otherMemberID, _ := s.CreateUser(ctx, "other@example.com", "unused", "member", "UTC", "")
 	artist, err := s.UpsertArtist(ctx, Artist{MBID: "admin-user-artist", Name: "Example", SortName: "Example"})
 	if err != nil {
 		t.Fatal(err)

@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current patch release is `v0.16.5`.
+footer. The current release is `v0.17.0`.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic

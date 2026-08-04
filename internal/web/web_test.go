@@ -131,7 +131,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	}
 	cipher, _ := security.NewCipher(cfg.EncryptionKey)
 	app, err := New(cfg, database, fakeCatalog{searchErr: io.ErrUnexpectedEOF}, nil,
-		fakeSender{}, cipher, fakeArtwork{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		fakeSender{}, cipher, fakeArtwork{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +555,7 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, mb, nil, nil)
 	ctx := context.Background()
 	user, _ := database.UserByEmail(ctx, "member@example.com")
-	otherID, _ := database.CreateUser(ctx, "other@example.com", "unused", "member", "UTC")
+	otherID, _ := database.CreateUser(ctx, "other@example.com", "unused", "member", "UTC", "")
 	followed, err := database.UpsertArtist(ctx, store.Artist{
 		MBID: "11111111-1111-4111-8111-111111111111", Name: "Comma, Artist", SortName: "Artist, Comma",
 		SpotifyID:  "0OdUWJ0sBjDrqHygGUXeCF",
@@ -682,7 +682,7 @@ func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	mb := &searchCatalog{}
 	database, server, client := authenticatedTestServer(t, mb, nil, nil)
-	targetID, err := database.CreateUser(context.Background(), "delete-me@example.com", "unused", "member", "UTC")
+	targetID, err := database.CreateUser(context.Background(), "delete-me@example.com", "unused", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,10 +810,7 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 		)
 	})
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
-	resolution, _, err := database.CreateArtistResolution(
-		context.Background(), user.ID, "spotify-id", "Example",
-		"https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example",
-	)
+	resolution, _, err := database.CreateArtistResolution(context.Background(), user.ID, "spotify", "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "https://i.scdn.co/example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -841,11 +838,8 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 		t.Fatalf("reviewed follow=%#v err=%v", followed, err)
 	}
 
-	otherID, _ := database.CreateUser(context.Background(), "other@example.com", "unused", "member", "UTC")
-	otherResolution, _, _ := database.CreateArtistResolution(
-		context.Background(), otherID, "other-spotify", "Other",
-		"https://open.spotify.com/artist/other-spotify", "",
-	)
+	otherID, _ := database.CreateUser(context.Background(), "other@example.com", "unused", "member", "UTC", "")
+	otherResolution, _, _ := database.CreateArtistResolution(context.Background(), otherID, "spotify", "other-spotify", "Other", "https://open.spotify.com/artist/other-spotify", "")
 	response, err = client.Get(server.URL + "/artist-resolutions/" + strconv.FormatInt(otherResolution.ID, 10))
 	if err != nil {
 		t.Fatal(err)
@@ -1057,7 +1051,7 @@ func TestReleaseDetailUnavailableIsStyledAndOwnerScoped(t *testing.T) {
 	if err := database.DB.QueryRow(`SELECT id FROM release_groups WHERE mbid=?`, "itunes:private-123").Scan(&releaseID); err != nil {
 		t.Fatal(err)
 	}
-	otherID, err := database.CreateUser(context.Background(), "other-detail@example.com", "unused", "member", "UTC")
+	otherID, err := database.CreateUser(context.Background(), "other-detail@example.com", "unused", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1194,7 +1188,7 @@ func authenticatedTestServer(
 		EncryptionKey: "the encryption key has more than 32 bytes",
 	}
 	cipher, _ := security.NewCipher(cfg.EncryptionKey)
-	userID, err := database.CreateUser(context.Background(), "member@example.com", "unused", "member", "UTC")
+	userID, err := database.CreateUser(context.Background(), "member@example.com", "unused", "member", "UTC", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1202,7 @@ func authenticatedTestServer(
 	}
 	app, err := New(
 		cfg, database, mb, spotify, fakeSender{}, cipher, fakeArtwork{}, runner,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	if err != nil {
 		t.Fatal(err)

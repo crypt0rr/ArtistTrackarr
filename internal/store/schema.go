@@ -1,0 +1,332 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/binary"
+	"fmt"
+	"io/fs"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+func (c ResolutionCandidate) Artist() Artist {
+	return Artist{
+		MBID: c.MBID, Name: c.Name, SortName: c.SortName, Type: c.Type,
+		Country: c.Country, Disambiguation: c.Disambiguation,
+		Genres: append([]string(nil), c.Genres...),
+	}
+}
+func Open(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &Store{DB: db}
+	if err := s.migrate(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+func (s *Store) migrate(ctx context.Context) error {
+	if _, err := s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations
+		(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	entries, err := fs.ReadDir(migrations, "migrations")
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		version, err := strconv.Atoi(strings.SplitN(entry.Name(), "_", 2)[0])
+		if err != nil {
+			return fmt.Errorf("invalid migration %s", entry.Name())
+		}
+		var exists int
+		if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=?`, version).Scan(&exists); err != nil {
+			return err
+		}
+		if exists > 0 {
+			continue
+		}
+		body, err := migrations.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			return err
+		}
+		if version == 8 {
+			if err := s.migrateITunesFallback(ctx); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+			if _, err := s.DB.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText()); err != nil {
+				return err
+			}
+			continue
+		}
+		if version == 11 {
+			if err := s.migrateUsernames(ctx, body); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+			continue
+		}
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, string(body)); err == nil {
+			_, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText())
+		}
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d: %w", version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateUsernames adds the required username column and deterministically
+// fills legacy rows before creating the case-insensitive uniqueness index.
+// It is kept as a Go migration because SQLite does not provide a portable way
+// to sanitize arbitrary email local-parts in a single ALTER TABLE statement.
+func (s *Store) migrateUsernames(ctx context.Context, body []byte) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(e error) error { _ = tx.Rollback(); return e }
+	if _, err = tx.ExecContext(ctx, string(body)); err != nil {
+		return rollback(err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,email FROM users ORDER BY id`)
+	if err != nil {
+		return rollback(err)
+	}
+	type legacyUser struct {
+		id    int64
+		email string
+	}
+	var users []legacyUser
+	for rows.Next() {
+		var user legacyUser
+		if err := rows.Scan(&user.id, &user.email); err != nil {
+			rows.Close()
+			return rollback(err)
+		}
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return rollback(err)
+	}
+	rows.Close()
+	taken := make(map[string]struct{}, len(users))
+	for _, user := range users {
+		name := derivedUsername(user.email, user.id, taken)
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET username=? WHERE id=?`, name, user.id); err != nil {
+			return rollback(err)
+		}
+		taken[strings.ToLower(name)] = struct{}{}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users(username COLLATE NOCASE)`); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(11,?)`, nowText()); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
+}
+
+// migrateITunesFallback rebuilds the two tables whose provider CHECK
+// constraints need to accept iTunes. SQLite cannot alter CHECK constraints in
+// place, so the tables are copied while foreign-key enforcement is temporarily
+// disabled during application startup. The dependent tables keep their
+// release_groups foreign-key name and continue to point at the replacement.
+func (s *Store) migrateITunesFallback(ctx context.Context) error {
+	if _, err := s.DB.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	defer s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error { _ = tx.Rollback(); return err }
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE release_groups_itunes (
+		id INTEGER PRIMARY KEY,
+		mbid TEXT NOT NULL UNIQUE,
+		artist_id INTEGER NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+		title TEXT NOT NULL,
+		primary_type TEXT NOT NULL,
+		secondary_types TEXT NOT NULL DEFAULT '[]',
+		first_release_date TEXT NOT NULL DEFAULT '',
+		date_precision INTEGER NOT NULL DEFAULT 0,
+		musicbrainz_url TEXT NOT NULL,
+		spotify_url TEXT,
+		first_observed_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		spotify_id TEXT,
+		spotify_image_url TEXT NOT NULL DEFAULT '',
+		itunes_id TEXT,
+		itunes_url TEXT,
+		source TEXT NOT NULL DEFAULT 'musicbrainz' CHECK(source IN ('musicbrainz','spotify','itunes','both'))
+	)`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_groups_itunes
+		(id,mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_url,first_observed_at,updated_at,spotify_id,spotify_image_url,source)
+		SELECT id,mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_url,first_observed_at,updated_at,spotify_id,spotify_image_url,source
+		FROM release_groups`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE release_groups`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE release_groups_itunes RENAME TO release_groups`); err != nil {
+		return rollback(err)
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS releases_artist ON release_groups(artist_id)`,
+		`CREATE INDEX IF NOT EXISTS releases_date ON release_groups(first_release_date)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS release_groups_spotify_id ON release_groups(spotify_id) WHERE spotify_id IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS release_groups_itunes_id ON release_groups(itunes_id) WHERE itunes_id IS NOT NULL`,
+	} {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE artist_resolutions_itunes (
+		id INTEGER PRIMARY KEY,
+		user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		provider TEXT NOT NULL CHECK(provider IN ('spotify','itunes')),
+		provider_id TEXT NOT NULL,
+		display_name TEXT NOT NULL,
+		provider_url TEXT NOT NULL,
+		image_url TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL CHECK(status IN ('pending','review')),
+		candidate_json TEXT NOT NULL DEFAULT '[]',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at TEXT,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		UNIQUE(user_id, provider, provider_id)
+	)`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO artist_resolutions_itunes
+		(id,user_id,provider,provider_id,display_name,provider_url,image_url,status,candidate_json,
+		 attempts,next_attempt_at,last_error,created_at,updated_at)
+		SELECT id,user_id,provider,provider_id,display_name,provider_url,image_url,status,candidate_json,
+		 attempts,next_attempt_at,last_error,created_at,updated_at FROM artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE artist_resolutions_itunes RENAME TO artist_resolutions`); err != nil {
+		return rollback(err)
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE INDEX artist_resolutions_due ON artist_resolutions(status, next_attempt_at)`); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
+}
+func (s *Store) Close() error { return s.DB.Close() }
+func (s *Store) Healthy(ctx context.Context) error {
+	var one int
+	return s.DB.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+}
+func changedOrNotFound(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func normalizeGenreKey(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+}
+func replaceArtistGenresExec(ctx context.Context, exec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, artistID int64, genres []string, source string) error {
+	if _, err := exec.ExecContext(ctx, `DELETE FROM artist_genres WHERE artist_id=? AND source=?`, artistID, source); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(genres))
+	for index, raw := range genres {
+		label := strings.TrimSpace(raw)
+		key := normalizeGenreKey(label)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, err := exec.ExecContext(ctx, `INSERT INTO artist_genres(artist_id,genre,genre_key,source,weight,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(artist_id,genre_key) DO UPDATE SET genre=excluded.genre,source=excluded.source,weight=excluded.weight,updated_at=excluded.updated_at`, artistID, label, key, source, len(genres)-index, nowText()); err != nil {
+			return err
+		}
+		if len(seen) >= 10 {
+			break
+		}
+	}
+	return nil
+}
+
+// spotifyPollDelay spreads artists deterministically across the polling
+// interval. The offset is stable for an artist but does not need another
+// persisted column, so restarts retain the same distribution.
+func spotifyPollDelay(artistID int64, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return interval
+	}
+	sum := sha256.Sum256([]byte(strconv.FormatInt(artistID, 10)))
+	span := interval
+	offset := time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(span))
+	return interval/2 + offset
+}
+func nullString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+func nowText() string                       { return timeText(time.Now().UTC()) }
+func timeText(t time.Time) string           { return t.UTC().Format(time.RFC3339Nano) }
+func parseTime(v string) (time.Time, error) { return time.Parse(time.RFC3339Nano, v) }
+func nullableTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return timeText(*t)
+}
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
