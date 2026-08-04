@@ -2,9 +2,9 @@ package version
 
 import "testing"
 
-func TestDevelopmentVersionFallback(t *testing.T) {
-	if Current != "dev" {
-		t.Fatalf("development Current=%q, want dev", Current)
+func TestCurrentReleaseVersion(t *testing.T) {
+	if Current != "0.21.0" {
+		t.Fatalf("Current=%q, want 0.21.0", Current)
 	}
 }
 

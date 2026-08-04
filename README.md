@@ -44,8 +44,8 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.21.0`. Local builds that do not provide a
-release build argument show `dev` instead. Operational timestamps are stored
+footer. The current release is `v0.21.0`, which is also displayed by local
+builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
 
@@ -81,9 +81,8 @@ GitHub Actions builds and publishes the Docker image to
 - `sha-<commit>` identifies an exact source revision.
 - Pushing a tag such as `v0.21.0` publishes `0.21.0`, `0.21`, and `latest`.
 
-Release images receive their semantic version at build time. Local Docker
-builds default to `dev`; set `APP_VERSION` when building a custom image if a
-different display version is needed.
+The application version is kept in the source and updated with each release,
+so local and published images show the same release number in the interface.
 
 Pin a deployment to a release by setting the Compose image before starting:
 

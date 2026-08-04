@@ -4,7 +4,7 @@ test:
 	docker build --target test .
 
 build:
-	docker build --build-arg APP_VERSION=$${APP_VERSION:-dev} -t artist-trackarr:local .
+	docker build -t artist-trackarr:local .
 
 run:
 	docker compose up --build
