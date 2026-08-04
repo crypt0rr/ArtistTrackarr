@@ -69,6 +69,14 @@ type parallelTestSender struct {
 	delay  time.Duration
 }
 
+type failingSender struct {
+	err error
+}
+
+func (s failingSender) Validate(string) error { return nil }
+
+func (s failingSender) Send(context.Context, string, string, string) error { return s.err }
+
 var _ notify.NotificationSender = (*parallelTestSender)(nil)
 
 func (s *parallelTestSender) Validate(string) error { return nil }
@@ -245,6 +253,76 @@ func TestDeliveryUsesBoundedWorkerPool(t *testing.T) {
 	}
 	if pending != 0 {
 		t.Fatalf("pending deliveries=%d", pending)
+	}
+}
+
+func TestDeliveryFailureSchedulesRetry(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "retry-delivery@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "retry-delivery-artist", Name: "Retry Delivery Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("retry delivery test secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test://retry-destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Retry", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	releaseResult, err := database.DB.Exec(`INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "retry-delivery-release", artist.ID, "Retry Release", "Album", "[]", "2026-01-01", 3,
+		"https://musicbrainz.org/release-group/retry-delivery-release", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := releaseResult.LastInsertId()
+	eventResult, err := database.DB.Exec(`INSERT INTO notification_events
+		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Retry title", "Retry body", now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, _ := eventResult.LastInsertId()
+	if _, err := database.DB.Exec(`INSERT INTO deliveries
+		(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[0].ID, "pending", 0, now.Format(time.RFC3339Nano), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, failingSender{err: errors.New("temporary delivery failure")}, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	before := time.Now().UTC()
+	summary, err := runner.deliver(ctx, before)
+	if err != nil || summary.Attempted != 1 || summary.Sent != 0 || summary.Failed != 1 {
+		t.Fatalf("delivery summary=%#v err=%v", summary, err)
+	}
+	var status, nextAttempt, lastError string
+	var attempts int
+	if err := database.DB.QueryRow(`SELECT status,attempts,next_attempt_at,last_error FROM deliveries WHERE event_id=?`, eventID).
+		Scan(&status, &attempts, &nextAttempt, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextAttempt)
+	if err != nil || status != "pending" || attempts != 1 || lastError != "temporary delivery failure" || next.Before(before.Add(59*time.Second)) {
+		t.Fatalf("retry row status=%q attempts=%d next=%q last_error=%q parsed=%v err=%v", status, attempts, nextAttempt, lastError, next, err)
 	}
 }
 

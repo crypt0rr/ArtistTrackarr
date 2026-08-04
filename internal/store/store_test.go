@@ -1019,6 +1019,64 @@ func TestFollowedArtistCount(t *testing.T) {
 	}
 }
 
+func TestFollowedArtistsFilteredPageAndCount(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "paged@example.com", "unused", "member", "UTC", "")
+	for i := range 55 {
+		genres := []string{"Pop"}
+		if i < 3 {
+			genres = []string{"Country"}
+		}
+		artist, err := s.UpsertArtist(ctx, Artist{
+			MBID: fmt.Sprintf("paged-artist-%02d", i), Name: fmt.Sprintf("Artist %02d", i),
+			SortName: fmt.Sprintf("Artist %02d", i), Genres: genres,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count, err := s.FollowedArtistsFilteredCount(ctx, userID, "", "", "")
+	if err != nil || count != 55 {
+		t.Fatalf("all artist count=%d err=%v", count, err)
+	}
+	first, err := s.FollowedArtistsFilteredPage(ctx, userID, "", "", "", 50, 0)
+	if err != nil || len(first) != 50 || first[0].Name != "Artist 00" || first[49].Name != "Artist 49" {
+		t.Fatalf("first page len=%d first=%q last=%q err=%v", len(first), firstName(first), lastName(first), err)
+	}
+	second, err := s.FollowedArtistsFilteredPage(ctx, userID, "", "", "", 50, 50)
+	if err != nil || len(second) != 5 || second[0].Name != "Artist 50" || second[4].Name != "Artist 54" {
+		t.Fatalf("second page len=%d first=%q last=%q err=%v", len(second), firstName(second), lastName(second), err)
+	}
+
+	filteredCount, err := s.FollowedArtistsFilteredCount(ctx, userID, "Country", "", "")
+	if err != nil || filteredCount != 3 {
+		t.Fatalf("filtered artist count=%d err=%v", filteredCount, err)
+	}
+	filtered, err := s.FollowedArtistsFilteredPage(ctx, userID, "Country", "", "", 50, 0)
+	if err != nil || len(filtered) != 3 {
+		t.Fatalf("filtered page len=%d err=%v", len(filtered), err)
+	}
+}
+
+func firstName(artists []Artist) string {
+	if len(artists) == 0 {
+		return ""
+	}
+	return artists[0].Name
+}
+
+func lastName(artists []Artist) string {
+	if len(artists) == 0 {
+		return ""
+	}
+	return artists[len(artists)-1].Name
+}
+
 func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

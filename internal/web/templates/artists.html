@@ -37,7 +37,7 @@
 </article>{{end}}</div></section></form>
 {{else if .Query}}<div class="empty">No artists matched that search.</div>{{end}}
 
-{{if or .GenreFilter .CountryFilter .TypeFilter}}<div class="notice active-filter">Showing {{len .Artists}} artists{{if .GenreFilter}} · genre: {{.GenreFilter}}{{end}}{{if .CountryFilter}} · country: {{.CountryFilter}}{{end}}{{if .TypeFilter}} · type: {{.TypeFilter}}{{end}} · <a href="/artists">Clear filters</a></div>{{end}}
+{{if or .GenreFilter .CountryFilter .TypeFilter}}<div class="notice active-filter">Showing {{.FilteredArtistCount}} artists{{if .GenreFilter}} · genre: {{.GenreFilter}}{{end}}{{if .CountryFilter}} · country: {{.CountryFilter}}{{end}}{{if .TypeFilter}} · type: {{.TypeFilter}}{{end}} · <a href="/artists">Clear filters</a></div>{{end}}
 {{if or .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel artist-breakdowns">
   <div class="section-head"><div><p class="eyebrow">Explore</p><h2>Watchlist breakdown</h2><p>Choose a group to filter the followed artists below.</p></div></div>
   <div class="breakdown-grid">
@@ -71,6 +71,12 @@
     <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}<button class="secondary">Sync now</button></form>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
   </article>{{end}}</div>
-  {{else}}<div class="empty">No artists yet. Search above to start your watchlist.</div>{{end}}
+  {{else}}<div class="empty">{{if or .GenreFilter .CountryFilter .TypeFilter}}No artists match the selected filters.{{else}}No artists yet. Search above to start your watchlist.{{end}}</div>{{end}}
 </section>
+{{if .ArtistPageEnd}}<nav class="pagination artists-pagination" aria-label="Followed artist pages">
+  <span class="pagination-summary">Showing {{.ArtistPageStart}}–{{.ArtistPageEnd}} of {{.FilteredArtistCount}}</span>
+  {{if .ArtistPrevURL}}<a class="button secondary" href="{{.ArtistPrevURL}}" rel="prev">Previous</a>{{end}}
+  <span class="pagination-pages" aria-label="Page number">{{range .ArtistPageLinks}}{{if .Current}}<span class="button page-current" aria-current="page">{{.Number}}</span>{{else}}<a class="button secondary" href="{{.URL}}">{{.Number}}</a>{{end}}{{end}}</span>
+  {{if .ArtistNextURL}}<a class="button secondary" href="{{.ArtistNextURL}}" rel="next">Next</a>{{end}}
+</nav>{{end}}
 {{template "foot" .}}

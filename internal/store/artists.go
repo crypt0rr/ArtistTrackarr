@@ -269,6 +269,36 @@ func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, er
 	return s.FollowedArtistsFiltered(ctx, userID, "", "", "")
 }
 func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre, country, artistType string) ([]Artist, error) {
+	where, args := followedArtistFilters(userID, genre, country, artistType)
+	return s.followedArtistsQuery(ctx, where, args, 0, 0)
+}
+
+// FollowedArtistsFilteredPage returns one alphabetically ordered page of the
+// user's followed artists. Metadata enrichment is applied to only the page,
+// keeping large watchlists from producing an oversized response or doing
+// unnecessary work for artists outside the current page.
+func (s *Store) FollowedArtistsFilteredPage(ctx context.Context, userID int64, genre, country, artistType string, limit, offset int) ([]Artist, error) {
+	if limit < 1 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where, args := followedArtistFilters(userID, genre, country, artistType)
+	return s.followedArtistsQuery(ctx, where, args, limit, offset)
+}
+
+// FollowedArtistsFilteredCount counts the distinct canonical artists matching
+// the same filters used by FollowedArtistsFilteredPage.
+func (s *Store) FollowedArtistsFilteredCount(ctx context.Context, userID int64, genre, country, artistType string) (int, error) {
+	where, args := followedArtistFilters(userID, genre, country, artistType)
+	var count int
+	err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(DISTINCT a.id)
+		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE `+strings.Join(where, " AND "), args...).Scan(&count)
+	return count, err
+}
+
+func followedArtistFilters(userID int64, genre, country, artistType string) ([]string, []any) {
 	where := []string{"f.user_id=?"}
 	args := []any{userID}
 	if strings.TrimSpace(genre) != "" {
@@ -295,10 +325,19 @@ func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre
 			args = append(args, strings.TrimSpace(artistType))
 		}
 	}
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
+	return where, args
+}
+
+func (s *Store) followedArtistsQuery(ctx context.Context, where []string, args []any, limit, offset int) ([]Artist, error) {
+	query := `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,a.spotify_next_check_at,f.baseline_synced_at
-		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE `+strings.Join(where, " AND ")+`
-		ORDER BY lower(trim(a.name)), lower(trim(a.sort_name)), a.id`, args...)
+		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE ` + strings.Join(where, " AND ") + `
+		ORDER BY lower(trim(a.name)), lower(trim(a.sort_name)), a.id`
+	if limit > 0 {
+		query += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
+	rows, err := s.readerDB().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -683,6 +683,45 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	}
 }
 
+func TestArtistsPagePaginatesAndPreservesFilters(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 51 {
+		artist, err := database.UpsertArtist(ctx, store.Artist{
+			MBID: fmt.Sprintf("paged-web-%02d", i), Name: fmt.Sprintf("Paged Artist %02d", i),
+			SortName: fmt.Sprintf("Paged Artist %02d", i), Type: "Person", Country: "NL", Genres: []string{"Pop"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Follow(ctx, user.ID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	response, err := client.Get(server.URL + "/artists?q=Paged&genre=Pop&country=NL&type=Person&page=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(page, "Paged Artist 50") ||
+		strings.Contains(page, "Paged Artist 00") || !strings.Contains(page, "Showing 51 artists") ||
+		!strings.Contains(page, "Showing 51–51 of 51") {
+		t.Fatalf("paginated artists status/body=%d %q", response.StatusCode, body)
+	}
+	for _, value := range []string{"page=1", "country=NL", "genre=Pop", "q=Paged", "type=Person"} {
+		if !strings.Contains(page, value) {
+			t.Fatalf("pagination link lost %q: %q", value, body)
+		}
+	}
+}
+
 func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	csrf := getCSRF(t, client, server.URL+"/artists/search")

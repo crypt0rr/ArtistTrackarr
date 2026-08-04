@@ -13,10 +13,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM dependencies AS build
 COPY . .
-ARG APP_VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X github.com/crypt0rr/artist-tracker/internal/version.Current=${APP_VERSION}" -o /out/artist-trackarr ./cmd/server
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/artist-trackarr ./cmd/server
 
 FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates tzdata && \
