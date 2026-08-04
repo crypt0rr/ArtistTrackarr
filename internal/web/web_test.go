@@ -200,7 +200,9 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		!strings.Contains(string(body), "ArtistTrackarr") ||
 		strings.Contains(string(body), "Artist Trackarr") ||
 		strings.Contains(string(body), "Artist Tracker") ||
-		!strings.Contains(string(body), `href="/artists"`) {
+		!strings.Contains(string(body), `href="/artists"`) ||
+		!strings.Contains(string(body), `data-mobile-menu-toggle`) ||
+		!strings.Contains(string(body), `id="site-navigation"`) {
 		t.Fatalf("dashboard status/body = %d, %q", response.StatusCode, body)
 	}
 	if strings.Contains(string(body), "Reminder settings") || strings.Contains(string(body), `action="/profile"`) {

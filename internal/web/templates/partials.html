@@ -16,7 +16,8 @@
 <header class="topbar">
   <a class="brand" href="/"><img src="/static/logo-mark.png" width="44" height="44" alt=""><span>ArtistTrackarr</span></a>
   <div class="topbar-actions">
-    {{if .User}}<nav>
+    {{if .User}}<button class="mobile-menu-toggle" type="button" data-mobile-menu-toggle aria-expanded="false" aria-controls="site-navigation" aria-label="Open navigation menu" title="Open navigation menu"><span class="mobile-menu-icon" data-mobile-menu-icon aria-hidden="true">☰</span><span class="sr-only" data-mobile-menu-label>Open navigation menu</span></button>
+    <nav id="site-navigation" aria-label="Main navigation">
       <a href="/">Dashboard</a>
       <a href="/artists">Artists</a>
     </nav>{{end}}
