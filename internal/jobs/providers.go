@@ -14,9 +14,13 @@ import (
 // cooldown and error handling stays with the provider, while syncOne remains
 // responsible for persistence and scheduling decisions shared by all sources.
 type providerObservation struct {
-	provider string
-	releases []store.Release
-	err      error
+	provider    string
+	releases    []store.Release
+	err         error
+	status      string
+	lastError   string
+	nextCheckAt *time.Time
+	attempted   bool
 
 	succeeded  bool
 	suppressed bool
@@ -56,6 +60,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	if err != nil {
 		return result, err
 	}
+	r.recordProviderStatus(ctx, artist.ID, spotify, now)
 	result.spotifySucceeded = spotify.succeeded
 	result.spotifySuppressed = spotify.suppressed
 	result.spotifyDeferred = spotify.deferred
@@ -81,6 +86,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	if err != nil {
 		return result, err
 	}
+	r.recordProviderStatus(ctx, artist.ID, itunes, now)
 	result.itunesSucceeded = itunes.succeeded
 	result.itunesRateLimit = itunes.itunesRateLimit
 	if itunes.succeeded {
@@ -99,6 +105,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 		if err != nil {
 			return result, err
 		}
+		r.recordProviderStatus(ctx, artist.ID, musicBrainz, now)
 		if musicBrainz.succeeded {
 			result.batches = append(result.batches, store.ReleaseBatch{
 				Provider: musicBrainz.provider,
@@ -118,6 +125,15 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 	observation := providerObservation{provider: "spotify"}
 	if !primary || !wasDue || r.spotify == nil {
 		observation.deferred = primary && !wasDue && knownDate != ""
+		if r.spotify == nil {
+			observation.status = "not_configured"
+		} else {
+			observation.status = "deferred"
+			if artist.SpotifyNextCheckAt != nil {
+				value := *artist.SpotifyNextCheckAt
+				observation.nextCheckAt = &value
+			}
+		}
 		return observation, nil
 	}
 	cooldown, err := r.spotifyProviderCooldown(ctx, now)
@@ -127,6 +143,8 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 	if cooldown.After(now) {
 		observation.suppressed = true
 		observation.cooldown = cooldown
+		observation.status = "cooldown"
+		observation.nextCheckAt = &cooldown
 		r.logger.Debug("Spotify check suppressed by provider cooldown", "artist_id", artist.ID,
 			"retry_after", cooldown.Sub(now).String())
 		return observation, nil
@@ -138,6 +156,7 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 	} else {
 		releases, err = r.spotify.ArtistReleases(ctx, artist.SpotifyID)
 	}
+	observation.attempted = true
 	if err == nil {
 		changed, changedErr := r.store.SpotifyBatchChanged(ctx, releases)
 		if changedErr != nil {
@@ -148,6 +167,8 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 		observation.releases = releases
 		observation.spotifyChanged = changed
 		observation.spotifyUnchanged = !changed
+		observation.status = "healthy"
+		observation.nextCheckAt = timePtr(now.Add(r.spotifyInterval))
 		_ = r.store.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, "")
 		return observation, nil
 	}
@@ -163,6 +184,9 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 	_ = r.store.UpsertProviderHealth(ctx, "spotify", false, retryAt, rateLimit != nil,
 		rateLimit != nil && rateLimit.QuotaExceeded, sanitizedProviderError(err))
 	observation.err = err
+	observation.status = "failed"
+	observation.lastError = sanitizedProviderError(err)
+	observation.nextCheckAt = retryAt
 	if rateLimit != nil {
 		if !rateLimit.AlreadyBlocked {
 			r.logger.Warn("Spotify release observation rate limited", "artist_id", artist.ID,
@@ -179,6 +203,11 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	allowed bool) (providerObservation, error) {
 	observation := providerObservation{provider: "itunes"}
 	if !allowed || r.itunes == nil {
+		if r.itunes == nil {
+			observation.status = "not_configured"
+		} else {
+			observation.status = "deferred"
+		}
 		return observation, nil
 	}
 	cooldown, err := r.itunesProviderCooldown(ctx, now)
@@ -186,16 +215,21 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 		return observation, err
 	}
 	if cooldown.After(now) {
+		observation.status = "cooldown"
+		observation.nextCheckAt = &cooldown
 		r.logger.Debug("iTunes check suppressed by provider cooldown", "artist_id", artist.ID,
 			"retry_after", cooldown.Sub(now).String())
 		return observation, nil
 	}
 
+	observation.attempted = true
 	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
 	if err == nil {
 		r.clearITunesProviderCooldown()
 		observation.succeeded = true
 		observation.releases = releases
+		observation.status = "healthy"
+		observation.nextCheckAt = timePtr(now.Add(r.interval))
 		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
 		return observation, nil
 	}
@@ -210,6 +244,9 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	}
 	_ = r.store.UpsertProviderHealth(ctx, "itunes", false, retryAt, rateLimit != nil, false, sanitizedProviderError(err))
 	observation.err = err
+	observation.status = "failed"
+	observation.lastError = sanitizedProviderError(err)
+	observation.nextCheckAt = retryAt
 	if rateLimit != nil {
 		if !rateLimit.AlreadyBlocked {
 			r.logger.Warn("iTunes release observation rate limited", "artist_id", artist.ID,
@@ -223,16 +260,55 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 
 func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, now time.Time) (providerObservation, error) {
 	observation := providerObservation{provider: "musicbrainz"}
+	observation.attempted = true
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 	if err == nil {
 		observation.succeeded = true
 		observation.releases = releases
+		observation.status = "healthy"
+		observation.nextCheckAt = timePtr(now.Add(r.interval))
 		_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
 		return observation, nil
 	}
 	retryAt := now.Add(providerFailureRetryDelay(nil, r.interval))
 	_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &retryAt, false, false, sanitizedProviderError(err))
 	observation.err = err
+	observation.status = "failed"
+	observation.lastError = sanitizedProviderError(err)
+	observation.nextCheckAt = &retryAt
 	r.logger.Warn("MusicBrainz release observation failed", "artist_id", artist.ID, "error", err)
 	return observation, nil
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
+}
+
+func (r *Runner) recordProviderStatus(ctx context.Context, artistID int64, observation providerObservation, now time.Time) {
+	if observation.provider == "" || observation.status == "" {
+		return
+	}
+	var attempt, success, failure *time.Time
+	if observation.attempted {
+		attempt = timePtr(now)
+	}
+	if observation.succeeded {
+		success = timePtr(now)
+	}
+	if observation.err != nil {
+		failure = timePtr(now)
+	}
+	releaseCount := -1
+	if observation.succeeded {
+		releaseCount = len(observation.releases)
+	}
+	if err := r.store.RecordArtistProviderStatus(ctx, store.ArtistProviderStatus{
+		ArtistID: artistID, Provider: observation.provider, Status: observation.status,
+		LastAttemptAt: attempt, LastSuccessAt: success, LastFailureAt: failure,
+		NextCheckAt: observation.nextCheckAt, ReleaseCount: releaseCount,
+		LastError: observation.lastError, UpdatedAt: now,
+	}); err != nil {
+		r.logger.Debug("artist provider status persistence failed", "artist_id", artistID,
+			"provider", observation.provider, "error", err)
+	}
 }

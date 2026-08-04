@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -261,13 +262,20 @@ func releasePayloadHash(release Release) string {
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
 	var release Release
 	var secondary, observed string
+	var sourceCount int
+	var observedProviders, lastObserved sql.NullString
 	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
 		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
-		itunes_id,itunes_url,itunes_artwork_url,source,first_observed_at FROM release_groups WHERE id=?`, releaseID).Scan(
+		itunes_id,itunes_url,itunes_artwork_url,source,first_observed_at,
+		(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
+		(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
+		(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=release_groups.id)
+		FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
 		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &release.Source, &observed,
+		&sourceCount, &observedProviders, &lastObserved,
 	)
 	if err != nil {
 		return Release{}, err
@@ -277,6 +285,12 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
 	release.ITunesArtworkURL = itunesArtworkURL.String
 	release.FirstObservedAt, _ = parseTime(observed)
+	release.SourceCount = sourceCount
+	release.Sources = splitReleaseProviders(observedProviders.String)
+	release.Confidence = releaseConfidence(release.Source, sourceCount)
+	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
+		release.LastObservedAt = parsed
+	}
 	return release, nil
 }
 func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
@@ -392,10 +406,13 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 	for rows.Next() {
 		var r Release
 		var secondary, observed string
+		var sourceCount int
+		var observedProviders, lastObserved sql.NullString
 		var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 		if err := rows.Scan(&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 			&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-			&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed); err != nil {
+			&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed,
+			&sourceCount, &observedProviders, &lastObserved); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(secondary), &r.SecondaryTypes); err != nil {
@@ -405,9 +422,43 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 		r.ITunesArtworkURL = itunesArtworkURL.String
 		r.FirstObservedAt, _ = parseTime(observed)
+		r.SourceCount = sourceCount
+		r.Sources = splitReleaseProviders(observedProviders.String)
+		r.Confidence = releaseConfidence(r.Source, sourceCount)
+		if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
+			r.LastObservedAt = parsed
+		}
 		result = append(result, r)
 	}
 	return result, rows.Err()
+}
+
+func splitReleaseProviders(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	providers := strings.Split(value, ",")
+	sort.Strings(providers)
+	return providers
+}
+
+func releaseConfidence(source string, sourceCount int) string {
+	if sourceCount >= 2 || source == "both" {
+		return "confirmed"
+	}
+	if source == "musicbrainz" {
+		return "canonical"
+	}
+	if source == "spotify" {
+		return "spotify"
+	}
+	if source == "itunes" {
+		return "itunes"
+	}
+	if sourceCount == 1 {
+		return "unconfirmed"
+	}
+	return "unconfirmed"
 }
 func releaseDate(value string) (time.Time, bool) {
 	if len(value) != 10 {

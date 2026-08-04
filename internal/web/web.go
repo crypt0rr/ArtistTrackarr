@@ -70,6 +70,17 @@ type PageData struct {
 	GenreBreakdown      []store.ArtistBreakdown
 	CountryBreakdown    []store.ArtistBreakdown
 	TypeBreakdown       []store.ArtistBreakdown
+	CoverageSummary     store.CoverageSummary
+	CoverageArtists     []store.ArtistCoverage
+	CoveragePage        int
+	CoveragePages       int
+	CoveragePrevPage    int
+	CoverageNextPage    int
+	CoveragePrevURL     string
+	CoverageNextURL     string
+	CoveragePageLinks   []PaginationLink
+	CoveragePageStart   int
+	CoveragePageEnd     int
 	GenreFilter         string
 	CountryFilter       string
 	TypeFilter          string

@@ -162,6 +162,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=12`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("timestamp migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=13`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("release trust migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var normalizedLogTime string
 	if err := db.QueryRow(`SELECT created_at FROM application_logs WHERE message=?`, "legacy timestamp").Scan(&normalizedLogTime); err != nil {
 		t.Fatal(err)
@@ -327,8 +330,11 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	releases, err := s.RecentReleases(ctx, userID, 10)
-	if err != nil || len(releases) != 1 || releases[0].MBID != "mb-release" || releases[0].Source != "both" || releases[0].ITunesID != "123" || releases[0].ITunesArtworkURL == "" {
+	if err != nil || len(releases) != 1 || releases[0].MBID != "mb-release" || releases[0].Source != "both" || releases[0].ITunesID != "123" || releases[0].ITunesArtworkURL == "" || releases[0].SourceCount != 2 || releases[0].Confidence != "confirmed" {
 		t.Fatalf("merged releases=%#v err=%v", releases, err)
+	}
+	if len(releases[0].Sources) != 2 || releases[0].Sources[0] != "itunes" || releases[0].Sources[1] != "musicbrainz" {
+		t.Fatalf("merged release sources=%#v", releases[0].Sources)
 	}
 	var observations, events int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM provider_observations WHERE release_group_id=?`, releases[0].ID).Scan(&observations); err != nil {
@@ -341,6 +347,52 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 		t.Fatalf("observations=%d events=%d", observations, events)
 	}
 }
+
+func TestArtistCoverageRecordsProviderOutcomes(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "coverage@example.com", "hash", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "coverage-artist", Name: "Coverage Artist", Country: "NL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 4, 10, 0, 0, 0, time.UTC)
+	for _, status := range []ArtistProviderStatus{
+		{ArtistID: artist.ID, Provider: "spotify", Status: "failed", LastAttemptAt: &now, LastFailureAt: &now, NextCheckAt: storeTestTimePtr(now.Add(time.Hour)), LastError: "rate limited", UpdatedAt: now},
+		{ArtistID: artist.ID, Provider: "itunes", Status: "healthy", LastAttemptAt: &now, LastSuccessAt: &now, NextCheckAt: storeTestTimePtr(now.Add(time.Minute)), ReleaseCount: 1, UpdatedAt: now},
+		{ArtistID: artist.ID, Provider: "musicbrainz", Status: "healthy", LastAttemptAt: &now, LastSuccessAt: &now, NextCheckAt: storeTestTimePtr(now.Add(time.Minute)), ReleaseCount: 1, UpdatedAt: now},
+	} {
+		if err := s.RecordArtistProviderStatus(ctx, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := Release{MBID: "coverage-release", Title: "Coverage Release", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.org/release-group/coverage-release"}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "musicbrainz", Releases: []Release{release}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	coverage, err := s.FollowedArtistCoveragePage(ctx, userID, 50, 0)
+	if err != nil || len(coverage) != 1 {
+		t.Fatalf("coverage=%#v err=%v", coverage, err)
+	}
+	if coverage[0].OverallStatus != "attention" || coverage[0].ReleaseCount != 1 || coverage[0].SingleSourceReleases != 1 || coverage[0].FallbackReleases != 0 {
+		t.Fatalf("coverage item=%#v", coverage[0])
+	}
+	if len(coverage[0].ProviderStatuses) != 3 || coverage[0].ProviderStatuses[0].Provider != "spotify" || coverage[0].ProviderStatuses[1].Provider != "itunes" {
+		t.Fatalf("provider statuses=%#v", coverage[0].ProviderStatuses)
+	}
+	summary, err := s.CoverageSummary(ctx, userID)
+	if err != nil || summary.Artists != 1 || summary.AttentionArtists != 1 || summary.FallbackReleases != 0 {
+		t.Fatalf("coverage summary=%#v err=%v", summary, err)
+	}
+}
+
+func storeTestTimePtr(value time.Time) *time.Time { return &value }
 
 func TestITunesArtworkBackfillDoesNotCreateNotifications(t *testing.T) {
 	ctx := context.Background()

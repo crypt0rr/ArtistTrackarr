@@ -1,0 +1,38 @@
+{{template "head" .}}
+<section class="page-head trust-heading">
+  <div><p class="eyebrow">Release trust</p><h1>Release Trust Center</h1>
+  <p>See which providers have recently confirmed your watchlist and where a fallback source is being used.</p></div>
+  <a class="secondary button-link" href="/artists">Manage artists</a>
+</section>
+<section class="trust-summary" aria-label="Release coverage summary">
+  <article class="trust-summary-card"><span class="eyebrow">Watchlist</span><strong>{{.CoverageSummary.Artists}}</strong><span>followed artists</span></article>
+  <article class="trust-summary-card"><span class="eyebrow">Fresh data</span><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed</span></article>
+  <article class="trust-summary-card {{if .CoverageSummary.AttentionArtists}}attention{{end}}"><span class="eyebrow">Attention</span><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>provider issues</span></article>
+  <article class="trust-summary-card"><span class="eyebrow">Provenance</span><strong>{{.CoverageSummary.ConfirmedReleases}}</strong><span>multi-source releases</span></article>
+</section>
+<section class="panel trust-explainer">
+  <p><strong>How to read this page</strong></p>
+  <p>Confirmed releases were observed by more than one provider. Fallback-only data is still useful, but may need a canonical confirmation later. Provider health and cooldowns are shown per artist; a manual sync uses the normal provider order and notification rules.</p>
+</section>
+<section class="panel coverage-panel">
+  <div class="section-head"><div><p class="eyebrow">Artist coverage</p><h2>Provider confidence</h2></div>{{if .CoverageSummary.Artists}}<span class="badge">{{.CoveragePageStart}}–{{.CoveragePageEnd}} of {{.CoverageSummary.Artists}}</span>{{end}}</div>
+  {{if .CoverageArtists}}<div class="coverage-list">
+    {{range .CoverageArtists}}<article class="coverage-row">
+      <div class="coverage-row-head">
+        <div><h3>{{.Artist.Name}}</h3><p>{{if .Artist.Country}}{{.Artist.Country}} · {{end}}{{if .Artist.Type}}{{.Artist.Type}}{{else}}Artist{{end}}</p></div>
+        <span class="badge coverage-status {{coverageStatusClass .OverallStatus}}">{{coverageStatusLabel .OverallStatus}}</span>
+      </div>
+      <div class="coverage-meta"><span>{{.ReleaseCount}} releases</span><span>{{.ConfirmedReleases}} confirmed</span><span>{{.SingleSourceReleases}} single source</span><span>{{.FallbackReleases}} iTunes-only</span>{{if .LastObservedAt}}<span>Last observed {{formatProviderTime .LastObservedAt}}</span>{{end}}{{if .NextCheckAt}}<span>Next check {{formatProviderTime .NextCheckAt}}</span>{{end}}</div>
+      <div class="coverage-links">
+        {{if .Artist.SpotifyURL}}<a href="{{.Artist.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
+        {{if .Artist.MBID}}<a href="https://musicbrainz.org/artist/{{.Artist.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a><a href="https://listenbrainz.org/artist/{{.Artist.MBID}}/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>{{end}}
+        <form method="post" action="/coverage/artists/{{.Artist.ID}}/sync" class="inline">{{template "csrf" $}}<input type="hidden" name="page" value="{{$.CoveragePage}}"><button class="secondary">Sync now</button></form>
+      </div>
+      <details class="coverage-details"><summary>Provider details</summary><div class="coverage-providers">
+        {{range .ProviderStatuses}}<div class="coverage-provider"><div><strong>{{providerLabel .Provider}}</strong><span class="badge {{providerStatusClass .Status}}">{{.Status}}</span></div><span>{{.ReleaseCount}} releases returned</span>{{if .LastSuccessAt}}<span>Success {{formatProviderTime .LastSuccessAt}}</span>{{else if .LastFailureAt}}<span>Failed {{formatProviderTime .LastFailureAt}}</span>{{end}}{{if .NextCheckAt}}<span>Next {{formatProviderTime .NextCheckAt}}</span>{{end}}{{if .LastError}}<small class="error-text">{{.LastError}}</small>{{end}}</div>{{end}}
+      </div></details>
+    </article>{{end}}
+  </div>{{else}}<div class="empty">Follow an artist to see provider coverage here.</div>{{end}}
+</section>
+{{if gt .CoveragePages 1}}<nav class="pagination" aria-label="Coverage pages">{{if .CoveragePrevURL}}<a href="{{.CoveragePrevURL}}">Previous</a>{{end}}{{range .CoveragePageLinks}}<a href="{{.URL}}"{{if .Current}} aria-current="page" class="current"{{end}}>{{.Number}}</a>{{end}}{{if .CoverageNextURL}}<a href="{{.CoverageNextURL}}">Next</a>{{end}}</nav>{{end}}
+{{template "foot" .}}

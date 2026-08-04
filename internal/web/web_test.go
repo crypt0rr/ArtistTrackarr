@@ -251,6 +251,16 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if strings.Contains(string(body), "Reminder settings") || strings.Contains(string(body), `action="/profile"`) {
 		t.Fatalf("dashboard still contains reminder settings: %q", body)
 	}
+	response, err = client.Get(server.URL + "/coverage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coverageBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(coverageBody), "Release Trust Center") ||
+		!strings.Contains(string(coverageBody), "Follow an artist to see provider coverage here") {
+		t.Fatalf("coverage status/body = %d, %q", response.StatusCode, coverageBody)
+	}
 	response, err = client.Get(server.URL + "/admin")
 	if err != nil {
 		t.Fatal(err)
@@ -933,6 +943,45 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-user review status=%d", response.StatusCode)
+	}
+}
+
+func TestCoverageSyncQueuesOnlyOwnedArtists(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	user, err := database.UserByEmail(context.Background(), "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: "coverage-web-artist", Name: "Coverage Web Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	csrf := getCSRF(t, client, server.URL+"/coverage")
+	response := postForm(t, client, server.URL+"/coverage/artists/"+strconv.FormatInt(artist.ID, 10)+"/sync", url.Values{
+		"_csrf": {csrf}, "page": {"1"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Synchronization queued") {
+		t.Fatalf("coverage sync status=%d body=%q", response.StatusCode, body)
+	}
+	requests, err := database.ManualSyncRequests(context.Background(), 10)
+	if err != nil || len(requests) != 1 || requests[0].ArtistID == nil || *requests[0].ArtistID != artist.ID {
+		t.Fatalf("manual sync requests=%#v err=%v", requests, err)
+	}
+	otherArtist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: "coverage-web-other", Name: "Other Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = postForm(t, client, server.URL+"/coverage/artists/"+strconv.FormatInt(otherArtist.ID, 10)+"/sync", url.Values{
+		"_csrf": {csrf},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unowned coverage sync status=%d", response.StatusCode)
 	}
 }
 
