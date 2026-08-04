@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -12,7 +14,62 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-type Store struct{ DB *sql.DB }
+// Store keeps writes on a single connection while allowing read-only queries
+// to use a small pool. SQLite WAL mode lets readers proceed while the writer
+// is committing, which keeps dashboard requests from queueing behind provider
+// synchronization work.
+type Store struct {
+	DB     *sql.DB
+	Reader *sql.DB
+}
+
+func (s *Store) readerDB() *sql.DB {
+	if s.Reader != nil {
+		return s.Reader
+	}
+	// A few internal tests construct Store values around an existing database
+	// handle. Keep those fixtures working without weakening production access.
+	return s.DB
+}
+
+// beginWriteTx retries transient SQLite lock errors at the transaction
+// boundary. The writer pool is intentionally one connection, but a reader
+// may still be finishing a WAL checkpoint or a short-lived external process
+// may hold the file lock.
+func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err == nil {
+			return tx, nil
+		}
+		lastErr = err
+		if !sqliteBusy(err) || attempt == 4 {
+			break
+		}
+		delay := time.Duration(25*(1<<attempt)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func sqliteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") ||
+		strings.Contains(message, "database table is locked") ||
+		strings.Contains(message, "database is busy")
+}
 
 type User struct {
 	ID           int64

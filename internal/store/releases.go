@@ -17,7 +17,7 @@ func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []
 	}}, observed)
 }
 func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches []ReleaseBatch, observed time.Time) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	today := dayUTC(now)
 	from := today.AddDate(0, 0, -1).Format("2006-01-02")
 	to := today.AddDate(0, 0, 1).Format("2006-01-02")
-	rows, err := s.DB.QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
 		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url
 		FROM follows f JOIN users u ON u.id=f.user_id JOIN release_groups rg ON rg.artist_id=f.artist_id
 		JOIN artists a ON a.id=rg.artist_id
@@ -231,7 +231,7 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	return nil
 }
 func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, eventType, title, body string, now time.Time) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
@@ -242,7 +242,7 @@ func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, event
 	return tx.Commit()
 }
 func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]Release, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC LIMIT ?`,
 		userID, limit)
 	if err != nil {
@@ -265,7 +265,7 @@ func (s *Store) DashboardReleases(
 	const preferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (SELECT 1 FROM release_groups external_release WHERE external_release.artist_id=rg.artist_id AND external_release.source IN ('spotify','itunes','both'))) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
 		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','itunes','both')
 	))`
-	upcomingRows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	upcomingRows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND `+definitelyFuture+`
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
 		userID, today, today, today, limit)
@@ -277,7 +277,7 @@ func (s *Store) DashboardReleases(
 	if err != nil {
 		return nil, nil, err
 	}
-	recentRows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
+	recentRows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id
 		WHERE f.user_id=? AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
 		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
 		userID, today, today, today, limit)
@@ -313,7 +313,7 @@ func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
 }
 func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
 	var d ReleaseDetail
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.artist_id=rg.artist_id WHERE f.user_id=? AND rg.id=?`, userID, releaseID)
 	if err != nil {
 		return d, err
 	}
@@ -326,7 +326,7 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 		return d, sql.ErrNoRows
 	}
 	d.Release = items[0]
-	obs, err := s.DB.QueryContext(ctx, `SELECT provider,provider_id,observed_at FROM provider_observations WHERE release_group_id=? ORDER BY observed_at DESC`, releaseID)
+	obs, err := s.readerDB().QueryContext(ctx, `SELECT provider,provider_id,observed_at FROM provider_observations WHERE release_group_id=? ORDER BY observed_at DESC`, releaseID)
 	if err != nil {
 		return d, err
 	}

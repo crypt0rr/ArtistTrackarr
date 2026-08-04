@@ -35,7 +35,7 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 	if limit > 500 {
 		limit = 500
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT created_at,level,message,attributes_json FROM application_logs ORDER BY datetime(created_at) DESC,id DESC LIMIT ?`, limit)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT created_at,level,message,attributes_json FROM application_logs ORDER BY datetime(created_at) DESC,id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +95,7 @@ func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]Manua
 	if limit < 1 {
 		limit = 1
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +157,7 @@ func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSync
 	if limit < 1 {
 		limit = 20
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,status,created_at,started_at,finished_at,last_error FROM manual_sync_requests ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,status,created_at,started_at,finished_at,last_error FROM manual_sync_requests ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +209,7 @@ func (s *Store) ProviderHealthByName(ctx context.Context, provider string) (Prov
 	var p ProviderHealth
 	var ls, lf, n, u sql.NullString
 	var rl, qe int
-	err := s.DB.QueryRowContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at
+	err := s.readerDB().QueryRowContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at
 		FROM provider_health WHERE provider=?`, provider).
 		Scan(&p.Provider, &ls, &lf, &p.LastError, &n, &rl, &qe, &u)
 	if err != nil {
@@ -239,7 +239,7 @@ func (s *Store) ProviderHealthByName(ctx context.Context, provider string) (Prov
 	return p, nil
 }
 func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at FROM provider_health ORDER BY provider`)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT provider,last_success_at,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at FROM provider_health ORDER BY provider`)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +278,7 @@ func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
 func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {
 	var a Artist
 	var sid, surl, simg, checked, next sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url,last_checked_at,spotify_next_check_at FROM artists WHERE id=?`, id).Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation, &sid, &surl, &simg, &checked, &next)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url,last_checked_at,spotify_next_check_at FROM artists WHERE id=?`, id).Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation, &sid, &surl, &simg, &checked, &next)
 	a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, simg.String
 	if checked.Valid {
 		t, _ := parseTime(checked.String)
@@ -291,7 +291,7 @@ func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {
 	return a, err
 }
 func (s *Store) AdminArtists(ctx context.Context) ([]AdminArtist, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT a.id,a.name,a.mbid FROM artists a JOIN follows f ON f.artist_id=a.id ORDER BY a.sort_name,a.name`)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.name,a.mbid FROM artists a JOIN follows f ON f.artist_id=a.id ORDER BY a.sort_name,a.name`)
 	if err != nil {
 		return nil, err
 	}

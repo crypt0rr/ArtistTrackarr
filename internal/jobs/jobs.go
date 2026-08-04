@@ -29,6 +29,11 @@ type Runner struct {
 	spotifyInterval       time.Duration
 	logger                *slog.Logger
 	syncMu                sync.Mutex
+	syncTaskMu            sync.Mutex
+	deliveryTaskMu        sync.Mutex
+	releaseDayTaskMu      sync.Mutex
+	maintenanceTaskMu     sync.Mutex
+	tasks                 sync.WaitGroup
 	lifecycleOnce         sync.Once
 	wake                  chan struct{}
 	done                  chan struct{}
@@ -38,6 +43,12 @@ type Runner struct {
 	itunesCooldownLoaded  bool
 	itunesCooldownUntil   time.Time
 }
+
+const (
+	deliveryCadence    = 10 * time.Second
+	syncCadence        = time.Minute
+	maintenanceCadence = time.Hour
+)
 
 type Option func(*Runner)
 
@@ -68,6 +79,12 @@ type deliveryStats struct {
 	Attempted int
 	Sent      int
 	Failed    int
+}
+
+type deliveryResult struct {
+	sent   bool
+	failed bool
+	err    error
 }
 
 type artworkBackfillStats struct {
@@ -227,26 +244,52 @@ func (r *Runner) clearITunesProviderCooldown() {
 
 func (r *Runner) Run(ctx context.Context) {
 	r.initLifecycle()
-	defer close(r.done)
+	defer func() {
+		r.tasks.Wait()
+		close(r.done)
+	}()
 	if ctx.Err() == nil {
-		r.tick(ctx)
+		r.launchSync(ctx)
+		r.launchReleaseDayQueue(ctx)
+		r.launchDelivery(ctx)
+		r.launchMaintenance(ctx)
 	}
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+	deliveryTicker := time.NewTicker(deliveryCadence)
+	defer deliveryTicker.Stop()
+	syncTicker := time.NewTicker(syncCadence)
+	defer syncTicker.Stop()
+	maintenanceTicker := time.NewTicker(maintenanceCadence)
+	defer maintenanceTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-deliveryTicker.C:
 			if ctx.Err() != nil {
 				return
 			}
-			r.tick(ctx)
+			r.launchDelivery(ctx)
+		case <-syncTicker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			r.launchSync(ctx)
+			r.launchReleaseDayQueue(ctx)
+		case <-maintenanceTicker.C:
+			if ctx.Err() != nil {
+				return
+			}
+			r.launchMaintenance(ctx)
 		case <-r.wake:
 			if ctx.Err() != nil {
 				return
 			}
-			r.tick(ctx)
+			// A wake is intended for newly queued/manual synchronization. Run
+			// the small queueing and delivery jobs as well so an onboarding
+			// notification does not wait for the next regular cadence.
+			r.launchSync(ctx)
+			r.launchReleaseDayQueue(ctx)
+			r.launchDelivery(ctx)
 		}
 	}
 }
@@ -269,46 +312,77 @@ func (r *Runner) Done() <-chan struct{} {
 	return r.done
 }
 
-func (r *Runner) tick(ctx context.Context) {
-	tickStarted := time.Now()
-	if r.syncMu.TryLock() {
-		manualSummary := r.processManualSyncRequests(ctx, time.Now().UTC())
-		if manualSummary > 0 {
-			r.logger.Info("manual synchronization requests completed", "processed", manualSummary)
-		}
-		resolutionSummary, err := r.resolveArtistResolutions(ctx, time.Now().UTC())
-		if err != nil {
-			r.logger.Error("artist resolution failed", "error", err)
-		} else {
-			r.logger.Info("artist resolution processing completed",
-				"processed", resolutionSummary.Processed, "followed", resolutionSummary.Followed,
-				"review", resolutionSummary.Review, "pending", resolutionSummary.Pending,
-				"failed", resolutionSummary.Failed)
-		}
-		syncSummary, err := r.syncArtists(ctx, time.Now().UTC())
-		if err != nil {
-			r.logger.Error("catalog sync failed", "error", err)
-		} else {
-			r.logger.Info("catalog synchronization completed",
-				"due", syncSummary.Due, "succeeded", syncSummary.Succeeded,
-				"failed", syncSummary.Failed, "changed", syncSummary.Changed,
-				"unchanged", syncSummary.Unchanged, "backoff", syncSummary.Backoff)
-		}
-		if artworkSummary, err := r.backfillITunesArtwork(ctx, time.Now().UTC()); err != nil {
-			r.logger.Warn("iTunes artwork backfill failed", "error", err)
-		} else if artworkSummary != nil {
-			r.logger.Info("iTunes artwork backfill completed", "artist_id", artworkSummary.ArtistID,
-				"checked", artworkSummary.Checked, "updated", artworkSummary.Updated)
-		}
-		if statsSummary, err := r.refreshListenBrainz(ctx, time.Now().UTC()); err != nil {
-			r.logger.Warn("ListenBrainz statistics refresh failed", "error", err)
-		} else if statsSummary > 0 {
-			r.logger.Info("ListenBrainz statistics refresh completed", "artists", statsSummary)
-		}
-		r.syncMu.Unlock()
-	} else {
-		r.logger.Debug("background tick skipped", "reason", "another synchronization is running")
+func (r *Runner) startTask(ctx context.Context, name string, guard *sync.Mutex, work func(context.Context)) {
+	if !guard.TryLock() {
+		r.logger.Debug("background task skipped", "task", name, "reason", "already running")
+		return
 	}
+	r.tasks.Add(1)
+	go func() {
+		defer r.tasks.Done()
+		defer guard.Unlock()
+		work(ctx)
+	}()
+}
+
+func (r *Runner) launchSync(ctx context.Context) {
+	r.startTask(ctx, "synchronization", &r.syncTaskMu, r.runSyncCadence)
+}
+
+func (r *Runner) launchDelivery(ctx context.Context) {
+	r.startTask(ctx, "delivery", &r.deliveryTaskMu, r.runDeliveryCadence)
+}
+
+func (r *Runner) launchReleaseDayQueue(ctx context.Context) {
+	r.startTask(ctx, "release-day queue", &r.releaseDayTaskMu, r.runReleaseDayQueue)
+}
+
+func (r *Runner) launchMaintenance(ctx context.Context) {
+	r.startTask(ctx, "maintenance", &r.maintenanceTaskMu, r.runMaintenance)
+}
+
+func (r *Runner) runSyncCadence(ctx context.Context) {
+	if !r.syncMu.TryLock() {
+		r.logger.Debug("synchronization task skipped", "reason", "another synchronization is running")
+		return
+	}
+	defer r.syncMu.Unlock()
+	manualSummary := r.processManualSyncRequests(ctx, time.Now().UTC())
+	if manualSummary > 0 {
+		r.logger.Info("manual synchronization requests completed", "processed", manualSummary)
+	}
+	resolutionSummary, err := r.resolveArtistResolutions(ctx, time.Now().UTC())
+	if err != nil {
+		r.logger.Error("artist resolution failed", "error", err)
+	} else {
+		r.logger.Info("artist resolution processing completed",
+			"processed", resolutionSummary.Processed, "followed", resolutionSummary.Followed,
+			"review", resolutionSummary.Review, "pending", resolutionSummary.Pending,
+			"failed", resolutionSummary.Failed)
+	}
+	syncSummary, err := r.syncArtists(ctx, time.Now().UTC())
+	if err != nil {
+		r.logger.Error("catalog sync failed", "error", err)
+	} else {
+		r.logger.Info("catalog synchronization completed",
+			"due", syncSummary.Due, "succeeded", syncSummary.Succeeded,
+			"failed", syncSummary.Failed, "changed", syncSummary.Changed,
+			"unchanged", syncSummary.Unchanged, "backoff", syncSummary.Backoff)
+	}
+	if artworkSummary, err := r.backfillITunesArtwork(ctx, time.Now().UTC()); err != nil {
+		r.logger.Warn("iTunes artwork backfill failed", "error", err)
+	} else if artworkSummary != nil {
+		r.logger.Info("iTunes artwork backfill completed", "artist_id", artworkSummary.ArtistID,
+			"checked", artworkSummary.Checked, "updated", artworkSummary.Updated)
+	}
+	if statsSummary, err := r.refreshListenBrainz(ctx, time.Now().UTC()); err != nil {
+		r.logger.Warn("ListenBrainz statistics refresh failed", "error", err)
+	} else if statsSummary > 0 {
+		r.logger.Info("ListenBrainz statistics refresh completed", "artists", statsSummary)
+	}
+}
+
+func (r *Runner) runMaintenance(ctx context.Context) {
 	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
@@ -320,21 +394,27 @@ func (r *Runner) tick(ctx context.Context) {
 			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
 			"import_jobs", maintenance.ImportJobs)
 	}
+}
+
+func (r *Runner) runReleaseDayQueue(ctx context.Context) {
 	now := time.Now().UTC()
 	if err := r.store.QueueDueReleaseDays(ctx, now); err != nil {
 		r.logger.Error("release-day scheduling failed", "error", err)
 	} else {
 		r.logger.Info("release-day queue completed")
 	}
+}
+
+func (r *Runner) runDeliveryCadence(ctx context.Context) {
+	now := time.Now().UTC()
 	deliverySummary, err := r.deliver(ctx, now)
 	if err != nil {
 		r.logger.Error("notification delivery failed", "error", err)
-	} else {
+	} else if deliverySummary.Attempted > 0 {
 		r.logger.Info("notification delivery batch completed",
 			"attempted", deliverySummary.Attempted, "sent", deliverySummary.Sent,
 			"failed", deliverySummary.Failed)
 	}
-	r.logger.Info("background tick completed", "duration", time.Since(tickStarted).String())
 }
 
 // backfillITunesArtwork fills artwork on existing iTunes rows only. It is
@@ -792,25 +872,85 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 	if err != nil {
 		return summary, err
 	}
+	if len(deliveries) == 0 {
+		return summary, nil
+	}
+
+	workerCount := min(4, len(deliveries))
+	work := make(chan store.Delivery)
+	results := make(chan deliveryResult, len(deliveries))
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for delivery := range work {
+				result := r.deliverOne(ctx, now, delivery)
+				results <- result
+			}
+		}()
+	}
 	for _, delivery := range deliveries {
+		select {
+		case <-ctx.Done():
+			break
+		case work <- delivery:
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	close(work)
+	workers.Wait()
+	close(results)
+
+	var storageErrors []error
+	for result := range results {
 		summary.Attempted++
-		serviceURL, err := r.cipher.Decrypt(delivery.Destination.EncryptedURL)
+		if result.sent {
+			summary.Sent++
+		}
+		if result.failed {
+			summary.Failed++
+		}
+		if result.err != nil {
+			storageErrors = append(storageErrors, result.err)
+		}
+	}
+	if len(storageErrors) > 0 {
+		return summary, errors.Join(storageErrors...)
+	}
+	return summary, nil
+}
+
+func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
+	result := deliveryResult{}
+	var err error
+	if r.cipher == nil {
+		err = errors.New("notification cipher is unavailable")
+	} else {
+		var serviceURL string
+		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
+		if err == nil && r.sender == nil {
+			err = errors.New("notification sender is unavailable")
+		}
 		if err == nil {
 			err = r.sender.Send(ctx, serviceURL, delivery.Title, delivery.Body)
 		}
-		if err == nil {
-			if err := r.store.MarkDeliverySent(ctx, delivery.ID, now); err != nil {
-				return summary, err
-			}
-			summary.Sent++
-			continue
-		}
-		summary.Failed++
-		r.logger.Warn("notification attempt failed",
-			"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", err)
-		if err := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, err.Error(), now); err != nil {
-			return summary, err
-		}
 	}
-	return summary, nil
+	if err == nil {
+		if markErr := r.store.MarkDeliverySent(ctx, delivery.ID, now); markErr != nil {
+			return deliveryResult{failed: true, err: markErr}
+		}
+		result.sent = true
+		return result
+	}
+
+	result.failed = true
+	r.logger.Warn("notification attempt failed",
+		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", err)
+	if markErr := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, err.Error(), now); markErr != nil {
+		result.err = markErr
+	}
+	return result
 }

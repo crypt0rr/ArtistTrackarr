@@ -60,7 +60,7 @@ func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, e
 // canonical artist and owner-scoped follow in the same transaction. This makes
 // partial uploads durable without coupling them to provider availability.
 func (s *Store) SaveImportRow(ctx context.Context, userID, jobID int64, input ImportInput) (ImportRow, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return ImportRow{}, err
 	}
@@ -139,12 +139,12 @@ func insertImportRowTx(ctx context.Context, tx *sql.Tx, row ImportRow) error {
 func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, error) {
 	var job ImportJob
 	var created string
-	if err := s.DB.QueryRowContext(ctx, `SELECT id,user_id,created_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,created_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
 		Scan(&job.ID, &job.UserID, &created); err != nil {
 		return ImportJob{}, err
 	}
 	job.CreatedAt, _ = parseTime(created)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,job_id,source_value,display_name,status,artist_id,reason
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,job_id,source_value,display_name,status,artist_id,reason
 		FROM import_rows WHERE job_id=? ORDER BY id`, jobID)
 	if err != nil {
 		return ImportJob{}, err
