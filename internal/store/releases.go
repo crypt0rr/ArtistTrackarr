@@ -168,15 +168,14 @@ func releaseRecordsMatch(a, b Release) bool {
 	if a.PrimaryType != b.PrimaryType || normalizedReleaseTitle(a.Title) != normalizedReleaseTitle(b.Title) {
 		return false
 	}
-	if a.DatePrecision == 0 || b.DatePrecision == 0 ||
-		a.FirstReleaseDate == "" || b.FirstReleaseDate == "" {
+	if a.DatePrecision == 0 || a.DatePrecision != b.DatePrecision {
 		return false
 	}
-	length := min(len(a.FirstReleaseDate), len(b.FirstReleaseDate))
-	if length < 4 {
+	length := map[int]int{1: 4, 2: 7, 3: 10}[a.DatePrecision]
+	if length == 0 || len(a.FirstReleaseDate) != length || len(b.FirstReleaseDate) != length {
 		return false
 	}
-	return a.FirstReleaseDate[:length] == b.FirstReleaseDate[:length]
+	return a.FirstReleaseDate == b.FirstReleaseDate
 }
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	today := dayUTC(now)

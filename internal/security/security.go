@@ -22,6 +22,19 @@ const (
 	argonKeyLen  = 32
 )
 
+// DummyPasswordHash is a valid Argon2id hash used for login attempts where no
+// account matches the supplied email. Verifying it keeps unknown-email and
+// wrong-password attempts on the same expensive code path without retaining
+// any user secret.
+var DummyPasswordHash = func() string {
+	salt := []byte("artisttrackarr-v2")
+	hash := argon2.IDKey([]byte("artisttrackarr-invalid-password"), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
+		argonMemory, argonTime, argonThreads,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(hash))
+}()
+
 func HashPassword(password string) (string, error) {
 	if len(password) < 12 {
 		return "", errors.New("password must be at least 12 characters")

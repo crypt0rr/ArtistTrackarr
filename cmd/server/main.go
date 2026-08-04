@@ -97,6 +97,7 @@ func main() {
 	}
 	runnerOptions = append(runnerOptions, jobs.WithITunes(itunes))
 	runnerOptions = append(runnerOptions, jobs.WithListenBrainz(listenBrainz))
+	runnerOptions = append(runnerOptions, jobs.WithArtworkCache(artworkCache))
 	runner := jobs.New(database, musicBrainz, catalog.AlbumEPNormalizer{}, sender, cipher, cfg.PollInterval, logger,
 		runnerOptions...)
 	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger, itunes)

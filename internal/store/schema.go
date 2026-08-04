@@ -102,6 +102,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 			continue
 		}
+		if version == 12 {
+			if err := s.migrateOperationalTimestamps(ctx); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+			continue
+		}
 		tx, err := s.DB.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -118,6 +124,90 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrateOperationalTimestamps rewrites every persisted timestamp into the
+// canonical UTC representation used by current writes. Older releases stored
+// application-log offsets and one migration used SQLite's space-separated
+// datetime format; normalizing both makes the existing text indexes usable.
+// The whole conversion is one transaction so malformed data never produces a
+// partially migrated database.
+func (s *Store) migrateOperationalTimestamps(ctx context.Context) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(e error) error { _ = tx.Rollback(); return e }
+	columns := []struct {
+		table  string
+		column string
+	}{
+		{"schema_migrations", "applied_at"},
+		{"users", "created_at"},
+		{"sessions", "expires_at"}, {"sessions", "created_at"},
+		{"auth_tokens", "expires_at"}, {"auth_tokens", "used_at"}, {"auth_tokens", "created_at"},
+		{"login_attempts", "first_at"}, {"login_attempts", "blocked_until"},
+		{"artists", "last_checked_at"}, {"artists", "next_check_at"}, {"artists", "spotify_next_check_at"},
+		{"artists", "spotify_last_change_at"}, {"artists", "created_at"}, {"artists", "updated_at"},
+		{"follows", "created_at"}, {"follows", "baseline_synced_at"}, {"follows", "spotify_baseline_synced_at"},
+		{"release_groups", "first_observed_at"}, {"release_groups", "updated_at"},
+		{"release_groups", "itunes_artwork_checked_at"}, {"release_groups", "itunes_artwork_next_check_at"},
+		{"provider_observations", "observed_at"},
+		{"import_jobs", "created_at"}, {"destinations", "created_at"},
+		{"notification_events", "created_at"}, {"deliveries", "next_attempt_at"}, {"deliveries", "sent_at"},
+		{"application_logs", "created_at"},
+		{"manual_sync_requests", "created_at"}, {"manual_sync_requests", "started_at"}, {"manual_sync_requests", "finished_at"},
+		{"provider_health", "last_success_at"}, {"provider_health", "last_failure_at"},
+		{"provider_health", "next_check_at"}, {"provider_health", "updated_at"},
+		{"artist_resolutions", "next_attempt_at"}, {"artist_resolutions", "created_at"}, {"artist_resolutions", "updated_at"},
+		{"notification_preferences", "updated_at"},
+		{"artist_listenbrainz_stats", "checked_at"}, {"artist_listenbrainz_stats", "next_check_at"}, {"artist_listenbrainz_stats", "updated_at"},
+		{"artist_genres", "updated_at"},
+	}
+	for _, item := range columns {
+		query := fmt.Sprintf("SELECT rowid,%s FROM %s WHERE %s IS NOT NULL AND %s<>''", item.column, item.table, item.column, item.column)
+		rows, queryErr := tx.QueryContext(ctx, query)
+		if queryErr != nil {
+			return rollback(fmt.Errorf("read %s.%s: %w", item.table, item.column, queryErr))
+		}
+		type update struct {
+			id   int64
+			text string
+		}
+		var updates []update
+		for rows.Next() {
+			var id int64
+			var raw string
+			if scanErr := rows.Scan(&id, &raw); scanErr != nil {
+				_ = rows.Close()
+				return rollback(fmt.Errorf("scan %s.%s: %w", item.table, item.column, scanErr))
+			}
+			parsed, parseErr := parseTime(raw)
+			if parseErr != nil {
+				_ = rows.Close()
+				return rollback(fmt.Errorf("invalid timestamp in %s.%s row %d: %w", item.table, item.column, id, parseErr))
+			}
+			canonical := timeText(parsed)
+			if raw != canonical {
+				updates = append(updates, update{id: id, text: canonical})
+			}
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return rollback(fmt.Errorf("read %s.%s: %w", item.table, item.column, rowsErr))
+		}
+		_ = rows.Close()
+		for _, change := range updates {
+			statement := fmt.Sprintf("UPDATE %s SET %s=? WHERE rowid=?", item.table, item.column)
+			if _, updateErr := tx.ExecContext(ctx, statement, change.text, change.id); updateErr != nil {
+				return rollback(fmt.Errorf("update %s.%s row %d: %w", item.table, item.column, change.id, updateErr))
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(12,?)`, nowText()); err != nil {
+		return rollback(err)
+	}
+	return tx.Commit()
 }
 
 // migrateUsernames adds the required username column and deterministically
@@ -346,9 +436,15 @@ func nullString(value string) any {
 	}
 	return value
 }
-func nowText() string                       { return timeText(time.Now().UTC()) }
-func timeText(t time.Time) string           { return t.UTC().Format(time.RFC3339Nano) }
-func parseTime(v string) (time.Time, error) { return time.Parse(time.RFC3339Nano, v) }
+func nowText() string             { return timeText(time.Now().UTC()) }
+func timeText(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+func parseTime(v string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, v)
+	if err == nil {
+		return parsed, nil
+	}
+	return time.ParseInLocation("2006-01-02 15:04:05", v, time.UTC)
+}
 func nullableTime(t *time.Time) any {
 	if t == nil {
 		return nil

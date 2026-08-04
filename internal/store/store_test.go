@@ -125,6 +125,10 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 		t.Fatal(err)
 	}
 	userID, _ := userResult.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`,
+		"2026-08-04T10:00:00+02:00", "INFO", "legacy timestamp", "[]"); err != nil {
+		t.Fatal(err)
+	}
 	artistResult, err := db.Exec(`INSERT INTO artists(mbid,name,created_at,updated_at) VALUES('artist-mbid','Legacy Artist',?,?)`, nowText(), nowText())
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +159,16 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=11`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("username migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=12`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("timestamp migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var normalizedLogTime string
+	if err := db.QueryRow(`SELECT created_at FROM application_logs WHERE message=?`, "legacy timestamp").Scan(&normalizedLogTime); err != nil {
+		t.Fatal(err)
+	}
+	if normalizedLogTime != "2026-08-04T08:00:00Z" {
+		t.Fatalf("normalized log timestamp=%q", normalizedLogTime)
+	}
 	var legacyUsername string
 	if err := db.QueryRow(`SELECT username FROM users WHERE id=?`, userID).Scan(&legacyUsername); err != nil || legacyUsername != "legacy" {
 		t.Fatalf("legacy username=%q err=%v", legacyUsername, err)
@@ -169,6 +183,20 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	}
 	if _, err := db.Exec(`INSERT INTO release_groups(mbid,artist_id,title,primary_type,musicbrainz_url,first_observed_at,updated_at,itunes_id,source) VALUES('itunes:new',?,'New','EP','',?,?,?,'itunes')`, artistID, nowText(), nowText(), "123"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReleaseRecordsMatchRequiresCompatiblePrecision(t *testing.T) {
+	base := Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024", DatePrecision: 1}
+	if !releaseRecordsMatch(base, Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024", DatePrecision: 1}) {
+		t.Fatal("equal year-precision releases did not match")
+	}
+	if releaseRecordsMatch(base, Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024-06-01", DatePrecision: 3}) {
+		t.Fatal("year and day precision releases were merged")
+	}
+	if releaseRecordsMatch(Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024-06", DatePrecision: 2},
+		Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024-06-15", DatePrecision: 3}) {
+		t.Fatal("month and day precision releases were merged")
 	}
 }
 

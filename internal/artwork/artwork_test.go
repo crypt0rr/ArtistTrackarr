@@ -3,11 +3,14 @@ package artwork
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,5 +170,65 @@ func TestConcurrentRequestsAreCoalesced(t *testing.T) {
 	wait.Wait()
 	if requests.Load() != 1 {
 		t.Fatalf("coalesced requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestPruneRemovesStaleAndBoundsCache(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	cache, err := NewCache(root, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldImage := filepath.Join(root, "old.img")
+	oldMissing := filepath.Join(root, "old.missing")
+	freshOne := filepath.Join(root, "fresh-one.img")
+	freshTwo := filepath.Join(root, "fresh-two.img")
+	for path, data := range map[string][]byte{
+		oldImage:   []byte("old-image"),
+		oldMissing: []byte{},
+		freshOne:   []byte("fresh-one"),
+		freshTwo:   []byte("fresh-two"),
+	} {
+		if err := os.WriteFile(path, data, 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(oldImage, now.Add(-31*24*time.Hour), now.Add(-31*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(oldMissing, now.Add(-25*time.Hour), now.Add(-25*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(freshOne, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(freshTwo, now.Add(-time.Minute), now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := cache.Prune(context.Background(), int64(len("fresh-one")), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.StaleFiles != 2 || stats.RemovedFiles != 3 {
+		t.Fatalf("prune stats=%#v, want two stale and three total removals", stats)
+	}
+	if _, err := os.Stat(freshTwo); err != nil {
+		t.Fatalf("newest cache file was removed: %v", err)
+	}
+	if _, err := os.Stat(oldImage); !os.IsNotExist(err) {
+		t.Fatalf("stale image still exists, err=%v", err)
+	}
+}
+
+func TestPruneHonorsContext(t *testing.T) {
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cache.Prune(ctx, 1, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("prune error=%v, want context canceled", err)
 	}
 }

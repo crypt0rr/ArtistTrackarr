@@ -117,6 +117,45 @@ func (fakeArtwork) Get(context.Context, string) artwork.Asset {
 	}
 }
 
+func TestSecurityHeadersAndDebugRequestLog(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "headers.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	public, _ := url.Parse("https://example.test")
+	cfg := config.Config{
+		PublicURL: public, SessionSecret: "the session secret has more than 32 bytes",
+		EncryptionKey: "the encryption key has more than 32 bytes",
+	}
+	cipher, _ := security.NewCipher(cfg.EncryptionKey)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app, err := New(cfg, database, fakeCatalog{}, nil, fakeSender{}, cipher, fakeArtwork{}, nil, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("health status=%d", response.Code)
+	}
+	if response.Header().Get("Strict-Transport-Security") != "max-age=31536000" {
+		t.Fatalf("HSTS=%q", response.Header().Get("Strict-Transport-Security"))
+	}
+	if response.Header().Get("Permissions-Policy") != "camera=(), geolocation=(), microphone=(), payment=()" {
+		t.Fatalf("Permissions-Policy=%q", response.Header().Get("Permissions-Policy"))
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, "http request completed") || !strings.Contains(logText, "route=/healthz") || !strings.Contains(logText, "status=204") {
+		t.Fatalf("debug request log=%q", logText)
+	}
+	if strings.Contains(logText, "example.test") || strings.Contains(logText, "password") || strings.Contains(logText, "body") {
+		t.Fatalf("request log leaked sensitive/path data: %q", logText)
+	}
+}
+
 func TestSetupLoginAndDashboard(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "web.db"))
 	if err != nil {

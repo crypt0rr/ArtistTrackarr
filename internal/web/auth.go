@@ -99,7 +99,15 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not sign in", http.StatusInternalServerError)
 		return
 	}
-	if err != nil || !security.CheckPassword(user.PasswordHash, r.FormValue("password")) {
+	passwordValid := false
+	if err == nil {
+		passwordValid = security.CheckPassword(user.PasswordHash, r.FormValue("password"))
+	} else {
+		// Keep unknown-email attempts on the same Argon2id path as an account
+		// with a wrong password, without exposing whether the email exists.
+		_ = security.CheckPassword(security.DummyPasswordHash, r.FormValue("password"))
+	}
+	if err != nil || !passwordValid {
 		_ = a.store.RecordLoginFailure(r.Context(), key)
 		time.Sleep(250 * time.Millisecond)
 		d := a.data(r, "Sign in")
