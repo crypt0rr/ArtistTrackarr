@@ -27,7 +27,7 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 	for _, batch := range batches {
 		provider := strings.ToLower(strings.TrimSpace(batch.Provider))
 		if seenProviders[provider] {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("duplicate release batch for %s", provider)
 		}
 		seenProviders[provider] = true
@@ -47,7 +47,7 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 				err = fmt.Errorf("unsupported release provider %q", provider)
 			}
 			if err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return err
 			}
 			savedReleases = append(savedReleases, saved)
@@ -56,7 +56,7 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at,spotify_baseline_synced_at
 		FROM follows WHERE artist_id=?`, artist.ID)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 	type follower struct {
@@ -69,33 +69,33 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 		var f follower
 		var baseline, spotifyBaseline sql.NullString
 		if err := rows.Scan(&f.id, &baseline, &spotifyBaseline); err != nil {
-			rows.Close()
-			tx.Rollback()
+			_ = rows.Close()
+			_ = tx.Rollback()
 			return err
 		}
 		f.baseline = baseline.Valid
 		f.spotifyBaseline = spotifyBaseline.Valid
 		followers = append(followers, f)
 	}
-	rows.Close()
+	_ = rows.Close()
 	for _, follower := range followers {
 		if !follower.baseline {
 			if selected, eventType, ok := selectInitialRelease(savedReleases, observed); ok {
 				title, body := initialReleaseMessage(artist, selected.release, eventType, observed)
 				if err := enqueueEventTx(ctx, tx, follower.id, selected.release.ID, eventType, title, body, observed); err != nil {
-					tx.Rollback()
+					_ = tx.Rollback()
 					return err
 				}
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
 				timeText(observed), follower.id, artist.ID); err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return err
 			}
 			if spotifyObserved {
 				if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
 					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
-					tx.Rollback()
+					_ = tx.Rollback()
 					return err
 				}
 			}
@@ -114,14 +114,14 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 				fmt.Sprintf("%s has announced %q for %s.\n%s", artist.Name, item.release.Title,
 					item.release.FirstReleaseDate, releaseExternalURL(item.release)),
 				observed); err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return err
 			}
 		}
 		if spotifyObserved && !follower.spotifyBaseline {
 			if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
 				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return err
 			}
 		}
@@ -140,7 +140,7 @@ func matchingReleaseIDTx(
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var matches []int64
 	for rows.Next() {
 		var id int64
@@ -204,12 +204,12 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 			&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
 			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL,
 		); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		candidates = append(candidates, d)
 	}
-	rows.Close()
+	_ = rows.Close()
 	for _, d := range candidates {
 		location, err := time.LoadLocation(d.timezone)
 		if err != nil {
@@ -236,7 +236,7 @@ func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, event
 		return err
 	}
 	if err := enqueueEventTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()
@@ -248,7 +248,7 @@ func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanReleases(rows)
 }
 func (s *Store) DashboardReleases(
@@ -273,7 +273,7 @@ func (s *Store) DashboardReleases(
 		return nil, nil, err
 	}
 	upcoming, err = scanReleases(upcomingRows)
-	upcomingRows.Close()
+	_ = upcomingRows.Close()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -285,7 +285,7 @@ func (s *Store) DashboardReleases(
 		return nil, nil, err
 	}
 	recent, err = scanReleases(recentRows)
-	recentRows.Close()
+	_ = recentRows.Close()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -318,7 +318,7 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 		return d, err
 	}
 	items, err := scanReleases(rows)
-	rows.Close()
+	_ = rows.Close()
 	if err != nil {
 		return d, err
 	}
@@ -330,7 +330,7 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 	if err != nil {
 		return d, err
 	}
-	defer obs.Close()
+	defer func() { _ = obs.Close() }()
 	for obs.Next() {
 		var o ReleaseObservation
 		var ts string

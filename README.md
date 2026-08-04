@@ -44,7 +44,8 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.18.0`.
+footer. The current release is `v0.19.0`. Local builds that do not provide a
+release build argument show `dev` instead.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
@@ -65,12 +66,16 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.16.1` publishes `0.16.1`, `0.16`, and `latest`.
+- Pushing a tag such as `v0.19.0` publishes `0.19.0`, `0.19`, and `latest`.
+
+Release images receive their semantic version at build time. Local Docker
+builds default to `dev`; set `APP_VERSION` when building a custom image if a
+different display version is needed.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.16.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.19.0 docker compose up -d
 ```
 
 ## Configuration

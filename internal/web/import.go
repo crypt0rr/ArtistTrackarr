@@ -190,7 +190,7 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		a.renderImportError(w, r, "Select an ArtistTrackarr CSV file.")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if header.Size > maxArtistImportBytes {
 		a.renderImportError(w, r, "CSV files must be 1 MiB or smaller.")
 		return

@@ -168,7 +168,9 @@ func (a *App) settingsPreferences(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a *App) updatePreferences(w http.ResponseWriter, r *http.Request) {
-	a.savePreferences(w, r, "/settings")
+	if err := a.savePreferences(w, r, "/settings"); err != nil {
+		return
+	}
 }
 func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPath string) error {
 	session, _ := currentSession(r)

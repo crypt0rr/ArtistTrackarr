@@ -40,19 +40,35 @@ func Load() (Config, error) {
 	if err != nil || spotifyInterval < time.Hour {
 		return Config{}, errors.New("SPOTIFY_POLL_INTERVAL must be a duration of at least 1h")
 	}
+	setupToken, err := secret("SETUP_TOKEN")
+	if err != nil {
+		return Config{}, err
+	}
+	encryptionKey, err := secret("APP_ENCRYPTION_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	sessionSecret, err := secret("SESSION_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+	spotifySecret, err := secret("SPOTIFY_CLIENT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		ListenAddr:          env("LISTEN_ADDR", ":8080"),
 		PublicURL:           publicURL,
 		DatabasePath:        env("DATABASE_PATH", "/data/artist-tracker.db"),
-		SetupToken:          secret("SETUP_TOKEN"),
-		EncryptionKey:       secret("APP_ENCRYPTION_KEY"),
-		SessionSecret:       secret("SESSION_SECRET"),
+		SetupToken:          setupToken,
+		EncryptionKey:       encryptionKey,
+		SessionSecret:       sessionSecret,
 		MusicBrainzContact:  strings.TrimSpace(env("MUSICBRAINZ_CONTACT", "")),
 		PollInterval:        interval,
 		SpotifyPollInterval: spotifyInterval,
 		TrustProxy:          strings.EqualFold(env("TRUST_PROXY", "false"), "true"),
 		SpotifyClientID:     strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
-		SpotifySecret:       secret("SPOTIFY_CLIENT_SECRET"),
+		SpotifySecret:       spotifySecret,
 		SpotifyMarket:       strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 	}
 	cfg.LogLevel, err = parseLogLevel(env("LOG_LEVEL", "info"))
@@ -98,13 +114,13 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-func secret(name string) string {
+func secret(name string) (string, error) {
 	if path := strings.TrimSpace(os.Getenv(name + "_FILE")); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			panic(fmt.Sprintf("read %s_FILE: %v", name, err))
+			return "", fmt.Errorf("read %s_FILE: %w", name, err)
 		}
-		return strings.TrimSpace(string(data))
+		return strings.TrimSpace(string(data)), nil
 	}
-	return strings.TrimSpace(os.Getenv(name))
+	return strings.TrimSpace(os.Getenv(name)), nil
 }

@@ -1,5 +1,8 @@
 package version
 
-const Current = "0.18.0"
+// Current is overridden by release builds with -ldflags -X. Keeping a clear
+// development fallback makes locally built binaries distinguishable from a
+// published release.
+var Current = "dev"
 
-const UserAgent = "ArtistTrackarr/" + Current
+var UserAgent = "ArtistTrackarr/" + Current

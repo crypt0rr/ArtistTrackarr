@@ -58,7 +58,7 @@ func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	now := nowText()
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
 		userID, artistID, now)
@@ -149,7 +149,7 @@ func (s *Store) ArtistResolutions(ctx context.Context, userID int64) ([]ArtistRe
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []ArtistResolution
 	for rows.Next() {
 		resolution, err := scanArtistResolution(rows)
@@ -167,7 +167,7 @@ func (s *Store) DueArtistResolutions(ctx context.Context, now time.Time, limit i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []ArtistResolution
 	for rows.Next() {
 		resolution, err := scanArtistResolution(rows)
@@ -207,7 +207,7 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 	var exists int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM artist_resolutions WHERE id=? AND user_id=?`,
 		resolution.ID, resolution.UserID).Scan(&exists); err != nil || exists == 0 {
-		tx.Rollback()
+		_ = tx.Rollback()
 		if err != nil {
 			return Artist{}, false, err
 		}
@@ -225,7 +225,7 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		artist.MBID, artist.Name, artist.SortName, artist.Type, artist.Country, artist.Disambiguation,
 		nullString(artist.SpotifyID), nullString(artist.SpotifyURL), nullString(artist.SpotifyImageURL), now, now)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return Artist{}, false, err
 	}
 	var sid, surl, image, checked sql.NullString
@@ -234,7 +234,7 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type, &artist.Country,
 		&artist.Disambiguation, &sid, &surl, &image, &checked)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return Artist{}, false, err
 	}
 	artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
@@ -244,20 +244,20 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 	}
 	if len(artist.Genres) > 0 {
 		if err := replaceArtistGenresExec(ctx, tx, artist.ID, artist.Genres, "musicbrainz"); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return Artist{}, false, err
 		}
 	}
 	follow, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
 		resolution.UserID, artist.ID, now)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return Artist{}, false, err
 	}
 	added, _ := follow.RowsAffected()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`,
 		resolution.ID, resolution.UserID); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return Artist{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -302,7 +302,7 @@ func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Artist
 	for rows.Next() {
 		var a Artist
@@ -344,7 +344,7 @@ func (s *Store) ArtistGenres(ctx context.Context, artistID int64) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var genres []string
 	for rows.Next() {
 		var genre string
@@ -384,16 +384,16 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 			var artistID int64
 			var genre string
 			if err := rows.Scan(&artistID, &genre); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return err
 			}
 			genresByArtist[artistID] = append(genresByArtist[artistID], genre)
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		statsRows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
 		if err != nil {
@@ -403,7 +403,7 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 			var stats ListenBrainzStats
 			var checked, next sql.NullString
 			if err := statsRows.Scan(&stats.ArtistID, &stats.TotalListenCount, &stats.TotalUserCount, &checked, &next, &stats.LastError); err != nil {
-				statsRows.Close()
+				_ = statsRows.Close()
 				return err
 			}
 			if checked.Valid {
@@ -421,10 +421,10 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 			statsByArtist[stats.ArtistID] = stats
 		}
 		if err := statsRows.Err(); err != nil {
-			statsRows.Close()
+			_ = statsRows.Close()
 			return err
 		}
-		statsRows.Close()
+		_ = statsRows.Close()
 	}
 	for index := range artists {
 		artists[index].Genres = genresByArtist[artists[index].ID]
@@ -446,7 +446,7 @@ func (s *Store) DueListenBrainzArtists(ctx context.Context, now time.Time, limit
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Artist
 	for rows.Next() {
 		var artist Artist
@@ -464,7 +464,7 @@ func (s *Store) SaveListenBrainzStats(ctx context.Context, stats map[int64]Liste
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for artistID, value := range stats {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,?,?,'',0,?) ON CONFLICT(artist_id) DO UPDATE SET total_listen_count=excluded.total_listen_count,total_user_count=excluded.total_user_count,checked_at=excluded.checked_at,next_check_at=excluded.next_check_at,last_error='',attempts=0,updated_at=excluded.updated_at`, artistID, value.TotalListenCount, value.TotalUserCount, timeText(now), timeText(next), timeText(now)); err != nil {
 			return err
@@ -489,7 +489,7 @@ func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Artist
 	for rows.Next() {
 		var artist Artist
@@ -522,7 +522,7 @@ func (s *Store) FollowedBreakdown(ctx context.Context, userID int64, dimension s
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []ArtistBreakdown
 	for rows.Next() {
 		var item ArtistBreakdown
@@ -549,7 +549,7 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Artist
 	for rows.Next() {
 		var a Artist
@@ -692,16 +692,16 @@ func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, 
 	for rows.Next() {
 		var item candidate
 		if err := rows.Scan(&item.id, &item.itunesID); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, 0, err
 		}
 		candidates = append(candidates, item)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return 0, 0, err
 	}
-	rows.Close()
+	_ = rows.Close()
 	checkedAt := timeText(observed)
 	negativeNext := timeText(observed.Add(30 * 24 * time.Hour))
 	for _, item := range candidates {

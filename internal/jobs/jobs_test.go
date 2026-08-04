@@ -104,7 +104,7 @@ func resolutionTestStore(t *testing.T) *store.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	return database
 }
 
@@ -325,7 +325,9 @@ func TestExistingFollowCompletesWithoutAnotherInitialSync(t *testing.T) {
 	database := resolutionTestStore(t)
 	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := database.UpsertArtist(ctx, store.Artist{MBID: "artist-mbid", Name: "Example"})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	resolution, _, _ := database.CreateArtistResolution(ctx, userID, "spotify", "spotify-id", "Example", "https://open.spotify.com/artist/spotify-id", "")
 	provider := &resolutionCatalog{
 		external: []catalog.ArtistResult{{MBID: "artist-mbid", Name: "Example"}},
@@ -344,7 +346,9 @@ func TestSyncContinuesWithSpotifyWhenMusicBrainzFails(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	spotify := &spotifyReleaseCatalog{releases: []store.Release{{
 		MBID: "spotify:album-id", SpotifyID: "album-id", Title: "Spotify Album", PrimaryType: "Album",
 		FirstReleaseDate: "2026-08-01", DatePrecision: 3,
@@ -371,7 +375,9 @@ func TestSpotifyIsPrimaryReleaseSourceWhenAvailable(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	mb := &resolutionCatalog{releases: []store.Release{{
 		MBID: "old-mbid", Title: "Old MusicBrainz Album", PrimaryType: "Album",
 		FirstReleaseDate: "2018-01-01", DatePrecision: 3,
@@ -403,7 +409,9 @@ func TestSpotifyFailureFallsBackToITunesBeforeMusicBrainz(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "spotify-artist",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	mb := &resolutionCatalog{releases: []store.Release{{
 		MBID: "mb-release", Title: "MusicBrainz fallback", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
 	}}}
@@ -431,7 +439,9 @@ func TestITunesFailureFallsBackToMusicBrainz(t *testing.T) {
 	database := resolutionTestStore(t)
 	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := database.UpsertArtist(ctx, store.Artist{MBID: "artist-mbid", Name: "Example"})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	itunes := &itunesReleaseCatalog{err: errors.New("itunes unavailable")}
 	mb := &resolutionCatalog{releases: []store.Release{{
 		MBID: "mb-release", Title: "MusicBrainz fallback", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3,
@@ -457,7 +467,9 @@ func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	oldSpotify := store.Release{
 		MBID: "spotify:old", SpotifyID: "old", Title: "Stored Spotify Album", PrimaryType: "Album",
 		FirstReleaseDate: "2025-01-01", DatePrecision: 3,
@@ -506,7 +518,9 @@ func TestQuotaCooldownDefersNextArtistCheckUntilProviderRetry(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	providerRetry := 8 * time.Hour
 	runner := New(
 		database,
@@ -542,7 +556,9 @@ func TestPersistedSpotifyCooldownSkipsCallsAfterRestart(t *testing.T) {
 	artist, _ := database.UpsertArtist(ctx, store.Artist{
 		MBID: "artist-mbid", Name: "Example", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF",
 	})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	future := time.Now().UTC().Add(2 * time.Hour)
 	if err := database.UpsertProviderHealth(ctx, "spotify", false, &future, true, true, "quota limited"); err != nil {
 		t.Fatal(err)
@@ -582,7 +598,9 @@ func TestTotalProviderFailureSchedulesBoundedRetry(t *testing.T) {
 	database := resolutionTestStore(t)
 	userID, _ := database.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := database.UpsertArtist(ctx, store.Artist{MBID: "artist-mbid", Name: "Example"})
-	database.Follow(ctx, userID, artist.ID)
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	before := time.Now().UTC()
 	err := testRunner(database, &resolutionCatalog{releaseErr: io.ErrUnexpectedEOF}).SyncArtistNow(ctx, artist)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {

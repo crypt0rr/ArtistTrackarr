@@ -31,16 +31,16 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000`); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	s := &Store{DB: db}
 	if err := s.migrate(context.Background()); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	// Open the reader pool only after migrations have completed. The read-only
@@ -48,14 +48,14 @@ func Open(path string) (*Store, error) {
 	// writer connection available for migrations and transactions.
 	reader, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	reader.SetMaxOpenConns(4)
 	reader.SetMaxIdleConns(4)
 	if err := reader.Ping(); err != nil {
-		reader.Close()
-		db.Close()
+		_ = reader.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	s.Reader = reader
@@ -110,7 +110,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			_, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText())
 		}
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("migration %d: %w", version, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -145,16 +145,16 @@ func (s *Store) migrateUsernames(ctx context.Context, body []byte) error {
 	for rows.Next() {
 		var user legacyUser
 		if err := rows.Scan(&user.id, &user.email); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return rollback(err)
 		}
 		users = append(users, user)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return rollback(err)
 	}
-	rows.Close()
+	_ = rows.Close()
 	taken := make(map[string]struct{}, len(users))
 	for _, user := range users {
 		name := derivedUsername(user.email, user.id, taken)
@@ -181,7 +181,7 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
 		return err
 	}
-	defer s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+	defer func() { _, _ = s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`) }()
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err

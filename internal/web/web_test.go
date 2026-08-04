@@ -122,7 +122,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	public, _ := url.Parse("http://example.test")
 	cfg := config.Config{
 		PublicURL: public, SetupToken: "the setup token has more than 32 bytes",
@@ -145,7 +145,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		t.Fatal(err)
 	}
 	loginBody, _ := io.ReadAll(loginPage.Body)
-	loginPage.Body.Close()
+	_ = loginPage.Body.Close()
 	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
 		!strings.Contains(string(loginBody), "/static/theme.js") ||
@@ -173,8 +173,10 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		io.Copy(io.Discard, staticResponse.Body)
-		staticResponse.Body.Close()
+		if _, err := io.Copy(io.Discard, staticResponse.Body); err != nil {
+			t.Fatal(err)
+		}
+		_ = staticResponse.Body.Close()
 		if staticResponse.StatusCode != http.StatusOK ||
 			!strings.HasPrefix(staticResponse.Header.Get("Content-Type"), asset.contentType) {
 			t.Fatalf("static asset %s status/type = %d, %q", asset.path,
@@ -187,14 +189,16 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		"_csrf": {csrf}, "setup_token": {cfg.SetupToken}, "email": {"admin@example.com"},
 		"password": {"a secure test password"}, "timezone": {"Europe/Amsterdam"},
 	})
-	io.Copy(io.Discard, setupResponse.Body)
-	setupResponse.Body.Close()
+	if _, err := io.Copy(io.Discard, setupResponse.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = setupResponse.Body.Close()
 	csrf = getCSRF(t, client, server.URL+"/login")
 	response := postForm(t, client, server.URL+"/login", url.Values{
 		"_csrf": {csrf}, "email": {"admin@example.com"}, "password": {"a secure test password"},
 	})
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
 		!strings.Contains(string(body), "/static/logo-mark.png") ||
 		!strings.Contains(string(body), "ArtistTrackarr") ||
@@ -213,7 +217,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Reminder settings") ||
 		!strings.Contains(string(body), `action="/admin/profile"`) {
 		t.Fatalf("admin reminder settings status/body = %d, %q", response.StatusCode, body)
@@ -223,7 +227,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		"_csrf": {csrf}, "timezone": {"America/New_York"}, "reminder_time": {"08:30"},
 	})
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Reminder settings updated") {
 		t.Fatalf("admin profile update status/body = %d, %q", response.StatusCode, body)
 	}
@@ -236,7 +240,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(string(body), "MusicBrainz is temporarily unavailable") ||
 		strings.Contains(string(body), "EOF") {
@@ -257,13 +261,13 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("rename without CSRF status = %d", response.StatusCode)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 
 	csrf = getCSRF(t, client, server.URL+"/destinations")
 	response = postForm(t, client, server.URL+"/destinations/1/rename", url.Values{
 		"_csrf": {csrf}, "name": {"My phone"},
 	})
-	response.Body.Close()
+	_ = response.Body.Close()
 	destination, err := database.Destination(context.Background(), user.ID, 1)
 	if err != nil || destination.Name != "My phone" {
 		t.Fatalf("renamed destination = %#v, %v", destination, err)
@@ -277,7 +281,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		response.Header.Get("Content-Type") != "image/svg+xml" {
 		t.Fatalf("artwork response status=%d headers=%v", response.StatusCode, response.Header)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 }
 
 func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
@@ -292,7 +296,7 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Spotify Result") ||
 		!strings.Contains(string(body), "/artists/follow/spotify") {
 		t.Fatalf("Spotify search status/body=%d %q", response.StatusCode, body)
@@ -309,7 +313,7 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(page, `name="username"`) ||
 		!strings.Contains(page, "Your destinations") || !strings.Contains(page, "Notification preferences") ||
@@ -323,7 +327,7 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != "/settings" {
 		t.Fatalf("destinations compatibility redirect status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
 	}
@@ -332,7 +336,7 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	response = postForm(t, client, server.URL+"/settings/profile", url.Values{
 		"_csrf": {csrf}, "username": {"Listener"}, "timezone": {"UTC"}, "reminder_time": {"09:00"},
 	})
-	response.Body.Close()
+	_ = response.Body.Close()
 	user, err := database.UserByEmail(context.Background(), "member@example.com")
 	if err != nil || user.Username != "Listener" {
 		t.Fatalf("updated username=%q err=%v", user.Username, err)
@@ -342,11 +346,11 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 		"_csrf": {csrf}, "name": {"Phone"}, "service": {"ntfy"}, "host": {"ntfy.sh"}, "topic": {"artisttrackarr"},
 	})
 	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
+		_ = response.Body.Close()
 		t.Fatalf("destination add status=%d", response.StatusCode)
 	}
 	pageBytes, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if !strings.Contains(string(pageBytes), "Phone") {
 		t.Fatalf("destination missing from settings response: %q", pageBytes)
 	}
@@ -370,7 +374,7 @@ func TestSearchFallsBackToMusicBrainz(t *testing.T) {
 				t.Fatal(err)
 			}
 			body, _ := io.ReadAll(response.Body)
-			response.Body.Close()
+			_ = response.Body.Close()
 			if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Fallback Result") ||
 				!strings.Contains(string(body), test.notice) {
 				t.Fatalf("fallback status/body=%d %q", response.StatusCode, body)
@@ -399,7 +403,7 @@ func TestSpotifyFollowCreatesOnePendingResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("Spotify follow without CSRF status=%d", response.StatusCode)
 	}
@@ -408,7 +412,7 @@ func TestSpotifyFollowCreatesOnePendingResolution(t *testing.T) {
 		response = postForm(t, client, server.URL+"/artists/follow/spotify", url.Values{
 			"_csrf": {csrf}, "spotify_id": {spotifyID},
 		})
-		response.Body.Close()
+		_ = response.Body.Close()
 	}
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
 	resolutions, err := database.ArtistResolutions(context.Background(), user.ID)
@@ -437,7 +441,7 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if !strings.Contains(string(body), `name="spotify_ids"`) ||
 		!strings.Contains(string(body), `data-select-all`) ||
 		!strings.Contains(string(body), `/artists/follow/spotify/batch`) {
@@ -449,7 +453,7 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("batch follow without CSRF status=%d", response.StatusCode)
 	}
@@ -460,7 +464,7 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 		"spotify_ids": {firstID, firstID, secondID, "invalid"},
 	})
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "2 queued") ||
 		!strings.Contains(string(body), "1 failed") {
 		t.Fatalf("batch follow status/body=%d %q", response.StatusCode, body)
@@ -472,7 +476,7 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 	}
 
 	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", url.Values{"_csrf": {csrf}})
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty selection status=%d", response.StatusCode)
 	}
@@ -481,7 +485,7 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 		tooMany.Add("spotify_ids", fmt.Sprintf("%022d", i))
 	}
 	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", tooMany)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("oversized selection status=%d", response.StatusCode)
 	}
@@ -508,7 +512,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 		"mbids": {firstMBID, firstMBID, secondMBID, "broken"},
 	})
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "2 added") ||
 		!strings.Contains(string(body), "1 failed") {
 		t.Fatalf("MusicBrainz batch status/body=%d %q", response.StatusCode, body)
@@ -524,7 +528,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "First Artist") ||
 		!strings.Contains(string(body), "Second Artist") ||
 		!strings.Contains(string(body), "Initial release synchronization pending") {
@@ -535,7 +539,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if !strings.Contains(string(body), "<strong>2</strong>") || strings.Contains(string(body), "First Artist") {
 		t.Fatalf("dashboard count/list body=%q", body)
 	}
@@ -544,7 +548,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 		"_csrf": {csrf}, "mbids": {firstMBID, secondMBID},
 	})
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if !strings.Contains(string(body), "0 added") || !strings.Contains(string(body), "2 already followed") {
 		t.Fatalf("duplicate batch body=%q", body)
 	}
@@ -570,15 +574,19 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	database.Follow(ctx, user.ID, followed.ID)
-	database.Follow(ctx, otherID, notFollowed.ID)
+	if _, err := database.Follow(ctx, user.ID, followed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, otherID, notFollowed.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	response, err := client.Get(server.URL + "/artists/search")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, "<h1>Artists</h1>") ||
@@ -595,7 +603,7 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("removed import endpoint status=%d", response.StatusCode)
 	}
@@ -604,7 +612,7 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("removed import POST endpoint status=%d", response.StatusCode)
 	}
@@ -614,7 +622,7 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK ||
 		response.Header.Get("Content-Type") != "text/csv; charset=utf-8" ||
 		!strings.Contains(response.Header.Get("Content-Disposition"), "artist-trackarr-watched-artists-") ||
@@ -663,7 +671,7 @@ func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Import results") ||
 		!strings.Contains(string(body), "Imported Artist") || !strings.Contains(string(body), ">added<") || !strings.Contains(string(body), ">invalid<") {
 		t.Fatalf("import response status/body=%d %q", response.StatusCode, body)
@@ -690,7 +698,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("member admin status=%d", response.StatusCode)
 	}
@@ -698,14 +706,14 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	response = postForm(t, client, server.URL+"/admin/profile", url.Values{
 		"_csrf": {csrf}, "timezone": {"America/New_York"}, "reminder_time": {"08:30"},
 	})
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("member admin profile status=%d", response.StatusCode)
 	}
 	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(targetID, 10)+"/delete", url.Values{
 		"_csrf": {csrf},
 	})
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("member user deletion status=%d", response.StatusCode)
 	}
@@ -754,7 +762,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	dashboardBody, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if !strings.Contains(string(dashboardBody), "delivery-scroll") ||
 		strings.Contains(string(dashboardBody), "provider rejected secret detail") {
 		t.Fatalf("dashboard delivery log is not compact: %q", dashboardBody)
@@ -764,7 +772,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	for _, expected := range []string{
 		"member@example.com", "Audited Album", "Kitchen display", "ntfy", "failed", "5 attempts",
 		"provider rejected secret detail", "Household accounts", "delete-me@example.com",
@@ -782,7 +790,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		"_csrf": {csrf},
 	})
 	selfDeleteBody, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest ||
 		!strings.Contains(string(selfDeleteBody), "cannot delete your own account") {
 		t.Fatalf("self deletion status/body=%d %q", response.StatusCode, selfDeleteBody)
@@ -792,7 +800,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		"_csrf": {csrf},
 	})
 	deleteBody, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(deleteBody), "User deleted") {
 		t.Fatalf("admin deletion status/body=%d %q", response.StatusCode, deleteBody)
 	}
@@ -824,7 +832,7 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Choose the MusicBrainz artist") {
 		t.Fatalf("review status/body=%d %q", response.StatusCode, body)
 	}
@@ -832,7 +840,7 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	response = postForm(t, client, server.URL+"/artist-resolutions/"+strconv.FormatInt(resolution.ID, 10), url.Values{
 		"_csrf": {csrf}, "mbid": {"candidate-mbid"},
 	})
-	response.Body.Close()
+	_ = response.Body.Close()
 	followed, err := database.FollowedArtists(context.Background(), user.ID)
 	if err != nil || len(followed) != 1 || followed[0].MBID != "candidate-mbid" {
 		t.Fatalf("reviewed follow=%#v err=%v", followed, err)
@@ -844,7 +852,7 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-user review status=%d", response.StatusCode)
 	}
@@ -880,7 +888,7 @@ func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, "MusicBrainz and Spotify are checked") ||
@@ -921,7 +929,7 @@ func TestDashboardRendersITunesArtworkWithAttribution(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`) ||
@@ -965,7 +973,7 @@ func TestReleaseDetailRendersITunesReleaseWithProviderLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	checks := map[string]bool{
 		"status":    response.StatusCode == http.StatusOK,
@@ -1020,7 +1028,7 @@ func TestReleaseDetailHandlesNullableProviderURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Nullable Album") {
 		t.Fatalf("nullable release detail status/body=%d %q", response.StatusCode, body)
 	}
@@ -1077,7 +1085,7 @@ func TestReleaseDetailUnavailableIsStyledAndOwnerScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusNotFound || !strings.Contains(page, "Release unavailable") ||
 		strings.Contains(page, "Private Album") || strings.Contains(page, "private-album") {
@@ -1089,7 +1097,7 @@ func TestReleaseDetailUnavailableIsStyledAndOwnerScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound || !strings.Contains(string(body), "Release unavailable") {
 		t.Fatalf("invalid release detail status/body=%d %q", response.StatusCode, body)
 	}
@@ -1127,7 +1135,7 @@ func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var payload []providerHealthPayload
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
@@ -1143,7 +1151,7 @@ func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	page := string(body)
 	if !strings.Contains(page, "quota limited") || !strings.Contains(page, "Last failure") ||
 		!strings.Contains(page, "Next check") || !strings.Contains(page, `data-refresh-url="/admin/provider-health"`) ||
@@ -1181,7 +1189,7 @@ func authenticatedTestServer(
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { database.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 	public, _ := url.Parse("http://example.test")
 	cfg := config.Config{
 		PublicURL: public, SessionSecret: "the session secret has more than 32 bytes",
@@ -1227,7 +1235,7 @@ func getCSRF(t *testing.T, client *http.Client, target string) string {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+	_ = response.Body.Close()
 	match := csrfPattern.FindSubmatch(body)
 	if len(match) != 2 {
 		t.Fatalf("CSRF token not found in %s", body)
