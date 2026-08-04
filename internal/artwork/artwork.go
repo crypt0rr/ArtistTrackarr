@@ -151,7 +151,7 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	if err != nil {
 		return fallback(stale, "upstream-error")
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode == http.StatusNotFound {
 		_ = os.Remove(imagePath)
@@ -220,7 +220,7 @@ func writeAtomic(path string, data []byte) error {
 		return err
 	}
 	tempName := file.Name()
-	defer os.Remove(tempName)
+	defer func() { _ = os.Remove(tempName) }()
 	if err := file.Chmod(0o640); err == nil {
 		_, err = file.Write(data)
 	}

@@ -64,7 +64,7 @@ func (s *Store) SaveImportRow(ctx context.Context, userID, jobID int64, input Im
 	if err != nil {
 		return ImportRow{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var owner int64
 	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM import_jobs WHERE id=?`, jobID).Scan(&owner); err != nil {
 		return ImportRow{}, err
@@ -149,7 +149,7 @@ func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, 
 	if err != nil {
 		return ImportJob{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var row ImportRow
 		var artistID sql.NullInt64

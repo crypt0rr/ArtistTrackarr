@@ -39,7 +39,7 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []logging.Entry
 	for rows.Next() {
 		var ts, level, msg, attrs string
@@ -99,12 +99,12 @@ func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]Manua
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,created_at FROM manual_sync_requests WHERE status='queued' ORDER BY id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []int64
 	var out []ManualSyncRequest
 	for rows.Next() {
@@ -161,7 +161,7 @@ func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSync
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ManualSyncRequest
 	for rows.Next() {
 		var r ManualSyncRequest
@@ -243,7 +243,7 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ProviderHealth
 	for rows.Next() {
 		var p ProviderHealth
@@ -295,7 +295,7 @@ func (s *Store) AdminArtists(ctx context.Context) ([]AdminArtist, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []AdminArtist
 	for rows.Next() {
 		var a AdminArtist

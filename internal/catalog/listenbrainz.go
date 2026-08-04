@@ -133,7 +133,7 @@ func (l *ListenBrainz) fetchPopularity(ctx context.Context, unique []string, see
 	if err != nil {
 		return nil, fmt.Errorf("request ListenBrainz popularity: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read ListenBrainz response: %w", err)

@@ -160,7 +160,7 @@ func (m *MusicBrainz) getJSON(ctx context.Context, endpoint string, target any) 
 			continue
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			last = fmt.Errorf("read MusicBrainz response: %w", readErr)
 			if err := m.waitForRetry(ctx, attempt, ""); err != nil {
@@ -568,7 +568,7 @@ func (s *Spotify) accessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("Spotify token endpoint returned %s", resp.Status)
 	}
@@ -1057,7 +1057,7 @@ func (s *Spotify) getAPIJSON(ctx context.Context, operation, endpoint string, ta
 			return err
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			return readErr
 		}

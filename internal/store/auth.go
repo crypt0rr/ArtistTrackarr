@@ -93,16 +93,16 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 		for rows.Next() {
 			var name string
 			if err := rows.Scan(&name); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return 0, err
 			}
 			existing = append(existing, name)
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, err
 		}
-		rows.Close()
+		_ = rows.Close()
 		taken := make(map[string]struct{}, len(existing))
 		for _, name := range existing {
 			taken[strings.ToLower(name)] = struct{}{}
@@ -150,7 +150,7 @@ func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var users []AdminUser
 	for rows.Next() {
 		var user AdminUser
@@ -174,7 +174,7 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var actingRole string
 	if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id=?`, actingAdminID).Scan(&actingRole); err != nil {
 		return err
@@ -216,7 +216,7 @@ func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) e
 		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
 	}
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()
@@ -250,7 +250,7 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var email string
 	if err := tx.QueryRowContext(ctx, `SELECT email FROM auth_tokens WHERE token_hash=? AND kind='invite' AND used_at IS NULL AND expires_at>?`, security.Digest(raw), nowText()).Scan(&email); err != nil {
 		return err
@@ -268,16 +268,16 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 		for rows.Next() {
 			var name string
 			if err := rows.Scan(&name); err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return err
 			}
 			taken[strings.ToLower(name)] = struct{}{}
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
-		rows.Close()
+		_ = rows.Close()
 		username = derivedUsername(email, nextID, taken)
 	}
 	username, err = validateUsername(username)
@@ -347,11 +347,11 @@ func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email s
 		WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>?`,
 		security.Digest(raw), kind, nowText()).Scan(&email, &id)
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return "", nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=?`, nowText(), security.Digest(raw)); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return "", nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -405,5 +405,5 @@ func (s *Store) RecordLoginFailure(ctx context.Context, key string) error {
 	return err
 }
 func (s *Store) ClearLoginFailures(ctx context.Context, key string) {
-	s.DB.ExecContext(ctx, `DELETE FROM login_attempts WHERE key_hash=?`, security.Digest(key))
+	_, _ = s.DB.ExecContext(ctx, `DELETE FROM login_attempts WHERE key_hash=?`, security.Digest(key))
 }

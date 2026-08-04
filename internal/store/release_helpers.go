@@ -398,7 +398,9 @@ func scanReleases(rows *sql.Rows) ([]Release, error) {
 			&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed); err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(secondary), &r.SecondaryTypes)
+		if err := json.Unmarshal([]byte(secondary), &r.SecondaryTypes); err != nil {
+			return nil, err
+		}
 		r.SpotifyID, r.SpotifyURL, r.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
 		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 		r.ITunesArtworkURL = itunesArtworkURL.String

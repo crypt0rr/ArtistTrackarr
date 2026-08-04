@@ -414,7 +414,7 @@ func (i *ITunes) getJSON(ctx context.Context, operation, endpoint string, target
 			return err
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			return readErr
 		}

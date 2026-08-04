@@ -42,7 +42,7 @@ func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Destination
 	for rows.Next() {
 		var d Destination
@@ -75,7 +75,7 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []Delivery
 	for rows.Next() {
 		var d Delivery
@@ -116,7 +116,7 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []DeliveryHistory
 	for rows.Next() {
 		var h DeliveryHistory
@@ -164,7 +164,7 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var result []AdminDeliveryHistory
 	for rows.Next() {
 		var h AdminDeliveryHistory

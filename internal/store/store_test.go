@@ -19,7 +19,7 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -96,7 +96,7 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,9 @@ func TestInitialSyncChoosesNearestUpcomingRelease(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.AddDestination(ctx, userID, "Phone", "ntfy", []byte("encrypted-one")); err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +522,9 @@ func TestInitialSyncChoosesLatestPastAndSkipsUndated(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	releases := []Release{
 		{MBID: "undated", Title: "Mystery", PrimaryType: "Album"},
@@ -546,7 +550,9 @@ func TestInitialSyncWithOnlyUndatedReleasesCreatesNoEvent(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.ApplyReleaseSync(ctx, artist, []Release{{MBID: "undated", Title: "Mystery", PrimaryType: "Album"}}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +566,9 @@ func TestInitialMultiSourceSyncCanChooseSpotifyRelease(t *testing.T) {
 	artist, _ := s.UpsertArtist(ctx, Artist{
 		MBID: "artist-id", Name: "Pjotr", SortName: "Pjotr", SpotifyID: "spotify-artist",
 	})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{
 		{Provider: "musicbrainz", Releases: []Release{{
@@ -597,7 +605,9 @@ func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *tes
 	artist, _ := s.UpsertArtist(ctx, Artist{
 		MBID: "artist-id", Name: "Example", SortName: "Example", SpotifyID: "spotify-artist",
 	})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	if err := s.ApplyReleaseSync(ctx, artist, nil, now); err != nil {
 		t.Fatal(err)
@@ -636,7 +646,9 @@ func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	spotifyRelease := Release{
 		MBID: "spotify:spotify-release", SpotifyID: "spotify-release", Title: "Shared Album",
@@ -681,7 +693,9 @@ func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SpotifyID: "spotify-artist"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
 		Provider: "spotify",
@@ -718,7 +732,9 @@ func TestDashboardReleasesSeparatesDefinitelyFutureDates(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	releases := []Release{
 		{MBID: "future-day", Title: "Future day", PrimaryType: "Album", FirstReleaseDate: "2026-08-15", DatePrecision: 3},
 		{MBID: "future-month", Title: "Future month", PrimaryType: "Album", FirstReleaseDate: "2026-09", DatePrecision: 2},
@@ -750,7 +766,9 @@ func TestScheduleArtistCheckDefersDueArtist(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	if err := s.ScheduleArtistCheck(ctx, artist.ID, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
@@ -799,7 +817,9 @@ func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 	s := testStore(t)
 	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "Europe/Amsterdam", "")
 	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Example", SortName: "Example"})
-	s.Follow(ctx, userID, artist.ID)
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 7, 1, 0, 0, time.UTC) // 09:01 in Amsterdam.
 	releases := []Release{{
 		MBID: "today", Title: "Today", PrimaryType: "Album",
@@ -960,7 +980,9 @@ func TestFollowedArtistCount(t *testing.T) {
 			t.Fatal(err)
 		}
 		if i == 0 {
-			s.Follow(ctx, otherID, artist.ID)
+			if _, err := s.Follow(ctx, otherID, artist.ID); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	count, err := s.FollowedArtistCount(ctx, userID)
@@ -1168,13 +1190,13 @@ func TestMigrationsUpgradeVersionOneDatabase(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(1,'2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	var applied int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=2`).Scan(&applied); err != nil || applied != 1 {
 		t.Fatalf("migration 2 applied=%d err=%v", applied, err)
