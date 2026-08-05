@@ -8,6 +8,9 @@
   <article><strong>{{.ReleaseCount}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
+<section class="panel inbox-summary">
+  <div class="section-head"><div><p class="eyebrow">Release inbox</p><h2>{{if .InboxUnreadCount}}{{.InboxUnreadCount}} release{{if ne .InboxUnreadCount 1}}s{{end}} need your attention{{else}}Your release inbox is clear{{end}}</h2><p>Review alertable releases, source evidence, and anything that arrived while a destination was unavailable.</p></div><a class="button secondary" href="/inbox">Open inbox</a></div>
+</section>
 {{if .CoverageSummary.Artists}}<section class="panel trust-overview">
   <div class="section-head"><div><p class="eyebrow">Release trust</p><h2>Know what is confirmed</h2><p>Provider coverage for your followed artists at a glance.</p></div><a href="/coverage">Open Trust Center</a></div>
   <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div></div>

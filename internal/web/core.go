@@ -324,6 +324,8 @@ func (a *App) Handler() http.Handler {
 		private.Get("/", a.dashboard)
 		private.Post("/logout", a.logout)
 		private.Get("/artists", a.artists)
+		private.Get("/inbox", a.inbox)
+		private.Post("/inbox/{id}/{action}", a.inboxStateAction)
 		private.Get("/coverage", a.coverage)
 		private.Post("/coverage/artists/{id}/sync", a.queueCoverageSync)
 		private.Get("/releases/{id}", a.releaseDetail)
