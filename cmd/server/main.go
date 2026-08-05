@@ -33,6 +33,12 @@ func main() {
 	stdoutLogger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	logHandler := logging.NewHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}), 200)
 	logger := slog.New(logHandler)
+	if cfg.AllowInsecureHTTP {
+		logger.Warn("insecure HTTP public URL explicitly enabled")
+	}
+	if cfg.AllowPrivateNotificationTargets {
+		logger.Warn("private notification targets explicitly enabled")
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o750); err != nil {
 		logger.Error("create data directory", "error", err)
 		os.Exit(1)
@@ -89,7 +95,7 @@ func main() {
 	} else if !errors.Is(healthErr, sql.ErrNoRows) {
 		logger.Warn("restore iTunes provider cooldown failed", "error", healthErr)
 	}
-	sender := notify.ShoutrrrSender{}
+	sender := notify.ShoutrrrSender{AllowPrivateTargets: cfg.AllowPrivateNotificationTargets}
 	var runnerOptions []jobs.Option
 	if spotify != nil {
 		runnerOptions = append(runnerOptions, jobs.WithSpotify(spotify))

@@ -355,6 +355,19 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 	}
 }
 
+func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
+	var logs bytes.Buffer
+	app := &App{
+		mb:     &searchCatalog{err: errors.New(`Get "https://musicbrainz.org/ws/2/artist?query=private-artist": EOF`)},
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	d := PageData{Query: "private-artist"}
+	app.populateSearch(context.Background(), &d)
+	if strings.Contains(logs.String(), "private-artist") || strings.Contains(logs.String(), "musicbrainz.org") {
+		t.Fatalf("search failure log leaked query or URL: %q", logs.String())
+	}
+}
+
 func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	response, err := client.Get(server.URL + "/settings")
@@ -863,7 +876,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	_ = response.Body.Close()
 	for _, expected := range []string{
 		"member@example.com", "Audited Album", "Kitchen display", "ntfy", "failed", "5 attempts",
-		"provider rejected secret detail", "Household accounts", "delete-me@example.com",
+		"View details", "Household accounts", "delete-me@example.com",
 		"/admin/users/" + strconv.FormatInt(targetID, 10) + "/delete", "Current account",
 	} {
 		if !strings.Contains(string(body), expected) {
@@ -872,6 +885,18 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	if strings.Contains(string(body), "encrypted-secret") {
 		t.Fatalf("admin audit exposed encrypted destination: %q", body)
+	}
+	if strings.Contains(string(body), "provider rejected secret detail") {
+		t.Fatalf("admin summary exposed notification error without explicit access: %q", body)
+	}
+	detailResponse, err := client.Get(server.URL + "/admin/deliveries/" + strconv.FormatInt(deliveries[0].ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detailBody, _ := io.ReadAll(detailResponse.Body)
+	_ = detailResponse.Body.Close()
+	if detailResponse.StatusCode != http.StatusOK || !strings.Contains(string(detailBody), "provider rejected secret detail") {
+		t.Fatalf("admin delivery detail status/body=%d %q", detailResponse.StatusCode, detailBody)
 	}
 	csrf = getCSRF(t, client, server.URL+"/admin")
 	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(user.ID, 10)+"/delete", url.Values{

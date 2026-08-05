@@ -289,6 +289,12 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		cfg: cfg, store: s, mb: mb, spotify: spotify, sender: sender,
 		itunes: itunesProvider,
 		cipher: cipher, artwork: art, jobs: runner, logger: logger, templates: tmpl,
+		setupLimiter:     newFixedWindowLimiter(10, 15*time.Minute),
+		loginLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
+		tokenLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
+		discoveryLimiter: newFixedWindowLimiter(30, 5*time.Minute),
+		providerLimiter:  newFixedWindowLimiter(30, 10*time.Minute),
+		loginSlots:       make(chan struct{}, 8),
 	}, nil
 }
 func (a *App) Handler() http.Handler {
@@ -349,6 +355,7 @@ func (a *App) Handler() http.Handler {
 		private.Group(func(admin chi.Router) {
 			admin.Use(a.requireAdmin)
 			admin.Get("/admin", a.admin)
+			admin.Get("/admin/deliveries/{id}", a.adminDeliveryDetail)
 			admin.Post("/admin/profile", a.profile)
 			admin.Post("/admin/invite", a.createInvite)
 			admin.Post("/admin/reset", a.createReset)
@@ -516,7 +523,14 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	}
 	const pageSize = 50
 	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
-	a.populateSearch(r.Context(), d)
+	if d.Query != "" {
+		key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+		if a.discoveryLimiter != nil && !a.discoveryLimiter.Allow(key) {
+			d.Error = "Artist search is temporarily rate limited. Please try again in a few minutes."
+		} else {
+			a.populateSearch(r.Context(), d)
+		}
+	}
 	d.GenreFilter = strings.TrimSpace(r.URL.Query().Get("genre"))
 	d.CountryFilter = strings.TrimSpace(r.URL.Query().Get("country"))
 	d.TypeFilter = strings.TrimSpace(r.URL.Query().Get("type"))

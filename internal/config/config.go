@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -11,26 +12,32 @@ import (
 )
 
 type Config struct {
-	ListenAddr          string
-	PublicURL           *url.URL
-	DatabasePath        string
-	SetupToken          string
-	EncryptionKey       string
-	SessionSecret       string
-	MusicBrainzContact  string
-	PollInterval        time.Duration
-	SpotifyPollInterval time.Duration
-	TrustProxy          bool
-	SpotifyClientID     string
-	SpotifySecret       string
-	SpotifyMarket       string
-	LogLevel            slog.Level
+	ListenAddr                      string
+	PublicURL                       *url.URL
+	DatabasePath                    string
+	SetupToken                      string
+	EncryptionKey                   string
+	SessionSecret                   string
+	MusicBrainzContact              string
+	PollInterval                    time.Duration
+	SpotifyPollInterval             time.Duration
+	TrustProxy                      bool
+	TrustedProxyNetworks            []*net.IPNet
+	AllowInsecureHTTP               bool
+	AllowPrivateNotificationTargets bool
+	SpotifyClientID                 string
+	SpotifySecret                   string
+	SpotifyMarket                   string
+	LogLevel                        slog.Level
 }
 
 func Load() (Config, error) {
 	publicURL, err := url.Parse(env("PUBLIC_URL", "http://localhost:8080"))
 	if err != nil || publicURL.Scheme == "" || publicURL.Host == "" {
 		return Config{}, errors.New("PUBLIC_URL must be an absolute http(s) URL")
+	}
+	if !strings.EqualFold(publicURL.Scheme, "http") && !strings.EqualFold(publicURL.Scheme, "https") {
+		return Config{}, errors.New("PUBLIC_URL must use http or https")
 	}
 	interval, err := time.ParseDuration(env("POLL_INTERVAL", "6h"))
 	if err != nil || interval < time.Hour {
@@ -56,24 +63,42 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	allowInsecureHTTP := strings.EqualFold(strings.TrimSpace(env("ALLOW_INSECURE_HTTP", "false")), "true")
+	trustedProxyNetworks, err := parseTrustedProxyNetworks(env("TRUSTED_PROXY_CIDRS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	trustProxy := strings.EqualFold(env("TRUST_PROXY", "false"), "true")
+	if trustProxy && len(trustedProxyNetworks) == 0 {
+		return Config{}, errors.New("TRUST_PROXY=true requires TRUSTED_PROXY_CIDRS")
+	}
+	if strings.EqualFold(publicURL.Scheme, "http") && !isLocalHost(publicURL.Hostname()) && !allowInsecureHTTP {
+		return Config{}, errors.New("PUBLIC_URL must use HTTPS unless it points to localhost or ALLOW_INSECURE_HTTP=true")
+	}
 	cfg := Config{
-		ListenAddr:          env("LISTEN_ADDR", ":8080"),
-		PublicURL:           publicURL,
-		DatabasePath:        env("DATABASE_PATH", "/data/artist-tracker.db"),
-		SetupToken:          setupToken,
-		EncryptionKey:       encryptionKey,
-		SessionSecret:       sessionSecret,
-		MusicBrainzContact:  strings.TrimSpace(env("MUSICBRAINZ_CONTACT", "")),
-		PollInterval:        interval,
-		SpotifyPollInterval: spotifyInterval,
-		TrustProxy:          strings.EqualFold(env("TRUST_PROXY", "false"), "true"),
-		SpotifyClientID:     strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
-		SpotifySecret:       spotifySecret,
-		SpotifyMarket:       strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
+		ListenAddr:                      env("LISTEN_ADDR", ":8080"),
+		PublicURL:                       publicURL,
+		DatabasePath:                    env("DATABASE_PATH", "/data/artist-tracker.db"),
+		SetupToken:                      setupToken,
+		EncryptionKey:                   encryptionKey,
+		SessionSecret:                   sessionSecret,
+		MusicBrainzContact:              strings.TrimSpace(env("MUSICBRAINZ_CONTACT", "")),
+		PollInterval:                    interval,
+		SpotifyPollInterval:             spotifyInterval,
+		TrustProxy:                      trustProxy,
+		TrustedProxyNetworks:            trustedProxyNetworks,
+		AllowInsecureHTTP:               allowInsecureHTTP,
+		AllowPrivateNotificationTargets: strings.EqualFold(strings.TrimSpace(env("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "false")), "true"),
+		SpotifyClientID:                 strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
+		SpotifySecret:                   spotifySecret,
+		SpotifyMarket:                   strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 	}
 	cfg.LogLevel, err = parseLogLevel(env("LOG_LEVEL", "info"))
 	if err != nil {
 		return Config{}, err
+	}
+	if len(cfg.SetupToken) < 32 {
+		return Config{}, errors.New("SETUP_TOKEN must be at least 32 characters")
 	}
 	if len(cfg.EncryptionKey) < 32 || len(cfg.SessionSecret) < 32 {
 		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must each be at least 32 characters")
@@ -90,6 +115,36 @@ func Load() (Config, error) {
 		return Config{}, errors.New("SPOTIFY_MARKET must be a two-letter ISO country code")
 	}
 	return cfg, nil
+}
+
+func parseTrustedProxyNetworks(value string) ([]*net.IPNet, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	networks := make([]*net.IPNet, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS contains invalid network %q", part)
+		}
+		networks = append(networks, network)
+	}
+	return networks, nil
+}
+
+func isLocalHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func parseLogLevel(value string) (slog.Level, error) {
@@ -118,7 +173,17 @@ func secret(name string) (string, error) {
 	if path := strings.TrimSpace(os.Getenv(name + "_FILE")); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return "", fmt.Errorf("read %s_FILE: %w", name, err)
+			// Keep startup diagnostics useful without echoing the configured
+			// filesystem path (which may itself contain sensitive deployment
+			// details). The secret contents are never included.
+			reason := "could not read the configured file"
+			switch {
+			case os.IsNotExist(err):
+				reason = "configured file does not exist"
+			case os.IsPermission(err):
+				reason = "permission denied reading configured file"
+			}
+			return "", fmt.Errorf("read %s_FILE: %s", name, reason)
 		}
 		return strings.TrimSpace(string(data)), nil
 	}

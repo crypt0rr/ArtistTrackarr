@@ -30,6 +30,11 @@ func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "setup", a.data(r, "Create administrator"), http.StatusOK)
 }
 func (a *App) setup(w http.ResponseWriter, r *http.Request) {
+	_, release, ok := a.acquirePasswordSlot(w, r, a.setupLimiter, 900, "too many setup attempts; try again later")
+	if !ok {
+		return
+	}
+	defer release()
 	count, err := a.store.UserCount(r.Context())
 	if err != nil {
 		a.logger.Error("setup user count failed", "page", "Create administrator", "path", r.URL.Path, "error", err)
@@ -79,8 +84,13 @@ func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "login", d, http.StatusOK)
 }
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
+	clientIP, release, ok := a.acquirePasswordSlot(w, r, a.loginLimiter, 300, "too many login attempts; try again later")
+	if !ok {
+		return
+	}
+	defer release()
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
-	key := a.clientIP(r) + "|" + email
+	key := clientIP + "|" + email
 	allowed, err := a.store.LoginAllowed(r.Context(), key)
 	if err != nil {
 		a.logger.Error("login throttling lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
@@ -146,6 +156,11 @@ func (a *App) tokenForm(kind string) http.HandlerFunc {
 	}
 }
 func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
+	_, release, ok := a.acquirePasswordSlot(w, r, a.tokenLimiter, 300, "too many account setup attempts; try again later")
+	if !ok {
+		return
+	}
+	defer release()
 	hash, err := security.HashPassword(r.FormValue("password"))
 	if err == nil {
 		username := strings.TrimSpace(r.FormValue("username"))
@@ -164,34 +179,82 @@ func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login?message=Account+created", http.StatusSeeOther)
 }
 func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
+	_, release, ok := a.acquirePasswordSlot(w, r, a.tokenLimiter, 300, "too many password reset attempts; try again later")
+	if !ok {
+		return
+	}
+	defer release()
 	hash, err := security.HashPassword(r.FormValue("password"))
-	var userID *int64
 	if err == nil {
-		_, userID, err = a.store.ConsumeAuthToken(r.Context(), chi.URLParam(r, "token"), "reset")
-		if err == nil && userID == nil {
-			err = errors.New("reset token has no user")
-		}
-		if err == nil {
-			err = a.store.UpdatePassword(r.Context(), *userID, hash)
-		}
+		err = a.store.ResetPasswordWithToken(r.Context(), chi.URLParam(r, "token"), hash)
 	}
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			a.logger.Warn("password reset failed", "page", "Reset password", "path", r.URL.Path, "error", err)
+		}
 		d := a.data(r, "Reset password")
-		d.Error, d.Token, d.TokenKind = "Reset link is invalid, expired, or already used: "+err.Error(), chi.URLParam(r, "token"), "reset"
+		d.Error, d.Token, d.TokenKind = "Reset link is invalid, expired, or already used. Please request a new link.", chi.URLParam(r, "token"), "reset"
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/login?message=Password+updated", http.StatusSeeOther)
 }
-func (a *App) clientIP(r *http.Request) string {
-	if a.cfg.TrustProxy {
-		if first := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); first != "" {
-			return first
-		}
+
+// acquirePasswordSlot bounds the expensive Argon2 work used by login and
+// token-backed account flows. The per-IP window slows repeated attempts while
+// the shared semaphore prevents a distributed source from exhausting CPU.
+func (a *App) acquirePasswordSlot(w http.ResponseWriter, r *http.Request, limiter *fixedWindowLimiter, retryAfter int, message string) (string, func(), bool) {
+	clientIP := a.clientIP(r)
+	if limiter != nil && !limiter.Allow(clientIP) {
+		rateLimited(w, retryAfter, message)
+		return clientIP, func() {}, false
 	}
+	if a.loginSlots == nil {
+		return clientIP, func() {}, true
+	}
+	select {
+	case a.loginSlots <- struct{}{}:
+		return clientIP, func() { <-a.loginSlots }, true
+	default:
+		rateLimited(w, 5, "password service is busy; try again shortly")
+		return clientIP, func() {}, false
+	}
+}
+func (a *App) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if !a.cfg.TrustProxy || peer == nil || !a.trustedProxy(peer) {
 		return host
 	}
-	return r.RemoteAddr
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	// Walk from the nearest proxy toward the original client. Ignore entries
+	// that are themselves trusted proxies and return the first untrusted IP;
+	// this prevents a direct client from spoofing a throttling key.
+	for i := len(forwarded) - 1; i >= 0; i-- {
+		candidate := net.ParseIP(strings.TrimSpace(forwarded[i]))
+		if candidate == nil {
+			continue
+		}
+		if !a.trustedProxy(candidate) {
+			return candidate.String()
+		}
+	}
+	if len(forwarded) > 0 {
+		if candidate := net.ParseIP(strings.TrimSpace(forwarded[0])); candidate != nil {
+			return candidate.String()
+		}
+	}
+	return host
+}
+
+func (a *App) trustedProxy(ip net.IP) bool {
+	for _, network := range a.cfg.TrustedProxyNetworks {
+		if network != nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

@@ -59,9 +59,9 @@
       <thead><tr><th>User</th><th>Notification</th><th>Destination</th><th>Delivery</th><th>Timing</th></tr></thead>
       <tbody>{{range .AdminHistory}}<tr>
         <td><strong>{{.UserEmail}}</strong></td>
-        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small><details><summary>Message</summary><p>{{.Body}}</p></details></td>
+        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small>{{if .DeliveryID}}<a class="admin-detail-link" href="/admin/deliveries/{{.DeliveryID}}">View details</a>{{else}}<small>Content unavailable: no delivery record</small>{{end}}</td>
         <td><strong>{{.Destination}}</strong>{{if .Service}}<small>{{.Service}}</small>{{end}}</td>
-        <td><span class="badge {{.Status}}">{{.Status}}</span><small>{{.Attempts}} attempts</small>{{if .LastError}}<details><summary>Error</summary><p class="error-copy">{{.LastError}}</p></details>{{end}}</td>
+        <td><span class="badge {{.Status}}">{{.Status}}</span><small>{{.Attempts}} attempts</small>{{if .DeliveryID}}<small>Details require explicit access</small>{{end}}</td>
         <td><small>Created {{formatTime .CreatedAt}}</small>{{if .NextAttempt}}<small>Next {{.NextAttempt.Format "2006-01-02 15:04"}}</small>{{end}}{{if .SentAt}}<small>Sent {{.SentAt.Format "2006-01-02 15:04"}}</small>{{end}}</td>
       </tr>{{end}}</tbody>
     </table>

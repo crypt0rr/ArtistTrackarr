@@ -408,6 +408,44 @@ func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email s
 	}
 	return email, userID, nil
 }
+
+// ResetPasswordWithToken updates the password, revokes existing sessions, and
+// consumes a reset token in one transaction. A transient database failure no
+// longer burns a still-valid recovery link.
+func (s *Store) ResetPasswordWithToken(ctx context.Context, raw, hash string) error {
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var userID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM auth_tokens
+		WHERE token_hash=? AND kind='reset' AND used_at IS NULL AND expires_at>?`,
+		security.Digest(raw), nowText()).Scan(&userID); err != nil {
+		return err
+	}
+	if !userID.Valid {
+		return errors.New("reset token has no user")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID.Int64); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID.Int64); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
+		WHERE token_hash=? AND kind='reset' AND used_at IS NULL`, nowText(), security.Digest(raw))
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed != 1 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func (s *Store) LoginAllowed(ctx context.Context, key string) (bool, error) {
 	var blocked sql.NullString
 	err := s.readerDB().QueryRowContext(ctx, `SELECT blocked_until FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&blocked)

@@ -1183,6 +1183,66 @@ func TestAdminDeliveryHistoryPaginationAndDetails(t *testing.T) {
 	}
 }
 
+func TestDeliveryErrorsAreRedactedBeforePersistenceAndDisplay(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "safe-delivery@example.com", "unused", "member", "UTC", "safe-delivery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "safe-delivery-artist", Name: "Safe Delivery Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Webhook", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	releaseResult, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "safe-delivery-release", artist.ID, "Safe Release", "Album", "[]", "2026-01-01", 3,
+		"https://musicbrainz.org/release-group/safe-delivery-release", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := releaseResult.LastInsertId()
+	eventResult, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events
+		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Safe event", "Safe body", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, _ := eventResult.LastInsertId()
+	deliveryResult, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries
+		(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[0].ID, "pending", 0, nowText(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := deliveryResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := "send failed to generic+https://user:password@example.test/hook?token=top-secret"
+	if err := s.MarkDeliveryFailed(ctx, deliveryID, 1, message, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := s.DB.QueryRowContext(ctx, `SELECT last_error FROM deliveries WHERE event_id=?`, eventID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored, "example.test") || strings.Contains(stored, "top-secret") || strings.Contains(stored, "password") {
+		t.Fatalf("stored delivery error leaked credentials: %q", stored)
+	}
+	history, err := s.DeliveryHistory(ctx, userID, 10)
+	if err != nil || len(history) != 1 || strings.Contains(history[0].LastError, "example.test") {
+		t.Fatalf("history=%#v err=%v", history, err)
+	}
+}
+
 func TestAdminUsersAndDeleteUser(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -1295,6 +1355,36 @@ func TestInviteUsernameFailureDoesNotConsumeToken(t *testing.T) {
 	}
 	if _, err := s.UserByEmail(ctx, "member@example.com"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResetPasswordWithTokenIsAtomicAndRevokesSessions(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "reset@example.com", "old-hash", "member", "UTC", "reset-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateAuthToken(ctx, "reset", "reset@example.com", &userID, userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetPasswordWithToken(ctx, token, "new-hash"); err != nil {
+		t.Fatal(err)
+	}
+	user, err := s.UserByID(ctx, userID)
+	if err != nil || user.PasswordHash != "new-hash" {
+		t.Fatalf("updated user=%#v err=%v", user, err)
+	}
+	var sessions int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions WHERE user_id=?`, userID).Scan(&sessions); err != nil || sessions != 0 {
+		t.Fatalf("sessions=%d err=%v", sessions, err)
+	}
+	if err := s.ResetPasswordWithToken(ctx, token, "another-hash"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("reused reset token error=%v", err)
 	}
 }
 

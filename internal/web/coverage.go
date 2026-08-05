@@ -68,6 +68,9 @@ func coveragePageURL(page int) string {
 }
 
 func (a *App) queueCoverageSync(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id < 1 {

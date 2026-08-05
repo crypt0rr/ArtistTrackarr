@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -29,6 +30,9 @@ func (a *App) artists(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id < 1 {
 		http.NotFound(w, r)
@@ -74,7 +78,7 @@ func (a *App) populateSearch(ctx context.Context, d *PageData) {
 			return
 		}
 		if err != nil {
-			a.logger.Warn("Spotify artist search failed", "query", d.Query, "error", err)
+			a.logger.Warn("Spotify artist search failed", "query_length", utf8.RuneCountInString(d.Query), "error", "provider request failed")
 			if a.itunes == nil {
 				d.ProviderNotice = "Spotify is temporarily unavailable; showing MusicBrainz results."
 			} else {
@@ -93,7 +97,7 @@ func (a *App) populateSearch(ctx context.Context, d *PageData) {
 			return
 		}
 		if err != nil {
-			a.logger.Warn("iTunes artist search failed", "query", d.Query, "error", err)
+			a.logger.Warn("iTunes artist search failed", "query_length", utf8.RuneCountInString(d.Query), "error", "provider request failed")
 			d.ProviderNotice = "Spotify and Apple/iTunes discovery are unavailable; showing MusicBrainz results."
 		} else {
 			d.ProviderNotice = "No Spotify or Apple/iTunes matches were found; showing MusicBrainz results."
@@ -101,13 +105,16 @@ func (a *App) populateSearch(ctx context.Context, d *PageData) {
 	}
 	results, err := a.mb.SearchArtists(ctx, d.Query, 10)
 	if err != nil {
-		a.logger.Warn("artist search failed", "query", d.Query, "error", err)
+		a.logger.Warn("artist search failed", "query_length", utf8.RuneCountInString(d.Query), "error", "provider request failed")
 		d.Error = "MusicBrainz is temporarily unavailable. Please try your search again in a moment."
 	} else {
 		d.Results = results
 	}
 }
 func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	if a.itunes == nil {
 		http.Error(w, "iTunes is unavailable", http.StatusBadRequest)
@@ -141,6 +148,9 @@ func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	if a.itunes == nil {
 		http.Error(w, "iTunes is unavailable", http.StatusBadRequest)
 		return
@@ -194,6 +204,9 @@ func validProviderID(value string) bool {
 	return true
 }
 func (a *App) followSpotify(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	if a.spotify == nil {
 		http.Error(w, "Spotify is not configured", http.StatusBadRequest)
@@ -227,6 +240,9 @@ func (a *App) followSpotify(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	if a.spotify == nil {
 		http.Error(w, "Spotify is not configured", http.StatusBadRequest)
 		return
@@ -306,6 +322,9 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 func (a *App) follow(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	result, err := a.mb.ResolveArtist(r.Context(), r.FormValue("mbid"))
 	if err != nil {
@@ -337,6 +356,9 @@ func (a *App) follow(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	values, err := selectedValues(r, "mbids")
 	if err != nil {

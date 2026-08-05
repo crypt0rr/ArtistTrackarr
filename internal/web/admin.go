@@ -24,6 +24,34 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, "admin", d, status)
 }
+
+func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
+	// Notification bodies and provider errors are deliberately only fetched
+	// after this explicit request. Keep the page out of browser/proxy caches
+	// because it contains household-private delivery content.
+	w.Header().Set("Cache-Control", "no-store")
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	detail, err := a.store.AdminDeliveryDetail(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		d := a.data(r, "Delivery details")
+		a.pageStoreError(r, &d, "Delivery details", "notification delivery", err)
+		a.render(w, "admin_delivery", d, http.StatusInternalServerError)
+		return
+	}
+	a.logger.Info("admin delivery details viewed", "delivery_id", id)
+	d := a.data(r, "Delivery details")
+	d.AdminDelivery = &detail
+	a.render(w, "admin_delivery", d, http.StatusOK)
+}
+
 func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 	health, err := a.store.ProviderHealth(r.Context())
 	if err != nil {
@@ -73,7 +101,7 @@ func (a *App) adminData(r *http.Request) PageData {
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
 	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
 	failed = a.pageStoreError(r, &d, "Household administration", "manual sync history", err) || failed
-	d.AdminHistory, err = a.store.AdminDeliveryHistory(r.Context(), pageSize, (page-1)*pageSize)
+	d.AdminHistory, err = a.store.AdminDeliveryHistorySummary(r.Context(), pageSize, (page-1)*pageSize)
 	failed = a.pageStoreError(r, &d, "Household administration", "delivery audit", err) || failed
 	if failed && d.Error == "" {
 		d.Error = "We couldn't load this page right now. Please try again."
@@ -88,6 +116,9 @@ func (a *App) adminData(r *http.Request) PageData {
 	return d
 }
 func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "retry", nil); err != nil {
 		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
@@ -99,6 +130,9 @@ func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?message=Retry+sync+queued", http.StatusSeeOther)
 }
 func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
+	if !a.allowProviderAction(w, r) {
+		return
+	}
 	session, _ := currentSession(r)
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {

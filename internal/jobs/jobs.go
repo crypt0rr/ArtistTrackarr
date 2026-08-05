@@ -963,9 +963,10 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	}
 
 	result.failed = true
+	redactedError := notify.RedactError(err)
 	r.logger.Warn("notification attempt failed",
-		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", err)
-	if markErr := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, err.Error(), now); markErr != nil {
+		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
+	if markErr := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
 		result.err = markErr
 	}
 	return result
