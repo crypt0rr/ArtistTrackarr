@@ -21,4 +21,5 @@
 </section>
 {{end}}
 {{end}}
+{{if .ReleaseEvidenceIssues}}<section class="panel release-evidence-panel"><div class="section-head"><div><p class="eyebrow">Release truth</p><h2>Provider evidence</h2><p>These observations differ or still need canonical confirmation.</p></div><a href="/coverage/issues">Review all</a></div><div class="evidence-list">{{range .ReleaseEvidenceIssues}}<article class="evidence-issue evidence-{{.Severity}}"><div class="evidence-issue-head"><div><span class="badge {{evidenceIssueSeverityClass .Severity}}">{{.Severity}}</span><span class="badge">{{evidenceIssueTypeLabel .IssueType}}</span><span class="badge">{{.ReviewState}}</span></div><small>Last seen {{formatTime .LastSeenAt}}</small></div><p class="evidence-summary">{{.Summary}}</p>{{if .Evidence}}<div class="evidence-snapshots">{{range .Evidence}}<div class="evidence-snapshot"><strong>{{providerLabel .Provider}}</strong><span>{{.Title}} · {{.PrimaryType}} · {{if .FirstReleaseDate}}{{.FirstReleaseDate}}{{else}}date unknown{{end}}</span></div>{{end}}</div>{{end}}</article>{{end}}</div></section>{{end}}
 {{template "foot" .}}

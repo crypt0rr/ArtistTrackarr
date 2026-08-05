@@ -1034,6 +1034,73 @@ func TestCoverageManageArtistsUsesSharedButtonStyles(t *testing.T) {
 	}
 }
 
+func TestReleaseTruthDeskReviewsProviderConflicts(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, err := database.UserByEmail(context.Background(), "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: "truth-desk-artist", Name: "Truth Desk Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	base := store.Release{MBID: "truth-desk-release", Title: "Truth Desk", PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.org/release-group/truth-desk-release"}
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{Provider: "musicbrainz", Releases: []store.Release{base}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	spotify := base
+	spotify.SpotifyID = "truth-desk-spotify"
+	spotify.SpotifyURL = "https://open.spotify.com/album/truth-desk-spotify"
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{Provider: "spotify", Releases: []store.Release{spotify}}}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	spotify.FirstReleaseDate = "2026-09-08"
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{Provider: "spotify", Releases: []store.Release{spotify}}}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/coverage/issues")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Release Truth Desk") || !strings.Contains(string(body), "Date conflict") {
+		t.Fatalf("truth desk status/body=%d %q", response.StatusCode, body)
+	}
+	issues, err := database.EvidenceIssues(context.Background(), user.ID, "open", "unread", "date_conflict", "", 50, 0, now.Add(2*time.Minute))
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("truth desk issues=%#v err=%v", issues, err)
+	}
+	var releaseID int64
+	if err := database.DB.QueryRow(`SELECT id FROM release_groups WHERE mbid=?`, "truth-desk-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Get(server.URL + "/releases/" + strconv.FormatInt(releaseID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detailBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(detailBody), "Provider evidence") {
+		t.Fatalf("truth desk detail status/body=%d %q", response.StatusCode, detailBody)
+	}
+	csrf := getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/coverage/issues/"+strconv.FormatInt(issues[0].ID, 10)+"/confirm", url.Values{
+		"_csrf": {csrf}, "return": {"/coverage/issues"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther && response.StatusCode != http.StatusOK {
+		t.Fatalf("truth desk confirm status=%d", response.StatusCode)
+	}
+	if count, err := database.EvidenceIssueUnreadCount(context.Background(), user.ID, now.Add(2*time.Minute)); err != nil || count != 0 {
+		t.Fatalf("truth desk unread after confirm=%d err=%v", count, err)
+	}
+}
+
 func TestDashboardRendersSpotifyReleaseObservation(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, &fakeSpotify{}, nil)
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")

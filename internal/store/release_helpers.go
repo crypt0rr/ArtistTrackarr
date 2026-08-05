@@ -250,6 +250,35 @@ func upsertProviderObservationTx(
 		ON CONFLICT(provider,provider_id) DO UPDATE SET release_group_id=excluded.release_group_id,
 		payload_hash=excluded.payload_hash,observed_at=excluded.observed_at`,
 		provider, providerID, releaseID, payloadHash, timeText(observed))
+	if err != nil {
+		return err
+	}
+	return upsertReleaseProviderEvidenceTx(ctx, tx, provider, providerID, releaseID, release, observed)
+}
+
+func upsertReleaseProviderEvidenceTx(
+	ctx context.Context, tx *sql.Tx, provider, providerID string, releaseID int64,
+	release Release, observed time.Time,
+) error {
+	providerURL := ""
+	switch provider {
+	case "spotify":
+		providerURL = release.SpotifyURL
+	case "itunes":
+		providerURL = release.ITunesURL
+	case "musicbrainz":
+		providerURL = release.MusicBrainzURL
+	default:
+		return fmt.Errorf("unsupported evidence provider %q", provider)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO release_provider_evidence
+		(provider,provider_id,release_group_id,title,primary_type,first_release_date,date_precision,provider_url,observed_at)
+		VALUES(?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(provider,provider_id) DO UPDATE SET release_group_id=excluded.release_group_id,
+		title=excluded.title,primary_type=excluded.primary_type,first_release_date=excluded.first_release_date,
+		date_precision=excluded.date_precision,provider_url=excluded.provider_url,observed_at=excluded.observed_at`,
+		provider, providerID, releaseID, release.Title, release.PrimaryType, release.FirstReleaseDate,
+		release.DatePrecision, strings.TrimSpace(providerURL), timeText(observed))
 	return err
 }
 func releasePayloadHash(release Release) string {

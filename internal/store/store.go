@@ -182,6 +182,41 @@ type ReleaseDetail struct {
 	Observations []ReleaseObservation
 }
 
+// ReleaseEvidence is the small normalized provider snapshot used to explain
+// an evidence issue. Raw provider payloads and credentials are never stored.
+type ReleaseEvidence struct {
+	Provider         string
+	ProviderID       string
+	Title            string
+	PrimaryType      string
+	FirstReleaseDate string
+	DatePrecision    int
+	ProviderURL      string
+	ObservedAt       time.Time
+}
+
+// EvidenceIssue describes a provider disagreement or a release that has not
+// yet been confirmed by the canonical catalog. The review state is private to
+// the requesting user and does not alter release or notification semantics.
+type EvidenceIssue struct {
+	ID             int64
+	ReleaseGroupID int64
+	ArtistID       int64
+	ArtistName     string
+	ReleaseTitle   string
+	IssueType      string
+	Severity       string
+	Fingerprint    string
+	Summary        string
+	Evidence       []ReleaseEvidence
+	Status         string
+	ReviewState    string
+	SnoozedUntil   *time.Time
+	FirstSeenAt    time.Time
+	LastSeenAt     time.Time
+	ResolvedAt     *time.Time
+}
+
 // ReleaseInboxItem is the latest alertable event for one followed release,
 // together with the member's local review state. Inbox state never changes
 // provider observations or notification delivery state.

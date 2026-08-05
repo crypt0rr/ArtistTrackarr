@@ -209,6 +209,30 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "MusicBrainz"
 			}
 		},
+		"evidenceIssueTypeLabel": func(issueType string) string {
+			switch strings.ToLower(issueType) {
+			case "date_conflict":
+				return "Date conflict"
+			case "title_conflict":
+				return "Title conflict"
+			case "type_conflict":
+				return "Type conflict"
+			case "missing_canonical":
+				return "Needs canonical confirmation"
+			default:
+				return "Provider issue"
+			}
+		},
+		"evidenceIssueSeverityClass": func(severity string) string {
+			switch strings.ToLower(severity) {
+			case "critical":
+				return "failed"
+			case "warning":
+				return "ambiguous"
+			default:
+				return "pending"
+			}
+		},
 		"releaseConfidenceLabel": func(r store.Release) string {
 			switch r.Confidence {
 			case "confirmed":
@@ -327,6 +351,8 @@ func (a *App) Handler() http.Handler {
 		private.Get("/inbox", a.inbox)
 		private.Post("/inbox/{id}/{action}", a.inboxStateAction)
 		private.Get("/coverage", a.coverage)
+		private.Get("/coverage/issues", a.evidenceIssues)
+		private.Post("/coverage/issues/{id}/{action}", a.evidenceIssueStateAction)
 		private.Post("/coverage/artists/{id}/sync", a.queueCoverageSync)
 		private.Get("/releases/{id}", a.releaseDetail)
 		private.Get("/artists/search", a.search)

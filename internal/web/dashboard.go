@@ -19,6 +19,8 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "followed artist count", err) || pageFailed
 	d.InboxUnreadCount, err = a.store.ReleaseInboxUnreadCount(r.Context(), session.User.ID, time.Now().UTC())
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release inbox count", err) || pageFailed
+	d.EvidenceIssueUnreadCount, err = a.store.EvidenceIssueUnreadCount(r.Context(), session.User.ID, time.Now().UTC())
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release evidence issue count", err) || pageFailed
 	d.CoverageSummary, err = a.store.CoverageSummary(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release coverage summary", err) || pageFailed
 	location, err := time.LoadLocation(session.User.Timezone)
@@ -74,5 +76,10 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.ReleaseDetail = &detail
+	d.ReleaseEvidenceIssues, err = a.store.EvidenceIssuesForRelease(r.Context(), session.User.ID, id, time.Now().UTC())
+	if a.pageStoreError(r, &d, "Release details", "release evidence issues", err) {
+		a.render(w, "release", d, http.StatusInternalServerError)
+		return
+	}
 	a.render(w, "release", d, http.StatusOK)
 }

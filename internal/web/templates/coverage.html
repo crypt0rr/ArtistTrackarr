@@ -2,7 +2,7 @@
 <section class="page-head trust-heading">
   <div><p class="eyebrow">Release trust</p><h1>Release Trust Center</h1>
   <p>See which providers have recently confirmed your watchlist and where a fallback source is being used.</p></div>
-  <a class="button secondary button-link" href="/artists">Manage artists</a>
+  <div class="actions"><a class="button secondary button-link" href="/coverage/issues">{{.EvidenceIssueUnreadCount}} evidence issue{{if ne .EvidenceIssueUnreadCount 1}}s{{end}}</a><a class="button secondary button-link" href="/artists">Manage artists</a></div>
 </section>
 <section class="trust-summary" aria-label="Release coverage summary">
   <article class="trust-summary-card"><span class="eyebrow">Watchlist</span><strong>{{.CoverageSummary.Artists}}</strong><span>followed artists</span></article>
