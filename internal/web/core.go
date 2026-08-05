@@ -257,7 +257,61 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "pending"
 			}
 		},
+		"releaseTruthLabel": func(r store.Release) string {
+			switch r.TruthState {
+			case "confirmed":
+				if r.TruthProvider != "" {
+					return "Confirmed: " + providerDisplayLabel(r.TruthProvider)
+				}
+				return "Confirmed"
+			case "verified":
+				return "Verified"
+			case "fallback_confirmed":
+				return "Fallback confirmed"
+			case "needs_review":
+				return "Needs review"
+			case "canonical":
+				return "Canonical"
+			default:
+				switch r.Source {
+				case "spotify":
+					return "Spotify only"
+				case "itunes":
+					return "iTunes only"
+				}
+				return "Observed"
+			}
+		},
+		"releaseTruthClass": func(r store.Release) string {
+			switch r.TruthState {
+			case "confirmed", "verified", "canonical":
+				return "sent"
+			case "needs_review":
+				return "failed"
+			case "fallback_confirmed":
+				return "ambiguous"
+			default:
+				if r.Source == "spotify" || r.Source == "itunes" {
+					return "ambiguous"
+				}
+				return "pending"
+			}
+		},
 		"releaseURL": func(r store.Release) string {
+			switch r.TruthProvider {
+			case "spotify":
+				if r.SpotifyURL != "" {
+					return r.SpotifyURL
+				}
+			case "itunes":
+				if r.ITunesURL != "" {
+					return r.ITunesURL
+				}
+			case "musicbrainz":
+				if r.MusicBrainzURL != "" {
+					return r.MusicBrainzURL
+				}
+			}
 			if r.SpotifyURL != "" {
 				return r.SpotifyURL
 			}
@@ -321,6 +375,17 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		loginSlots:       make(chan struct{}, 8),
 	}, nil
 }
+
+func providerDisplayLabel(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "spotify":
+		return "Spotify"
+	case "itunes":
+		return "iTunes"
+	default:
+		return "MusicBrainz"
+	}
+}
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), a.requestLogging)
@@ -355,6 +420,7 @@ func (a *App) Handler() http.Handler {
 		private.Post("/coverage/issues/{id}/{action}", a.evidenceIssueStateAction)
 		private.Post("/coverage/artists/{id}/sync", a.queueCoverageSync)
 		private.Get("/releases/{id}", a.releaseDetail)
+		private.Post("/releases/{id}/truth", a.releaseTruthAction)
 		private.Get("/artists/search", a.search)
 		private.Get("/settings", a.settings)
 		private.Post("/settings/profile", a.settingsProfile)

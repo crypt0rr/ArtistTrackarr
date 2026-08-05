@@ -14,7 +14,7 @@
   {{if .InboxItems}}<div class="inbox-list">
     {{range .InboxItems}}<article class="inbox-item inbox-{{.State}}">
       <div class="inbox-item-main">
-        <div class="inbox-item-heading"><span class="badge inbox-state {{.State}}">{{.State}}</span><span class="badge release-confidence {{releaseConfidenceClass .Release}}">{{releaseConfidenceLabel .Release}}</span></div>
+        <div class="inbox-item-heading"><span class="badge inbox-state {{.State}}">{{.State}}</span><span class="badge release-confidence {{releaseTruthClass .Release}}">{{releaseTruthLabel .Release}}</span></div>
         <a class="inbox-release-link" href="/releases/{{.ID}}"><h3>{{.Title}}</h3><p>{{.ArtistName}} · {{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</p></a>
         <p class="inbox-event">{{if eq .EventType "release_day"}}Release-day reminder{{else}}New release announcement{{end}}{{if .EventTitle}} · {{.EventTitle}}{{end}} · {{formatTime .EventCreatedAt}} · {{sourceLabel .Release}}</p>
         <p class="inbox-evidence">Observed by {{if .Sources}}{{join .Sources ", "}}{{else}}one provider{{end}}{{if .LastObservedAt}} · last checked {{formatProviderTime .LastObservedAt}}{{end}}</p>
