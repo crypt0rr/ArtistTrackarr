@@ -440,11 +440,14 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	var secondary, observed string
 	var sourceCount int
 	var observedProviders, lastObserved sql.NullString
+	var truthState, truthProvider, truthProviderID, truthReason, truthUpdatedAt sql.NullString
+	var truthIssueCount int
 	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
 	destinations := []any{&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 		&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
 		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed,
-		&sourceCount, &observedProviders, &lastObserved}
+		&sourceCount, &observedProviders, &lastObserved, &truthState, &truthProvider, &truthProviderID,
+		&truthReason, &truthUpdatedAt, &truthIssueCount}
 	destinations = append(destinations, extra...)
 	if err := row.Scan(destinations...); err != nil {
 		return r, err
@@ -459,6 +462,12 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	r.SourceCount = sourceCount
 	r.Sources = splitReleaseProviders(observedProviders.String)
 	r.Confidence = releaseConfidence(r.Source, sourceCount)
+	r.TruthProvider = truthProvider.String
+	r.TruthProviderID = truthProviderID.String
+	r.TruthReason = truthReason.String
+	r.TruthUpdatedAt = parseTruthUpdatedAt(truthUpdatedAt)
+	r.TruthIssueCount = truthIssueCount
+	r.TruthState = releaseTruthState(truthState.String, r.Source, sourceCount, r.Sources, truthIssueCount)
 	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
 		r.LastObservedAt = parsed
 	}

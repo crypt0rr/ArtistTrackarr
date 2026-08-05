@@ -12,8 +12,18 @@
         {{if releaseUsesITunesArtwork .Release}}<p class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></p>{{end}}
       </div>
       <div class="release-detail-meta">
-        <p class="date">{{shortDate .FirstReleaseDate}}</p><p>Observed {{formatTime .FirstObservedAt}}</p><p>Source: {{sourceLabel .Release}} · <span class="badge release-confidence {{releaseConfidenceClass .Release}}">{{releaseConfidenceLabel .Release}}</span></p>
-        <div class="actions">{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}{{if .ITunesURL}}<a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Apple Music</a>{{end}}</div>
+        <p class="date">{{shortDate .FirstReleaseDate}}</p><p>Observed {{formatTime .FirstObservedAt}}</p><p>Source: {{sourceLabel .Release}} · <span class="badge release-confidence {{releaseTruthClass .Release}}">{{releaseTruthLabel .Release}}</span></p>
+        <div class="actions">{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}{{if .ITunesURL}}<a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Apple Music</a>{{end}}{{if and .TruthProvider (releaseURL .Release)}}<a class="button secondary" href="{{releaseURL .Release}}" target="_blank" rel="noopener noreferrer">Open confirmed source</a>{{end}}</div>
+        <div class="release-truth-choice">
+          <p><strong>Release truth</strong> <span class="badge release-confidence {{releaseTruthClass .Release}}">{{releaseTruthLabel .Release}}</span></p>
+          {{if .TruthReason}}<small>{{.TruthReason}}</small>{{else}}<small>Choose the provider that best represents this release for your household.</small>{{end}}
+          <div class="actions">
+            {{if .SpotifyID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="spotify"><button class="secondary">Confirm Spotify</button></form>{{end}}
+            {{if .ITunesID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="itunes"><button class="secondary">Confirm iTunes</button></form>{{end}}
+            {{if .MBID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="musicbrainz"><button class="secondary">Keep MusicBrainz</button></form>{{end}}
+            {{if eq .TruthState "confirmed"}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="clear"><button class="link">Clear decision</button></form>{{end}}
+          </div>
+        </div>
       </div>
     </div>
   </section>

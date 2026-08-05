@@ -173,8 +173,27 @@ type Release struct {
 	SourceCount      int
 	Sources          []string
 	Confidence       string
+	TruthState       string
+	TruthProvider    string
+	TruthProviderID  string
+	TruthReason      string
+	TruthUpdatedAt   *time.Time
+	TruthIssueCount  int
 	LastObservedAt   *time.Time
 	FirstObservedAt  time.Time
+}
+
+// ReleaseTruthDecision is an explicit, reversible source choice for a
+// release. It never overwrites provider observations or canonical metadata.
+type ReleaseTruthDecision struct {
+	ReleaseGroupID     int64
+	State              string
+	SelectedProvider   string
+	SelectedProviderID string
+	Reason             string
+	DecidedByUserID    *int64
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type ReleaseDetail struct {
@@ -412,4 +431,10 @@ const releaseSelectColumns = `rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.prim
 	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at,
 	(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
 	(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
-	(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=rg.id)`
+	(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=rg.id),
+	COALESCE((SELECT state FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
+	COALESCE((SELECT selected_provider FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
+	COALESCE((SELECT selected_provider_id FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
+	COALESCE((SELECT reason FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
+	(SELECT updated_at FROM release_truth_decisions td WHERE td.release_group_id=rg.id),
+	(SELECT COUNT(*) FROM release_evidence_issues ei WHERE ei.release_group_id=rg.id AND ei.status='open' AND ei.severity IN ('warning','critical'))`

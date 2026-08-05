@@ -42,7 +42,7 @@
     <a class="release-card-link" href="/releases/{{.ID}}">
       <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
       <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseConfidenceClass .}}">{{releaseConfidenceLabel .}}</span></small>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseTruthClass .}}">{{releaseTruthLabel .}}</span></small>
       </span>
     </a>
     {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}
@@ -56,7 +56,7 @@
     <a class="release-card-link" href="/releases/{{.ID}}">
       <img src="{{releaseArtwork .}}" data-artwork-fallback="{{releaseArtworkFallback .}}" loading="lazy" width="250" height="250" alt="Cover art for {{.Title}}" referrerpolicy="no-referrer">
       <span class="release-copy"><span class="date">{{shortDate .FirstReleaseDate}}</span><strong>{{.Title}}</strong><span>{{.ArtistName}}</span>
-        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseConfidenceClass .}}">{{releaseConfidenceLabel .}}</span></small>
+        <small>{{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}} · {{sourceLabel .}} · <span class="badge release-confidence {{releaseTruthClass .}}">{{releaseTruthLabel .}}</span></small>
       </span>
     </a>
     {{if releaseUsesITunesArtwork .}}<small class="release-art-credit">Artwork provided courtesy of iTunes · <a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Open in Apple Music</a></small>{{end}}
