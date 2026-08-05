@@ -29,6 +29,8 @@ func (a *App) inbox(w http.ResponseWriter, r *http.Request) {
 	var err error
 	d.InboxUnreadCount, err = a.store.ReleaseInboxUnreadCount(r.Context(), session.User.ID, now)
 	pageFailed = a.pageStoreError(r, &d, "Release inbox", "unread release count", err) || pageFailed
+	d.EvidenceIssueUnreadCount, err = a.store.EvidenceIssueUnreadCount(r.Context(), session.User.ID, now)
+	pageFailed = a.pageStoreError(r, &d, "Release inbox", "unread evidence issue count", err) || pageFailed
 	d.InboxCount, err = a.store.ReleaseInboxCount(r.Context(), session.User.ID, d.InboxState, d.InboxSource, d.InboxType, now)
 	pageFailed = a.pageStoreError(r, &d, "Release inbox", "release inbox count", err) || pageFailed
 	pages := (d.InboxCount + inboxPageSize - 1) / inboxPageSize
@@ -109,6 +111,9 @@ func (a *App) inboxStateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "action")))
+	if action == "dismiss" {
+		action = "dismissed"
+	}
 	state := action
 	var snoozedUntil *time.Time
 	if action == "snooze" {

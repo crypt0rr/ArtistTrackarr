@@ -50,6 +50,10 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 				_ = tx.Rollback()
 				return err
 			}
+			if err := evaluateReleaseEvidenceTx(ctx, tx, saved.release.ID, observed); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
 			savedReleases = append(savedReleases, saved)
 		}
 	}

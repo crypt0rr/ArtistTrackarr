@@ -13,7 +13,7 @@
 </section>
 {{if .CoverageSummary.Artists}}<section class="panel trust-overview">
   <div class="section-head"><div><p class="eyebrow">Release trust</p><h2>Know what is confirmed</h2><p>Provider coverage for your followed artists at a glance.</p></div><a href="/coverage">Open Trust Center</a></div>
-  <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div></div>
+  <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div>{{if .EvidenceIssueUnreadCount}}<div class="attention"><strong>{{.EvidenceIssueUnreadCount}}</strong><span><a href="/coverage/issues">evidence issues to review</a></span></div>{{end}}</div>
 </section>{{end}}
 {{if or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel insights-panel">
   <div class="section-head insights-heading"><div><p class="eyebrow">Watchlist insights</p><h2>Explore your artists</h2><p>Quick patterns from your followed artists, with one-click filters.</p></div><div class="insights-heading-actions"><span class="badge">{{.FollowCount}} artists</span><a href="/artists">View all artists</a></div></div>

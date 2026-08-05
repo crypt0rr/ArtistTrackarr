@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.24.0`, which is also displayed by local
+footer. The current release is `v0.25.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -82,6 +82,17 @@ dismiss and restore them. Historical releases silently baselined during an
 initial sync do not appear, and inbox state never changes notification
 delivery or provider polling.
 
+The **Release Truth Desk** highlights disagreements between the latest Spotify,
+Apple/iTunes, and MusicBrainz observations for a release, as well as releases
+that have multiple fallback observations without canonical confirmation. Open
+issues are visible from the Trust Center, dashboard, and release details. Each
+household member can confirm, snooze, dismiss, or restore an issue privately;
+review actions never change canonical release metadata, notifications, or
+provider polling. Evidence is normalized to provider, title, type, date, and
+link fields; raw provider payloads and credentials are never stored. Issues are
+created or refreshed during normal synchronization, so existing records appear
+after their next provider check.
+
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
 hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
@@ -102,7 +113,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.24.0` publishes `0.24.0`, `0.24`, and `latest`.
+- Pushing a tag such as `v0.25.0` publishes `0.25.0`, `0.25`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -110,7 +121,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.24.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.25.0 docker compose up -d
 ```
 
 ## Configuration

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -22,6 +23,8 @@ func (a *App) coverage(w http.ResponseWriter, r *http.Request) {
 	var err error
 	d.CoverageSummary, err = a.store.CoverageSummary(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Release Trust Center", "coverage summary", err) || pageFailed
+	d.EvidenceIssueUnreadCount, err = a.store.EvidenceIssueUnreadCount(r.Context(), session.User.ID, time.Now().UTC())
+	pageFailed = a.pageStoreError(r, &d, "Release Trust Center", "release evidence issue count", err) || pageFailed
 	pages := (d.CoverageSummary.Artists + coveragePageSize - 1) / coveragePageSize
 	if pages < 1 {
 		pages = 1

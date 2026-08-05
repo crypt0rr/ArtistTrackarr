@@ -1,7 +1,7 @@
 {{template "head" .}}
 <section class="page-head inbox-heading">
   <div><p class="eyebrow">Release inbox</p><h1>Keep every release in view.</h1><p>Alertable releases stay here even when a notification destination is offline. Review the provider evidence, then mark items read, snooze them, or dismiss them.</p></div>
-  <span class="badge inbox-count">{{.InboxUnreadCount}} unread</span>
+  <div class="actions"><span class="badge inbox-count">{{.InboxUnreadCount}} unread</span><a class="button secondary" href="/coverage/issues">{{.EvidenceIssueUnreadCount}} evidence issue{{if ne .EvidenceIssueUnreadCount 1}}s{{end}}</a></div>
 </section>
 <section class="panel inbox-panel">
   <form method="get" class="inbox-filters" aria-label="Filter release inbox">

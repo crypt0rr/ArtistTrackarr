@@ -1,0 +1,30 @@
+{{template "head" .}}
+<section class="page-head evidence-heading">
+  <div><p class="eyebrow">Release trust</p><h1>Release Truth Desk</h1><p>Review disagreements and incomplete provider coverage without changing canonical release data or notification history.</p></div>
+  <a class="button secondary" href="/coverage">Back to Trust Center</a>
+</section>
+<section class="panel evidence-panel">
+  <div class="section-head"><div><p class="eyebrow">Evidence review</p><h2>{{if .EvidenceIssueCount}}{{.EvidenceIssuePageStart}}–{{.EvidenceIssuePageEnd}} of {{.EvidenceIssueCount}}{{else}}No matching issues{{end}}</h2><p>{{.EvidenceIssueUnreadCount}} issue{{if ne .EvidenceIssueUnreadCount 1}}s{{end}} need your attention.</p></div><span class="badge">{{.EvidenceIssueUnreadCount}} unread</span></div>
+  <form method="get" class="evidence-filters" aria-label="Filter release evidence issues">
+    <label>Status<select name="status"><option value="open"{{if eq .EvidenceIssueStatus "open"}} selected{{end}}>Open</option><option value="resolved"{{if eq .EvidenceIssueStatus "resolved"}} selected{{end}}>Resolved</option></select></label>
+    <label>Review state<select name="state"><option value="unread"{{if eq .EvidenceIssueState "unread"}} selected{{end}}>Needs review</option><option value="all"{{if eq .EvidenceIssueState "all"}} selected{{end}}>All states</option><option value="confirmed"{{if eq .EvidenceIssueState "confirmed"}} selected{{end}}>Confirmed</option><option value="snoozed"{{if eq .EvidenceIssueState "snoozed"}} selected{{end}}>Snoozed</option><option value="dismissed"{{if eq .EvidenceIssueState "dismissed"}} selected{{end}}>Dismissed</option></select></label>
+    <label>Issue type<select name="type"><option value="">All issue types</option><option value="date_conflict"{{if eq .EvidenceIssueType "date_conflict"}} selected{{end}}>Date conflicts</option><option value="title_conflict"{{if eq .EvidenceIssueType "title_conflict"}} selected{{end}}>Title conflicts</option><option value="type_conflict"{{if eq .EvidenceIssueType "type_conflict"}} selected{{end}}>Type conflicts</option><option value="missing_canonical"{{if eq .EvidenceIssueType "missing_canonical"}} selected{{end}}>Needs canonical confirmation</option></select></label>
+    <label>Severity<select name="severity"><option value="">All severities</option><option value="critical"{{if eq .EvidenceIssueSeverity "critical"}} selected{{end}}>Critical</option><option value="warning"{{if eq .EvidenceIssueSeverity "warning"}} selected{{end}}>Warning</option><option value="info"{{if eq .EvidenceIssueSeverity "info"}} selected{{end}}>Info</option></select></label>
+    <button class="secondary">Apply filters</button>
+  </form>
+  {{if .EvidenceIssues}}<div class="evidence-list">
+    {{range .EvidenceIssues}}<article class="evidence-issue evidence-{{.Severity}}">
+      <div class="evidence-issue-head"><div><span class="badge {{evidenceIssueSeverityClass .Severity}}">{{.Severity}}</span><span class="badge">{{evidenceIssueTypeLabel .IssueType}}</span><span class="badge">{{.ReviewState}}</span></div><small>Last seen {{formatTime .LastSeenAt}}</small></div>
+      <a class="evidence-release-link" href="/releases/{{.ReleaseGroupID}}"><h3>{{.ReleaseTitle}}</h3><p>{{.ArtistName}}</p></a>
+      <p class="evidence-summary">{{.Summary}}</p>
+      {{if .Evidence}}<div class="evidence-snapshots" aria-label="Provider snapshots">{{range .Evidence}}<div class="evidence-snapshot"><div><strong>{{providerLabel .Provider}}</strong>{{if .ProviderURL}}<a href="{{.ProviderURL}}" target="_blank" rel="noopener noreferrer">Open source</a>{{end}}</div><span>{{.Title}} · {{.PrimaryType}} · {{if .FirstReleaseDate}}{{.FirstReleaseDate}}{{else}}date unknown{{end}}</span></div>{{end}}</div>{{end}}
+      <div class="actions evidence-actions">
+        {{if ne .ReviewState "confirmed"}}<form method="post" action="/coverage/issues/{{.ID}}/confirm" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.EvidenceIssueURL}}"><button class="secondary">Confirm</button></form>{{end}}
+        {{if ne .ReviewState "snoozed"}}<form method="post" action="/coverage/issues/{{.ID}}/snooze" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.EvidenceIssueURL}}"><select name="duration" aria-label="Snooze duration"><option value="1d">1 day</option><option value="7d">7 days</option></select><button class="secondary">Snooze</button></form>{{end}}
+        {{if ne .ReviewState "dismissed"}}<form method="post" action="/coverage/issues/{{.ID}}/dismiss" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.EvidenceIssueURL}}"><button class="link danger">Dismiss</button></form>{{else}}<form method="post" action="/coverage/issues/{{.ID}}/restore" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.EvidenceIssueURL}}"><button class="link">Restore</button></form>{{end}}
+      </div>
+    </article>{{end}}
+  {{else}}<div class="empty">No provider issues match these filters. A future synchronization will refresh the evidence desk.</div>{{end}}
+</section>
+{{if gt .EvidenceIssuePages 1}}<nav class="pagination" aria-label="Evidence issue pages">{{if .EvidenceIssuePrevURL}}<a href="{{.EvidenceIssuePrevURL}}">Previous</a>{{end}}{{range .EvidenceIssuePageLinks}}<a href="{{.URL}}"{{if .Current}} aria-current="page" class="current"{{end}}>{{.Number}}</a>{{end}}{{if .EvidenceIssueNextURL}}<a href="{{.EvidenceIssueNextURL}}">Next</a>{{end}}</nav>{{end}}
+{{template "foot" .}}
