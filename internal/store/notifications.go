@@ -3,10 +3,23 @@ package store
 import (
 	"context"
 	"database/sql"
+	"regexp"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+var (
+	deliveryURLPattern        = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+	deliveryCredentialPattern = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
+)
+
+func safeDeliveryError(message string) string {
+	message = deliveryURLPattern.ReplaceAllString(message, "[redacted destination]")
+	message = deliveryCredentialPattern.ReplaceAllString(message, "$1=[redacted]")
+	return strings.TrimSpace(message)
+}
 
 func (s *Store) AddDestination(ctx context.Context, userID int64, name, service string, encrypted []byte) error {
 	name, err := destinationName(name)
@@ -96,6 +109,7 @@ func (s *Store) MarkDeliverySent(ctx context.Context, id int64, now time.Time) e
 	return err
 }
 func (s *Store) MarkDeliveryFailed(ctx context.Context, id int64, attempts int, message string, now time.Time) error {
+	message = safeDeliveryError(message)
 	status := "pending"
 	if attempts >= 5 {
 		status = "failed"
@@ -128,7 +142,7 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 		if err := rows.Scan(&h.Title, &h.EventType, &dest, &status, &attempts, &lastError, &created, &sent); err != nil {
 			return nil, err
 		}
-		h.Destination, h.Status, h.Attempts, h.LastError = dest.String, status.String, int(attempts.Int64), lastError.String
+		h.Destination, h.Status, h.Attempts, h.LastError = dest.String, status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
 		if h.Destination == "" {
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
@@ -154,7 +168,7 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT u.email,e.title,e.body,e.event_type,
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
 		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
 		FROM notification_events e
 		JOIN users u ON u.id=e.user_id
@@ -170,17 +184,21 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 		var h AdminDeliveryHistory
 		var destination, service, status, lastError sql.NullString
 		var attempts sql.NullInt64
+		var deliveryID sql.NullInt64
 		var created string
 		var nextAttempt, sent sql.NullString
 		if err := rows.Scan(
-			&h.UserEmail, &h.Title, &h.Body, &h.EventType,
+			&deliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
 			&destination, &service, &status, &attempts, &lastError,
 			&created, &nextAttempt, &sent,
 		); err != nil {
 			return nil, err
 		}
+		if deliveryID.Valid {
+			h.DeliveryID = deliveryID.Int64
+		}
 		h.Destination, h.Service = destination.String, service.String
-		h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), lastError.String
+		h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
 		if h.Destination == "" {
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
@@ -196,6 +214,91 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 		result = append(result, h)
 	}
 	return result, rows.Err()
+}
+
+// AdminDeliveryHistorySummary deliberately omits notification bodies and
+// provider error strings from the normal admin page. An administrator can
+// request one specific record through AdminDeliveryDetail when investigation
+// requires the full content, keeping bulk household data out of routine HTML.
+func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset int) ([]AdminDeliveryHistory, error) {
+	if limit < 1 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,u.email,e.title,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,e.created_at,d.next_attempt_at,d.sent_at
+		FROM notification_events e
+		JOIN users u ON u.id=e.user_id
+		LEFT JOIN deliveries d ON d.event_id=e.id
+		LEFT JOIN destinations dst ON dst.id=d.destination_id
+		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []AdminDeliveryHistory
+	for rows.Next() {
+		var h AdminDeliveryHistory
+		var deliveryID, attempts sql.NullInt64
+		var destination, service, status sql.NullString
+		var created, nextAttempt, sent sql.NullString
+		if err := rows.Scan(&deliveryID, &h.UserEmail, &h.Title, &h.EventType,
+			&destination, &service, &status, &attempts, &created, &nextAttempt, &sent); err != nil {
+			return nil, err
+		}
+		if deliveryID.Valid {
+			h.DeliveryID = deliveryID.Int64
+		}
+		h.Destination, h.Service = destination.String, service.String
+		h.Status, h.Attempts = status.String, int(attempts.Int64)
+		if h.Destination == "" {
+			h.Destination, h.Status = "No destination configured", "not sent"
+		}
+		h.CreatedAt, _ = parseTime(created.String)
+		if nextAttempt.Valid {
+			t, _ := parseTime(nextAttempt.String)
+			h.NextAttempt = &t
+		}
+		if sent.Valid {
+			t, _ := parseTime(sent.String)
+			h.SentAt = &t
+		}
+		result = append(result, h)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+	var h AdminDeliveryHistory
+	var destination, service, status, lastError sql.NullString
+	var attempts sql.NullInt64
+	var created, nextAttempt, sent sql.NullString
+	err := s.readerDB().QueryRowContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
+		FROM deliveries d JOIN notification_events e ON e.id=d.event_id
+		JOIN users u ON u.id=e.user_id LEFT JOIN destinations dst ON dst.id=d.destination_id
+		WHERE d.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
+	if err != nil {
+		return h, err
+	}
+	h.Destination, h.Service = destination.String, service.String
+	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
+	if h.Destination == "" {
+		h.Destination, h.Status = "No destination configured", "not sent"
+	}
+	h.CreatedAt, _ = parseTime(created.String)
+	if nextAttempt.Valid {
+		t, _ := parseTime(nextAttempt.String)
+		h.NextAttempt = &t
+	}
+	if sent.Valid {
+		t, _ := parseTime(sent.String)
+		h.SentAt = &t
+	}
+	return h, nil
 }
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences

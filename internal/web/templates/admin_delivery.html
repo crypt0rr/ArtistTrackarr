@@ -1,0 +1,27 @@
+{{template "head" .}}
+<section class="page-head">
+  <p class="eyebrow">Administrator · delivery details</p>
+  <h1>Notification delivery</h1>
+  <p>Full message content is shown only after an explicit administrator request.</p>
+  <a class="button secondary" href="/admin">Back to administration</a>
+</section>
+{{if .Error}}
+<section class="panel error-panel"><p>{{.Error}}</p></section>
+{{else if .AdminDelivery}}
+<section class="panel admin-delivery-detail">
+  <div class="detail-grid">
+    <div><span class="eyebrow">User</span><strong>{{.AdminDelivery.UserEmail}}</strong></div>
+    <div><span class="eyebrow">Destination</span><strong>{{.AdminDelivery.Destination}}</strong><small>{{.AdminDelivery.Service}}</small></div>
+    <div><span class="eyebrow">Status</span><strong>{{.AdminDelivery.Status}}</strong><small>{{.AdminDelivery.Attempts}} attempts</small></div>
+    <div><span class="eyebrow">Event</span><strong>{{.AdminDelivery.Title}}</strong><small>{{.AdminDelivery.EventType}}</small></div>
+  </div>
+  <hr>
+  <p class="eyebrow">Notification body</p>
+  <pre class="message-copy">{{.AdminDelivery.Body}}</pre>
+  {{if .AdminDelivery.LastError}}
+  <p class="eyebrow">Last error</p>
+  <pre class="error-copy">{{.AdminDelivery.LastError}}</pre>
+  {{end}}
+</section>
+{{end}}
+{{template "foot" .}}

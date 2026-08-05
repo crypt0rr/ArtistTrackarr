@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +47,7 @@ func TestParseLogLevelRejectsInvalidAndEmptyValues(t *testing.T) {
 }
 
 func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
-	for _, name := range []string{"PUBLIC_URL", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "LOG_LEVEL"} {
+	for _, name := range []string{"PUBLIC_URL", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -62,6 +63,9 @@ func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
 	if err := os.Setenv("APP_ENCRYPTION_KEY", strings.Repeat("e", 32)); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Setenv("SETUP_TOKEN", strings.Repeat("t", 32)); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Setenv("SESSION_SECRET", strings.Repeat("s", 32)); err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +75,42 @@ func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
 	cfg, err := Load()
 	if err != nil || cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("Load() log level = %v, err=%v; want info", cfg.LogLevel, err)
+	}
+}
+
+func TestParseTrustedProxyNetworks(t *testing.T) {
+	networks, err := parseTrustedProxyNetworks("127.0.0.1/32, 10.0.0.0/8")
+	if err != nil || len(networks) != 2 || !networks[0].Contains(net.ParseIP("127.0.0.1")) {
+		t.Fatalf("trusted proxy networks=%v err=%v", networks, err)
+	}
+	if _, err := parseTrustedProxyNetworks("not-a-network"); err == nil {
+		t.Fatal("invalid trusted proxy network was accepted")
+	}
+}
+
+func TestLoadRejectsUntrustedHTTPAndProxyWithoutNetworks(t *testing.T) {
+	for _, name := range []string{"PUBLIC_URL", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "LOG_LEVEL"} {
+		value, present := os.LookupEnv(name)
+		_ = os.Unsetenv(name)
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv(name, value)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
+	_ = os.Setenv("PUBLIC_URL", "http://tracker.example")
+	_ = os.Setenv("APP_ENCRYPTION_KEY", strings.Repeat("e", 32))
+	_ = os.Setenv("SESSION_SECRET", strings.Repeat("s", 32))
+	_ = os.Setenv("MUSICBRAINZ_CONTACT", "test@example.com")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PUBLIC_URL must use HTTPS") {
+		t.Fatalf("external HTTP was accepted: %v", err)
+	}
+	_ = os.Setenv("PUBLIC_URL", "https://tracker.example")
+	_ = os.Setenv("TRUST_PROXY", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TRUST_PROXY=true requires") {
+		t.Fatalf("proxy without networks was accepted: %v", err)
 	}
 }
 
@@ -122,6 +162,9 @@ func TestSecretFileErrorIsReturnedWithoutPanic(t *testing.T) {
 	if !strings.Contains(err.Error(), "TEST_SECRET_FILE") {
 		t.Fatalf("secret error %q does not identify the configured secret file", err)
 	}
+	if strings.Contains(err.Error(), path) {
+		t.Fatalf("secret error exposed the configured path: %q", err)
+	}
 }
 
 func TestSecretFileDirectoryIsReturnedAsError(t *testing.T) {
@@ -139,7 +182,7 @@ func TestSecretFileDirectoryIsReturnedAsError(t *testing.T) {
 }
 
 func TestLoadReturnsSecretFileError(t *testing.T) {
-	for _, name := range []string{"PUBLIC_URL", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "LOG_LEVEL"} {
+	for _, name := range []string{"PUBLIC_URL", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)

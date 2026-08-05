@@ -3,8 +3,8 @@ package version
 import "testing"
 
 func TestCurrentReleaseVersion(t *testing.T) {
-	if Current != "0.22.1" {
-		t.Fatalf("Current=%q, want 0.22.1", Current)
+	if Current != "0.23.0" {
+		t.Fatalf("Current=%q, want 0.23.0", Current)
 	}
 }
 

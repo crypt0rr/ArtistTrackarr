@@ -4,7 +4,7 @@ services:
     image: "${ARTIST_TRACKARR_IMAGE:-ghcr.io/crypt0rr/artist-trackarr:latest}"
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${ARTIST_TRACKARR_BIND:-127.0.0.1}:8080:8080"
     environment:
       LISTEN_ADDR: ":8080"
       PUBLIC_URL: "${PUBLIC_URL:-http://localhost:8080}"
@@ -13,6 +13,9 @@ services:
       POLL_INTERVAL: "${POLL_INTERVAL:-6h}"
       SPOTIFY_POLL_INTERVAL: "${SPOTIFY_POLL_INTERVAL:-24h}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
+      ALLOW_INSECURE_HTTP: "${ALLOW_INSECURE_HTTP:-false}"
+      ALLOW_PRIVATE_NOTIFICATION_TARGETS: "${ALLOW_PRIVATE_NOTIFICATION_TARGETS:-false}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       TZ: "${TZ:-UTC}"
       SETUP_TOKEN_FILE: /run/secrets/setup_token

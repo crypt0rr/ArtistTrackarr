@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.22.1`, which is also displayed by local
+footer. The current release is `v0.23.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -54,6 +54,14 @@ orderly fashion before SQLite is closed. Routine page loads return a generic
 error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
+
+The v0.23.0 hardening defaults keep setup and login attempts bounded, accept
+forwarded client addresses only from explicitly trusted proxy networks, and
+redact notification destination credentials from delivery errors. Notification
+targets that resolve to loopback, private, link-local, metadata, shared, or
+reserved networks are blocked by default; enable
+`ALLOW_PRIVATE_NOTIFICATION_TARGETS` only for a trusted household that needs a
+local notification service.
 
 The Artists page uses 50-item, page-number navigation for followed artists.
 Genre, country, artist-type, and search filters remain in the page URL while
@@ -86,7 +94,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.22.1` publishes `0.22.1`, `0.22`, and `latest`.
+- Pushing a tag such as `v0.23.0` publishes `0.23.0`, `0.23`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -94,7 +102,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.22.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.23.0 docker compose up -d
 ```
 
 ## Configuration
@@ -102,6 +110,7 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.22.1 docker compose up 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `PUBLIC_URL` | yes | `http://localhost:8080` | External base URL; use HTTPS behind a reverse proxy. |
+| `ARTIST_TRACKARR_BIND` | no | `127.0.0.1` | Host address for the Compose port; expose wider only behind a trusted TLS proxy/firewall. |
 | `SETUP_TOKEN` | first run | — | Protects initial administrator creation. |
 | `APP_ENCRYPTION_KEY` | yes | — | Encrypts notification credentials at rest. |
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
@@ -113,6 +122,10 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.22.1 docker compose up 
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
+| `TRUST_PROXY` | no | `false` | Trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
+| `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated proxy networks, for example `127.0.0.1/32,10.0.0.0/8`; required when `TRUST_PROXY=true`. |
+| `ALLOW_INSECURE_HTTP` | no | `false` | Explicitly permits a non-local HTTP `PUBLIC_URL`; use only on a trusted, isolated network. |
+| `ALLOW_PRIVATE_NOTIFICATION_TARGETS` | no | `false` | Explicitly permits ntfy/Gotify/SMTP/webhook destinations resolving to private networks. |
 | `LOG_LEVEL` | no | `info` | JSON log threshold: `debug`, `info`, `warn`, or `error`. |
 | `TZ` | no | `UTC` | Container/system timezone for runtime logs and local process time, e.g. `Europe/Amsterdam`. |
 
@@ -221,8 +234,17 @@ their own account or leave the household without an administrator.
 ## Reverse proxy and backups
 
 Terminate TLS at Caddy, Traefik, nginx, or another reverse proxy and set
-`PUBLIC_URL` to its HTTPS address. The app honors `X-Forwarded-For` only when
-`TRUST_PROXY=true`.
+`PUBLIC_URL` to its HTTPS address. Non-local HTTP is rejected unless
+`ALLOW_INSECURE_HTTP=true` is explicitly set. To preserve accurate login
+throttling, set `TRUST_PROXY=true` together with the proxy's exact
+`TRUSTED_PROXY_CIDRS`; forwarding headers from an untrusted connection are
+ignored.
+
+Notification destinations are server-side outbound requests. By default,
+ArtistTrackarr blocks loopback, private, link-local, multicast, and metadata
+network addresses to prevent an invited user from using notifications as an
+SSRF proxy. Set `ALLOW_PRIVATE_NOTIFICATION_TARGETS=true` only when all
+household members are trusted and local notification services are required.
 
 For a consistent backup, stop the container and archive the Docker volume:
 

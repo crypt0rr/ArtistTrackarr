@@ -51,7 +51,7 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		d := a.data(r, "Settings")
-		d.Error = err.Error()
+		d.Error = notify.RedactError(err)
 		if a.loadSettingsData(r, &d) {
 			a.render(w, "settings", d, http.StatusInternalServerError)
 		} else {
@@ -81,7 +81,7 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		http.Redirect(w, r, "/settings?message="+url.QueryEscape("Test failed: "+err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/settings?message="+url.QueryEscape("Test failed: "+notify.RedactError(err)), http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Test+sent", http.StatusSeeOther)

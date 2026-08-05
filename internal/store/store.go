@@ -278,6 +278,7 @@ type DeliveryHistory struct {
 }
 
 type AdminDeliveryHistory struct {
+	DeliveryID  int64
 	UserEmail   string
 	Title       string
 	Body        string

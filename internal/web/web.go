@@ -23,17 +23,23 @@ const (
 )
 
 type App struct {
-	cfg       config.Config
-	store     *store.Store
-	mb        catalog.CatalogProvider
-	spotify   catalog.SpotifyProvider
-	itunes    catalog.ITunesProvider
-	sender    notify.NotificationSender
-	cipher    *security.Cipher
-	artwork   artwork.Provider
-	jobs      *jobs.Runner
-	logger    *slog.Logger
-	templates *template.Template
+	cfg              config.Config
+	store            *store.Store
+	mb               catalog.CatalogProvider
+	spotify          catalog.SpotifyProvider
+	itunes           catalog.ITunesProvider
+	sender           notify.NotificationSender
+	cipher           *security.Cipher
+	artwork          artwork.Provider
+	jobs             *jobs.Runner
+	logger           *slog.Logger
+	templates        *template.Template
+	setupLimiter     *fixedWindowLimiter
+	loginLimiter     *fixedWindowLimiter
+	tokenLimiter     *fixedWindowLimiter
+	discoveryLimiter *fixedWindowLimiter
+	providerLimiter  *fixedWindowLimiter
+	loginSlots       chan struct{}
 }
 
 type PageData struct {
@@ -59,6 +65,7 @@ type PageData struct {
 	Destinations        []store.Destination
 	History             []store.DeliveryHistory
 	AdminHistory        []store.AdminDeliveryHistory
+	AdminDelivery       *store.AdminDeliveryHistory
 	AppLogs             []logging.Entry
 	AdminUsers          []store.AdminUser
 	AdminArtists        []store.AdminArtist
