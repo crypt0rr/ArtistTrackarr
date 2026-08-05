@@ -182,6 +182,18 @@ type ReleaseDetail struct {
 	Observations []ReleaseObservation
 }
 
+// ReleaseInboxItem is the latest alertable event for one followed release,
+// together with the member's local review state. Inbox state never changes
+// provider observations or notification delivery state.
+type ReleaseInboxItem struct {
+	Release
+	EventType      string
+	EventTitle     string
+	EventCreatedAt time.Time
+	State          string
+	SnoozedUntil   *time.Time
+}
+
 type ReleaseObservation struct {
 	Provider   string
 	ProviderID string

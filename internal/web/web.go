@@ -91,6 +91,20 @@ type PageData struct {
 	GenreFilter         string
 	CountryFilter       string
 	TypeFilter          string
+	InboxItems          []store.ReleaseInboxItem
+	InboxUnreadCount    int
+	InboxCount          int
+	InboxState          string
+	InboxSource         string
+	InboxType           string
+	InboxPage           int
+	InboxPages          int
+	InboxPrevURL        string
+	InboxNextURL        string
+	InboxPageLinks      []PaginationLink
+	InboxPageStart      int
+	InboxPageEnd        int
+	InboxURL            string
 	AdminPage           int
 	AdminPages          int
 	AdminPrevPage       int

@@ -401,32 +401,51 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 		SELECT ?,id,'pending',? FROM destinations WHERE user_id=? AND enabled=1`, eventID, timeText(now), userID)
 	return err
 }
+
+type releaseRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) {
+	var r Release
+	var secondary, observed string
+	var sourceCount int
+	var observedProviders, lastObserved sql.NullString
+	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
+	destinations := []any{&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
+		&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
+		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed,
+		&sourceCount, &observedProviders, &lastObserved}
+	destinations = append(destinations, extra...)
+	if err := row.Scan(destinations...); err != nil {
+		return r, err
+	}
+	if err := json.Unmarshal([]byte(secondary), &r.SecondaryTypes); err != nil {
+		return r, err
+	}
+	r.SpotifyID, r.SpotifyURL, r.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
+	r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
+	r.ITunesArtworkURL = itunesArtworkURL.String
+	r.FirstObservedAt, _ = parseTime(observed)
+	r.SourceCount = sourceCount
+	r.Sources = splitReleaseProviders(observedProviders.String)
+	r.Confidence = releaseConfidence(r.Source, sourceCount)
+	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
+		r.LastObservedAt = parsed
+	}
+	return r, nil
+}
+
+func scanRelease(row releaseRowScanner) (Release, error) {
+	return scanReleaseWithExtra(row)
+}
+
 func scanReleases(rows *sql.Rows) ([]Release, error) {
 	var result []Release
 	for rows.Next() {
-		var r Release
-		var secondary, observed string
-		var sourceCount int
-		var observedProviders, lastObserved sql.NullString
-		var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
-		if err := rows.Scan(&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
-			&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-			&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed,
-			&sourceCount, &observedProviders, &lastObserved); err != nil {
+		r, err := scanRelease(rows)
+		if err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal([]byte(secondary), &r.SecondaryTypes); err != nil {
-			return nil, err
-		}
-		r.SpotifyID, r.SpotifyURL, r.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
-		r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
-		r.ITunesArtworkURL = itunesArtworkURL.String
-		r.FirstObservedAt, _ = parseTime(observed)
-		r.SourceCount = sourceCount
-		r.Sources = splitReleaseProviders(observedProviders.String)
-		r.Confidence = releaseConfidence(r.Source, sourceCount)
-		if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
-			r.LastObservedAt = parsed
 		}
 		result = append(result, r)
 	}

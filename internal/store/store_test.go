@@ -165,6 +165,13 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=13`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("release trust migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=14`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("release inbox migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var inboxTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_release_states'`).Scan(&inboxTable); err != nil {
+		t.Fatalf("release inbox table missing: %v", err)
+	}
 	var normalizedLogTime string
 	if err := db.QueryRow(`SELECT created_at FROM application_logs WHERE message=?`, "legacy timestamp").Scan(&normalizedLogTime); err != nil {
 		t.Fatal(err)

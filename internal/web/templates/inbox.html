@@ -1,0 +1,31 @@
+{{template "head" .}}
+<section class="page-head inbox-heading">
+  <div><p class="eyebrow">Release inbox</p><h1>Keep every release in view.</h1><p>Alertable releases stay here even when a notification destination is offline. Review the provider evidence, then mark items read, snooze them, or dismiss them.</p></div>
+  <span class="badge inbox-count">{{.InboxUnreadCount}} unread</span>
+</section>
+<section class="panel inbox-panel">
+  <form method="get" class="inbox-filters" aria-label="Filter release inbox">
+    <label>State<select name="state"><option value=""{{if eq .InboxState ""}} selected{{end}}>All active</option><option value="unread"{{if eq .InboxState "unread"}} selected{{end}}>Unread</option><option value="read"{{if eq .InboxState "read"}} selected{{end}}>Read</option><option value="snoozed"{{if eq .InboxState "snoozed"}} selected{{end}}>Snoozed</option><option value="dismissed"{{if eq .InboxState "dismissed"}} selected{{end}}>Dismissed</option></select></label>
+    <label>Source<select name="source"><option value=""{{if eq .InboxSource ""}} selected{{end}}>All sources</option><option value="spotify"{{if eq .InboxSource "spotify"}} selected{{end}}>Spotify</option><option value="itunes"{{if eq .InboxSource "itunes"}} selected{{end}}>iTunes</option><option value="musicbrainz"{{if eq .InboxSource "musicbrainz"}} selected{{end}}>MusicBrainz</option><option value="both"{{if eq .InboxSource "both"}} selected{{end}}>Multiple sources</option></select></label>
+    <label>Type<select name="type"><option value=""{{if eq .InboxType ""}} selected{{end}}>All types</option><option value="album"{{if eq .InboxType "album"}} selected{{end}}>Albums</option><option value="ep"{{if eq .InboxType "ep"}} selected{{end}}>EPs</option><option value="single"{{if eq .InboxType "single"}} selected{{end}}>Singles</option></select></label>
+    <button class="secondary">Apply filters</button>
+  </form>
+  <div class="section-head inbox-list-head"><div><p class="eyebrow">Activity</p><h2>{{if .InboxCount}}{{.InboxPageStart}}–{{.InboxPageEnd}} of {{.InboxCount}}{{else}}No releases{{end}}</h2></div><a href="/" class="button-link">Back to dashboard</a></div>
+  {{if .InboxItems}}<div class="inbox-list">
+    {{range .InboxItems}}<article class="inbox-item inbox-{{.State}}">
+      <div class="inbox-item-main">
+        <div class="inbox-item-heading"><span class="badge inbox-state {{.State}}">{{.State}}</span><span class="badge release-confidence {{releaseConfidenceClass .Release}}">{{releaseConfidenceLabel .Release}}</span></div>
+        <a class="inbox-release-link" href="/releases/{{.ID}}"><h3>{{.Title}}</h3><p>{{.ArtistName}} · {{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</p></a>
+        <p class="inbox-event">{{if eq .EventType "release_day"}}Release-day reminder{{else}}New release announcement{{end}}{{if .EventTitle}} · {{.EventTitle}}{{end}} · {{formatTime .EventCreatedAt}} · {{sourceLabel .Release}}</p>
+        <p class="inbox-evidence">Observed by {{if .Sources}}{{join .Sources ", "}}{{else}}one provider{{end}}{{if .LastObservedAt}} · last checked {{formatProviderTime .LastObservedAt}}{{end}}</p>
+        <div class="inbox-links" aria-label="Provider evidence">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}{{if .ITunesURL}}<a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Apple Music</a>{{end}}{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}</div>
+      </div>
+      <div class="actions inbox-actions">
+        {{if or (eq .State "read") (eq .State "snoozed")}}<form method="post" action="/inbox/{{.ID}}/unread" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.InboxURL}}"><button class="secondary">Mark unread</button></form>{{else}}<form method="post" action="/inbox/{{.ID}}/read" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.InboxURL}}"><button class="secondary">Mark read</button></form>{{end}}
+        {{if ne .State "dismissed"}}<form method="post" action="/inbox/{{.ID}}/snooze" class="inline inbox-snooze">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.InboxURL}}"><label class="sr-only" for="snooze-{{.ID}}">Snooze {{.Title}}</label><select id="snooze-{{.ID}}" name="duration"><option value="1d">1 day</option><option value="7d">7 days</option></select><button class="secondary">Snooze</button></form><form method="post" action="/inbox/{{.ID}}/dismiss" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.InboxURL}}"><button class="link danger">Dismiss</button></form>{{else}}<form method="post" action="/inbox/{{.ID}}/unread" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="{{$.InboxURL}}"><button class="link">Restore</button></form>{{end}}
+      </div>
+    </article>{{end}}
+  </div>{{else}}<div class="empty">{{if eq .InboxState "dismissed"}}No dismissed releases.{{else}}No releases match these filters.{{end}}</div>{{end}}
+</section>
+{{if gt .InboxPages 1}}<nav class="pagination" aria-label="Release inbox pages">{{if .InboxPrevURL}}<a href="{{.InboxPrevURL}}">Previous</a>{{end}}{{range .InboxPageLinks}}<a href="{{.URL}}"{{if .Current}} aria-current="page" class="current"{{end}}>{{.Number}}</a>{{end}}{{if .InboxNextURL}}<a href="{{.InboxNextURL}}">Next</a>{{end}}</nav>{{end}}
+{{template "foot" .}}

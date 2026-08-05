@@ -17,6 +17,8 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	var err error
 	d.FollowCount, err = a.store.FollowedArtistCount(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "followed artist count", err) || pageFailed
+	d.InboxUnreadCount, err = a.store.ReleaseInboxUnreadCount(r.Context(), session.User.ID, time.Now().UTC())
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release inbox count", err) || pageFailed
 	d.CoverageSummary, err = a.store.CoverageSummary(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release coverage summary", err) || pageFailed
 	location, err := time.LoadLocation(session.User.Timezone)
