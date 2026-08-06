@@ -89,6 +89,10 @@ type NotificationPreferences struct {
 	Singles       bool
 	Announcements bool
 	ReleaseDay    bool
+	// DigestEnabled enables a compact upcoming-release digest delivered at
+	// the user's existing reminder time.
+	DigestEnabled   bool
+	DigestFrequency string
 	// HoldConflictingNotifications keeps warning/critical provider conflicts
 	// out of deliveries until a household member explicitly reviews them.
 	// It defaults to false so existing accounts retain immediate notifications.
@@ -204,6 +208,30 @@ type ReleaseTruthDecision struct {
 type ReleaseDetail struct {
 	Release
 	Observations []ReleaseObservation
+}
+
+// CalendarRelease is an owner-scoped release projection used by the calendar
+// page, ICS export, and digest builder. Held is deliberately derived from the
+// requesting user's notification hold state and never changes shared release
+// metadata.
+type CalendarRelease struct {
+	Release
+	CalendarDate string
+	Held         bool
+}
+
+// DigestDelivery is a queued delivery for one generated release digest. It
+// uses the same encrypted destination and retry semantics as normal events,
+// but keeps one aggregate message per digest period instead of attaching the
+// message to an individual release event.
+type DigestDelivery struct {
+	ID          int64
+	RunID       int64
+	Destination Destination
+	Title       string
+	Body        string
+	Attempts    int
+	NextAttempt time.Time
 }
 
 // NotificationHold is an owner-scoped notification that was kept out of the

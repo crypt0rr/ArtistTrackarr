@@ -1,0 +1,28 @@
+{{template "head" .}}
+<section class="page-head calendar-heading">
+  <div><p class="eyebrow">Plan your listening</p><h1>Release calendar</h1><p>Upcoming releases from your watchlist, with provider confidence and review state included.</p></div>
+  <div class="actions"><a class="button secondary" href="{{.CalendarICSURL}}">Download ICS</a><a href="/calendar?month={{.CalendarPrevMonth}}" aria-label="Previous month">←</a><strong>{{.CalendarMonth}}</strong><a href="/calendar?month={{.CalendarNextMonth}}" aria-label="Next month">→</a></div>
+</section>
+<section class="panel calendar-panel">
+  {{if .CalendarDays}}
+  <div class="calendar-list">
+    {{range .CalendarDays}}
+    <section class="calendar-day{{if .Today}} calendar-day-today{{end}}">
+      <div class="calendar-day-heading"><div><p class="eyebrow">{{if .Today}}Today{{else}}Release day{{end}}</p><h2>{{.Label}}</h2></div><span class="badge">{{len .Releases}} release{{if ne (len .Releases) 1}}s{{end}}</span></div>
+      <div class="calendar-releases">
+        {{range .Releases}}
+        <a class="calendar-release" href="/releases/{{.ID}}">
+          <span class="calendar-release-date">{{shortDate .FirstReleaseDate}}</span>
+          <span class="calendar-release-copy"><strong>{{.Title}}</strong><span>{{.ArtistName}} · {{.PrimaryType}}</span><small>{{sourceLabel .Release}} · <span class="badge {{calendarStatusClass .}}">{{calendarStatus .}}</span></small></span>
+        </a>
+        {{end}}
+      </div>
+    </section>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty"><strong>No dated releases this month.</strong><br>New releases will appear here after the next provider sync.</div>
+  {{end}}
+</section>
+<section class="panel calendar-help"><p class="eyebrow">Calendar sync</p><h2>Keep your calendar current</h2><p>Download the ICS file and subscribe to it in your calendar app. It contains the next year of precise, day-dated releases and respects your followed-artist list.</p><a href="/settings">Configure release digests in Settings</a></section>
+{{template "foot" .}}

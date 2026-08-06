@@ -103,6 +103,39 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 	}
 	return result, rows.Err()
 }
+
+// DueDigestDeliveries returns aggregate release-digest deliveries ready for
+// the same notification worker used by normal release events.
+func (s *Store) DueDigestDeliveries(ctx context.Context, now time.Time, limit int) ([]DigestDelivery, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT dd.id,dd.run_id,dd.attempts,dd.next_attempt_at,
+		dst.id,dst.user_id,dst.name,dst.service,dst.encrypted_url,dst.enabled,
+		r.title,r.body
+		FROM release_digest_deliveries dd
+		JOIN release_digest_runs r ON r.id=dd.run_id
+		JOIN destinations dst ON dst.id=dd.destination_id
+		WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
+		ORDER BY dd.next_attempt_at,dd.id LIMIT ?`, timeText(now), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []DigestDelivery
+	for rows.Next() {
+		var d DigestDelivery
+		var next string
+		if err := rows.Scan(&d.ID, &d.RunID, &d.Attempts, &next,
+			&d.Destination.ID, &d.Destination.UserID, &d.Destination.Name, &d.Destination.Service,
+			&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Title, &d.Body); err != nil {
+			return nil, err
+		}
+		d.NextAttempt, _ = parseTime(next)
+		result = append(result, d)
+	}
+	return result, rows.Err()
+}
 func (s *Store) MarkDeliverySent(ctx context.Context, id int64, now time.Time) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='sent',attempts=attempts+1,sent_at=?,last_error='' WHERE id=?`,
 		timeText(now), id)
@@ -122,11 +155,67 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, id int64, attempts int, 
 		status, attempts, timeText(now.Add(delay)), message, id)
 	return err
 }
+
+func (s *Store) MarkDigestDeliverySent(ctx context.Context, id int64, now time.Time) error {
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries
+		SET status='sent',attempts=attempts+1,sent_at=?,last_error='' WHERE id=?`, timeText(now), id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status=CASE WHEN EXISTS (
+		SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status='failed'
+	) THEN 'failed' ELSE 'sent' END
+		WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
+		AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status='pending')`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) MarkDigestDeliveryFailed(ctx context.Context, id int64, attempts int, message string, now time.Time) error {
+	message = safeDeliveryError(message)
+	status := "pending"
+	if attempts >= 5 {
+		status = "failed"
+	}
+	delay := time.Minute * time.Duration(1<<min(attempts, 6))
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries
+		SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?`,
+		status, attempts, timeText(now.Add(delay)), message, id); err != nil {
+		return err
+	}
+	if status == "failed" {
+		if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='failed'
+			WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
+			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status='pending')`, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([]DeliveryHistory, error) {
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT e.title,e.event_type,dst.name,d.status,d.attempts,d.last_error,e.created_at,d.sent_at
-		FROM notification_events e LEFT JOIN deliveries d ON d.event_id=e.id
-		LEFT JOIN destinations dst ON dst.id=d.destination_id WHERE e.user_id=?
-		ORDER BY e.created_at DESC,d.id DESC LIMIT ?`, userID, limit)
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT title,event_type,destination,status,attempts,last_error,created_at,sent_at
+		FROM (
+			SELECT e.title,e.event_type,dst.name AS destination,d.status,d.attempts,d.last_error,e.created_at,d.sent_at,d.id AS sort_id
+			FROM notification_events e LEFT JOIN deliveries d ON d.event_id=e.id
+			LEFT JOIN destinations dst ON dst.id=d.destination_id WHERE e.user_id=?
+			UNION ALL
+			SELECT r.title,'digest',dst.name,dd.status,dd.attempts,dd.last_error,r.created_at,dd.sent_at,dd.id
+			FROM release_digest_runs r JOIN release_digest_deliveries dd ON dd.run_id=r.id
+			LEFT JOIN destinations dst ON dst.id=dd.destination_id WHERE r.user_id=?
+		) ORDER BY created_at DESC,sort_id DESC LIMIT ?`, userID, userID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -303,22 +392,40 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences
 	p.UserID = userID
-	var albums, eps, singles, announcements, releaseDay, holdConflicts int
-	err := s.readerDB().QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day,hold_conflicting_notifications FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts)
+	var albums, eps, singles, announcements, releaseDay, digestEnabled, holdConflicts int
+	var digestFrequency string
+	err := s.readerDB().QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day,
+		release_digest_enabled,release_digest_frequency,hold_conflicting_notifications
+		FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &digestEnabled, &digestFrequency, &holdConflicts)
 	if err == sql.ErrNoRows {
 		_, err = s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
 		if err == nil {
 			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = true, true, true, true, true
+			p.DigestFrequency = "weekly"
 		}
 		return p, err
 	}
 	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+	p.DigestEnabled, p.DigestFrequency = digestEnabled != 0, normalizeDigestFrequency(digestFrequency)
 	p.HoldConflictingNotifications = holdConflicts != 0
 	return p, err
 }
 func (s *Store) UpdateNotificationPreferences(ctx context.Context, p NotificationPreferences) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,hold_conflicting_notifications,updated_at) VALUES(?,?,?,?,?,?,?,?)
-		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,announcements=excluded.announcements,release_day=excluded.release_day,hold_conflicting_notifications=excluded.hold_conflicting_notifications,updated_at=excluded.updated_at`,
-		p.UserID, boolInt(p.Albums), boolInt(p.EPs), boolInt(p.Singles), boolInt(p.Announcements), boolInt(p.ReleaseDay), boolInt(p.HoldConflictingNotifications), nowText())
+	p.DigestFrequency = normalizeDigestFrequency(p.DigestFrequency)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,
+		release_digest_enabled,release_digest_frequency,hold_conflicting_notifications,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,
+		announcements=excluded.announcements,release_day=excluded.release_day,
+		release_digest_enabled=excluded.release_digest_enabled,release_digest_frequency=excluded.release_digest_frequency,
+		hold_conflicting_notifications=excluded.hold_conflicting_notifications,updated_at=excluded.updated_at`,
+		p.UserID, boolInt(p.Albums), boolInt(p.EPs), boolInt(p.Singles), boolInt(p.Announcements), boolInt(p.ReleaseDay),
+		boolInt(p.DigestEnabled), p.DigestFrequency, boolInt(p.HoldConflictingNotifications), nowText())
 	return err
+}
+
+func normalizeDigestFrequency(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "daily") {
+		return "daily"
+	}
+	return "weekly"
 }

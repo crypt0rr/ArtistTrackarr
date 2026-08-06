@@ -42,7 +42,7 @@ jobs:
 
   quality:
     name: Native race and vulnerability checks
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -77,7 +77,7 @@ jobs:
   publish:
     name: Publish Docker image
     if: github.event_name == 'push'
-    needs: test
+    needs: [test, quality]
     runs-on: ubuntu-latest
     permissions:
       contents: read

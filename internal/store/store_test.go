@@ -177,6 +177,17 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=17`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("notification holds migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=18`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("release calendar migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var digestTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
+		t.Fatalf("release digest table missing: %v", err)
+	}
+	var digestEnabled int
+	if err := db.QueryRow(`SELECT release_digest_enabled FROM notification_preferences WHERE user_id=?`, userID).Scan(&digestEnabled); err != nil || digestEnabled != 0 {
+		t.Fatalf("legacy digest default=%d err=%v", digestEnabled, err)
+	}
 	var evidenceTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_provider_evidence'`).Scan(&evidenceTable); err != nil {
 		t.Fatalf("release evidence table missing: %v", err)

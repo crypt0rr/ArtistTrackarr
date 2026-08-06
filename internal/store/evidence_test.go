@@ -26,7 +26,9 @@ func TestReleaseEvidenceDetectsConflictsAndOwnerReview(t *testing.T) {
 	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	// Keep the fixture relative to the clock used by SetEvidenceIssueState so
+	// this validation remains stable as the calendar advances.
+	now := time.Now().UTC().Truncate(time.Second)
 	base := Release{MBID: "evidence-release", Title: "Truth", PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.org/release-group/evidence-release"}
 	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "musicbrainz", Releases: []Release{base}}}, now); err != nil {
 		t.Fatal(err)

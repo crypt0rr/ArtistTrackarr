@@ -154,8 +154,20 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			}
 			return v
 		},
-		"formatTime":           func(v time.Time) string { return v.Format("2006-01-02 15:04") },
-		"compactCount":         compactCount,
+		"formatTime":     func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"compactCount":   compactCount,
+		"calendarStatus": calendarReleaseStatus,
+		"calendarStatusClass": func(release store.CalendarRelease) string {
+			status := calendarReleaseStatus(release)
+			switch status {
+			case "confirmed":
+				return "sent"
+			case "held for review", "review required":
+				return "ambiguous"
+			default:
+				return "pending"
+			}
+		},
 		"formatProviderTime":   providerHealthTime,
 		"providerTimeAttr":     providerHealthTimeAttr,
 		"providerHealthStatus": providerHealthStatus,
@@ -413,6 +425,8 @@ func (a *App) Handler() http.Handler {
 		private.Get("/", a.dashboard)
 		private.Post("/logout", a.logout)
 		private.Get("/artists", a.artists)
+		private.Get("/calendar", a.calendar)
+		private.Get("/calendar.ics", a.calendarICS)
 		private.Get("/inbox", a.inbox)
 		private.Post("/inbox/{id}/{action}", a.inboxStateAction)
 		private.Post("/notifications/holds/{id}/{action}", a.notificationHoldAction)

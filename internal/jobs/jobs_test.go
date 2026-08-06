@@ -256,6 +256,70 @@ func TestDeliveryUsesBoundedWorkerPool(t *testing.T) {
 	}
 }
 
+func TestDigestDeliveryUsesNotificationWorker(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "digest-delivery@example.com", "unused", "member", "UTC", "digest-delivery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "digest-delivery-artist", Name: "Digest Delivery Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("digest delivery secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test://digest-destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Digest", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateNotificationPreferences(ctx, store.NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-delivery-release", artist.ID, "Digest Delivery Release", "Album", "[]",
+		now.AddDate(0, 0, 1).Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/digest-delivery-release", "musicbrainz", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := database.QueueDueReleaseDigests(ctx, now); err != nil || queued != 1 {
+		t.Fatalf("queued digest=%d err=%v", queued, err)
+	}
+	sender := &parallelTestSender{delay: 5 * time.Millisecond}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	summary, err := runner.deliver(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Attempted != 1 || summary.Sent != 1 || summary.Failed != 0 || sender.calls.Load() != 1 {
+		t.Fatalf("digest delivery summary=%#v calls=%d", summary, sender.calls.Load())
+	}
+	var status string
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "sent" {
+		t.Fatalf("digest delivery status=%q", status)
+	}
+}
+
 func TestDeliveryFailureSchedulesRetry(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
