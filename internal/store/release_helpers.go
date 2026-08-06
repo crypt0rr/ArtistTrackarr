@@ -403,15 +403,26 @@ func comparableReleaseDate(value string) (time.Time, bool) {
 }
 func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
 	var p NotificationPreferences
-	var albums, eps, singles, announcements, releaseDay int
+	var albums, eps, singles, announcements, releaseDay, holdConflicts int
 	var primary string
-	err := tx.QueryRowContext(ctx, `SELECT p.albums,p.eps,p.singles,p.announcements,p.release_day,rg.primary_type FROM notification_preferences p JOIN release_groups rg ON rg.id=? WHERE p.user_id=?`, releaseID, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &primary)
+	err := tx.QueryRowContext(ctx, `SELECT p.albums,p.eps,p.singles,p.announcements,p.release_day,p.hold_conflicting_notifications,rg.primary_type FROM notification_preferences p JOIN release_groups rg ON rg.id=? WHERE p.user_id=?`, releaseID, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts, &primary)
 	if err == nil {
 		p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+		p.HoldConflictingNotifications = holdConflicts != 0
 		if !releaseTypeEnabled(p, primary) || (eventType == "announcement" && !p.Announcements) || (eventType == "release_day" && !p.ReleaseDay) {
 			return nil
 		}
+		if p.HoldConflictingNotifications {
+			if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
+	return insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
+}
+
+func insertNotificationEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO notification_events
 		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
 		userID, releaseID, eventType, title, body, timeText(now))

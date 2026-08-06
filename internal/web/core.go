@@ -415,6 +415,7 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artists", a.artists)
 		private.Get("/inbox", a.inbox)
 		private.Post("/inbox/{id}/{action}", a.inboxStateAction)
+		private.Post("/notifications/holds/{id}/{action}", a.notificationHoldAction)
 		private.Get("/coverage", a.coverage)
 		private.Get("/coverage/issues", a.evidenceIssues)
 		private.Post("/coverage/issues/{id}/{action}", a.evidenceIssueStateAction)

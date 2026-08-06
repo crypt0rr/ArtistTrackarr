@@ -89,6 +89,10 @@ type NotificationPreferences struct {
 	Singles       bool
 	Announcements bool
 	ReleaseDay    bool
+	// HoldConflictingNotifications keeps warning/critical provider conflicts
+	// out of deliveries until a household member explicitly reviews them.
+	// It defaults to false so existing accounts retain immediate notifications.
+	HoldConflictingNotifications bool
 }
 
 type AdminUser struct {
@@ -104,11 +108,12 @@ type AdminUser struct {
 }
 
 var (
-	ErrAdminRequired    = errors.New("administrator access is required")
-	ErrCannotDeleteSelf = errors.New("you cannot delete your own account")
-	ErrLastAdmin        = errors.New("the last administrator cannot be deleted")
-	ErrInvalidUsername  = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
-	ErrUsernameTaken    = errors.New("that username is already in use")
+	ErrAdminRequired                 = errors.New("administrator access is required")
+	ErrCannotDeleteSelf              = errors.New("you cannot delete your own account")
+	ErrLastAdmin                     = errors.New("the last administrator cannot be deleted")
+	ErrInvalidUsername               = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
+	ErrUsernameTaken                 = errors.New("that username is already in use")
+	ErrInvalidNotificationHoldAction = errors.New("invalid notification hold action")
 )
 
 type Session struct {
@@ -199,6 +204,26 @@ type ReleaseTruthDecision struct {
 type ReleaseDetail struct {
 	Release
 	Observations []ReleaseObservation
+}
+
+// NotificationHold is an owner-scoped notification that was kept out of the
+// delivery queue while provider evidence was conflicting. The original event
+// content is retained so releasing a hold is deterministic and auditable.
+type NotificationHold struct {
+	ID               int64
+	UserID           int64
+	ReleaseGroupID   int64
+	ArtistName       string
+	ReleaseTitle     string
+	EventType        string
+	Title            string
+	Body             string
+	Reason           string
+	IssueFingerprint string
+	PlannedAt        time.Time
+	Status           string
+	CreatedAt        time.Time
+	ReleasedAt       *time.Time
 }
 
 // ReleaseEvidence is the small normalized provider snapshot used to explain

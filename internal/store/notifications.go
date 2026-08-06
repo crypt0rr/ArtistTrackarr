@@ -303,8 +303,8 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences
 	p.UserID = userID
-	var albums, eps, singles, announcements, releaseDay int
-	err := s.DB.QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay)
+	var albums, eps, singles, announcements, releaseDay, holdConflicts int
+	err := s.readerDB().QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day,hold_conflicting_notifications FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts)
 	if err == sql.ErrNoRows {
 		_, err = s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
 		if err == nil {
@@ -313,11 +313,12 @@ func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (Noti
 		return p, err
 	}
 	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+	p.HoldConflictingNotifications = holdConflicts != 0
 	return p, err
 }
 func (s *Store) UpdateNotificationPreferences(ctx context.Context, p NotificationPreferences) error {
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,updated_at) VALUES(?,?,?,?,?,?,?)
-		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,announcements=excluded.announcements,release_day=excluded.release_day,updated_at=excluded.updated_at`,
-		p.UserID, boolInt(p.Albums), boolInt(p.EPs), boolInt(p.Singles), boolInt(p.Announcements), boolInt(p.ReleaseDay), nowText())
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,hold_conflicting_notifications,updated_at) VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,announcements=excluded.announcements,release_day=excluded.release_day,hold_conflicting_notifications=excluded.hold_conflicting_notifications,updated_at=excluded.updated_at`,
+		p.UserID, boolInt(p.Albums), boolInt(p.EPs), boolInt(p.Singles), boolInt(p.Announcements), boolInt(p.ReleaseDay), boolInt(p.HoldConflictingNotifications), nowText())
 	return err
 }

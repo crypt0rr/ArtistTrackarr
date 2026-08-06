@@ -39,6 +39,8 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist resolutions", err) || pageFailed
 	d.Preferences, err = a.store.NotificationPreferences(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification preferences", err) || pageFailed
+	d.NotificationHolds, err = a.store.NotificationHolds(r.Context(), session.User.ID, 20)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification holds", err) || pageFailed
 	d.ListenBrainzArtists, err = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "ListenBrainz popularity", err) || pageFailed
 	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
@@ -78,6 +80,11 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 	d.ReleaseDetail = &detail
 	d.ReleaseEvidenceIssues, err = a.store.EvidenceIssuesForRelease(r.Context(), session.User.ID, id, time.Now().UTC())
 	if a.pageStoreError(r, &d, "Release details", "release evidence issues", err) {
+		a.render(w, "release", d, http.StatusInternalServerError)
+		return
+	}
+	d.ReleaseNotificationHolds, err = a.store.NotificationHoldsForRelease(r.Context(), session.User.ID, id)
+	if a.pageStoreError(r, &d, "Release details", "release notification holds", err) {
 		a.render(w, "release", d, http.StatusInternalServerError)
 		return
 	}

@@ -58,6 +58,8 @@ type PageData struct {
 	RecentReleases           []store.Release
 	ReleaseCount             int
 	Preferences              store.NotificationPreferences
+	NotificationHolds        []store.NotificationHold
+	ReleaseNotificationHolds []store.NotificationHold
 	ReleaseDetail            *store.ReleaseDetail
 	ReleaseEvidenceIssues    []store.EvidenceIssue
 	ReleaseUnavailable       bool

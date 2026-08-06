@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.26.0`, which is also displayed by local
+footer. The current release is `v0.27.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -95,6 +95,14 @@ after their next provider check. Release details also expose a reversible Truth
 Loop decision: members can explicitly confirm the provider that best represents
 a release for their household without rewriting provider observations.
 
+The optional **Release Trust Guard** builds on the Truth Desk. Enable “Hold
+notifications when provider evidence conflicts” under Settings to keep alerts
+with warning or critical date, title, or type disagreements out of the delivery
+queue. Held alerts appear on the dashboard and release details, where a member
+can confirm a provider, notify anyway, or discard the alert. The default remains
+immediate delivery, and informational gaps such as a missing canonical
+observation do not block notifications.
+
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
 hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
@@ -115,7 +123,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.26.0` publishes `0.26.0`, `0.26`, and `latest`.
+- Pushing a tag such as `v0.27.0` publishes `0.27.0`, `0.27`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -123,7 +131,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.26.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.27.0 docker compose up -d
 ```
 
 ## Configuration

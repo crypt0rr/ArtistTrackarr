@@ -416,6 +416,15 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	if !strings.Contains(string(pageBytes), "Phone") {
 		t.Fatalf("destination missing from settings response: %q", pageBytes)
 	}
+	response = postForm(t, client, server.URL+"/settings/preferences", url.Values{
+		"_csrf": {csrf}, "albums": {"on"}, "eps": {"on"}, "singles": {"on"},
+		"announcements": {"on"}, "release_day": {"on"}, "hold_conflicting_notifications": {"on"},
+	})
+	_ = response.Body.Close()
+	preferences, err := database.NotificationPreferences(context.Background(), user.ID)
+	if err != nil || !preferences.HoldConflictingNotifications {
+		t.Fatalf("conflict hold preference=%v err=%v", preferences.HoldConflictingNotifications, err)
+	}
 }
 
 func TestSearchFallsBackToMusicBrainz(t *testing.T) {

@@ -62,6 +62,12 @@ func (s *Store) SetReleaseTruthDecision(ctx context.Context, userID, releaseID i
 	if err != nil {
 		return err
 	}
+	// Confirming a provider is an explicit review decision, so release any
+	// notification that was held for this member even if another observation
+	// remains present for audit purposes.
+	if err := drainNotificationHoldsTx(ctx, tx, userID, releaseID, time.Now().UTC()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
