@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestReleaseTruthDecisionIsOwnerScopedAndReversible(t *testing.T) {
@@ -130,5 +131,87 @@ func TestReleaseTruthState(t *testing.T) {
 				t.Fatalf("releaseTruthState()=%q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestConflictingNotificationCanBeHeldAndReleased(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "hold@example.com", "hash", "member", "UTC", "hold-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := s.CreateUser(ctx, "hold-other@example.com", "hash", "member", "UTC", "hold-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "hold-artist", Name: "Hold Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,
+		 spotify_id,spotify_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, "hold-release", artist.ID, "Held Release", "Album", "2026-09-01", 3,
+		"https://musicbrainz.org/release-group/hold-release", "hold-spotify",
+		"https://open.spotify.com/album/hold-spotify", "both", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,'open',?,?)`, releaseID, "date_conflict", "warning", "hold-fingerprint",
+		"Providers disagree on the release date", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	prefs, err := s.NotificationPreferences(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefs.HoldConflictingNotifications = true
+	if err := s.UpdateNotificationPreferences(ctx, prefs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "Held release", "Review this release", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var events int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("held notification created %d events", events)
+	}
+	holds, err := s.NotificationHolds(ctx, userID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 1 || holds[0].Reason == "" {
+		t.Fatalf("holds=%+v", holds)
+	}
+	if err := s.ResolveNotificationHold(ctx, otherID, holds[0].ID, "notify"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user hold action error=%v, want sql.ErrNoRows", err)
+	}
+	if err := s.SetReleaseTruthDecision(ctx, userID, releaseID, "spotify", "Spotify has the current listing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("released notification events=%d, want 1", events)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE id=?`, holds[0].ID).Scan(&holds[0].Status); err != nil {
+		t.Fatal(err)
+	}
+	if holds[0].Status != "released" {
+		t.Fatalf("hold status=%q, want released", holds[0].Status)
 	}
 }

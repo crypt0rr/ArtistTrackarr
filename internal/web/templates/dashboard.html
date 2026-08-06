@@ -11,6 +11,13 @@
 <section class="panel inbox-summary">
   <div class="section-head"><div><p class="eyebrow">Release inbox</p><h2>{{if .InboxUnreadCount}}{{.InboxUnreadCount}} release{{if ne .InboxUnreadCount 1}}s{{end}} need your attention{{else}}Your release inbox is clear{{end}}</h2><p>Review alertable releases, source evidence, and anything that arrived while a destination was unavailable.</p></div><a class="button secondary" href="/inbox">Open inbox</a></div>
 </section>
+{{if .NotificationHolds}}<section class="panel notification-holds-panel">
+  <div class="section-head"><div><p class="eyebrow">Needs review</p><h2>Notifications held for provider conflicts</h2><p>These alerts are waiting for your confirmation because providers disagree on important release details.</p></div><span class="badge">{{len .NotificationHolds}} held</span></div>
+  <div class="list notification-holds-list">{{range .NotificationHolds}}<article class="list-row notification-hold-row">
+    <div><a href="/releases/{{.ReleaseGroupID}}"><strong>{{.ReleaseTitle}}</strong></a><span>{{.ArtistName}} · {{if eq .EventType "release_day"}}Release-day reminder{{else}}New-release announcement{{end}}</span><small>{{.Reason}}</small></div>
+    <div class="actions"><form method="post" action="/notifications/holds/{{.ID}}/notify" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="/"><button class="secondary">Notify anyway</button></form><form method="post" action="/notifications/holds/{{.ID}}/discard" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="/"><button class="link danger">Discard</button></form></div>
+  </article>{{end}}</div>
+</section>{{end}}
 {{if .CoverageSummary.Artists}}<section class="panel trust-overview">
   <div class="section-head"><div><p class="eyebrow">Release trust</p><h2>Know what is confirmed</h2><p>Provider coverage for your followed artists at a glance.</p></div><a href="/coverage">Open Trust Center</a></div>
   <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div>{{if .EvidenceIssueUnreadCount}}<div class="attention"><strong>{{.EvidenceIssueUnreadCount}}</strong><span><a href="/coverage/issues">evidence issues to review</a></span></div>{{end}}</div>

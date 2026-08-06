@@ -57,6 +57,16 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			savedReleases = append(savedReleases, saved)
 		}
 	}
+	// A later synchronization may have made previously conflicting evidence
+	// agree again. Drain those holds only after every provider batch in this
+	// transaction has been evaluated, so an intermediate provider cannot
+	// release a notification before the rest of the batch is visible.
+	for _, item := range savedReleases {
+		if err := drainResolvedNotificationHoldsTx(ctx, tx, item.release.ID, observed); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at,spotify_baseline_synced_at
 		FROM follows WHERE artist_id=?`, artist.ID)
 	if err != nil {

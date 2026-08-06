@@ -498,11 +498,11 @@ func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var exists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM release_evidence_issues i
+	var releaseID int64
+	err = tx.QueryRowContext(ctx, `SELECT i.release_group_id FROM release_evidence_issues i
 		JOIN release_groups rg ON rg.id=i.release_group_id
 		JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE i.id=? AND f.user_id=? LIMIT 1`, issueID, userID).Scan(&exists)
+		WHERE i.id=? AND f.user_id=? LIMIT 1`, issueID, userID).Scan(&releaseID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	}
@@ -521,6 +521,11 @@ func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64
 		nullableTime(snoozedUntil), nowText())
 	if err != nil {
 		return err
+	}
+	if state == "confirmed" {
+		if err := drainNotificationHoldsTx(ctx, tx, userID, releaseID, time.Now().UTC()); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

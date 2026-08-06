@@ -4,6 +4,7 @@
 {{else if .ReleaseDetail}}
 {{with .ReleaseDetail}}
 <section class="page-head split-head"><div><p class="eyebrow">Release details</p><h1>{{.Title}}</h1><p>{{.ArtistName}} · {{.PrimaryType}}{{if .SecondaryTypes}} · {{join .SecondaryTypes ", "}}{{end}}</p></div><a class="button secondary" href="/">Back to dashboard</a></section>
+{{if $.ReleaseNotificationHolds}}<section class="panel notification-hold-banner"><div><p class="eyebrow">Notification held</p><h2>Review before notifying</h2><p>This release has a pending notification because provider evidence conflicts. Confirm a source below, notify anyway, or discard the alert.</p></div><div class="list">{{range $.ReleaseNotificationHolds}}<article class="list-row"><div><strong>{{.Title}}</strong><small>{{.Reason}}</small></div><div class="actions"><form method="post" action="/notifications/holds/{{.ID}}/notify" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="/releases/{{$.ReleaseDetail.ID}}"><button class="secondary">Notify anyway</button></form><form method="post" action="/notifications/holds/{{.ID}}/discard" class="inline">{{template "csrf" $}}<input type="hidden" name="return" value="/releases/{{$.ReleaseDetail.ID}}"><button class="link danger">Discard</button></form></div></article>{{end}}</div></section>{{end}}
 <section class="grid two release-layout">
   <section class="panel release-detail-card">
     <div class="release-detail-summary">
