@@ -8,6 +8,7 @@
   <article><strong>{{.ReleaseCount}}</strong><span>catalog entries shown</span></article>
   <article><strong>{{.User.ReminderTime}}</strong><span>release reminders</span></article>
 </section>
+<section class="panel calendar-callout"><div><p class="eyebrow">Release planning</p><h2>Plan the next record</h2><p>See upcoming releases with source confidence, review status, and a calendar export for the year ahead.</p></div><a class="button secondary" href="/calendar">Open release calendar</a></section>
 <section class="panel inbox-summary">
   <div class="section-head"><div><p class="eyebrow">Release inbox</p><h2>{{if .InboxUnreadCount}}{{.InboxUnreadCount}} release{{if ne .InboxUnreadCount 1}}s{{end}} need your attention{{else}}Your release inbox is clear{{end}}</h2><p>Review alertable releases, source evidence, and anything that arrived while a destination was unavailable.</p></div><a class="button secondary" href="/inbox">Open inbox</a></div>
 </section>

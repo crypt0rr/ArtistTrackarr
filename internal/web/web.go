@@ -56,6 +56,11 @@ type PageData struct {
 	ITunesResults            []catalog.ITunesArtist
 	UpcomingReleases         []store.Release
 	RecentReleases           []store.Release
+	CalendarDays             []CalendarDay
+	CalendarMonth            string
+	CalendarPrevMonth        string
+	CalendarNextMonth        string
+	CalendarICSURL           string
 	ReleaseCount             int
 	Preferences              store.NotificationPreferences
 	NotificationHolds        []store.NotificationHold
@@ -144,6 +149,13 @@ type PageData struct {
 	TokenEmail               string
 	SpotifyOn                bool
 	ProviderNotice           string
+}
+
+type CalendarDay struct {
+	Date     string
+	Label    string
+	Today    bool
+	Releases []store.CalendarRelease
 }
 
 type PaginationLink struct {

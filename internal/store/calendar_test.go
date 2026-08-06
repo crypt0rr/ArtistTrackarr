@@ -1,0 +1,136 @@
+package store
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestCalendarReleasesAreOwnerScopedAndExposeHoldState(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	owner, err := s.CreateUser(ctx, "calendar-owner@example.com", "hash", "member", "UTC", "calendar-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateUser(ctx, "calendar-other@example.com", "hash", "member", "UTC", "calendar-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "calendar-artist", Name: "Calendar Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, owner, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	releaseDate := time.Now().UTC().AddDate(0, 0, 3).Format("2006-01-02")
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "calendar-release", artist.ID, "Calendar Release", "Album", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/calendar-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO notification_holds
+		(user_id,release_group_id,event_type,title,body,reason,planned_at,status,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, owner, releaseID, "announcement", "held", "body", "provider conflict", nowText(), "held", nowText()); err != nil {
+		t.Fatal(err)
+	}
+	from := time.Now().UTC().Format("2006-01-02")
+	to := time.Now().UTC().AddDate(0, 0, 7).Format("2006-01-02")
+	items, err := s.CalendarReleases(ctx, owner, from, to, 20)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("calendar items=%#v err=%v", items, err)
+	}
+	if items[0].ID != releaseID || !items[0].Held {
+		t.Fatalf("calendar release=%#v, want held release %d", items[0], releaseID)
+	}
+	items, err = s.CalendarReleases(ctx, other, from, to, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("cross-user calendar items=%#v", items)
+	}
+}
+
+func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "digest@example.com", "hash", "member", "UTC", "digest-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "digest-artist", Name: "Digest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Digest destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	releaseDate := now.AddDate(0, 0, 1).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-release", artist.ID, "Digest Release", "EP", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/digest-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := s.QueueDueReleaseDigests(ctx, now)
+	if err != nil || queued != 1 {
+		t.Fatalf("queued=%d err=%v", queued, err)
+	}
+	queued, err = s.QueueDueReleaseDigests(ctx, now.Add(time.Hour))
+	if err != nil || queued != 0 {
+		t.Fatalf("duplicate queued=%d err=%v", queued, err)
+	}
+	var runs, deliveries int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_deliveries`).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || deliveries != 1 {
+		t.Fatalf("digest runs=%d deliveries=%d", runs, deliveries)
+	}
+	due, err := s.DueDigestDeliveries(ctx, now, 10)
+	if err != nil || len(due) != 1 || due[0].Title == "" || due[0].Body == "" {
+		t.Fatalf("due digest=%#v err=%v", due, err)
+	}
+	if !strings.Contains(due[0].Body, "Digest Release") {
+		t.Fatalf("digest body=%q", due[0].Body)
+	}
+	if err := s.MarkDigestDeliverySent(ctx, due[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := s.DB.QueryRow(`SELECT status FROM release_digest_runs WHERE id=?`, due[0].RunID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "sent" {
+		t.Fatalf("digest run status=%q, want sent", status)
+	}
+}

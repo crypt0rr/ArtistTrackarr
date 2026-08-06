@@ -100,7 +100,9 @@ func TestReleaseInboxSnoozeExpires(t *testing.T) {
 	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	// Keep the fixture relative to the clock used by SetReleaseInboxState so
+	// this validation remains stable as the calendar advances.
+	now := time.Now().UTC().Truncate(time.Second)
 	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
 		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at,source)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "snooze-release", artist.ID, "Snooze Release", "EP", "[]", "2026-08-05", 3,

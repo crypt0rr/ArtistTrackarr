@@ -379,7 +379,8 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	page := string(body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(page, `name="username"`) ||
 		!strings.Contains(page, "Your destinations") || !strings.Contains(page, "Notification preferences") ||
-		strings.Contains(page, `href="/destinations"`) {
+		!strings.Contains(page, `name="digest_enabled"`) ||
+		!strings.Contains(page, `name="digest_frequency"`) || strings.Contains(page, `href="/destinations"`) {
 		t.Fatalf("settings page missing consolidated account controls: %q", page)
 	}
 
@@ -424,6 +425,58 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	preferences, err := database.NotificationPreferences(context.Background(), user.ID)
 	if err != nil || !preferences.HoldConflictingNotifications {
 		t.Fatalf("conflict hold preference=%v err=%v", preferences.HoldConflictingNotifications, err)
+	}
+}
+
+func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	user, err := database.UserByEmail(context.Background(), "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "88888888-8888-4888-8888-888888888888", Name: "Calendar Web Artist", SortName: "Calendar Web Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	releaseDate := time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")
+	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:calendar-web", ITunesID: "calendar-web", Title: "Calendar Web Release", PrimaryType: "Album",
+			FirstReleaseDate: releaseDate, DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/calendar-web-release",
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	month := releaseDate[:7]
+	response, err := client.Get(server.URL + "/calendar?month=" + month)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	page := string(body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(page, "Release calendar") ||
+		!strings.Contains(page, "Calendar Web Release") || !strings.Contains(page, "Download ICS") ||
+		!strings.Contains(page, `href="/releases/1"`) {
+		t.Fatalf("calendar status/body=%d %q", response.StatusCode, body)
+	}
+	response, err = client.Get(server.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	ics := string(body)
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/calendar; charset=utf-8" ||
+		!strings.Contains(ics, "BEGIN:VCALENDAR") || !strings.Contains(ics, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
+		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) {
+		t.Fatalf("calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
 	}
 }
 

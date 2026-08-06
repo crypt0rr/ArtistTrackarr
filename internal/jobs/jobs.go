@@ -89,6 +89,11 @@ type deliveryResult struct {
 	err    error
 }
 
+type deliveryWork struct {
+	normal *store.Delivery
+	digest *store.DigestDelivery
+}
+
 type artworkBackfillStats struct {
 	ArtistID int64
 	Checked  int
@@ -418,6 +423,11 @@ func (r *Runner) runReleaseDayQueue(ctx context.Context) {
 		r.logger.Error("release-day scheduling failed", "error", err)
 	} else {
 		r.logger.Info("release-day queue completed")
+	}
+	if queued, err := r.store.QueueDueReleaseDigests(ctx, now); err != nil {
+		r.logger.Warn("release digest scheduling failed", "error", err)
+	} else if queued > 0 {
+		r.logger.Info("release digest queue completed", "runs", queued)
 	}
 }
 
@@ -888,32 +898,57 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 	if err != nil {
 		return summary, err
 	}
-	if len(deliveries) == 0 {
+	digestLimit := 25 - len(deliveries)
+	if digestLimit < 0 {
+		digestLimit = 0
+	}
+	digestDeliveries, err := r.store.DueDigestDeliveries(ctx, now, digestLimit)
+	if err != nil {
+		return summary, err
+	}
+	if len(deliveries) == 0 && len(digestDeliveries) == 0 {
 		return summary, nil
 	}
 
-	workerCount := min(4, len(deliveries))
-	work := make(chan store.Delivery)
-	results := make(chan deliveryResult, len(deliveries))
+	workerCount := min(4, len(deliveries)+len(digestDeliveries))
+	work := make(chan deliveryWork)
+	results := make(chan deliveryResult, len(deliveries)+len(digestDeliveries))
 	var workers sync.WaitGroup
 	for worker := 0; worker < workerCount; worker++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for delivery := range work {
-				result := r.deliverOne(ctx, now, delivery)
+			for item := range work {
+				var result deliveryResult
+				if item.normal != nil {
+					result = r.deliverOne(ctx, now, *item.normal)
+				} else if item.digest != nil {
+					result = r.deliverDigestOne(ctx, now, *item.digest)
+				}
 				results <- result
 			}
 		}()
 	}
 	for _, delivery := range deliveries {
+		item := delivery
 		select {
 		case <-ctx.Done():
-			break
-		case work <- delivery:
+			close(work)
+			workers.Wait()
+			close(results)
+			return summary, ctx.Err()
+		case work <- deliveryWork{normal: &item}:
 		}
-		if ctx.Err() != nil {
-			break
+	}
+	for _, delivery := range digestDeliveries {
+		item := delivery
+		select {
+		case <-ctx.Done():
+			close(work)
+			workers.Wait()
+			close(results)
+			return summary, ctx.Err()
+		case work <- deliveryWork{digest: &item}:
 		}
 	}
 	close(work)
@@ -937,6 +972,39 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 		return summary, errors.Join(storageErrors...)
 	}
 	return summary, nil
+}
+
+func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
+	result := deliveryResult{}
+	var err error
+	if r.cipher == nil {
+		err = errors.New("notification cipher is unavailable")
+	} else {
+		var serviceURL string
+		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
+		if err == nil && r.sender == nil {
+			err = errors.New("notification sender is unavailable")
+		}
+		if err == nil {
+			err = r.sender.Send(ctx, serviceURL, delivery.Title, delivery.Body)
+		}
+	}
+	if err == nil {
+		if markErr := r.store.MarkDigestDeliverySent(ctx, delivery.ID, now); markErr != nil {
+			return deliveryResult{failed: true, err: markErr}
+		}
+		result.sent = true
+		return result
+	}
+
+	result.failed = true
+	redactedError := notify.RedactError(err)
+	r.logger.Warn("release digest delivery attempt failed",
+		"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
+	if markErr := r.store.MarkDigestDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
+		result.err = markErr
+	}
+	return result
 }
 
 func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {

@@ -177,6 +177,7 @@ func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPa
 	p := store.NotificationPreferences{UserID: session.User.ID,
 		Albums: r.FormValue("albums") == "on", EPs: r.FormValue("eps") == "on", Singles: r.FormValue("singles") == "on",
 		Announcements: r.FormValue("announcements") == "on", ReleaseDay: r.FormValue("release_day") == "on",
+		DigestEnabled: r.FormValue("digest_enabled") == "on", DigestFrequency: r.FormValue("digest_frequency"),
 		HoldConflictingNotifications: r.FormValue("hold_conflicting_notifications") == "on"}
 	if err := a.store.UpdateNotificationPreferences(r.Context(), p); err != nil {
 		http.Redirect(w, r, redirectPath+"?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
