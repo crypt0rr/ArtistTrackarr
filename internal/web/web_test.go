@@ -433,6 +433,33 @@ func TestLoginRejectsInvalidAndUnknownCredentials(t *testing.T) {
 	}
 }
 
+func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/")
+	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	for attempt := 0; attempt < 5; attempt++ {
+		csrf = getCSRF(t, client, server.URL+"/login")
+		response = postForm(t, client, server.URL+"/login", url.Values{
+			"_csrf": {csrf}, "email": {"member@example.com"}, "password": {"wrong password"},
+		})
+		if response.StatusCode != http.StatusUnauthorized {
+			_ = response.Body.Close()
+			t.Fatalf("failed login attempt %d status=%d", attempt+1, response.StatusCode)
+		}
+		_ = response.Body.Close()
+	}
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
+		"_csrf": {csrf}, "email": {"member@example.com"}, "password": {"wrong password"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(body), "Too many attempts") {
+		t.Fatalf("throttled login status/body=%d %q", response.StatusCode, body)
+	}
+}
+
 func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
 	var logs bytes.Buffer
 	app := &App{
@@ -503,6 +530,41 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	preferences, err := database.NotificationPreferences(context.Background(), user.ID)
 	if err != nil || !preferences.HoldConflictingNotifications {
 		t.Fatalf("conflict hold preference=%v err=%v", preferences.HoldConflictingNotifications, err)
+	}
+}
+
+func TestSettingsPreferencesRedirectsOnStoreFailure(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "settings-error.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	userID, err := database.CreateUser(context.Background(), "settings-error@example.com", "hash", "member", "UTC", "settings-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/settings/preferences", strings.NewReader(url.Values{
+		"albums": {"on"}, "digest_frequency": {"daily"},
+	}.Encode())).WithContext(context.WithValue(ctx, sessionKey, store.Session{User: store.User{ID: userID}}))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	app.settingsPreferences(response, request)
+	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+		t.Fatalf("settings preferences failure status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+
+	compatCtx, compatCancel := context.WithCancel(context.Background())
+	compatCancel()
+	compatRequest := httptest.NewRequest(http.MethodPost, "/preferences", strings.NewReader("albums=on"))
+	compatRequest = compatRequest.WithContext(context.WithValue(compatCtx, sessionKey, store.Session{User: store.User{ID: userID}}))
+	compatRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	compatResponse := httptest.NewRecorder()
+	app.updatePreferences(compatResponse, compatRequest)
+	if compatResponse.Code != http.StatusSeeOther || !strings.Contains(compatResponse.Header().Get("Location"), "context+canceled") {
+		t.Fatalf("compatibility preferences failure status=%d location=%q", compatResponse.Code, compatResponse.Header().Get("Location"))
 	}
 }
 

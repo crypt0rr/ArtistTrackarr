@@ -91,4 +91,48 @@ func TestReleaseInboxPageAndStateAction(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("dismiss action status=%d", response.StatusCode)
 	}
+
+	// A different household member must not be able to mutate this release's
+	// inbox state or its evidence review, even when they know the numeric IDs.
+	otherID, err := database.CreateUser(ctx, "other-inbox@example.com", "hash", "member", "UTC", "other-inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,'open',?,?)`, releaseID, "date_conflict", "warning", "inbox-owner-fingerprint", "Owner-only review",
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	var issueID int64
+	if err := database.DB.QueryRowContext(ctx, `SELECT id FROM release_evidence_issues WHERE fingerprint=?`, "inbox-owner-fingerprint").Scan(&issueID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `UPDATE sessions SET user_id=? WHERE user_id=?`, otherID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	bad := noRedirectClient(client)
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, bad, server.URL+"/inbox/"+fmt.Sprint(releaseID)+"/read", url.Values{
+		"_csrf": {csrf}, "return": {"/inbox"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-user inbox action status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, bad, server.URL+"/coverage/issues/"+fmt.Sprint(issueID)+"/dismiss", url.Values{
+		"_csrf": {csrf}, "return": {"/coverage/issues"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-user evidence action status=%d", response.StatusCode)
+	}
+	var reviews int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_evidence_reviews WHERE user_id=? AND issue_id=?`, otherID, issueID).Scan(&reviews); err != nil {
+		t.Fatal(err)
+	}
+	if reviews != 0 {
+		t.Fatalf("cross-user evidence action created %d review rows", reviews)
+	}
 }

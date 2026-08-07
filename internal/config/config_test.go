@@ -203,3 +203,63 @@ func TestLoadReturnsSecretFileError(t *testing.T) {
 		t.Fatalf("Load() error=%v; want APP_ENCRYPTION_KEY_FILE read error", err)
 	}
 }
+
+func setLoadBaseline(t *testing.T) {
+	t.Helper()
+	t.Setenv("PUBLIC_URL", "https://tracker.example")
+	t.Setenv("SETUP_TOKEN", strings.Repeat("t", 32))
+	t.Setenv("APP_ENCRYPTION_KEY", strings.Repeat("e", 32))
+	t.Setenv("SESSION_SECRET", strings.Repeat("s", 32))
+	t.Setenv("MUSICBRAINZ_CONTACT", "test@example.com")
+	t.Setenv("POLL_INTERVAL", "6h")
+	t.Setenv("SPOTIFY_POLL_INTERVAL", "24h")
+	t.Setenv("TRUST_PROXY", "false")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "")
+	t.Setenv("ALLOW_INSECURE_HTTP", "false")
+	t.Setenv("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "false")
+	t.Setenv("SPOTIFY_CLIENT_ID", "")
+	t.Setenv("SPOTIFY_CLIENT_SECRET", "")
+	t.Setenv("SPOTIFY_MARKET", "US")
+	t.Setenv("LOG_LEVEL", "info")
+	for _, name := range []string{"SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "SPOTIFY_CLIENT_SECRET"} {
+		t.Setenv(name+"_FILE", "")
+	}
+}
+
+func TestLoadRejectsInvalidRuntimeConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func()
+		want string
+	}{
+		{name: "log level", set: func() { t.Setenv("LOG_LEVEL", "trace") }, want: "LOG_LEVEL"},
+		{name: "poll interval", set: func() { t.Setenv("POLL_INTERVAL", "30m") }, want: "POLL_INTERVAL"},
+		{name: "Spotify credentials", set: func() { t.Setenv("SPOTIFY_CLIENT_ID", "client-id") }, want: "SPOTIFY_CLIENT_ID"},
+		{name: "market", set: func() { t.Setenv("SPOTIFY_MARKET", "USA") }, want: "SPOTIFY_MARKET"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setLoadBaseline(t)
+			test.set()
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error=%v; want %q validation", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadAllowsLocalHTTPAndValidOptionalConfiguration(t *testing.T) {
+	setLoadBaseline(t)
+	t.Setenv("PUBLIC_URL", "http://localhost:8080")
+	t.Setenv("SPOTIFY_CLIENT_ID", "client-id")
+	t.Setenv("SPOTIFY_CLIENT_SECRET", "client-secret")
+	t.Setenv("SPOTIFY_MARKET", "nl")
+	t.Setenv("LOG_LEVEL", "DEBUG")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpotifyMarket != "NL" || cfg.SpotifyClientID != "client-id" || cfg.LogLevel != slog.LevelDebug {
+		t.Fatalf("optional configuration=%#v", cfg)
+	}
+}

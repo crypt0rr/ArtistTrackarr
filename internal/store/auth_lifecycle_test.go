@@ -31,6 +31,15 @@ func TestAuthSessionTokenAndLoginLifecycle(t *testing.T) {
 	if _, err := s.Session(ctx, raw); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("password update left session usable: %v", err)
 	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := s.UpdatePassword(canceled, userID, "should-not-apply"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled password update error=%v", err)
+	}
+	updatedUser, err := s.UserByID(ctx, userID)
+	if err != nil || updatedUser.PasswordHash != "new-hash" {
+		t.Fatalf("canceled password update changed hash=%q err=%v", updatedUser.PasswordHash, err)
+	}
 	newRaw, _, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)

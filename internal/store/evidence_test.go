@@ -53,6 +53,14 @@ func TestReleaseEvidenceDetectsConflictsAndOwnerReview(t *testing.T) {
 	if len(issues) != 3 {
 		t.Fatalf("issues=%#v, want date/title/type conflicts", issues)
 	}
+	var releaseID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, base.MBID).Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	releaseIssues, err := s.EvidenceIssuesForRelease(ctx, userID, releaseID, now.Add(2*time.Minute))
+	if err != nil || len(releaseIssues) != 3 {
+		t.Fatalf("release-scoped issues=%#v err=%v", releaseIssues, err)
+	}
 	seen := map[string]bool{}
 	for _, issue := range issues {
 		seen[issue.IssueType] = true
@@ -87,6 +95,16 @@ func TestReleaseEvidenceDetectsConflictsAndOwnerReview(t *testing.T) {
 	}
 	if got, err := s.EvidenceIssues(ctx, userID, "open", "snoozed", "", "", 50, 0, now); err != nil || len(got) != 1 {
 		t.Fatalf("snoozed issues=%#v err=%v", got, err)
+	}
+	// Once the snooze expires, the same issue is visible as unread again and
+	// the nullable review timestamp is normalized by the scanner.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE release_evidence_reviews SET snoozed_until=? WHERE user_id=? AND issue_id=?`,
+		now.Add(-time.Minute).Format(time.RFC3339Nano), userID, issues[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.EvidenceIssues(ctx, userID, "open", "unread", issues[0].IssueType, "", 50, 0, now)
+	if err != nil || len(got) != 1 || got[0].ReviewState != "unread" {
+		t.Fatalf("expired snooze issues=%#v err=%v", got, err)
 	}
 }
 

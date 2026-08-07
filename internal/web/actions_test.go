@@ -1,22 +1,59 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
+	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
+
+func postArtistImportCSV(t *testing.T, client *http.Client, target, csrf, content string) *http.Response {
+	t.Helper()
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	if err := writer.WriteField("_csrf", csrf); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("file", "artists.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(part, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, target, &payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
 
 type actionITunes struct {
 	artists   map[string]catalog.ITunesArtist
@@ -222,6 +259,13 @@ func TestAdminInvitationAndResetRoutes(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid invite status=%d", response.StatusCode)
 	}
+	response = postForm(t, client, server.URL+"/admin/invite", url.Values{
+		"_csrf": {csrf}, "email": {"member@example.com"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate invite status=%d", response.StatusCode)
+	}
 	response = postForm(t, client, server.URL+"/admin/reset", url.Values{
 		"_csrf": {csrf}, "email": {"missing-user@example.com"},
 	})
@@ -355,6 +399,156 @@ func TestAdminInvitationAndResetRoutes(t *testing.T) {
 	}
 }
 
+func TestAdminQueueActionsHandleCanceledStoreContext(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "admin-actions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	userID, err := database.CreateUser(context.Background(), "admin-actions@example.com", "hash", "admin", "UTC", "admin-actions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: "admin-actions-artist", Name: "Admin Actions Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	session := store.Session{User: store.User{ID: userID, Role: "admin"}}
+	request := httptest.NewRequest(http.MethodPost, "/admin/sync/retry", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(canceled, sessionKey, session), csrfKey, "csrf"))
+	response := httptest.NewRecorder()
+	app.queueRetrySync(response, request)
+	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+		t.Fatalf("canceled retry queue status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+
+	routeContext := chi.NewRouteContext()
+	routeContext.URLParams.Add("id", strconv.FormatInt(artist.ID, 10))
+	request = httptest.NewRequest(http.MethodPost, "/admin/sync/artists/"+strconv.FormatInt(artist.ID, 10), nil)
+	request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeContext), csrfKey, "csrf"))
+	response = httptest.NewRecorder()
+	app.queueArtistSync(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled artist queue status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	routeContext = chi.NewRouteContext()
+	routeContext.URLParams.Add("id", "999")
+	request = httptest.NewRequest(http.MethodPost, "/admin/users/999/delete", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeContext), csrfKey, "csrf"))
+	response = httptest.NewRecorder()
+	app.deleteUser(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled user delete status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestOwnerActionsHandleCanceledStoreContext(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "owner-actions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	userID, err := database.CreateUser(context.Background(), "owner-actions@example.com", "hash", "member", "UTC", "owner-actions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	session := store.Session{User: store.User{ID: userID, Role: "member", Username: "owner-actions"}}
+	invoke := func(method, path, id string, handler func(http.ResponseWriter, *http.Request)) *httptest.ResponseRecorder {
+		routeContext := chi.NewRouteContext()
+		routeContext.URLParams.Add("id", id)
+		request := httptest.NewRequest(method, path, nil)
+		request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeContext), csrfKey, "csrf"))
+		response := httptest.NewRecorder()
+		handler(response, request)
+		return response
+	}
+	checks := []struct {
+		name    string
+		path    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{name: "unfollow", path: "/artists/1/delete", handler: app.unfollow},
+		{name: "cancel resolution", path: "/artist-resolutions/1/cancel", handler: app.cancelArtistResolution},
+		{name: "delete destination", path: "/destinations/1/delete", handler: app.deleteDestination},
+		{name: "coverage sync", path: "/coverage/artists/1/sync", handler: app.queueCoverageSync},
+		{name: "select resolution", path: "/artist-resolutions/1", handler: app.selectArtistResolution},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			response := invoke(http.MethodPost, check.path, "1", check.handler)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("canceled action status=%d body=%q", response.Code, response.Body.String())
+			}
+		})
+	}
+	// The release truth and notification hold actions should also turn a
+	// canceled store operation into a generic server error, never a success or
+	// a leaked database error.
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", "1")
+	request := httptest.NewRequest(http.MethodPost, "/releases/1/truth?provider=spotify", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeCtx), csrfKey, "csrf"))
+	response := httptest.NewRecorder()
+	app.releaseTruthAction(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled release truth status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	routeCtx = chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", "1")
+	routeCtx.URLParams.Add("action", "notify")
+	request = httptest.NewRequest(http.MethodPost, "/notifications/holds/1/notify", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeCtx), csrfKey, "csrf"))
+	response = httptest.NewRecorder()
+	app.notificationHoldAction(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled notification hold status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/admin/profile?timezone=UTC&reminder_time=09:00", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(canceled, sessionKey, session), csrfKey, "csrf"))
+	response = httptest.NewRecorder()
+	app.profile(response, request)
+	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+		t.Fatalf("canceled legacy profile status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+
+	routeCtx = chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", "1")
+	routeCtx.URLParams.Add("action", "read")
+	request = httptest.NewRequest(http.MethodPost, "/inbox/1/read", nil)
+	request = request.WithContext(context.WithValue(context.WithValue(context.WithValue(canceled, sessionKey, session), chi.RouteCtxKey, routeCtx), csrfKey, "csrf"))
+	response = httptest.NewRecorder()
+	app.inboxStateAction(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled inbox action status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestSetupPageRendersGenericErrorWhenStoreIsUnavailable(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError || !strings.Contains(string(body), "couldn&#39;t load this page") ||
+		strings.Contains(string(body), "database closed") {
+		t.Fatalf("setup store failure status/body=%d %q", response.StatusCode, body)
+	}
+}
+
 func TestDestinationActionsAndPreferences(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	ctx := context.Background()
@@ -401,6 +595,59 @@ func TestDestinationActionsAndPreferences(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Test sent") {
 		t.Fatalf("destination test status/body=%d %q", response.StatusCode, body)
 	}
+	csrf = getCSRF(t, client, server.URL+"/settings")
+	response = postForm(t, client, server.URL+"/destinations", url.Values{
+		"_csrf": {csrf}, "name": {"Kitchen"}, "service": {"ntfy"}, "topic": {"kitchen"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Destination added") {
+		t.Fatalf("destination add status/body=%d %q", response.StatusCode, body)
+	}
+	destinations, err := database.Destinations(ctx, user.ID)
+	foundKitchen := false
+	for _, destination := range destinations {
+		if destination.Name == "Kitchen" {
+			foundKitchen = true
+			break
+		}
+	}
+	if err != nil || len(destinations) != 2 || !foundKitchen {
+		t.Fatalf("added destinations=%#v err=%v", destinations, err)
+	}
+	if err := database.AddDestination(ctx, user.ID, "Broken", "ntfy", []byte("not encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err = database.Destinations(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var brokenID int64
+	for _, destination := range destinations {
+		if destination.Name == "Broken" {
+			brokenID = destination.ID
+			break
+		}
+	}
+	if brokenID == 0 {
+		t.Fatal("broken destination was not added")
+	}
+	csrf = getCSRF(t, client, server.URL+"/settings")
+	response = postForm(t, client, fmt.Sprintf("%s/destinations/%d/test", server.URL, brokenID), url.Values{"_csrf": {csrf}})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Test failed") {
+		t.Fatalf("broken destination test status/body=%d %q", response.StatusCode, body)
+	}
+	csrf = getCSRF(t, client, server.URL+"/settings")
+	response = postForm(t, client, server.URL+"/destinations", url.Values{
+		"_csrf": {csrf}, "name": {"Invalid"}, "service": {"unsupported"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "unsupported destination service") {
+		t.Fatalf("invalid destination add status/body=%d %q", response.StatusCode, body)
+	}
 	response = postForm(t, client, server.URL+"/preferences", url.Values{
 		"_csrf": {csrf}, "albums": {"on"}, "eps": {"on"}, "singles": {"on"}, "announcements": {"on"}, "release_day": {"on"},
 	})
@@ -437,6 +684,28 @@ func TestArtistImportWithoutFileRendersArtistsPage(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "Select an ArtistTrackarr CSV file") ||
 		!strings.Contains(string(body), "<h1>Artists</h1>") || !strings.Contains(string(body), "Export CSV") {
 		t.Fatalf("import error status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestArtistImportValidationAndSizeErrorsRenderArtistsPage(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/artists")
+	response := postArtistImportCSV(t, client, server.URL+"/artists/import", csrf, "artist,display_name\ninvalid,row\n")
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "CSV is missing required column") ||
+		!strings.Contains(string(body), "<h1>Artists</h1>") || !strings.Contains(string(body), "Export CSV") {
+		t.Fatalf("invalid CSV status/body=%d %q", response.StatusCode, body)
+	}
+
+	oversized := strings.Repeat("x", maxArtistImportBytes+1)
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response = postArtistImportCSV(t, client, server.URL+"/artists/import", csrf, oversized)
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "1 MiB or smaller") ||
+		!strings.Contains(string(body), "<h1>Artists</h1>") {
+		t.Fatalf("oversized CSV status/body=%d %q", response.StatusCode, body)
 	}
 }
 
@@ -662,7 +931,13 @@ func TestNotificationHoldActionsAreOwnerScoped(t *testing.T) {
 	}
 	holdID := holds[0].ID
 	csrf := getCSRF(t, client, server.URL+"/inbox")
-	response := postForm(t, client, server.URL+"/notifications/holds/"+strconv.FormatInt(holdID, 10)+"/invalid", url.Values{"_csrf": {csrf}})
+	bad := noRedirectClient(client)
+	response := postForm(t, bad, server.URL+"/notifications/holds/not-an-id/notify", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid hold ID status=%d", response.StatusCode)
+	}
+	response = postForm(t, client, server.URL+"/notifications/holds/"+strconv.FormatInt(holdID, 10)+"/invalid", url.Values{"_csrf": {csrf}})
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid hold action status=%d", response.StatusCode)

@@ -1,16 +1,22 @@
 package web
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/config"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
+	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
 
@@ -168,5 +174,74 @@ func TestPageStoreErrorProvidesGenericMessage(t *testing.T) {
 	}
 	if app.pageStoreError(request, &data, "Artists", "artist list", nil) {
 		t.Fatal("nil page error reported failure")
+	}
+}
+
+func TestProviderHealthReturnsGenericErrorWhenStoreIsUnavailable(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "provider-health-error.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{store: database, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	request := httptest.NewRequest(http.MethodGet, "/admin/provider-health", nil)
+	response := httptest.NewRecorder()
+	app.providerHealth(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("provider health status=%d body=%q", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "database") {
+		t.Fatalf("provider health leaked storage details: %q", response.Body.String())
+	}
+}
+
+func TestTemplatesRenderRepresentativePageData(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "template-smoke.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	cfg := config.Config{SessionSecret: "template smoke session secret with at least 32 bytes", EncryptionKey: "template smoke encryption key with at least 32 bytes"}
+	cipher, err := security.NewCipher(cfg.EncryptionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(cfg, database, fakeCatalog{}, nil, fakeSender{}, cipher, fakeArtwork{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	user := &store.User{ID: 1, Email: "template@example.com", Username: "template-user", Role: "admin", Timezone: "UTC", ReminderTime: "09:00", CreatedAt: now}
+	artist := store.Artist{ID: 1, MBID: "template-artist", Name: "Template Artist", Type: "Person", Country: "NL", Genres: []string{"Pop"}, ListenCount: 1234, ListenUsers: 56}
+	release := store.Release{ID: 1, MBID: "template-release", ArtistID: 1, ArtistName: artist.Name, Title: "Template Album", PrimaryType: "Album", SecondaryTypes: []string{"Live"}, FirstReleaseDate: "2026-09-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.org/release-group/template-release", SpotifyID: "spotify-template", SpotifyURL: "https://open.spotify.com/album/template", ITunesID: "123", ITunesURL: "https://music.apple.com/us/album/template/123", ITunesArtworkURL: "https://is1.mzstatic.com/image/250x250bb.jpg", Source: "both", Confidence: "confirmed", TruthState: "confirmed", TruthProvider: "spotify", FirstObservedAt: now, LastObservedAt: &now}
+	providerTime := now.Add(-time.Hour)
+	resolution := &store.ArtistResolution{ID: 1, UserID: user.ID, Provider: "spotify", ProviderID: "spotify-template", DisplayName: artist.Name, ProviderURL: "https://open.spotify.com/artist/template", Status: "review", Candidates: []store.ResolutionCandidate{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}}}
+	data := PageData{
+		Title: "Template smoke", Version: "dev", User: user, CSRF: "csrf", SetupNeeded: true, Query: "template",
+		Artists: []store.Artist{artist}, Results: []catalog.ArtistResult{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}},
+		SpotifyResults: []catalog.SpotifyArtist{{ID: "spotify-template", Name: artist.Name, URL: "https://open.spotify.com/artist/template"}},
+		ITunesResults:  []catalog.ITunesArtist{{ID: "123", Name: artist.Name, URL: "https://music.apple.com/us/artist/template/123"}}, UpcomingReleases: []store.Release{release}, RecentReleases: []store.Release{release},
+		CalendarDays: []CalendarDay{{Date: "2026-09-01", Label: "September 1", Today: false, Releases: []store.CalendarRelease{{Release: release, CalendarDate: "2026-09-01"}}}}, CalendarMonth: "September 2026", CalendarPrevMonth: "2026-08", CalendarNextMonth: "2026-10", CalendarICSURL: "/calendar.ics",
+		ReleaseCount: 1, Preferences: store.NotificationPreferences{UserID: user.ID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true, DigestEnabled: true, DigestFrequency: "daily"}, NotificationHolds: []store.NotificationHold{{ID: 1, Title: "Held", Reason: "Review"}}, ReleaseNotificationHolds: []store.NotificationHold{{ID: 1, Title: "Held", Reason: "Review"}},
+		ReleaseDetail: &store.ReleaseDetail{Release: release, Observations: []store.ReleaseObservation{{Provider: "spotify", ProviderID: "spotify-template", ObservedAt: now}}}, ReleaseEvidenceIssues: []store.EvidenceIssue{{ID: 1, ReleaseGroupID: release.ID, ArtistName: artist.Name, ReleaseTitle: release.Title, IssueType: "date_conflict", Severity: "warning", Summary: "Review", ReviewState: "unread", Evidence: []store.ReleaseEvidence{{Provider: "spotify", ProviderID: "spotify-template", Title: release.Title, PrimaryType: "Album", FirstReleaseDate: release.FirstReleaseDate, ProviderURL: release.SpotifyURL}}}},
+		Resolutions: []store.ArtistResolution{*resolution}, Resolution: resolution, Destinations: []store.Destination{{ID: 1, UserID: user.ID, Name: "Primary", Service: "ntfy", Enabled: true}}, History: []store.DeliveryHistory{{Title: "Template", EventType: "announcement", Destination: "Primary", Status: "sent", CreatedAt: now}},
+		AdminHistory: []store.AdminDeliveryHistory{{DeliveryID: 1, UserEmail: user.Email, Title: "Template", Body: "Body", EventType: "announcement", Destination: "Primary", Service: "ntfy", Status: "sent", Attempts: 1, CreatedAt: now}}, AdminDelivery: &store.AdminDeliveryHistory{UserEmail: user.Email, Title: "Template", Body: "Body", EventType: "announcement", Destination: "Primary", Service: "ntfy", Status: "sent", Attempts: 1},
+		AppLogs: []logging.Entry{{Time: now, Level: "INFO", Message: "template smoke", Attributes: []logging.Field{{Key: "count", Value: "1"}}}}, AdminUsers: []store.AdminUser{{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime, CreatedAt: now, FollowCount: 1, DestinationCount: 1}}, AdminArtists: []store.AdminArtist{{ID: artist.ID, Name: artist.Name, MBID: artist.MBID}}, ProviderHealth: []store.ProviderHealth{{Provider: "spotify", LastSuccessAt: &providerTime, UpdatedAt: now}}, ManualSyncs: []store.ManualSyncRequest{{ID: 1, Scope: "artist", Status: "queued", CreatedAt: now}}, Import: &store.ImportJob{ID: 1, UserID: user.ID, CreatedAt: now, Added: 1, Rows: []store.ImportRow{{SourceValue: artist.MBID, DisplayName: artist.Name, Status: "added"}}},
+		FollowCount: 1, ListenBrainzArtists: []store.Artist{artist}, GenreBreakdown: []store.ArtistBreakdown{{Label: "Pop", Count: 1}}, CountryBreakdown: []store.ArtistBreakdown{{Label: "NL", Count: 1}}, TypeBreakdown: []store.ArtistBreakdown{{Label: "Person", Count: 1}}, CoverageSummary: store.CoverageSummary{Artists: 1, FreshArtists: 1, ConfirmedReleases: 1}, CoverageArtists: []store.ArtistCoverage{{Artist: artist, OverallStatus: "confirmed", ReleaseCount: 1, ConfirmedReleases: 1, ProviderStatuses: []store.ArtistProviderStatus{{Provider: "spotify", Status: "healthy", ReleaseCount: 1, LastSuccessAt: &providerTime}}}}, CoveragePage: 1, CoveragePages: 1, CoveragePageStart: 1, CoveragePageEnd: 1,
+		EvidenceIssues: []store.EvidenceIssue{{ID: 1, ReleaseGroupID: release.ID, ArtistName: artist.Name, ReleaseTitle: release.Title, IssueType: "date_conflict", Severity: "warning", Summary: "Review", ReviewState: "unread", LastSeenAt: now}}, EvidenceIssueCount: 1, EvidenceIssueUnreadCount: 1, EvidenceIssueStatus: "open", EvidenceIssueState: "unread", EvidenceIssuePage: 1, EvidenceIssuePages: 1, EvidenceIssuePageStart: 1, EvidenceIssuePageEnd: 1, EvidenceIssueURL: "/coverage/issues",
+		InboxItems: []store.ReleaseInboxItem{{Release: release, EventType: "release_day", EventTitle: "Template", EventCreatedAt: now, State: "unread"}}, InboxUnreadCount: 1, InboxCount: 1, InboxState: "unread", InboxPage: 1, InboxPages: 1, InboxPageStart: 1, InboxPageEnd: 1, InboxURL: "/inbox",
+		AdminPage: 1, AdminPages: 1, ArtistPage: 1, ArtistPages: 1, ArtistPageStart: 1, ArtistPageEnd: 1, FilteredArtistCount: 1, GeneratedURL: "https://example.test/token", Token: "token", TokenKind: "invite", TokenEmail: user.Email,
+	}
+	for _, name := range []string{"login", "setup", "token", "admin", "admin_delivery", "artists", "calendar", "coverage", "evidence_issues", "dashboard", "inbox", "release", "resolution", "settings", "destinations", "import"} {
+		var output bytes.Buffer
+		if err := app.templates.ExecuteTemplate(&output, name+".html", data); err != nil {
+			t.Errorf("template %s failed: %v", name, err)
+		}
+		if output.Len() == 0 {
+			t.Errorf("template %s rendered an empty page", name)
+		}
 	}
 }

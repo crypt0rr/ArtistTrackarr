@@ -308,6 +308,16 @@ The test suite runs in the pinned Go toolchain from the build image:
 docker build --target test .
 ```
 
+To measure statement coverage for the internal packages locally:
+
+```console
+make coverage
+```
+
+The command writes the temporary `coverage.out` profile (ignored by Git) and
+prints the combined percentage from `go tool cover`. It enforces an 80% minimum
+by default; use `make coverage COVERAGE_MIN=85` to test a stricter local target.
+
 To build and run the current checkout instead of the published image:
 
 ```console
