@@ -78,3 +78,18 @@ func TestPasswordSlotsBoundConcurrentArgon2Work(t *testing.T) {
 	}
 	thirdRelease()
 }
+
+func TestFormatRetryAfterNormalizesNonPositiveValues(t *testing.T) {
+	for _, test := range []struct {
+		seconds int
+		want    string
+	}{
+		{seconds: -10, want: "1"},
+		{seconds: 0, want: "1"},
+		{seconds: 42, want: "42"},
+	} {
+		if got := formatRetryAfter(test.seconds); got != test.want {
+			t.Errorf("formatRetryAfter(%d)=%q, want %q", test.seconds, got, test.want)
+		}
+	}
+}

@@ -134,3 +134,74 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 		t.Fatalf("digest run status=%q, want sent", status)
 	}
 }
+
+func TestQueueDueReleaseDigestsWeeklyAndSkipsInvalidSchedules(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	weeklyUser, err := s.CreateUser(ctx, "weekly-digest@example.com", "hash", "member", "UTC", "weekly-digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "weekly-digest-artist", Name: "Weekly Digest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, weeklyUser, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: weeklyUser, Albums: true, EPs: true, Singles: true, DigestEnabled: true, DigestFrequency: "weekly",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, weeklyUser, "Weekly destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "weekly-digest-release", artist.ID, "Weekly Digest Release", "Album", "[]", "2026-08-10", 3,
+		"https://musicbrainz.org/release-group/weekly-digest-release", "musicbrainz", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	queued, err := s.QueueDueReleaseDigests(ctx, now)
+	if err != nil || queued != 1 {
+		t.Fatalf("weekly queued=%d err=%v", queued, err)
+	}
+	queued, err = s.QueueDueReleaseDigests(ctx, now.Add(time.Hour))
+	if err != nil || queued != 0 {
+		t.Fatalf("weekly duplicate queued=%d err=%v", queued, err)
+	}
+
+	invalidUser, err := s.CreateUser(ctx, "invalid-zone@example.com", "hash", "member", "UTC", "invalid-zone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE users SET timezone='Not/AZone' WHERE id=?`, invalidUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: invalidUser, Albums: true, DigestEnabled: true, DigestFrequency: "weekly",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lateUser, err := s.CreateUser(ctx, "late-reminder@example.com", "hash", "member", "UTC", "late-reminder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, lateUser, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: lateUser, Albums: true, DigestEnabled: true, DigestFrequency: "weekly",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE users SET reminder_time='23:00' WHERE id=?`, lateUser); err != nil {
+		t.Fatal(err)
+	}
+	queued, err = s.QueueDueReleaseDigests(ctx, now)
+	if err != nil || queued != 0 {
+		t.Fatalf("invalid/future schedules queued=%d err=%v", queued, err)
+	}
+}

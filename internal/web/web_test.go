@@ -93,6 +93,7 @@ type fakeSpotify struct {
 	artist      catalog.SpotifyArtist
 	artists     map[string]catalog.SpotifyArtist
 	artistErr   error
+	batchErr    error
 	searchCalls int
 }
 
@@ -106,6 +107,19 @@ func (f *fakeSpotify) Artist(_ context.Context, id string) (catalog.SpotifyArtis
 		return artist, nil
 	}
 	return f.artist, f.artistErr
+}
+
+func (f *fakeSpotify) Artists(_ context.Context, ids []string) ([]catalog.SpotifyArtist, error) {
+	if f.batchErr != nil {
+		return nil, f.batchErr
+	}
+	result := make([]catalog.SpotifyArtist, 0, len(ids))
+	for _, id := range ids {
+		if artist, ok := f.artists[id]; ok {
+			result = append(result, artist)
+		}
+	}
+	return result, nil
 }
 
 type fakeArtwork struct{}
@@ -224,6 +238,24 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/setup")
+	response := postForm(t, client, server.URL+"/setup", url.Values{
+		"_csrf": {csrf}, "setup_token": {"incorrect setup token"}, "email": {"admin@example.com"},
+		"username": {"administrator"}, "password": {"a secure test password"}, "timezone": {"Europe/Amsterdam"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("invalid setup token status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/setup")
+	response = postForm(t, client, server.URL+"/setup", url.Values{
+		"_csrf": {csrf}, "setup_token": {cfg.SetupToken}, "email": {"admin@example.com"},
+		"username": {"x"}, "password": {"a secure test password"}, "timezone": {"Europe/Amsterdam"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid setup username status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/setup")
 	setupResponse := postForm(t, client, server.URL+"/setup", url.Values{
 		"_csrf": {csrf}, "setup_token": {cfg.SetupToken}, "email": {"admin@example.com"},
 		"password": {"a secure test password"}, "timezone": {"Europe/Amsterdam"},
@@ -232,8 +264,29 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = setupResponse.Body.Close()
+	setupRedirectClient := noRedirectClient(client)
+	setupPage, err := setupRedirectClient.Get(server.URL + "/setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = setupPage.Body.Close()
+	if setupPage.StatusCode != http.StatusSeeOther || setupPage.Header.Get("Location") != "/login" {
+		t.Fatalf("completed setup GET status=%d location=%q", setupPage.StatusCode, setupPage.Header.Get("Location"))
+	}
 	csrf = getCSRF(t, client, server.URL+"/login")
-	response := postForm(t, client, server.URL+"/login", url.Values{
+	setupConflict, err := setupRedirectClient.PostForm(server.URL+"/setup", url.Values{
+		"_csrf": {csrf}, "setup_token": {cfg.SetupToken}, "email": {"second-admin@example.com"},
+		"password": {"another secure test password"}, "timezone": {"UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = setupConflict.Body.Close()
+	if setupConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("completed setup POST status=%d", setupConflict.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
 		"_csrf": {csrf}, "email": {"admin@example.com"}, "password": {"a secure test password"},
 	})
 	body, _ := io.ReadAll(response.Body)
@@ -352,6 +405,31 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 	}
 	if spotify.searchCalls != 1 || mb.calls != 0 {
 		t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", spotify.searchCalls, mb.calls)
+	}
+}
+
+func TestLoginRejectsInvalidAndUnknownCredentials(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/")
+	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
+		"_csrf": {csrf}, "email": {"member@example.com"}, "password": {"wrong password"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "Email or password is incorrect") {
+		t.Fatalf("invalid password status/body=%d %q", response.StatusCode, body)
+	}
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
+		"_csrf": {csrf}, "email": {"missing@example.com"}, "password": {"wrong password"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "Email or password is incorrect") {
+		t.Fatalf("unknown email status/body=%d %q", response.StatusCode, body)
 	}
 }
 
@@ -474,8 +552,11 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	_ = response.Body.Close()
 	ics := string(body)
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/calendar; charset=utf-8" ||
+		response.Header.Get("Content-Disposition") != `attachment; filename="artisttrackarr-releases.ics"` ||
+		response.Header.Get("Cache-Control") != "private, max-age=300" ||
 		!strings.Contains(ics, "BEGIN:VCALENDAR") || !strings.Contains(ics, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
-		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) {
+		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
+		!strings.Contains(ics, "https://music.apple.com/us/album/calendar-web-release") {
 		t.Fatalf("calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
 	}
 }
@@ -507,6 +588,37 @@ func TestSearchFallsBackToMusicBrainz(t *testing.T) {
 				t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", test.spotify.searchCalls, mb.calls)
 			}
 		})
+	}
+}
+
+func TestSearchUsesITunesBeforeMusicBrainzWhenSpotifyIsUnavailable(t *testing.T) {
+	mb := &searchCatalog{results: []catalog.ArtistResult{{MBID: "musicbrainz-fallback", Name: "MusicBrainz fallback"}}}
+	itunes := &actionITunes{artists: map[string]catalog.ITunesArtist{
+		"123": {ID: "123", Name: "Apple result", URL: "https://music.apple.com/us/artist/apple-result/123"},
+	}}
+	spotify := &fakeSpotify{searchErr: errors.New("Spotify unavailable")}
+	_, server, client := authenticatedTestServerWithITunes(t, mb, spotify, itunes, nil)
+	response, err := client.Get(server.URL + "/artists/search?q=apple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Apple result") ||
+		!strings.Contains(string(body), "Apple/iTunes discovery") || mb.calls != 0 {
+		t.Fatalf("iTunes search status/body=%d %q mb calls=%d", response.StatusCode, body, mb.calls)
+	}
+
+	itunes.searchErr = errors.New("iTunes unavailable")
+	response, err = client.Get(server.URL + "/artists/search?q=apple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "MusicBrainz fallback") ||
+		!strings.Contains(string(body), "Spotify and Apple/iTunes discovery are unavailable") || mb.calls != 1 {
+		t.Fatalf("MusicBrainz fallback status/body=%d %q mb calls=%d", response.StatusCode, body, mb.calls)
 	}
 }
 
@@ -612,6 +724,36 @@ func TestSpotifyBatchFollowSelection(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("oversized selection status=%d", response.StatusCode)
+	}
+}
+
+func TestSpotifyBatchLookupHandlesMissingAndProviderErrors(t *testing.T) {
+	const knownID = "0OdUWJ0sBjDrqHygGUXeCF"
+	const missingID = "1OdUWJ0sBjDrqHygGUXeCG"
+	spotify := &fakeSpotify{artists: map[string]catalog.SpotifyArtist{
+		knownID: {ID: knownID, Name: "Known Artist", URL: "https://open.spotify.com/artist/" + knownID},
+	}}
+	_, server, client := authenticatedTestServer(t, &searchCatalog{}, spotify, nil)
+	csrf := getCSRF(t, client, server.URL+"/artists")
+	response := postForm(t, client, server.URL+"/artists/follow/spotify/batch", url.Values{
+		"_csrf": {csrf}, "spotify_ids": {knownID, missingID},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "1 queued") ||
+		!strings.Contains(string(body), "1 failed") {
+		t.Fatalf("missing batch artist status/body=%d %q", response.StatusCode, body)
+	}
+
+	spotify.batchErr = errors.New("Spotify batch unavailable")
+	response = postForm(t, client, server.URL+"/artists/follow/spotify/batch", url.Values{
+		"_csrf": {csrf}, "spotify_ids": {knownID},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "0 queued") ||
+		!strings.Contains(string(body), "1 failed") {
+		t.Fatalf("batch provider error status/body=%d %q", response.StatusCode, body)
 	}
 }
 
@@ -960,6 +1102,23 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	if detailResponse.StatusCode != http.StatusOK || !strings.Contains(string(detailBody), "provider rejected secret detail") {
 		t.Fatalf("admin delivery detail status/body=%d %q", detailResponse.StatusCode, detailBody)
 	}
+	bad := noRedirectClient(client)
+	response, err = bad.Get(server.URL + "/admin/deliveries/not-an-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid admin delivery ID status=%d", response.StatusCode)
+	}
+	response, err = bad.Get(server.URL + "/admin/deliveries/999999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing admin delivery status=%d", response.StatusCode)
+	}
 	csrf = getCSRF(t, client, server.URL+"/admin")
 	response = postForm(t, client, server.URL+"/admin/users/"+strconv.FormatInt(user.ID, 10)+"/delete", url.Values{
 		"_csrf": {csrf},
@@ -1030,6 +1189,14 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-user review status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response = postForm(t, client, server.URL+"/artist-resolutions/"+strconv.FormatInt(otherResolution.ID, 10)+"/cancel", url.Values{
+		"_csrf": {csrf},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-user resolution cancel status=%d", response.StatusCode)
 	}
 }
 
@@ -1160,6 +1327,62 @@ func TestReleaseTruthDeskReviewsProviderConflicts(t *testing.T) {
 	}
 	if count, err := database.EvidenceIssueUnreadCount(context.Background(), user.ID, now.Add(2*time.Minute)); err != nil || count != 0 {
 		t.Fatalf("truth desk unread after confirm=%d err=%v", count, err)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/releases/"+strconv.FormatInt(releaseID, 10)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"confirm"}, "provider": {"spotify"}, "reason": {"current listing"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("confirm release truth action status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/releases/"+strconv.FormatInt(releaseID, 10)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"unknown"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid truth action status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/releases/"+strconv.FormatInt(releaseID, 10)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"clear"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("clear truth action status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/coverage/issues/"+strconv.FormatInt(issues[0].ID, 10)+"/restore", url.Values{
+		"_csrf": {csrf}, "return": {"/coverage/issues"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("truth desk restore status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/coverage/issues/"+strconv.FormatInt(issues[0].ID, 10)+"/snooze", url.Values{
+		"_csrf": {csrf}, "duration": {"1d"}, "return": {"/coverage/issues"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("truth desk snooze status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/coverage/issues/"+strconv.FormatInt(issues[0].ID, 10)+"/snooze", url.Values{
+		"_csrf": {csrf}, "duration": {"invalid"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("truth desk invalid snooze status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/coverage/issues")
+	response = postForm(t, client, server.URL+"/coverage/issues/"+strconv.FormatInt(issues[0].ID, 10)+"/dismiss", url.Values{
+		"_csrf": {csrf}, "return": {"/coverage/issues"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("truth desk dismiss status=%d", response.StatusCode)
 	}
 }
 
@@ -1489,6 +1712,16 @@ func authenticatedTestServer(
 	spotify catalog.SpotifyProvider,
 	runnerFactory func(*store.Store) *jobs.Runner,
 ) (*store.Store, *httptest.Server, *http.Client) {
+	return authenticatedTestServerWithITunes(t, mb, spotify, nil, runnerFactory)
+}
+
+func authenticatedTestServerWithITunes(
+	t *testing.T,
+	mb catalog.CatalogProvider,
+	spotify catalog.SpotifyProvider,
+	itunes catalog.ITunesProvider,
+	runnerFactory func(*store.Store) *jobs.Runner,
+) (*store.Store, *httptest.Server, *http.Client) {
 	t.Helper()
 	database, err := store.Open(filepath.Join(t.TempDir(), "authenticated.db"))
 	if err != nil {
@@ -1515,7 +1748,7 @@ func authenticatedTestServer(
 	}
 	app, err := New(
 		cfg, database, mb, spotify, fakeSender{}, cipher, fakeArtwork{}, runner,
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), itunes,
 	)
 	if err != nil {
 		t.Fatal(err)

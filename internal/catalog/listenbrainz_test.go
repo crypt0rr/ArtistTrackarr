@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,17 @@ import (
 	"testing"
 	"time"
 )
+
+func TestListenBrainzWaitHonorsContextCancellation(t *testing.T) {
+	provider := NewListenBrainz()
+	provider.requestEvery = time.Hour
+	provider.lastRequest = time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := provider.wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait cancellation error=%v", err)
+	}
+}
 
 func TestListenBrainzPopularityParsesAndCaches(t *testing.T) {
 	var requests atomic.Int32
@@ -32,5 +44,14 @@ func TestListenBrainzPopularityParsesAndCaches(t *testing.T) {
 	second, err := provider.Popularity(context.Background(), []string{"ABC"})
 	if err != nil || second["abc"].TotalListenCount != 1234 || requests.Load() != 1 {
 		t.Fatalf("cached stats=%#v requests=%d err=%v", second, requests.Load(), err)
+	}
+}
+
+func TestMergeListenBrainzStatsPrefersFreshValues(t *testing.T) {
+	base := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: 1}}
+	extra := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: 2}, "other": {MBID: "other"}}
+	merged := mergeListenBrainzStats(base, extra)
+	if len(merged) != 2 || merged["artist"].TotalListenCount != 2 || merged["other"].MBID != "other" {
+		t.Fatalf("merged stats=%#v", merged)
 	}
 }

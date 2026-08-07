@@ -916,7 +916,7 @@ func SpotifyID(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	if strings.HasPrefix(value, "spotify:artist:") {
 		value = strings.TrimPrefix(value, "spotify:artist:")
-	} else if parsed, err := url.Parse(value); err == nil && strings.Contains(parsed.Host, "spotify.com") {
+	} else if parsed, err := url.Parse(value); err == nil && parsed.Scheme == "https" && trustedProviderHost(parsed.Hostname(), "spotify.com") {
 		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 		if len(parts) == 2 && parts[0] == "artist" {
 			value = parts[1]
@@ -1225,13 +1225,19 @@ func spotifyReleaseImage(images []struct {
 
 func extractMBID(value string) string {
 	value = strings.TrimSpace(value)
-	if parsed, err := url.Parse(value); err == nil && strings.Contains(parsed.Host, "musicbrainz.org") {
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme == "https" && trustedProviderHost(parsed.Hostname(), "musicbrainz.org") {
 		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 		if len(parts) == 2 && parts[0] == "artist" {
 			return parts[1]
 		}
 	}
 	return value
+}
+
+func trustedProviderHost(host, domain string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 func validMBID(value string) bool {
