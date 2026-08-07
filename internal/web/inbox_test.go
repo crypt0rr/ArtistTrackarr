@@ -67,4 +67,28 @@ func TestReleaseInboxPageAndStateAction(t *testing.T) {
 	if count, err := database.ReleaseInboxUnreadCount(ctx, user.ID, now); err != nil || count != 0 {
 		t.Fatalf("unread count after read=%d err=%v", count, err)
 	}
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, client, server.URL+"/inbox/"+fmt.Sprint(releaseID)+"/snooze", url.Values{
+		"_csrf": {csrf}, "duration": {"1h"}, "return": {"/inbox"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("snooze action status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, client, server.URL+"/inbox/"+fmt.Sprint(releaseID)+"/snooze", url.Values{
+		"_csrf": {csrf}, "duration": {"invalid"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid snooze status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, client, server.URL+"/inbox/"+fmt.Sprint(releaseID)+"/dismiss", url.Values{
+		"_csrf": {csrf}, "return": {"/inbox"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("dismiss action status=%d", response.StatusCode)
+	}
 }

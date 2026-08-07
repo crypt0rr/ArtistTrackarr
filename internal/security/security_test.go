@@ -1,6 +1,9 @@
 package security
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPasswordRoundTrip(t *testing.T) {
 	encoded, err := HashPassword("a very good household password")
@@ -53,5 +56,15 @@ func TestSignedToken(t *testing.T) {
 	}
 	if _, ok := VerifySignedToken("different secret", signed); ok {
 		t.Fatal("token validated under a different secret")
+	}
+}
+
+func TestTokenAndDigest(t *testing.T) {
+	token, err := Token(24)
+	if err != nil || len(token) < 20 || strings.ContainsAny(token, "=+/\n") {
+		t.Fatalf("token=%q err=%v", token, err)
+	}
+	if len(Digest("artisttrackarr")) != 32 || string(Digest("artisttrackarr")) == string(Digest("different")) {
+		t.Fatal("digest was not a stable 256-bit distinction")
 	}
 }

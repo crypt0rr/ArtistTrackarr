@@ -47,6 +47,268 @@ func TestMusicBrainzRetriesTransientTransportFailures(t *testing.T) {
 	}
 }
 
+func TestSpotifyCachesEvictOldestEntriesAndExpire(t *testing.T) {
+	now := time.Now()
+	spotify := &Spotify{
+		searchCache: map[string]spotifySearchCache{
+			"old": {observedAt: now.Add(-2 * time.Minute), expiresAt: now.Add(time.Minute), results: []SpotifyArtist{{ID: "old"}}},
+			"new": {observedAt: now.Add(-time.Minute), expiresAt: now.Add(time.Minute), results: []SpotifyArtist{{ID: "new"}}},
+		},
+		artistCache: map[string]spotifyArtistCache{
+			"old": {observedAt: now.Add(-2 * time.Minute), expiresAt: now.Add(time.Minute), artist: SpotifyArtist{ID: "old"}},
+			"new": {observedAt: now.Add(-time.Minute), expiresAt: now.Add(time.Minute), artist: SpotifyArtist{ID: "new"}},
+		},
+		maxSearchCache: 1, maxArtistCache: 1,
+	}
+	spotify.evictSearchCacheLocked()
+	spotify.evictArtistCacheLocked()
+	if _, ok := spotify.searchCache["old"]; ok {
+		t.Fatal("oldest search cache entry was not evicted")
+	}
+	if _, ok := spotify.artistCache["old"]; ok {
+		t.Fatal("oldest artist cache entry was not evicted")
+	}
+
+	spotify.searchCache["expired"] = spotifySearchCache{expiresAt: now.Add(-time.Second), results: []SpotifyArtist{{ID: "expired"}}}
+	if _, ok := spotify.cachedSearch("expired"); ok {
+		t.Fatal("expired search cache entry was returned")
+	}
+	spotify.artistCache["expired"] = spotifyArtistCache{expiresAt: now.Add(-time.Second), artist: SpotifyArtist{ID: "expired"}}
+	if _, ok := spotify.cachedArtist("expired"); ok {
+		t.Fatal("expired artist cache entry was returned")
+	}
+}
+
+func TestMusicBrainzSearchValidationAndResponseErrors(t *testing.T) {
+	mb := NewMusicBrainz("test@example.com")
+	mb.interval = 0
+	mb.retryBase = 0
+	if _, err := mb.SearchArtists(context.Background(), "   ", 10); err == nil {
+		t.Fatal("blank MusicBrainz query was accepted")
+	}
+	var requests atomic.Int32
+	mb.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		if request.URL.Query().Get("limit") != "25" {
+			t.Fatalf("limit=%q, want 25", request.URL.Query().Get("limit"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"artists":[{"id":"6e335887-60ba-38f0-95af-fae7774336bf","name":"Example","aliases":[{"name":"one"},{"name":"two"},{"name":"three"},{"name":"four"}],"genres":[{"name":"pop"},{"name":"rock"},{"name":"jazz"},{"name":"metal"},{"name":"folk"},{"name":"soul"},{"name":"rap"},{"name":"blues"},{"name":"house"},{"name":"techno"},{"name":"noise"}]}]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	results, err := mb.SearchArtists(context.Background(), "example", 25)
+	if err != nil || len(results) != 1 || len(results[0].Aliases) != 3 || len(results[0].Genres) != 10 || requests.Load() != 1 {
+		t.Fatalf("results=%#v requests=%d err=%v", results, requests.Load(), err)
+	}
+
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		mb.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Status: http.StatusText(status), Body: io.NopCloser(strings.NewReader("error")), Header: make(http.Header)}, nil
+		})}
+		_, err := mb.SearchArtists(context.Background(), "example", 10)
+		var statusErr *HTTPStatusError
+		if !errors.As(err, &statusErr) || statusErr.Status != status {
+			t.Fatalf("status=%d error=%#v err=%v", status, statusErr, err)
+		}
+	}
+
+	mb.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("not json")), Header: make(http.Header)}, nil
+	})}
+	if _, err := mb.SearchArtists(context.Background(), "example", 10); err == nil {
+		t.Fatal("malformed MusicBrainz response was accepted")
+	}
+
+	mb.interval = time.Hour
+	mb.lastCall = time.Now()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := mb.SearchArtists(canceled, "example", 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled MusicBrainz search error=%v", err)
+	}
+}
+
+func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
+	const mbid = "11111111-1111-4111-8111-111111111111"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/ws/2/artist/" + mbid:
+			_, _ = io.WriteString(w, `{"id":"`+mbid+`","name":"Resolved","sort-name":"Resolved","type":"Person","country":"NL","disambiguation":"singer","genres":[{"name":"pop"},{"name":""}]}`)
+		case "/ws/2/release-group":
+			if request.URL.Query().Get("artist") != mbid || request.URL.Query().Get("type") != "album|ep|single" {
+				t.Fatalf("unexpected release-group query: %s", request.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"release-one","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"release-two","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	artist, err := mb.ResolveArtist(context.Background(), mbid)
+	if err != nil || artist.MBID != mbid || artist.Name != "Resolved" || len(artist.Genres) != 1 {
+		t.Fatalf("resolved artist=%#v err=%v", artist, err)
+	}
+	if _, err := mb.ResolveArtist(context.Background(), "not-an-mbid"); err == nil {
+		t.Fatal("invalid MusicBrainz ID was accepted")
+	}
+	releases, err := mb.ArtistReleases(context.Background(), mbid)
+	if err != nil || len(releases) != 2 || releases[0].DatePrecision != 1 || releases[1].DatePrecision != 2 {
+		t.Fatalf("release groups=%#v err=%v", releases, err)
+	}
+	if got := artist.StoreArtist(); got.MBID != mbid || got.Country != "NL" {
+		t.Fatalf("StoreArtist projection=%#v", got)
+	}
+	results := []ArtistResult{{Name: "Resolved"}, {Name: "Other", Genres: []string{"rock"}}}
+	Enrich(results, []SpotifyArtist{{Name: "resolved", ID: "spotify-id", URL: "https://open.spotify.com/artist/spotify-id", Genres: []string{"pop"}}})
+	if results[0].SpotifyID != "spotify-id" || len(results[0].Genres) != 1 {
+		t.Fatalf("artist enrichment=%#v", results)
+	}
+}
+
+func TestCatalogProviderErrorsAndIdentifiers(t *testing.T) {
+	if got := (&HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusBadGateway, Text: "502 Bad Gateway"}).Error(); got != "MusicBrainz returned 502 Bad Gateway" {
+		t.Fatalf("HTTPStatusError=%q", got)
+	}
+	if got := (&SpotifyRateLimitError{Operation: "search", Reason: "RATE_LIMITED", RetryAfter: time.Second}).Error(); !strings.Contains(got, "retry after 1s") {
+		t.Fatalf("SpotifyRateLimitError=%q", got)
+	}
+	if got := (&ITunesRateLimitError{Operation: "lookup", Reason: "RATE_LIMITED", RetryAfter: time.Second}).Error(); !strings.Contains(got, "retry after 1s") {
+		t.Fatalf("ITunesRateLimitError=%q", got)
+	}
+	if got := (&ITunesAPIError{Operation: "search", StatusText: "500 Internal Server Error"}).Error(); got != "search returned 500 Internal Server Error" {
+		t.Fatalf("ITunesAPIError=%q", got)
+	}
+	for _, value := range []string{"1", "123456789"} {
+		if !validITunesID(value) {
+			t.Fatalf("valid iTunes ID %q rejected", value)
+		}
+	}
+	for _, value := range []string{"", "1a", "-1"} {
+		if validITunesID(value) {
+			t.Fatalf("invalid iTunes ID %q accepted", value)
+		}
+	}
+}
+
+func TestProviderDatePrecisionFallbacks(t *testing.T) {
+	for _, test := range []struct {
+		precision, value string
+		want             int
+	}{
+		{precision: "year", value: "2026-08-07", want: 1},
+		{precision: "month", value: "2026-08-07", want: 2},
+		{precision: "day", value: "2026-08-07", want: 3},
+		{precision: "unknown", value: "2026", want: 1},
+		{precision: "unknown", value: "2026-08", want: 2},
+		{precision: "unknown", value: "2026-08-07", want: 3},
+		{precision: "unknown", value: "x", want: 0},
+	} {
+		if got := spotifyDatePrecision(test.precision, test.value); got != test.want {
+			t.Errorf("spotifyDatePrecision(%q,%q)=%d, want %d", test.precision, test.value, got, test.want)
+		}
+	}
+	for _, test := range []struct {
+		value string
+		want  string
+		prec  int
+	}{
+		{value: "2026-08-07T00:00:00Z", want: "2026-08-07", prec: 3},
+		{value: "2026-08-07", want: "2026-08-07", prec: 3},
+		{value: "2026-08", want: "2026-08", prec: 2},
+		{value: "2026", want: "2026", prec: 1},
+		{value: "not-a-date", want: "", prec: 0},
+	} {
+		got, precision := iTunesDate(test.value)
+		if got != test.want || precision != test.prec {
+			t.Errorf("iTunesDate(%q)=(%q,%d), want (%q,%d)", test.value, got, precision, test.want, test.prec)
+		}
+	}
+}
+
+func TestSpotifyReleaseTypeClassification(t *testing.T) {
+	for _, test := range []struct {
+		name, albumType, group, title string
+		tracks                        int
+		want                          string
+		secondary                     []string
+		ok                            bool
+	}{
+		{name: "album", albumType: "album", want: "Album", ok: true},
+		{name: "compilation group", albumType: "album", group: "compilation", want: "Album", secondary: []string{"Compilation"}, ok: true},
+		{name: "compilation type", albumType: "compilation", want: "Album", secondary: []string{"Compilation"}, ok: true},
+		{name: "long single ep", albumType: "single", tracks: 4, want: "EP", ok: true},
+		{name: "named ep", albumType: "single", title: "Live EP", tracks: 2, want: "EP", ok: true},
+		{name: "single", albumType: "single", tracks: 1, want: "Single", ok: true},
+		{name: "unknown", albumType: "podcast", want: "", ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, secondary, ok := spotifyReleaseType(test.albumType, test.group, test.title, test.tracks)
+			if got != test.want || ok != test.ok || strings.Join(secondary, ",") != strings.Join(test.secondary, ",") {
+				t.Fatalf("spotifyReleaseType()=(%q,%#v,%v), want (%q,%#v,%v)", got, secondary, ok, test.want, test.secondary, test.ok)
+			}
+		})
+	}
+}
+
+func TestSpotifyReleaseImageSelectionAndTrustedHosts(t *testing.T) {
+	if got := spotifyReleaseImage(nil); got != "" {
+		t.Fatalf("empty release image=%q", got)
+	}
+	images := []struct {
+		URL   string `json:"url"`
+		Width int    `json:"width"`
+	}{
+		{URL: "small", Width: 64},
+		{URL: "large", Width: 640},
+	}
+	if got := spotifyReleaseImage(images); got != "large" {
+		t.Fatalf("selected release image=%q", got)
+	}
+	if got := spotifyReleaseImage([]struct {
+		URL   string `json:"url"`
+		Width int    `json:"width"`
+	}{{URL: "small", Width: 64}}); got != "small" {
+		t.Fatalf("small-only release image=%q", got)
+	}
+	for _, test := range []struct {
+		host, domain string
+		want         bool
+	}{
+		{host: "musicbrainz.org", domain: "musicbrainz.org", want: true},
+		{host: "api.musicbrainz.org", domain: "musicbrainz.org", want: true},
+		{host: "MUSICBRAINZ.ORG.", domain: "musicbrainz.org", want: true},
+		{host: "musicbrainz.org.evil.test", domain: "musicbrainz.org", want: false},
+	} {
+		if got := trustedProviderHost(test.host, test.domain); got != test.want {
+			t.Errorf("trustedProviderHost(%q,%q)=%v, want %v", test.host, test.domain, got, test.want)
+		}
+	}
+}
+
+func TestITunesRetryAfterBoundsValues(t *testing.T) {
+	if got := iTunesRetryAfter("0"); got != time.Minute {
+		t.Fatalf("zero Retry-After=%v", got)
+	}
+	if got := iTunesRetryAfter("120"); got != 2*time.Minute {
+		t.Fatalf("numeric Retry-After=%v", got)
+	}
+	if got := iTunesRetryAfter("99999999"); got != 6*time.Hour {
+		t.Fatalf("bounded Retry-After=%v", got)
+	}
+	if got := iTunesRetryAfter("not-a-duration"); got != time.Minute {
+		t.Fatalf("invalid Retry-After=%v", got)
+	}
+	future := time.Now().Add(2 * time.Minute).UTC().Format(http.TimeFormat)
+	if got := iTunesRetryAfter(future); got < time.Minute || got > 3*time.Minute {
+		t.Fatalf("HTTP-date Retry-After=%v", got)
+	}
+}
+
 func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 	var searchRequests, releaseRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -59,6 +321,10 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 			return
 		}
 		if request.URL.Path == "/lookup" {
+			if request.URL.Query().Get("entity") == "musicArtist" {
+				_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/nl/artist/example"}]}`)
+				return
+			}
 			releaseRequests.Add(1)
 			if request.URL.Query().Get("entity") != "album" {
 				t.Fatalf("unexpected iTunes lookup query: %s", request.URL.RawQuery)
@@ -87,6 +353,13 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 	}
 	if first[0].ITunesArtworkURL != "https://is1-ssl.mzstatic.com/image/thumb/Features/250x250bb.jpg" {
 		t.Fatalf("normalized artwork=%q", first[0].ITunesArtworkURL)
+	}
+	artist, err := itunes.Artist(context.Background(), "123")
+	if err != nil || artist.ID != "123" || artist.Name != "Example" || artist.URL == "" {
+		t.Fatalf("artist lookup=%#v err=%v", artist, err)
+	}
+	if _, err := itunes.Artist(context.Background(), "not-an-id"); err == nil {
+		t.Fatal("invalid iTunes artist lookup was accepted")
 	}
 	second, err := itunes.ArtistReleases(context.Background(), "Example")
 	if err != nil || len(second) != len(first) || searchRequests.Load() != 1 || releaseRequests.Load() != 1 {
@@ -130,6 +403,21 @@ func TestITunesRateLimitHonorsRetryAfterAndSharedCooldown(t *testing.T) {
 	_, err = itunes.SearchArtists(context.Background(), "Other")
 	if !errors.As(err, &rateLimit) || !rateLimit.AlreadyBlocked || requests.Load() != 1 {
 		t.Fatalf("shared cooldown=%#v requests=%d err=%v", rateLimit, requests.Load(), err)
+	}
+}
+
+func TestITunesCooldownCanBeRestored(t *testing.T) {
+	itunes := NewITunes("US")
+	until := time.Now().Add(time.Minute)
+	itunes.RestoreCooldown(until, "quota")
+	if got := itunes.CooldownUntil(); got.Before(until.Add(-time.Second)) {
+		t.Fatalf("restored cooldown=%v, want around %v", got, until)
+	}
+	// A nil provider is safe for lifecycle code that conditionally restores
+	// persisted health state.
+	(*ITunes)(nil).RestoreCooldown(until, "ignored")
+	if got := (*ITunes)(nil).CooldownUntil(); !got.IsZero() {
+		t.Fatalf("nil cooldown=%v", got)
 	}
 }
 
@@ -615,5 +903,30 @@ func TestSpotifyID(t *testing.T) {
 	}
 	if _, ok := SpotifyID("https://example.com/artist/" + id); ok {
 		t.Fatal("accepted non-Spotify URL")
+	}
+	for _, value := range []string{
+		"https://spotify.com.evil.example/artist/" + id,
+		"https://evilspotify.com/artist/" + id,
+		"http://open.spotify.com/artist/" + id,
+	} {
+		if _, ok := SpotifyID(value); ok {
+			t.Fatalf("accepted spoofed or insecure Spotify URL %q", value)
+		}
+	}
+}
+
+func TestExtractMBIDRejectsSpoofedHosts(t *testing.T) {
+	const mbid = "11111111-1111-4111-8111-111111111111"
+	if got := extractMBID("https://musicbrainz.org/artist/" + mbid); got != mbid {
+		t.Fatalf("extractMBID() = %q, want %q", got, mbid)
+	}
+	for _, value := range []string{
+		"https://musicbrainz.org.evil.example/artist/" + mbid,
+		"https://evil-musicbrainz.org/artist/" + mbid,
+		"http://musicbrainz.org/artist/" + mbid,
+	} {
+		if got := extractMBID(value); got != value {
+			t.Fatalf("extractMBID accepted untrusted URL %q as %q", value, got)
+		}
 	}
 }

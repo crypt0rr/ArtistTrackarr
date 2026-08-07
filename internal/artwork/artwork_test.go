@@ -67,6 +67,17 @@ func TestCacheFollowsRedirectAndRefreshes(t *testing.T) {
 	}
 }
 
+func TestCacheAcceptsCustomHTTPClient(t *testing.T) {
+	client := &http.Client{Timeout: time.Second}
+	cache, err := NewCache(t.TempDir(), WithHTTPClient(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.client != client {
+		t.Fatal("custom artwork HTTP client was not retained")
+	}
+}
+
 func TestMissingArtIsNegativelyCached(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -105,6 +116,46 @@ func TestTransientFailuresAreNotNegativelyCached(t *testing.T) {
 	cache.Get(context.Background(), testMBID)
 	if requests.Load() != 2 {
 		t.Fatalf("transient response was cached; requests=%d", requests.Load())
+	}
+}
+
+func TestTransientFailureServesStaleArtwork(t *testing.T) {
+	imageData := jpegImage(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(imageData)
+			return
+		}
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	cache, err := NewCache(t.TempDir(), WithBaseURL(server.URL), WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first := cache.Get(context.Background(), testMBID); first.Status != "fetched" {
+		t.Fatalf("initial artwork status=%q", first.Status)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	stale := cache.Get(context.Background(), testMBID)
+	if stale.Status != "stale" || !bytes.Equal(stale.Data, imageData) || stale.MaxAge != time.Hour {
+		t.Fatalf("stale artwork=%#v", stale)
+	}
+}
+
+func TestAllowedImageTypes(t *testing.T) {
+	for _, value := range []string{"image/jpeg", "image/png", "image/webp; charset=binary", "image/gif"} {
+		if !allowedImageType(value) {
+			t.Fatalf("allowed image type %q rejected", value)
+		}
+	}
+	for _, value := range []string{"", "text/plain", "image/svg+xml"} {
+		if allowedImageType(value) {
+			t.Fatalf("unsupported image type %q accepted", value)
+		}
 	}
 }
 
