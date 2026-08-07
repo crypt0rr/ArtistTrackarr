@@ -6,6 +6,9 @@ import (
 )
 
 func TestPasswordRoundTrip(t *testing.T) {
+	if _, err := HashPassword("too short"); err == nil {
+		t.Fatal("short password was accepted")
+	}
 	encoded, err := HashPassword("a very good household password")
 	if err != nil {
 		t.Fatal(err)
@@ -18,6 +21,21 @@ func TestPasswordRoundTrip(t *testing.T) {
 	}
 	if CheckPassword("not-a-hash", "anything") {
 		t.Fatal("malformed hash was accepted")
+	}
+}
+
+func TestCheckPasswordRejectsMalformedArgon2Parameters(t *testing.T) {
+	for _, encoded := range []string{
+		"",
+		"not-a-hash",
+		"$argon2id$v=18$m=65536,t=3,p=2$c2FsdA$YWJj",
+		"$argon2id$v=19$m=bad,t=3,p=2$c2FsdA$YWJj",
+		"$argon2id$v=19$m=65536,t=3,p=2$%%%$YWJj",
+		"$argon2id$v=19$m=65536,t=3,p=2$c2FsdA$YWJj",
+	} {
+		if CheckPassword(encoded, "anything sufficiently long") {
+			t.Fatalf("malformed Argon2 hash was accepted: %q", encoded)
+		}
 	}
 }
 
@@ -46,6 +64,9 @@ func TestCipherRoundTripAndTamper(t *testing.T) {
 	encrypted[len(encrypted)-1] ^= 1
 	if _, err := cipher.Decrypt(encrypted); err == nil {
 		t.Fatal("tampered ciphertext was accepted")
+	}
+	if _, err := cipher.Decrypt([]byte("short")); err == nil {
+		t.Fatal("truncated ciphertext was accepted")
 	}
 }
 

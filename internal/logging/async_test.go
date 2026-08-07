@@ -58,3 +58,35 @@ func TestAsyncSinkCountsWriterErrors(t *testing.T) {
 		t.Fatalf("errors=%d, want 2", got)
 	}
 }
+
+func TestAsyncSinkCloseCanBeCanceledAndRejectsLaterEntries(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	sink := NewAsyncSink(1, func(Entry) error {
+		close(started)
+		<-release
+		return nil
+	})
+	sink.Enqueue(Entry{Message: "in flight"})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("async sink did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sink.Close(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled close error=%v", err)
+	}
+	sink.Enqueue(Entry{Message: "after close"})
+	if got := sink.Dropped(); got != 0 {
+		t.Fatalf("closed enqueue changed dropped count to %d", got)
+	}
+	close(release)
+	select {
+	case <-sink.Done():
+	case <-time.After(time.Second):
+		t.Fatal("async sink did not finish after cancellation")
+	}
+}

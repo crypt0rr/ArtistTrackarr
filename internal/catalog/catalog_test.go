@@ -406,6 +406,64 @@ func TestITunesRateLimitHonorsRetryAfterAndSharedCooldown(t *testing.T) {
 	}
 }
 
+func TestITunesProviderErrorsAndContextCancellation(t *testing.T) {
+	if got := NewITunes(" nl "); got.country != "NL" {
+		t.Fatalf("normalized storefront=%q, want NL", got.country)
+	}
+	if got := NewITunes("not-a-country"); got.country != "US" {
+		t.Fatalf("invalid storefront=%q, want US", got.country)
+	}
+
+	t.Run("upstream status", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer server.Close()
+		itunes := NewITunes("US")
+		itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+		_, err := itunes.SearchArtists(context.Background(), "status")
+		var apiErr *ITunesAPIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadGateway {
+			t.Fatalf("API error=%#v err=%v", apiErr, err)
+		}
+	})
+
+	t.Run("malformed response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, "not-json")
+		}))
+		defer server.Close()
+		itunes := NewITunes("US")
+		itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+		if _, err := itunes.SearchArtists(context.Background(), "malformed"); err == nil {
+			t.Fatal("malformed provider response was accepted")
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		itunes := NewITunes("US")
+		itunes.requestInterval = 0
+		itunes.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		})}
+		if _, err := itunes.SearchArtists(context.Background(), "transport"); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("transport error=%v", err)
+		}
+	})
+
+	t.Run("wait honors cancellation", func(t *testing.T) {
+		itunes := NewITunes("US")
+		itunes.requestInterval = time.Hour
+		itunes.lastRequest = time.Now()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := itunes.SearchArtists(ctx, "cancelled"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation error=%v", err)
+		}
+	})
+}
+
 func TestITunesCooldownCanBeRestored(t *testing.T) {
 	itunes := NewITunes("US")
 	until := time.Now().Add(time.Minute)
@@ -557,6 +615,79 @@ func TestSpotifySearchAndArtistCachesAvoidDuplicateRequests(t *testing.T) {
 	}
 	if tokenRequests.Load() != 1 || searchRequests.Load() != 1 || artistRequests.Load() != 0 {
 		t.Fatalf("token=%d search=%d artist=%d", tokenRequests.Load(), searchRequests.Load(), artistRequests.Load())
+	}
+}
+
+func TestSpotifyCoalescedLookupsHonorResultsAndCancellation(t *testing.T) {
+	spotify := NewSpotify("client-id", "client-secret")
+	searchKey := normalizeSpotifySearchQuery("same query")
+	searchCall := &spotifySearchCall{
+		done:    make(chan struct{}),
+		results: []SpotifyArtist{{ID: "search-id", Name: "Search result"}},
+	}
+	close(searchCall.done)
+	spotify.searchCalls[searchKey] = searchCall
+	results, err := spotify.SearchArtists(context.Background(), "  same   query ")
+	if err != nil || len(results) != 1 || results[0].ID != "search-id" {
+		t.Fatalf("coalesced search results=%#v err=%v", results, err)
+	}
+
+	cancelledSearch := &spotifySearchCall{done: make(chan struct{})}
+	spotify.searchCalls[normalizeSpotifySearchQuery("cancelled")] = cancelledSearch
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := spotify.SearchArtists(ctx, "cancelled"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("coalesced search cancellation=%v", err)
+	}
+
+	artistID := "artist-coalesced"
+	artistCall := &spotifyArtistCall{
+		done:   make(chan struct{}),
+		artist: SpotifyArtist{ID: artistID, Name: "Artist result"},
+	}
+	close(artistCall.done)
+	spotify.artistCalls[artistID] = artistCall
+	artist, err := spotify.Artist(context.Background(), artistID)
+	if err != nil || artist.Name != "Artist result" {
+		t.Fatalf("coalesced artist=%#v err=%v", artist, err)
+	}
+
+	cancelledArtistID := "artist-cancelled"
+	spotify.artistCalls[cancelledArtistID] = &spotifyArtistCall{done: make(chan struct{})}
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	if _, err := spotify.Artist(ctx, cancelledArtistID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("coalesced artist cancellation=%v", err)
+	}
+}
+
+func TestSpotifyCachesExpireAndEvictOldEntries(t *testing.T) {
+	spotify := NewSpotify("client-id", "client-secret")
+	now := time.Now()
+	spotify.searchCache = map[string]spotifySearchCache{
+		"expired": {expiresAt: now.Add(-time.Second)},
+		"old":     {observedAt: now.Add(-time.Hour), expiresAt: now.Add(time.Hour)},
+	}
+	if _, ok := spotify.cachedSearch("expired"); ok {
+		t.Fatal("expired search cache entry was returned")
+	}
+	spotify.maxSearchCache = 1
+	spotify.cacheSearchLocked("new", []SpotifyArtist{{ID: "new"}})
+	if _, ok := spotify.searchCache["old"]; ok {
+		t.Fatal("old search cache entry was not evicted")
+	}
+
+	spotify.artistCache = map[string]spotifyArtistCache{
+		"expired": {expiresAt: now.Add(-time.Second)},
+		"old":     {observedAt: now.Add(-time.Hour), expiresAt: now.Add(time.Hour)},
+	}
+	if _, ok := spotify.cachedArtist("expired"); ok {
+		t.Fatal("expired artist cache entry was returned")
+	}
+	spotify.maxArtistCache = 1
+	spotify.cacheArtistLocked(SpotifyArtist{ID: "new"})
+	if _, ok := spotify.artistCache["old"]; ok {
+		t.Fatal("old artist cache entry was not evicted")
 	}
 }
 

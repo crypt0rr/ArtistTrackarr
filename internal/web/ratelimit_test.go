@@ -1,6 +1,9 @@
 package web
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +11,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/config"
+	"github.com/crypt0rr/artist-tracker/internal/store"
 )
 
 func TestFixedWindowLimiterBoundsRequestsAndExpires(t *testing.T) {
@@ -51,6 +55,26 @@ func TestClientIPOnlyTrustsForwardedHeadersFromConfiguredProxy(t *testing.T) {
 	if got := app.clientIP(request); got != "198.51.100.20" {
 		t.Fatalf("trusted proxy client address=%q", got)
 	}
+	request.Header.Set("X-Forwarded-For", "127.0.0.1, 127.0.0.1")
+	if got := app.clientIP(request); got != "127.0.0.1" {
+		t.Fatalf("all-trusted forwarded chain address=%q", got)
+	}
+	request.Header.Set("X-Forwarded-For", "not-an-ip")
+	if got := app.clientIP(request); got != "127.0.0.1" {
+		t.Fatalf("invalid forwarded chain address=%q", got)
+	}
+
+	request.RemoteAddr = "203.0.113.10"
+	request.Header.Set("X-Forwarded-For", "198.51.100.20")
+	if got := app.clientIP(request); got != "203.0.113.10" {
+		t.Fatalf("address without port=%q", got)
+	}
+	app.cfg.TrustProxy = false
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("X-Forwarded-For", "198.51.100.20")
+	if got := app.clientIP(request); got != "127.0.0.1" {
+		t.Fatalf("forwarded address accepted when proxy trust disabled: %q", got)
+	}
 }
 
 func TestPasswordSlotsBoundConcurrentArgon2Work(t *testing.T) {
@@ -91,5 +115,28 @@ func TestFormatRetryAfterNormalizesNonPositiveValues(t *testing.T) {
 		if got := formatRetryAfter(test.seconds); got != test.want {
 			t.Errorf("formatRetryAfter(%d)=%q, want %q", test.seconds, got, test.want)
 		}
+	}
+}
+
+func TestAllowProviderActionReturnsRetryResponseAfterLimit(t *testing.T) {
+	app := &App{
+		providerLimiter: newFixedWindowLimiter(1, time.Minute),
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://example.test/artists/1/sync", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	request = request.WithContext(context.WithValue(request.Context(), sessionKey, store.Session{
+		User: store.User{ID: 42},
+	}))
+	first := httptest.NewRecorder()
+	if !app.allowProviderAction(first, request) {
+		t.Fatal("first provider action was rejected")
+	}
+	second := httptest.NewRecorder()
+	if app.allowProviderAction(second, request) {
+		t.Fatal("second provider action bypassed the limiter")
+	}
+	if second.Code != http.StatusTooManyRequests || second.Header().Get("Retry-After") != "600" {
+		t.Fatalf("rate-limited response status=%d retry-after=%q", second.Code, second.Header().Get("Retry-After"))
 	}
 }

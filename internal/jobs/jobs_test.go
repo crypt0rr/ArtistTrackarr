@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
@@ -202,6 +203,149 @@ func TestRunnerOptionalProviderOptions(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), WithListenBrainz(nil), WithArtworkCache(nil), WithSpotifyInterval(time.Hour))
 	if runner.listenbrainz != nil || runner.artwork != nil || runner.spotifyInterval != time.Hour {
 		t.Fatalf("runner options were not applied safely: listenbrainz=%v artwork=%v spotify_interval=%v", runner.listenbrainz, runner.artwork, runner.spotifyInterval)
+	}
+}
+
+func TestWithSpotifyIntervalRejectsTooShortAndAcceptsLongerCadence(t *testing.T) {
+	runner := &Runner{spotifyInterval: 24 * time.Hour}
+	WithSpotifyInterval(59 * time.Minute)(runner)
+	if runner.spotifyInterval != 24*time.Hour {
+		t.Fatalf("short Spotify interval changed to %s", runner.spotifyInterval)
+	}
+	WithSpotifyInterval(2 * time.Hour)(runner)
+	if runner.spotifyInterval != 2*time.Hour {
+		t.Fatalf("accepted Spotify interval=%s, want 2h", runner.spotifyInterval)
+	}
+}
+
+func TestProviderCooldownLoadsPersistedFlagsAndIgnoresExpiredState(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	database := resolutionTestStore(t)
+	spotifyUntil := now.Add(2 * time.Hour)
+	itunesUntil := now.Add(time.Hour)
+	if err := database.UpsertProviderHealth(ctx, "spotify", false, &spotifyUntil, false, true, "quota"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProviderHealth(ctx, "itunes", false, &itunesUntil, true, false, "rate limited"); err != nil {
+		t.Fatal(err)
+	}
+	runner := testRunner(database, nil)
+	if got, err := runner.spotifyProviderCooldown(ctx, now); err != nil || !got.Equal(spotifyUntil) {
+		t.Fatalf("Spotify persisted cooldown=%v err=%v", got, err)
+	}
+	if got, err := runner.itunesProviderCooldown(ctx, now); err != nil || !got.Equal(itunesUntil) {
+		t.Fatalf("iTunes persisted cooldown=%v err=%v", got, err)
+	}
+
+	// A successful provider row or an expired next check must not suppress work.
+	expired := now.Add(-time.Minute)
+	if err := database.UpsertProviderHealth(ctx, "spotify", false, &expired, false, false, "old failure"); err != nil {
+		t.Fatal(err)
+	}
+	runner = testRunner(database, nil)
+	if got, err := runner.spotifyProviderCooldown(ctx, now); err != nil || !got.IsZero() {
+		t.Fatalf("expired Spotify cooldown=%v err=%v", got, err)
+	}
+	if err := database.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	runner = testRunner(database, nil)
+	if got, err := runner.itunesProviderCooldown(ctx, now); err != nil || !got.IsZero() {
+		t.Fatalf("healthy iTunes cooldown=%v err=%v", got, err)
+	}
+}
+
+func TestProviderCooldownSetDoesNotShortenAndClearExpiresState(t *testing.T) {
+	runner := &Runner{}
+	later := time.Date(2026, time.August, 7, 16, 0, 0, 0, time.UTC)
+	earlier := later.Add(-time.Hour)
+	runner.setSpotifyProviderCooldown(later)
+	runner.setSpotifyProviderCooldown(earlier)
+	if runner.spotifyCooldownUntil != later {
+		t.Fatalf("Spotify cooldown shortened to %v", runner.spotifyCooldownUntil)
+	}
+	runner.setSpotifyProviderCooldown(time.Time{})
+	runner.clearSpotifyProviderCooldown()
+	if !runner.spotifyCooldownUntil.IsZero() || !runner.spotifyCooldownLoaded {
+		t.Fatalf("Spotify cooldown was not cleared: %#v", runner)
+	}
+	runner.setITunesProviderCooldown(later)
+	runner.setITunesProviderCooldown(earlier)
+	if runner.itunesCooldownUntil != later {
+		t.Fatalf("iTunes cooldown shortened to %v", runner.itunesCooldownUntil)
+	}
+	runner.clearITunesProviderCooldown()
+	if !runner.itunesCooldownUntil.IsZero() || !runner.itunesCooldownLoaded {
+		t.Fatalf("iTunes cooldown was not cleared: %#v", runner)
+	}
+}
+
+func TestCadenceWrappersHandleEmptyQueuesAndArtworkMaintenance(t *testing.T) {
+	database := resolutionTestStore(t)
+	cache, err := artwork.NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithArtworkCache(cache))
+	ctx := context.Background()
+	runner.runSyncCadence(ctx)
+	runner.runReleaseDayQueue(ctx)
+	runner.runDeliveryCadence(ctx)
+	runner.runMaintenance(ctx)
+	closed := resolutionTestStore(t)
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closedRunner := testRunner(closed, nil)
+	closedRunner.runSyncCadence(ctx)
+	closedRunner.runReleaseDayQueue(ctx)
+	closedRunner.runDeliveryCadence(ctx)
+	closedRunner.runMaintenance(ctx)
+}
+
+func TestDeliveryHandlesUnavailableCipherSenderAndCanceledContext(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	now := time.Now().UTC()
+	missingCipher := testRunner(database, nil)
+	result := missingCipher.deliverOne(ctx, now, store.Delivery{ID: 1, Destination: store.Destination{ID: 1}})
+	if !result.failed || result.err != nil {
+		t.Fatalf("missing cipher result=%#v", result)
+	}
+	digestResult := missingCipher.deliverDigestOne(ctx, now, store.DigestDelivery{ID: 1, Destination: store.Destination{ID: 1}})
+	if !digestResult.failed || digestResult.err != nil {
+		t.Fatalf("missing digest cipher result=%#v", digestResult)
+	}
+
+	cipher, err := security.NewCipher("delivery edge case secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	validURL, err := cipher.Encrypt("test://edge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	noSender := New(database, nil, catalog.AlbumEPNormalizer{}, nil, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result = noSender.deliverOne(ctx, now, store.Delivery{ID: 2, Destination: store.Destination{ID: 1, EncryptedURL: validURL}})
+	if !result.failed || result.err != nil {
+		t.Fatalf("missing sender result=%#v", result)
+	}
+	result = noSender.deliverOne(ctx, now, store.Delivery{ID: 3, Destination: store.Destination{ID: 1, EncryptedURL: []byte("malformed")}})
+	if !result.failed || result.err != nil {
+		t.Fatalf("malformed ciphertext result=%#v", result)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	sender := failingSender{err: errors.New("send canceled")}
+	withSender := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result = withSender.deliverOne(canceled, now, store.Delivery{ID: 4, Destination: store.Destination{ID: 1, EncryptedURL: validURL}})
+	if !result.failed || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("canceled delivery result=%#v", result)
 	}
 }
 
@@ -1093,6 +1237,9 @@ func TestProviderCooldownAndReleaseDateHelpers(t *testing.T) {
 	}
 	if got := providerFailureRetryDelay(nil, time.Hour); got != 15*time.Minute {
 		t.Fatalf("provider failure retry delay=%v", got)
+	}
+	if got := providerFailureRetryDelay(&catalog.SpotifyRateLimitError{RetryAfter: 2 * time.Minute}, time.Hour); got != 2*time.Minute {
+		t.Fatalf("rate-limited provider retry delay=%v", got)
 	}
 }
 

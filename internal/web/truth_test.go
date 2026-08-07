@@ -71,4 +71,33 @@ func TestReleaseTruthDecisionPageAndAction(t *testing.T) {
 	if detail.TruthState != "confirmed" || detail.TruthProvider != "spotify" || detail.TruthReason != "Spotify has the current listing" {
 		t.Fatalf("truth decision=%+v", detail.Release)
 	}
+
+	// A valid provider without a persisted observation is rejected without
+	// changing the existing decision.
+	csrf = getCSRF(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID))
+	response = postForm(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"confirm"}, "provider": {"itunes"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "provider is not available") {
+		t.Fatalf("unavailable truth provider status/body=%d %q", response.StatusCode, body)
+	}
+
+	csrf = getCSRF(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID))
+	response = postForm(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"clear"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("clear truth status=%d", response.StatusCode)
+	}
+	csrf = getCSRF(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID))
+	response = postForm(t, client, server.URL+"/releases/"+fmt.Sprint(releaseID)+"/truth", url.Values{
+		"_csrf": {csrf}, "action": {"clear"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("clearing absent truth decision status=%d", response.StatusCode)
+	}
 }

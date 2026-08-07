@@ -1,4 +1,6 @@
-.PHONY: test build run fmt-check tooling-check lint vuln quality
+COVERAGE_MIN ?= 80.0
+
+.PHONY: test build run fmt-check tooling-check lint vuln coverage quality
 
 test:
 	docker build --target test .
@@ -23,6 +25,16 @@ lint:
 
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+coverage:
+	go test ./internal/... -p 1 -count=1 -coverprofile=coverage.out
+	@coverage="$$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $$NF); print $$NF}')"; \
+	if [ -z "$$coverage" ]; then \
+		echo "could not determine test coverage" >&2; \
+		exit 1; \
+	fi; \
+	printf 'total coverage: %s%% (minimum: %s%%)\n' "$$coverage" "$(COVERAGE_MIN)"; \
+	awk -v coverage="$$coverage" -v minimum="$(COVERAGE_MIN)" 'BEGIN { exit !(coverage >= minimum) }'
 
 quality: fmt-check tooling-check
 	go vet ./...
