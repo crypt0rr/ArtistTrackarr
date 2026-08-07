@@ -347,6 +347,12 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"releaseUsesITunesArtwork": func(r store.Release) bool {
 			return strings.TrimSpace(r.SpotifyImageURL) == "" && strings.TrimSpace(r.ITunesArtworkURL) != ""
 		},
+		"releaseCreditLabel": func(r store.Release) string {
+			if strings.EqualFold(strings.TrimSpace(r.ArtistCreditRole), "featured") {
+				return "Featured appearance"
+			}
+			return ""
+		},
 		"sourceLabel": func(r store.Release) string {
 			switch r.Source {
 			case "spotify":

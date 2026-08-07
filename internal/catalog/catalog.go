@@ -385,16 +385,23 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 type AlbumEPNormalizer struct{}
 
 func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	output := make([]store.Release, 0, len(input))
 	for _, release := range input {
 		if release.PrimaryType != "Album" && release.PrimaryType != "EP" && release.PrimaryType != "Single" {
 			continue
 		}
-		if release.MBID == "" || seen[release.MBID] {
+		if release.MBID == "" {
 			continue
 		}
-		seen[release.MBID] = true
+		if index, ok := seen[release.MBID]; ok {
+			if strings.EqualFold(strings.TrimSpace(output[index].ArtistCreditRole), "featured") &&
+				!strings.EqualFold(strings.TrimSpace(release.ArtistCreditRole), "featured") {
+				output[index] = release
+			}
+			continue
+		}
+		seen[release.MBID] = len(output)
 		output = append(output, release)
 	}
 	return output
@@ -952,10 +959,10 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	// with a 400 Invalid limit response.
 	const pageSize = 10
 	var result []store.Release
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	for offset := 0; offset < 1000; offset += pageSize {
 		endpoint := fmt.Sprintf(
-			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation&market=%s&limit=%d&offset=%d",
+			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation%%2Cappears_on&market=%s&limit=%d&offset=%d",
 			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
 		)
 		var page struct {
@@ -983,7 +990,7 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 			if item.ReleaseDate != "" && (oldest == "" || item.ReleaseDate < oldest) {
 				oldest = item.ReleaseDate
 			}
-			if item.ID == "" || seen[item.ID] {
+			if item.ID == "" {
 				continue
 			}
 			primaryType, secondaryTypes, eligible := spotifyReleaseType(
@@ -992,14 +999,28 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 			if !eligible {
 				continue
 			}
-			seen[item.ID] = true
-			result = append(result, store.Release{
+			role := "primary"
+			if strings.EqualFold(strings.TrimSpace(item.AlbumGroup), "appears_on") {
+				role = "featured"
+			}
+			candidate := store.Release{
 				MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
 				SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
 				DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
 				SpotifyID:     item.ID, SpotifyURL: item.ExternalURLs["spotify"],
-				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify",
-			})
+				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
+			}
+			if existing, ok := seen[item.ID]; ok {
+				// Spotify can expose one release in both the artist's primary
+				// catalogue and appears_on. Keep one record and prefer the
+				// direct release-level credit when both are present.
+				if result[existing].ArtistCreditRole == "featured" && role == "primary" {
+					result[existing] = candidate
+				}
+				continue
+			}
+			seen[item.ID] = len(result)
+			result = append(result, candidate)
 		}
 		if since == "" || oldest == "" || oldest <= since || len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
 			break
@@ -1007,6 +1028,18 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	}
 	s.cacheReleases(artistID, result)
 	return result, nil
+}
+
+// InvalidateArtistReleases drops the cached release pages for one artist.
+// Scheduled polling continues to use the normal cache; explicit manual sync
+// callers use this hook to request fresh Spotify metadata immediately.
+func (s *Spotify) InvalidateArtistReleases(artistID string) {
+	if s == nil {
+		return
+	}
+	s.cacheMu.Lock()
+	delete(s.releaseCache, artistID)
+	s.cacheMu.Unlock()
 }
 
 func (s *Spotify) cachedReleases(artistID, since string) ([]store.Release, bool) {

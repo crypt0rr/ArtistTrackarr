@@ -33,7 +33,7 @@ func saveMusicBrainzReleaseTx(
 			err = nil
 		} else if err == nil {
 			existed = true
-			_, err = tx.ExecContext(ctx, `UPDATE release_groups SET mbid=?,source='both' WHERE id=?`,
+			_, err = tx.ExecContext(ctx, `UPDATE release_groups SET mbid=?,source='both',artist_credit_role='primary' WHERE id=?`,
 				release.MBID, releaseID)
 		}
 	}
@@ -44,11 +44,11 @@ func saveMusicBrainzReleaseTx(
 	if releaseID == 0 {
 		result, insertErr := tx.ExecContext(ctx, `INSERT INTO release_groups
 			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
-			 musicbrainz_url,source,first_observed_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?, 'musicbrainz',?,?)`,
+			 musicbrainz_url,artist_credit_role,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,'musicbrainz',?,?)`,
 			release.MBID, artistID, release.Title, release.PrimaryType, string(secondary),
 			release.FirstReleaseDate, release.DatePrecision, release.MusicBrainzURL,
-			timeText(observed), timeText(observed))
+			"primary", timeText(observed), timeText(observed))
 		if insertErr != nil {
 			return syncedRelease{}, insertErr
 		}
@@ -58,6 +58,7 @@ func saveMusicBrainzReleaseTx(
 			title=?,primary_type=?,secondary_types=?,
 			first_release_date=CASE WHEN ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=MAX(date_precision,?),musicbrainz_url=?,
+			artist_credit_role='primary',
 			source=CASE WHEN spotify_id IS NULL AND itunes_id IS NULL THEN 'musicbrainz' ELSE 'both' END,updated_at=?
 			WHERE id=?`,
 			release.Title, release.PrimaryType, string(secondary),
@@ -100,11 +101,11 @@ func saveSpotifyReleaseTx(
 	if releaseID == 0 {
 		result, insertErr := tx.ExecContext(ctx, `INSERT INTO release_groups
 			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
-			 musicbrainz_url,spotify_id,spotify_url,spotify_image_url,source,first_observed_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,'spotify',?,?)`,
+			 musicbrainz_url,spotify_id,spotify_url,spotify_image_url,artist_credit_role,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'spotify',?,?)`,
 			"spotify:"+release.SpotifyID, artistID, release.Title, release.PrimaryType, string(secondary),
 			release.FirstReleaseDate, release.DatePrecision, "", release.SpotifyID, release.SpotifyURL,
-			release.SpotifyImageURL, timeText(observed), timeText(observed))
+			release.SpotifyImageURL, normalizedArtistCreditRole(release.ArtistCreditRole), timeText(observed), timeText(observed))
 		if insertErr != nil {
 			return syncedRelease{}, insertErr
 		}
@@ -117,12 +118,13 @@ func saveSpotifyReleaseTx(
 			secondary_types=CASE WHEN source='spotify' THEN ? ELSE secondary_types END,
 			first_release_date=CASE WHEN source='spotify' AND ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=CASE WHEN source='spotify' THEN MAX(date_precision,?) ELSE date_precision END,
+			artist_credit_role=CASE WHEN artist_credit_role='primary' OR ?='primary' THEN 'primary' ELSE 'featured' END,
 			source=CASE WHEN source IN ('musicbrainz','itunes') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,
 			release.SpotifyID, release.SpotifyURL, release.SpotifyImageURL,
 			release.Title, release.PrimaryType, string(secondary),
 			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision,
-			timeText(observed), releaseID)
+			normalizedArtistCreditRole(release.ArtistCreditRole), timeText(observed), releaseID)
 		if err != nil {
 			return syncedRelease{}, err
 		}
@@ -212,6 +214,13 @@ func validITunesArtworkURL(value string) bool {
 	return host == "mzstatic.com" || strings.HasSuffix(host, ".mzstatic.com") ||
 		host == "itunes.apple.com" || strings.HasSuffix(host, ".itunes.apple.com")
 }
+
+func normalizedArtistCreditRole(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "featured") {
+		return "featured"
+	}
+	return "primary"
+}
 func normalizedReleaseTitle(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
@@ -272,20 +281,21 @@ func upsertReleaseProviderEvidenceTx(
 		return fmt.Errorf("unsupported evidence provider %q", provider)
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO release_provider_evidence
-		(provider,provider_id,release_group_id,title,primary_type,first_release_date,date_precision,provider_url,observed_at)
-		VALUES(?,?,?,?,?,?,?,?,?)
+		(provider,provider_id,release_group_id,title,primary_type,first_release_date,date_precision,provider_url,artist_credit_role,observed_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(provider,provider_id) DO UPDATE SET release_group_id=excluded.release_group_id,
 		title=excluded.title,primary_type=excluded.primary_type,first_release_date=excluded.first_release_date,
-		date_precision=excluded.date_precision,provider_url=excluded.provider_url,observed_at=excluded.observed_at`,
+		date_precision=excluded.date_precision,provider_url=excluded.provider_url,
+		artist_credit_role=excluded.artist_credit_role,observed_at=excluded.observed_at`,
 		provider, providerID, releaseID, release.Title, release.PrimaryType, release.FirstReleaseDate,
-		release.DatePrecision, strings.TrimSpace(providerURL), timeText(observed))
+		release.DatePrecision, strings.TrimSpace(providerURL), normalizedArtistCreditRole(release.ArtistCreditRole), timeText(observed))
 	return err
 }
 func releasePayloadHash(release Release) string {
 	secondary, _ := json.Marshal(release.SecondaryTypes)
 	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
 		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL + "\x00" +
-		release.ITunesURL + "\x00" + release.ITunesArtworkURL))
+		release.ITunesURL + "\x00" + release.ITunesArtworkURL + "\x00" + normalizedArtistCreditRole(release.ArtistCreditRole)))
 	return fmt.Sprintf("%x", payloadHash)
 }
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
@@ -293,17 +303,17 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	var secondary, observed string
 	var sourceCount int
 	var observedProviders, lastObserved sql.NullString
-	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
+	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL, artistCreditRole sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
 		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
-		itunes_id,itunes_url,itunes_artwork_url,source,first_observed_at,
+		itunes_id,itunes_url,itunes_artwork_url,artist_credit_role,source,first_observed_at,
 		(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
 		(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
 		(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=release_groups.id)
 		FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &release.Source, &observed,
+		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &artistCreditRole, &release.Source, &observed,
 		&sourceCount, &observedProviders, &lastObserved,
 	)
 	if err != nil {
@@ -313,6 +323,7 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	release.SpotifyID, release.SpotifyURL, release.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
 	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
 	release.ITunesArtworkURL = itunesArtworkURL.String
+	release.ArtistCreditRole = normalizedArtistCreditRole(artistCreditRole.String)
 	release.FirstObservedAt, _ = parseTime(observed)
 	release.SourceCount = sourceCount
 	release.Sources = splitReleaseProviders(observedProviders.String)
@@ -365,17 +376,42 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 	start, _ := comparableReleaseDate(release.FirstReleaseDate)
 	link := releaseExternalURL(release)
 	if eventType == "release_day" {
+		if release.ArtistCreditRole == "featured" {
+			return "Featured appearance released today: " + release.Title,
+				fmt.Sprintf("%s appears on %q, released today.\n%s", artist.Name, release.Title, link)
+		}
 		return "Released today: " + release.Title,
 			fmt.Sprintf("%s's %q is out today.\n%s", artist.Name, release.Title, link)
 	}
 	if start.After(today) {
+		if release.ArtistCreditRole == "featured" {
+			return "Upcoming featured appearance from " + artist.Name,
+				fmt.Sprintf("%s appears on %q, expected %s.\n%s", artist.Name, release.Title,
+					release.FirstReleaseDate, link)
+		}
 		return "Upcoming release from " + artist.Name,
 			fmt.Sprintf("%s's %q is expected %s.\n%s", artist.Name, release.Title,
+				release.FirstReleaseDate, link)
+	}
+	if release.ArtistCreditRole == "featured" {
+		return "Latest featured appearance from " + artist.Name,
+			fmt.Sprintf("%s appears on %q (%s).\n%s", artist.Name, release.Title,
 				release.FirstReleaseDate, link)
 	}
 	return "Latest release from " + artist.Name,
 		fmt.Sprintf("%s's latest known release is %q (%s).\n%s", artist.Name, release.Title,
 			release.FirstReleaseDate, link)
+}
+
+func releaseAnnouncementMessage(artist Artist, release Release) (string, string) {
+	if release.ArtistCreditRole == "featured" {
+		return "New featured appearance from " + artist.Name,
+			fmt.Sprintf("%s appears on %q for %s.\n%s", artist.Name, release.Title,
+				release.FirstReleaseDate, releaseExternalURL(release))
+	}
+	return "New release from " + artist.Name,
+		fmt.Sprintf("%s has announced %q for %s.\n%s", artist.Name, release.Title,
+			release.FirstReleaseDate, releaseExternalURL(release))
 }
 func releaseExternalURL(release Release) string {
 	if release.SpotifyURL != "" {
@@ -453,10 +489,10 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	var observedProviders, lastObserved sql.NullString
 	var truthState, truthProvider, truthProviderID, truthReason, truthUpdatedAt sql.NullString
 	var truthIssueCount int
-	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL sql.NullString
+	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL, artistCreditRole sql.NullString
 	destinations := []any{&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 		&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &r.Source, &observed,
+		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &artistCreditRole, &r.Source, &observed,
 		&sourceCount, &observedProviders, &lastObserved, &truthState, &truthProvider, &truthProviderID,
 		&truthReason, &truthUpdatedAt, &truthIssueCount}
 	destinations = append(destinations, extra...)
@@ -469,6 +505,7 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	r.SpotifyID, r.SpotifyURL, r.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
 	r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 	r.ITunesArtworkURL = itunesArtworkURL.String
+	r.ArtistCreditRole = normalizedArtistCreditRole(artistCreditRole.String)
 	r.FirstObservedAt, _ = parseTime(observed)
 	r.SourceCount = sourceCount
 	r.Sources = splitReleaseProviders(observedProviders.String)

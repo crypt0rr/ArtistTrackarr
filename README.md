@@ -1,6 +1,6 @@
 # ArtistTrackarr
 
-A self-hosted household dashboard that watches Spotify for new albums, EPs, and singles,
+A self-hosted household dashboard that watches Spotify for new albums, EPs, singles, and compilations,
 using MusicBrainz for stable artist identity with Apple/iTunes fallback observations,
 public ListenBrainz artist popularity, and sends announcement and release-day notifications through
 [Shoutrrr](https://containrrr.dev/shoutrrr/).
@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.28.2`, which is also displayed by local
+footer. The current release is `v0.29.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -136,7 +136,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.28.2` publishes `0.28.2`, `0.28`, and `latest`.
+- Pushing a tag such as `v0.29.0` publishes `0.29.0`, `0.29`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -144,7 +144,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.28.2 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.29.0 docker compose up -d
 ```
 
 ## Configuration
@@ -184,9 +184,14 @@ Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
 example `NL`. Existing followed artists are silently baselined the first time
 Spotify release polling runs after an upgrade, preventing back-catalogue
 notification floods. New releases observed after that baseline can notify
-independently of MusicBrainz. Albums, EPs, and singles are all eligible release
+independently of MusicBrainz. Albums, EPs, singles, and compilations are all eligible release
 types; multi-track Spotify releases with at least four tracks are treated as
-EPs.
+EPs. Spotify also requests the `appears_on` relationship, so a followed artist
+is notified when they are featured on another artist's album, EP, single, or
+compilation. Existing follows receive a one-time appearance baseline during
+their first successful post-upgrade Spotify sync; new followers retain the
+normal single-release onboarding notification. Featured alerts represent the
+containing release rather than individual tracks.
 
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored

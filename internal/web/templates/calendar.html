@@ -13,7 +13,7 @@
         {{range .Releases}}
         <a class="calendar-release" href="/releases/{{.ID}}">
           <span class="calendar-release-date">{{shortDate .FirstReleaseDate}}</span>
-          <span class="calendar-release-copy"><strong>{{.Title}}</strong><span>{{.ArtistName}} · {{.PrimaryType}}</span><small>{{sourceLabel .Release}} · <span class="badge {{calendarStatusClass .}}">{{calendarStatus .}}</span></small></span>
+          <span class="calendar-release-copy"><strong>{{.Title}}</strong><span>{{if releaseCreditLabel .Release}}{{releaseCreditLabel .Release}} · {{end}}{{.ArtistName}} · {{.PrimaryType}}</span><small>{{sourceLabel .Release}} · <span class="badge {{calendarStatusClass .}}">{{calendarStatus .}}</span></small></span>
         </a>
         {{end}}
       </div>

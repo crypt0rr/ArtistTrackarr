@@ -1,5 +1,5 @@
 package version
 
-const Current = "0.28.2"
+const Current = "0.29.0"
 
 const UserAgent = "ArtistTrackarr/" + Current

@@ -22,6 +22,7 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 		return err
 	}
 	var savedReleases []syncedRelease
+	savedIndexes := make(map[string]int)
 	spotifyObserved := false
 	seenProviders := make(map[string]bool)
 	for _, batch := range batches {
@@ -54,7 +55,23 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 				_ = tx.Rollback()
 				return err
 			}
-			savedReleases = append(savedReleases, saved)
+			// One Spotify release can arrive through both the direct catalogue
+			// and appears_on. Keep one notification candidate and let a primary
+			// credit win even if Spotify returned the featured copy first.
+			key := saved.provider + "\x00" + fmt.Sprint(saved.release.ID)
+			if index, exists := savedIndexes[key]; exists {
+				previous := savedReleases[index]
+				if previous.release.ArtistCreditRole == "primary" && saved.release.ArtistCreditRole == "featured" {
+					previous.isNew = previous.isNew || saved.isNew
+					savedReleases[index] = previous
+				} else {
+					saved.isNew = saved.isNew || previous.isNew
+					savedReleases[index] = saved
+				}
+			} else {
+				savedIndexes[key] = len(savedReleases)
+				savedReleases = append(savedReleases, saved)
+			}
 		}
 	}
 	// A later synchronization may have made previously conflicting evidence
@@ -67,28 +84,30 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at,spotify_baseline_synced_at
+	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at,spotify_baseline_synced_at,spotify_appears_on_baseline_synced_at
 		FROM follows WHERE artist_id=?`, artist.ID)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	type follower struct {
-		id              int64
-		baseline        bool
-		spotifyBaseline bool
+		id                        int64
+		baseline                  bool
+		spotifyBaseline           bool
+		spotifyAppearanceBaseline bool
 	}
 	var followers []follower
 	for rows.Next() {
 		var f follower
-		var baseline, spotifyBaseline sql.NullString
-		if err := rows.Scan(&f.id, &baseline, &spotifyBaseline); err != nil {
+		var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
+		if err := rows.Scan(&f.id, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
 			_ = rows.Close()
 			_ = tx.Rollback()
 			return err
 		}
 		f.baseline = baseline.Valid
 		f.spotifyBaseline = spotifyBaseline.Valid
+		f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
 		followers = append(followers, f)
 	}
 	_ = rows.Close()
@@ -112,6 +131,11 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 					_ = tx.Rollback()
 					return err
 				}
+				if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_appears_on_baseline_synced_at=?
+					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
 			}
 			continue
 		}
@@ -119,21 +143,28 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			if item.provider == "spotify" && !follower.spotifyBaseline {
 				continue
 			}
+			if item.provider == "spotify" && item.release.ArtistCreditRole == "featured" && !follower.spotifyAppearanceBaseline {
+				continue
+			}
 			date, full := releaseDate(item.release.FirstReleaseDate)
 			if !item.isNew || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
 				continue
 			}
-			if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement",
-				"New release from "+artist.Name,
-				fmt.Sprintf("%s has announced %q for %s.\n%s", artist.Name, item.release.Title,
-					item.release.FirstReleaseDate, releaseExternalURL(item.release)),
-				observed); err != nil {
+			title, body := releaseAnnouncementMessage(artist, item.release)
+			if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement", title, body, observed); err != nil {
 				_ = tx.Rollback()
 				return err
 			}
 		}
 		if spotifyObserved && !follower.spotifyBaseline {
 			if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
+				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if spotifyObserved && !follower.spotifyAppearanceBaseline {
+			if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_appears_on_baseline_synced_at=?
 				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
 				_ = tx.Rollback()
 				return err
@@ -196,7 +227,7 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	from := today.AddDate(0, 0, -1).Format("2006-01-02")
 	to := today.AddDate(0, 0, 1).Format("2006-01-02")
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
-		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url
+		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role
 		FROM follows f JOIN users u ON u.id=f.user_id JOIN release_groups rg ON rg.artist_id=f.artist_id
 		JOIN artists a ON a.id=rg.artist_id
 		WHERE rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
@@ -209,13 +240,14 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		artist, title, releaseDate string
 		musicBrainzURL             string
 		spotifyURL, itunesURL      sql.NullString
+		artistCreditRole           string
 	}
 	var candidates []due
 	for rows.Next() {
 		var d due
 		if err := rows.Scan(
 			&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
-			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL,
+			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole,
 		); err != nil {
 			_ = rows.Close()
 			return err
@@ -233,11 +265,15 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 			continue
 		}
 		body := fmt.Sprintf("%s's %q is out today.", d.artist, d.title)
+		title := "Released today: " + d.title
+		if d.artistCreditRole == "featured" {
+			body = fmt.Sprintf("%s appears on %q, released today.", d.artist, d.title)
+			title = "Featured appearance released today: " + d.title
+		}
 		if link := firstNonEmpty(d.spotifyURL.String, d.itunesURL.String, d.musicBrainzURL); link != "" {
 			body += "\n" + link
 		}
-		if err := s.EnqueueEvent(ctx, d.userID, d.releaseID, "release_day",
-			"Released today: "+d.title, body, now); err != nil {
+		if err := s.EnqueueEvent(ctx, d.userID, d.releaseID, "release_day", title, body, now); err != nil {
 			return err
 		}
 	}

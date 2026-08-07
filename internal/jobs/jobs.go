@@ -551,6 +551,7 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 			var artist store.Artist
 			artist, syncErr = r.store.ArtistByID(ctx, *req.ArtistID)
 			if syncErr == nil {
+				r.invalidateSpotifyReleaseCache(artist)
 				_, syncErr = r.syncOne(ctx, artist, now)
 			}
 		} else if req.Scope == "retry" {
@@ -699,6 +700,7 @@ func (r *Runner) completeArtistResolution(ctx context.Context, resolution store.
 		return "", err
 	}
 	if added && syncInitial {
+		r.invalidateSpotifyReleaseCache(artist)
 		if _, err := r.syncOne(ctx, artist, time.Now().UTC()); err != nil {
 			r.logger.Warn("initial resolved artist sync failed", "artist_id", artist.ID, "error", err)
 		}
@@ -711,8 +713,22 @@ func (r *Runner) SyncArtistNow(ctx context.Context, artist store.Artist) error {
 	defer r.syncMu.Unlock()
 	// A manual sync is an explicit request to refresh both providers.
 	artist.SpotifyNextCheckAt = nil
+	r.invalidateSpotifyReleaseCache(artist)
 	_, err := r.syncOne(ctx, artist, time.Now().UTC())
 	return err
+}
+
+type spotifyReleaseCacheInvalidator interface {
+	InvalidateArtistReleases(string)
+}
+
+func (r *Runner) invalidateSpotifyReleaseCache(artist store.Artist) {
+	if r.spotify == nil || strings.TrimSpace(artist.SpotifyID) == "" {
+		return
+	}
+	if invalidator, ok := r.spotify.(spotifyReleaseCacheInvalidator); ok {
+		invalidator.InvalidateArtistReleases(artist.SpotifyID)
+	}
 }
 
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {
