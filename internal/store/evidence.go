@@ -18,7 +18,7 @@ import (
 // can never describe a provider observation that was not committed.
 func evaluateReleaseEvidenceTx(ctx context.Context, tx *sql.Tx, releaseID int64, observed time.Time) error {
 	rows, err := tx.QueryContext(ctx, `SELECT provider,provider_id,title,primary_type,
-		first_release_date,date_precision,provider_url,observed_at
+		first_release_date,date_precision,provider_url,artist_credit_role,observed_at
 		FROM release_provider_evidence WHERE release_group_id=?
 		ORDER BY observed_at DESC,provider,provider_id`, releaseID)
 	if err != nil {
@@ -31,9 +31,10 @@ func evaluateReleaseEvidenceTx(ctx context.Context, tx *sql.Tx, releaseID int64,
 		var observedAt string
 		if err := rows.Scan(&evidence.Provider, &evidence.ProviderID, &evidence.Title,
 			&evidence.PrimaryType, &evidence.FirstReleaseDate, &evidence.DatePrecision,
-			&evidence.ProviderURL, &observedAt); err != nil {
+			&evidence.ProviderURL, &evidence.ArtistCreditRole, &observedAt); err != nil {
 			return err
 		}
+		evidence.ArtistCreditRole = normalizedArtistCreditRole(evidence.ArtistCreditRole)
 		evidence.ObservedAt, _ = parseTime(observedAt)
 		if _, exists := latest[evidence.Provider]; !exists {
 			latest[evidence.Provider] = evidence

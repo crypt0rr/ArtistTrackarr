@@ -180,6 +180,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=18`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("release calendar migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=19`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("Spotify appearance migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var digestTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
 		t.Fatalf("release digest table missing: %v", err)
@@ -758,6 +761,57 @@ func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *tes
 		t.Fatal(err)
 	}
 	assertEventCount(t, s, userID, "announcement", 1)
+}
+
+func TestSpotifyAppearanceBaselineSuppressesHistoricalFeaturedReleases(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "listener@example.com", "unused", "member", "UTC", "")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "artist-id", Name: "Fridayy", SpotifyID: "spotify-artist"})
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	oldFeatured := Release{
+		MBID: "spotify:old-featured", SpotifyID: "old-featured", Title: "Old Guest Album", PrimaryType: "Album",
+		FirstReleaseDate: "2020-01-01", DatePrecision: 3, ArtistCreditRole: "featured",
+		SpotifyURL: "https://open.spotify.com/album/old-featured", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{oldFeatured}}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+	var appearanceBaseline sql.NullString
+	if err := s.DB.QueryRow(`SELECT spotify_appears_on_baseline_synced_at FROM follows
+		WHERE user_id=? AND artist_id=?`, userID, artist.ID).Scan(&appearanceBaseline); err != nil || !appearanceBaseline.Valid {
+		t.Fatalf("appearance baseline=%#v err=%v", appearanceBaseline, err)
+	}
+	newFeatured := Release{
+		MBID: "spotify:new-featured", SpotifyID: "new-featured", Title: "New Guest Single", PrimaryType: "Single",
+		FirstReleaseDate: "2026-08-02", DatePrecision: 3, ArtistCreditRole: "featured",
+		SpotifyURL: "https://open.spotify.com/album/new-featured", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{oldFeatured, newFeatured}}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+	var title, body, role string
+	if err := s.DB.QueryRow(`SELECT e.title,e.body,rg.artist_credit_role
+		FROM notification_events e JOIN release_groups rg ON rg.id=e.release_group_id WHERE e.user_id=?`, userID).
+		Scan(&title, &body, &role); err != nil {
+		t.Fatal(err)
+	}
+	if title != "New featured appearance from Fridayy" || !strings.Contains(body, "appears on") || role != "featured" {
+		t.Fatalf("unexpected featured notification title=%q body=%q role=%q", title, body, role)
+	}
+	var evidenceRole string
+	if err := s.DB.QueryRow(`SELECT artist_credit_role FROM release_provider_evidence
+		WHERE provider='spotify' AND provider_id=?`, newFeatured.SpotifyID).Scan(&evidenceRole); err != nil || evidenceRole != "featured" {
+		t.Fatalf("featured evidence role=%q err=%v", evidenceRole, err)
+	}
 }
 
 func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {

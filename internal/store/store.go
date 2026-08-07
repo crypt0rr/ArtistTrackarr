@@ -178,6 +178,10 @@ type Release struct {
 	ITunesID         string
 	ITunesURL        string
 	ITunesArtworkURL string
+	// ArtistCreditRole records how the followed artist is credited by the
+	// provider. Spotify can return releases through appears_on when the
+	// artist is featured on another artist's release.
+	ArtistCreditRole string
 	Source           string
 	SourceCount      int
 	Sources          []string
@@ -264,6 +268,7 @@ type ReleaseEvidence struct {
 	FirstReleaseDate string
 	DatePrecision    int
 	ProviderURL      string
+	ArtistCreditRole string
 	ObservedAt       time.Time
 }
 
@@ -481,7 +486,7 @@ const artistResolutionColumns = `id,user_id,provider,provider_id,display_name,pr
 
 const releaseSelectColumns = `rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.primary_type,
 	rg.secondary_types,rg.first_release_date,rg.date_precision,rg.musicbrainz_url,
-	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.source,rg.first_observed_at,
+	rg.spotify_id,rg.spotify_url,rg.spotify_image_url,rg.itunes_id,rg.itunes_url,rg.itunes_artwork_url,rg.artist_credit_role,rg.source,rg.first_observed_at,
 	(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
 	(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=rg.id),
 	(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=rg.id),

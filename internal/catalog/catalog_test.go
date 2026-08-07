@@ -926,7 +926,7 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums":
 			albumRequests.Add(1)
 			if request.URL.Query().Get("limit") != "10" || request.URL.Query().Get("market") != "NL" ||
-				request.URL.Query().Get("include_groups") != "album,single,compilation" ||
+				request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" ||
 				request.Header.Get("Authorization") != "Bearer test-token" {
 				t.Fatalf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
 			}
@@ -945,6 +945,10 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 					 "release_date":"2026-07","release_date_precision":"month","external_urls":{"spotify":"https://open.spotify.com/album/ep-id"}},
 					{"id":"compilation-id","name":"Collected","album_type":"compilation","album_group":"compilation","total_tracks":14,
 					 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}
+					,{"id":"featured-id","name":"Guest Album","album_type":"album","album_group":"appears_on","total_tracks":10,
+					 "release_date":"2026-09-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/featured-id"}},
+					{"id":"album-id","name":"Album","album_type":"album","album_group":"appears_on","total_tracks":10,
+					 "release_date":"2026-08-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/album-id"}}
 				]}`)
 			return
 		default:
@@ -963,7 +967,12 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 	if err != nil || len(cached) != len(releases) {
 		t.Fatalf("cached releases=%#v err=%v", cached, err)
 	}
-	if tokenRequests.Load() != 1 || albumRequests.Load() != 1 || len(releases) != 4 {
+	spotify.InvalidateArtistReleases("0OdUWJ0sBjDrqHygGUXeCF")
+	fresh, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil || len(fresh) != len(releases) {
+		t.Fatalf("fresh releases=%#v err=%v", fresh, err)
+	}
+	if tokenRequests.Load() != 1 || albumRequests.Load() != 2 || len(releases) != 5 {
 		t.Fatalf("token requests=%d album requests=%d releases=%#v",
 			tokenRequests.Load(), albumRequests.Load(), releases)
 	}
@@ -974,7 +983,8 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 		releases[2].PrimaryType != "EP" || releases[2].Title != "1. KRUIS" ||
 		releases[2].DatePrecision != 2 ||
 		releases[3].PrimaryType != "Album" || len(releases[3].SecondaryTypes) != 1 ||
-		releases[3].SecondaryTypes[0] != "Compilation" {
+		releases[3].SecondaryTypes[0] != "Compilation" ||
+		releases[4].ArtistCreditRole != "featured" || releases[0].ArtistCreditRole != "primary" {
 		t.Fatalf("unexpected Spotify releases: %#v", releases)
 	}
 }
