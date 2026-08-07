@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.28.1`, which is also displayed by local
+footer. The current release is `v0.28.2`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -136,7 +136,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.28.1` publishes `0.28.1`, `0.28`, and `latest`.
+- Pushing a tag such as `v0.28.2` publishes `0.28.2`, `0.28`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -144,7 +144,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.28.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.28.2 docker compose up -d
 ```
 
 ## Configuration
