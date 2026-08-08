@@ -95,6 +95,7 @@ func main() {
 	} else if !errors.Is(healthErr, sql.ErrNoRows) {
 		logger.Warn("restore iTunes provider cooldown failed", "error", healthErr)
 	}
+	notify.ConfigureHTTPClient(notify.DefaultSendTimeout, cfg.AllowPrivateNotificationTargets)
 	sender := notify.ShoutrrrSender{AllowPrivateTargets: cfg.AllowPrivateNotificationTargets}
 	var runnerOptions []jobs.Option
 	if spotify != nil {

@@ -992,6 +992,10 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 
 func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
 	result := deliveryResult{}
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(ctx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	if attemptErr != nil {
+		r.logger.Warn("record delivery attempt failed", "digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
+	}
 	var err error
 	if r.cipher == nil {
 		err = errors.New("notification cipher is unavailable")
@@ -1007,7 +1011,15 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	}
 	if err == nil {
 		if markErr := r.store.MarkDigestDeliverySent(ctx, delivery.ID, now); markErr != nil {
+			if attemptID > 0 {
+				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+			}
 			return deliveryResult{failed: true, err: markErr}
+		}
+		if attemptID > 0 {
+			if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+				return deliveryResult{sent: true, err: finishErr}
+			}
 		}
 		result.sent = true
 		return result
@@ -1020,11 +1032,25 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	if markErr := r.store.MarkDigestDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
 		result.err = markErr
 	}
+	if attemptID > 0 {
+		var nextRetry *time.Time
+		if delivery.Attempts+1 < 5 {
+			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
+			nextRetry = &next
+		}
+		if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+			result.err = finishErr
+		}
+	}
 	return result
 }
 
 func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
 	result := deliveryResult{}
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(ctx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	if attemptErr != nil {
+		r.logger.Warn("record delivery attempt failed", "delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
+	}
 	var err error
 	if r.cipher == nil {
 		err = errors.New("notification cipher is unavailable")
@@ -1040,7 +1066,15 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	}
 	if err == nil {
 		if markErr := r.store.MarkDeliverySent(ctx, delivery.ID, now); markErr != nil {
+			if attemptID > 0 {
+				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+			}
 			return deliveryResult{failed: true, err: markErr}
+		}
+		if attemptID > 0 {
+			if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+				return deliveryResult{sent: true, err: finishErr}
+			}
 		}
 		result.sent = true
 		return result
@@ -1052,6 +1086,16 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
 	if markErr := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
 		result.err = markErr
+	}
+	if attemptID > 0 {
+		var nextRetry *time.Time
+		if delivery.Attempts+1 < 5 {
+			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
+			nextRetry = &next
+		}
+		if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+			result.err = finishErr
+		}
 	}
 	return result
 }

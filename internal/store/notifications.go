@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -65,6 +66,193 @@ func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, 
 		result = append(result, d)
 	}
 	return result, rows.Err()
+}
+
+// DestinationHealthByUser returns health for every destination owned by the
+// user. Destinations created before the assurance migration are treated as
+// healthy until their first delivery attempt.
+func (s *Store) DestinationHealthByUser(ctx context.Context, userID int64) (map[int64]DestinationHealth, error) {
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,
+		CASE WHEN COALESCE(h.status,'healthy')='healthy' AND (
+			(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='failed')+
+			(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='failed'))>0 THEN 'degraded' ELSE COALESCE(h.status,'healthy') END,
+		COALESCE(h.consecutive_failures,0),
+		(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='pending')+
+		(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='pending'),
+		(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='failed')+
+		(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='failed'),
+		h.last_success_at,h.last_failure_at,h.next_retry_at,COALESCE(h.last_error,''),
+		COALESCE(h.updated_at,d.created_at)
+		FROM destinations d LEFT JOIN destination_health h ON h.destination_id=d.id
+		WHERE d.user_id=? ORDER BY d.id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := make(map[int64]DestinationHealth)
+	for rows.Next() {
+		var health DestinationHealth
+		var status string
+		var lastSuccess, lastFailure, nextRetry, lastError, updated sql.NullString
+		if err := rows.Scan(&health.DestinationID, &status, &health.ConsecutiveFailures,
+			&health.PendingCount, &health.FailedCount, &lastSuccess, &lastFailure, &nextRetry, &lastError, &updated); err != nil {
+			return nil, err
+		}
+		health.Status = status
+		health.LastError = safeDeliveryError(lastError.String)
+		health.LastSuccessAt = parseNullableTime(lastSuccess.String)
+		health.LastFailureAt = parseNullableTime(lastFailure.String)
+		health.NextRetryAt = parseNullableTime(nextRetry.String)
+		health.UpdatedAt, _ = parseTime(updated.String)
+		result[health.DestinationID] = health
+	}
+	return result, rows.Err()
+}
+
+// AdminDestinationHealth is a compact household-wide view used by the admin
+// dashboard. It never includes encrypted destination URLs or message bodies.
+func (s *Store) AdminDestinationHealth(ctx context.Context) ([]AdminDestinationHealth, error) {
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,u.email,d.name,d.service,
+		COALESCE(h.status,'healthy'),COALESCE(h.consecutive_failures,0),
+		(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='pending')+
+		(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='pending'),
+		(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='failed')+
+		(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='failed'),
+		h.last_success_at,h.last_failure_at,h.next_retry_at,COALESCE(h.last_error,''),
+		COALESCE(h.updated_at,d.created_at)
+		FROM destinations d JOIN users u ON u.id=d.user_id
+		LEFT JOIN destination_health h ON h.destination_id=d.id
+		ORDER BY CASE COALESCE(h.status,'healthy') WHEN 'paused' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END,
+		d.name,u.email`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []AdminDestinationHealth
+	for rows.Next() {
+		var health AdminDestinationHealth
+		var lastSuccess, lastFailure, nextRetry, lastError, updated sql.NullString
+		if err := rows.Scan(&health.DestinationID, &health.UserEmail, &health.DestinationName,
+			&health.Service, &health.Status, &health.ConsecutiveFailures, &health.PendingCount,
+			&health.FailedCount, &lastSuccess, &lastFailure, &nextRetry, &lastError, &updated); err != nil {
+			return nil, err
+		}
+		health.LastSuccessAt = parseNullableTime(lastSuccess.String)
+		health.LastFailureAt = parseNullableTime(lastFailure.String)
+		health.NextRetryAt = parseNullableTime(nextRetry.String)
+		health.LastError = safeDeliveryError(lastError.String)
+		health.UpdatedAt, _ = parseTime(updated.String)
+		result = append(result, health)
+	}
+	return result, rows.Err()
+}
+
+// StartDeliveryAttempt records an attempt before decryption and network I/O.
+// Keeping the destination name/service snapshot here makes the audit useful
+// even if the destination is renamed or removed later.
+func (s *Store) StartDeliveryAttempt(ctx context.Context, deliveryID, digestDeliveryID int64, destination Destination, attemptNumber int, started time.Time) (int64, error) {
+	if (deliveryID == 0) == (digestDeliveryID == 0) {
+		return 0, errors.New("exactly one delivery kind is required")
+	}
+	if attemptNumber < 1 {
+		attemptNumber = 1
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO delivery_attempts
+		(delivery_id,digest_delivery_id,destination_id,destination_name,service,attempt_number,status,started_at)
+		VALUES(?,?,?,?,?,?, 'started',?)`, nullableID(deliveryID), nullableID(digestDeliveryID),
+		nullableID(destination.ID), destination.Name, destination.Service, attemptNumber, timeText(started))
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// FinishDeliveryAttempt updates the attempt and destination circuit state in
+// one writer transaction. Five consecutive failures pause the destination;
+// a successful send clears the failure streak.
+func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinationID int64, success bool, message string, nextRetry *time.Time, finished time.Time) error {
+	if attemptID < 1 || destinationID < 1 {
+		return errors.New("delivery attempt and destination are required")
+	}
+	message = safeDeliveryError(message)
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	status := "failed"
+	if success {
+		status = "sent"
+		message = ""
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status=?,finished_at=?,last_error=? WHERE id=?`,
+		status, timeText(finished), message, attemptID); err != nil {
+		return err
+	}
+	if success {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_success_at,next_retry_at,last_error,updated_at)
+			VALUES(?,'healthy',0,?,NULL,'',?)
+			ON CONFLICT(destination_id) DO UPDATE SET status='healthy',consecutive_failures=0,last_success_at=excluded.last_success_at,next_retry_at=NULL,last_error='',updated_at=excluded.updated_at`,
+			destinationID, timeText(finished), timeText(finished)); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_failure_at,next_retry_at,last_error,updated_at)
+			VALUES(?,CASE WHEN 1>=5 THEN 'paused' ELSE 'degraded' END,1,?,?,?,?)
+			ON CONFLICT(destination_id) DO UPDATE SET
+			consecutive_failures=destination_health.consecutive_failures+1,
+			status=CASE WHEN destination_health.consecutive_failures+1>=5 THEN 'paused' ELSE 'degraded' END,
+			last_failure_at=excluded.last_failure_at,next_retry_at=excluded.next_retry_at,last_error=excluded.last_error,updated_at=excluded.updated_at`,
+			destinationID, timeText(finished), nullableTime(nextRetry), message, timeText(finished)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// RetryFailedDeliveries requeues all permanently failed deliveries for an
+// owned destination. It is intentionally owner-scoped and resets the circuit
+// only after the queue has been made runnable.
+func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID int64, now time.Time) (int, error) {
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var owned int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM destinations WHERE id=? AND user_id=?`, destinationID, userID).Scan(&owned); err != nil {
+		return 0, err
+	}
+	if owned == 0 {
+		return 0, sql.ErrNoRows
+	}
+	count := 0
+	for _, query := range []string{
+		`UPDATE deliveries SET status='pending',attempts=0,next_attempt_at=?,last_error='' WHERE destination_id=? AND status='failed'`,
+		`UPDATE release_digest_deliveries SET status='pending',attempts=0,next_attempt_at=?,last_error='' WHERE destination_id=? AND status='failed'`,
+	} {
+		result, updateErr := tx.ExecContext(ctx, query, timeText(now), destinationID)
+		if updateErr != nil {
+			return 0, updateErr
+		}
+		changed, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return 0, rowsErr
+		}
+		count += int(changed)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,next_retry_at,last_error,updated_at)
+		VALUES(?,'healthy',0,NULL,'',?)
+		ON CONFLICT(destination_id) DO UPDATE SET status='healthy',consecutive_failures=0,next_retry_at=NULL,last_error='',updated_at=excluded.updated_at`, destinationID, timeText(now)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination, error) {
 	var d Destination

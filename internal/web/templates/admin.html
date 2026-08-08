@@ -38,6 +38,12 @@
     </table>
   </div>
 </section>
+<section class="panel destination-admin">
+  <div class="section-head"><div><p class="eyebrow">Delivery assurance</p><h2>Destination health</h2></div><span class="badge">{{len .AdminDestinationHealth}} destination{{if ne (len .AdminDestinationHealth) 1}}s{{end}}</span></div>
+  {{if .AdminDestinationHealth}}<div class="table-scroll"><table><thead><tr><th>Account</th><th>Destination</th><th>Health</th><th>Queue</th><th>Last error</th><th>Updated</th></tr></thead><tbody>
+    {{range .AdminDestinationHealth}}<tr><td><strong>{{.UserEmail}}</strong></td><td><strong>{{.DestinationName}}</strong><small>{{.Service}}</small></td><td><span class="badge {{destinationHealthClass .Status}}">{{destinationHealthLabel .Status}}</span>{{if .ConsecutiveFailures}}<small>{{.ConsecutiveFailures}} consecutive failures</small>{{end}}</td><td><small>{{.PendingCount}} pending</small><small>{{.FailedCount}} failed</small></td><td>{{if .LastError}}<small class="health-error">{{.LastError}}</small>{{else}}<small>—</small>{{end}}</td><td>{{if .UpdatedAt}}{{formatTime .UpdatedAt}}{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<div class="empty">No notification destinations configured.</div>{{end}}
+</section>
 <section class="panel admin-ops">
   <div class="section-head"><div><p class="eyebrow">Operations</p><h2>Provider health &amp; sync</h2></div><form method="post" action="/admin/sync/retry">{{template "csrf" .}}<button class="secondary">Retry due/failed artists</button></form></div>
   <div class="grid two admin-ops-grid">

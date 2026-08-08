@@ -51,8 +51,11 @@
 <section class="settings-notifications">
   <section class="panel">
     <div class="section-head"><div><p class="eyebrow">Delivery</p><h2>Your destinations</h2><p>Credentials are encrypted at rest. Send a test after adding a destination.</p></div><span class="badge">{{len .Destinations}} configured</span></div>
-    {{if .Destinations}}<div class="list">{{range .Destinations}}<article class="list-row">
+    {{if .Destinations}}<div class="list">{{range .Destinations}}{{$health := index $.DestinationHealth .ID}}<article class="list-row">
       <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span>
+        <span class="destination-health"><span class="badge {{destinationHealthClass $health.Status}}">{{destinationHealthLabel $health.Status}}</span>{{if $health.PendingCount}}<small>{{$health.PendingCount}} pending</small>{{end}}{{if $health.FailedCount}}<small>{{$health.FailedCount}} failed</small>{{end}}{{if $health.ConsecutiveFailures}}<small>{{$health.ConsecutiveFailures}} consecutive failure{{if ne $health.ConsecutiveFailures 1}}s{{end}}</small>{{end}}</span>
+        {{if $health.LastError}}<small class="health-error">{{$health.LastError}}</small>{{end}}
+        {{if $health.NextRetryAt}}<small>Retry after {{formatProviderTime $health.NextRetryAt}}</small>{{end}}
         <details class="rename"><summary>Rename</summary>
           <form method="post" action="/destinations/{{.ID}}/rename" class="rename-form">
             {{template "csrf" $}}<label>New name<input name="name" value="{{.Name}}" maxlength="80" required></label><button class="secondary">Save</button>
@@ -60,6 +63,7 @@
         </details>
       </div>
       <div class="actions"><form method="post" action="/destinations/{{.ID}}/test" class="inline">{{template "csrf" $}}<button class="secondary">Send test</button></form>
+      {{if and $health.Status (ne $health.Status "healthy")}}<form method="post" action="/destinations/{{.ID}}/retry" class="inline">{{template "csrf" $}}<button class="secondary">Retry failed</button></form>{{end}}
       <form method="post" action="/destinations/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Delete</button></form></div>
     </article>{{end}}</div>{{else}}<div class="empty">No destinations configured yet.</div>{{end}}
   </section>

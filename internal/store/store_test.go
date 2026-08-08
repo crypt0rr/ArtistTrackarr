@@ -183,9 +183,16 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=19`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("Spotify appearance migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=20`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("delivery assurance migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var digestTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
 		t.Fatalf("release digest table missing: %v", err)
+	}
+	var assuranceTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_attempts'`).Scan(&assuranceTable); err != nil {
+		t.Fatalf("delivery attempts table missing: %v", err)
 	}
 	var digestEnabled int
 	if err := db.QueryRow(`SELECT release_digest_enabled FROM notification_preferences WHERE user_id=?`, userID).Scan(&digestEnabled); err != nil || digestEnabled != 0 {
