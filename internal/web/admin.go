@@ -99,6 +99,8 @@ func (a *App) adminData(r *http.Request) PageData {
 	failed = a.pageStoreError(r, &d, "Household administration", "followed artists", err) || failed
 	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
+	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
 	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
 	failed = a.pageStoreError(r, &d, "Household administration", "manual sync history", err) || failed
 	d.AdminHistory, err = a.store.AdminDeliveryHistorySummary(r.Context(), pageSize, (page-1)*pageSize)

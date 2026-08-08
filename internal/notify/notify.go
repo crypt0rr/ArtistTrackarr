@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containrrr/shoutrrr"
@@ -25,6 +27,49 @@ type ShoutrrrSender struct {
 	// services on a trusted LAN. It is disabled by default to keep a member
 	// supplied destination from turning the application into an SSRF proxy.
 	AllowPrivateTargets bool
+	// SendTimeout bounds HTTP-based notification providers. Shoutrrr uses the
+	// process-wide net/http client for several services, so this timeout also
+	// protects those providers from hanging forever.
+	SendTimeout time.Duration
+}
+
+const DefaultSendTimeout = 15 * time.Second
+
+var notificationHTTPClientMu sync.Mutex
+
+// ConfigureHTTPClient installs the bounded client used by Shoutrrr's HTTP
+// services. Redirects are checked again so a public endpoint cannot redirect
+// a notification into a private network.
+func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
+	if timeout <= 0 {
+		timeout = DefaultSendTimeout
+	}
+	notificationHTTPClientMu.Lock()
+	defer notificationHTTPClientMu.Unlock()
+	transport := http.DefaultTransport
+	if base, ok := transport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+	http.DefaultClient = &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("notification redirect limit exceeded")
+			}
+			if err := validateOutboundTarget(req.Context(), req.URL.String(), allowPrivateTargets, true); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
+func (s ShoutrrrSender) sendTimeout() time.Duration {
+	if s.SendTimeout <= 0 {
+		return DefaultSendTimeout
+	}
+	return s.SendTimeout
 }
 
 func (s ShoutrrrSender) Validate(serviceURL string) error {
@@ -39,7 +84,12 @@ func (s ShoutrrrSender) Validate(serviceURL string) error {
 }
 
 func (s ShoutrrrSender) Send(ctx context.Context, serviceURL, title, body string) error {
-	if err := validateOutboundTarget(ctx, serviceURL, s.AllowPrivateTargets, true); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
+	defer cancel()
+	if err := validateOutboundTarget(sendCtx, serviceURL, s.AllowPrivateTargets, true); err != nil {
 		return err
 	}
 	sender, err := shoutrrr.CreateSender(serviceURL)
@@ -52,7 +102,10 @@ func (s ShoutrrrSender) Send(ctx context.Context, serviceURL, title, body string
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-	return ctx.Err()
+	if err := sendCtx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 var (

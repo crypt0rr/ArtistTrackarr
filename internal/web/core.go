@@ -173,6 +173,28 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"providerHealthStatus": providerHealthStatus,
 		"providerHealthClass":  providerHealthClass,
 		"providerHealthError":  providerHealthError,
+		"destinationHealthClass": func(status string) string {
+			switch strings.ToLower(status) {
+			case "healthy":
+				return "sent"
+			case "paused":
+				return "failed"
+			default:
+				return "ambiguous"
+			}
+		},
+		"destinationHealthLabel": func(status string) string {
+			switch strings.ToLower(status) {
+			case "healthy":
+				return "Healthy"
+			case "paused":
+				return "Paused"
+			case "degraded":
+				return "Degraded"
+			default:
+				return "Unknown"
+			}
+		},
 		"coverageStatusLabel": func(status string) string {
 			switch status {
 			case "fresh":
@@ -466,6 +488,7 @@ func (a *App) Handler() http.Handler {
 		private.Post("/destinations", a.addDestination)
 		private.Post("/destinations/{id}/rename", a.renameDestination)
 		private.Post("/destinations/{id}/test", a.testDestination)
+		private.Post("/destinations/{id}/retry", a.retryDestination)
 		private.Post("/destinations/{id}/delete", a.deleteDestination)
 		private.Group(func(admin chi.Router) {
 			admin.Use(a.requireAdmin)
@@ -629,6 +652,8 @@ func (a *App) loadSettingsData(r *http.Request, d *PageData) bool {
 	failed = a.pageStoreError(r, d, "Settings", "notification preferences", err) || failed
 	d.Destinations, err = a.store.Destinations(r.Context(), session.User.ID)
 	failed = a.pageStoreError(r, d, "Settings", "notification destinations", err) || failed
+	d.DestinationHealth, err = a.store.DestinationHealthByUser(r.Context(), session.User.ID)
+	failed = a.pageStoreError(r, d, "Settings", "destination health", err) || failed
 	return failed
 }
 func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildURL(t *testing.T) {
@@ -185,5 +186,27 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 		if isBlockedIP(ip, true) {
 			t.Fatalf("private-target opt-in did not allow %s", value)
 		}
+	}
+}
+
+func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
+	ConfigureHTTPClient(time.Second, false)
+	redirect, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/hook", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := http.DefaultClient.CheckRedirect(redirect, nil); err == nil {
+		t.Fatal("private redirect was accepted by the notification client")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	ConfigureHTTPClient(10*time.Millisecond, true)
+	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 10 * time.Millisecond}
+	if err := sender.Send(context.Background(), "generic+"+server.URL+"/slow", "title", "body"); err == nil {
+		t.Fatal("slow notification was not bounded by the client timeout")
 	}
 }
