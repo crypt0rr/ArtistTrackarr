@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -85,6 +86,29 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Test+sent", http.StatusSeeOther)
+}
+
+func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	count, err := a.store.RetryFailedDeliveries(r.Context(), session.User.ID, id, time.Now().UTC())
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("retry destination deliveries failed", "user_id", session.User.ID, "destination_id", id, "error", err)
+		http.Error(w, "destination deliveries could not be retried", http.StatusInternalServerError)
+		return
+	}
+	if a.jobs != nil && count > 0 {
+		a.jobs.Wake()
+	}
+	http.Redirect(w, r, "/settings?message="+url.QueryEscape(fmt.Sprintf("%d failed deliveries queued for retry", count)), http.StatusSeeOther)
 }
 func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)

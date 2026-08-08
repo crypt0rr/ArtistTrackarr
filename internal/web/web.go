@@ -71,6 +71,7 @@ type PageData struct {
 	Resolutions              []store.ArtistResolution
 	Resolution               *store.ArtistResolution
 	Destinations             []store.Destination
+	DestinationHealth        map[int64]store.DestinationHealth
 	History                  []store.DeliveryHistory
 	AdminHistory             []store.AdminDeliveryHistory
 	AdminDelivery            *store.AdminDeliveryHistory
@@ -78,6 +79,7 @@ type PageData struct {
 	AdminUsers               []store.AdminUser
 	AdminArtists             []store.AdminArtist
 	ProviderHealth           []store.ProviderHealth
+	AdminDestinationHealth   []store.AdminDestinationHealth
 	ManualSyncs              []store.ManualSyncRequest
 	Import                   *store.ImportJob
 	FollowCount              int

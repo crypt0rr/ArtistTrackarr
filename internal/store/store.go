@@ -378,6 +378,38 @@ type Destination struct {
 	Enabled      bool
 }
 
+// DestinationHealth is durable, owner-visible delivery state. It is kept
+// separate from Destination so encrypted credentials and service metadata are
+// never mixed into operational status projections.
+type DestinationHealth struct {
+	DestinationID       int64
+	Status              string
+	ConsecutiveFailures int
+	PendingCount        int
+	FailedCount         int
+	LastSuccessAt       *time.Time
+	LastFailureAt       *time.Time
+	NextRetryAt         *time.Time
+	LastError           string
+	UpdatedAt           time.Time
+}
+
+type AdminDestinationHealth struct {
+	DestinationID       int64
+	UserEmail           string
+	DestinationName     string
+	Service             string
+	Status              string
+	ConsecutiveFailures int
+	PendingCount        int
+	FailedCount         int
+	LastSuccessAt       *time.Time
+	LastFailureAt       *time.Time
+	NextRetryAt         *time.Time
+	LastError           string
+	UpdatedAt           time.Time
+}
+
 type Delivery struct {
 	ID           int64
 	EventID      int64

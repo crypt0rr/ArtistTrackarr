@@ -445,6 +445,24 @@ func parseTime(v string) (time.Time, error) {
 	}
 	return time.ParseInLocation("2006-01-02 15:04:05", v, time.UTC)
 }
+
+func parseNullableTime(v string) *time.Time {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	t, err := parseTime(v)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+func nullableID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
+}
 func nullableTime(t *time.Time) any {
 	if t == nil {
 		return nil
