@@ -21,8 +21,8 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release inbox count", err) || pageFailed
 	d.EvidenceIssueUnreadCount, err = a.store.EvidenceIssueUnreadCount(r.Context(), session.User.ID, time.Now().UTC())
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release evidence issue count", err) || pageFailed
-	d.CoverageSummary, err = a.store.CoverageSummary(r.Context(), session.User.ID)
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release coverage summary", err) || pageFailed
+	d.CoverageSummary, d.AssuranceSummary, err = a.store.CoverageOverview(r.Context(), session.User.ID, 5)
+	pageFailed = a.pageStoreError(r, &d, "Dashboard", "release coverage and watchlist assurance", err) || pageFailed
 	location, err := time.LoadLocation(session.User.Timezone)
 	if err != nil {
 		location = time.UTC

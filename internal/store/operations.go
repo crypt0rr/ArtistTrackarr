@@ -270,6 +270,64 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 	}
 	return out, rows.Err()
 }
+
+// Diagnostics returns bounded operational counters for the administrator
+// support view. It deliberately omits error text and all destination/provider
+// credentials so the resulting report is safe to copy into an issue.
+func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
+	var snapshot DiagnosticsSnapshot
+	snapshot.CheckedAt = time.Now().UTC()
+	err := s.readerDB().QueryRowContext(ctx, `SELECT
+		COALESCE((SELECT MAX(version) FROM schema_migrations),0),
+		(SELECT COUNT(*) FROM follows),
+		(SELECT COUNT(*) FROM release_groups),
+		(SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'),
+		(SELECT COUNT(*) FROM manual_sync_requests WHERE status='running'),
+		(SELECT COUNT(*) FROM deliveries WHERE status='pending'),
+		(SELECT COUNT(*) FROM deliveries WHERE status='failed'),
+		(SELECT COUNT(*) FROM application_logs WHERE created_at>=?)`,
+		timeText(snapshot.CheckedAt.Add(-24*time.Hour))).
+		Scan(&snapshot.SchemaVersion, &snapshot.FollowedArtists, &snapshot.Releases,
+			&snapshot.QueuedSyncs, &snapshot.RunningSyncs, &snapshot.PendingDeliveries,
+			&snapshot.FailedDeliveries, &snapshot.RecentLogEntries)
+	if err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	snapshot.DatabaseHealthy = true
+	health, err := s.ProviderHealth(ctx)
+	if err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	snapshot.Providers = make([]DiagnosticsProvider, 0, len(health))
+	for _, provider := range health {
+		snapshot.Providers = append(snapshot.Providers, DiagnosticsProvider{
+			Provider: provider.Provider, Status: diagnosticsProviderStatus(provider), NextCheckAt: provider.NextCheckAt,
+		})
+	}
+	return snapshot, nil
+}
+
+func diagnosticsProviderStatus(provider ProviderHealth) string {
+	latestFailure := provider.LastFailureAt != nil &&
+		(provider.LastSuccessAt == nil || !provider.LastFailureAt.Before(*provider.LastSuccessAt))
+	if latestFailure {
+		switch {
+		case provider.QuotaExceeded:
+			return "quota limited"
+		case provider.RateLimited:
+			return "rate limited"
+		default:
+			return "degraded"
+		}
+	}
+	if provider.LastSuccessAt != nil {
+		return "healthy"
+	}
+	if provider.LastFailureAt != nil {
+		return "unavailable"
+	}
+	return "no success yet"
+}
 func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())
 	return err

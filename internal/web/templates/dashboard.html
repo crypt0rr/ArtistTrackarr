@@ -23,6 +23,18 @@
   <div class="section-head"><div><p class="eyebrow">Release trust</p><h2>Know what is confirmed</h2><p>Provider coverage for your followed artists at a glance.</p></div><a href="/coverage">Open Trust Center</a></div>
   <div class="trust-overview-grid"><div><strong>{{.CoverageSummary.FreshArtists}}</strong><span>fresh or confirmed artists</span></div><div class="{{if .CoverageSummary.AttentionArtists}}attention{{end}}"><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>need provider attention</span></div><div><strong>{{.CoverageSummary.FallbackReleases}}</strong><span>iTunes-only releases</span></div>{{if .EvidenceIssueUnreadCount}}<div class="attention"><strong>{{.EvidenceIssueUnreadCount}}</strong><span><a href="/coverage/issues">evidence issues to review</a></span></div>{{end}}</div>
 </section>{{end}}
+{{if .AssuranceSummary.Total}}<section class="panel assurance-overview">
+  <div class="section-head"><div><p class="eyebrow">Watchlist assurance</p><h2>Know what is being watched</h2><p>Freshness and provider state for your followed artists, with the most important gaps first.</p></div><a class="button secondary" href="/coverage">Review coverage</a></div>
+  <div class="assurance-metrics">
+    <div class="assurance-metric"><strong>{{.AssuranceSummary.Healthy}}</strong><span>healthy</span></div>
+    <div class="assurance-metric delayed"><strong>{{.AssuranceSummary.Delayed}}</strong><span>delayed</span></div>
+    <div class="assurance-metric degraded"><strong>{{.AssuranceSummary.Degraded}}</strong><span>degraded</span></div>
+    <div class="assurance-metric pending"><strong>{{.AssuranceSummary.Pending}}</strong><span>pending first check</span></div>
+  </div>
+  {{if .AssuranceSummary.AtRisk}}<div class="assurance-risk-list" aria-label="Artists needing attention">
+    {{range .AssuranceSummary.AtRisk}}<a class="assurance-risk-row" href="/artists?q={{query .Artist.Name}}"><span><strong>{{.Artist.Name}}</strong><small>{{.AssuranceReason}}</small></span><span class="badge {{assuranceStatusClass .AssuranceStatus}}">{{assuranceStatusLabel .AssuranceStatus}}</span></a>{{end}}
+  </div>{{else}}<p class="assurance-clear">All followed artists have recent provider data.</p>{{end}}
+</section>{{end}}
 {{if or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel insights-panel">
   <div class="section-head insights-heading"><div><p class="eyebrow">Watchlist insights</p><h2>Explore your artists</h2><p>Quick patterns from your followed artists, with one-click filters.</p></div><div class="insights-heading-actions"><span class="badge">{{.FollowCount}} artists</span><a href="/artists">View all artists</a></div></div>
   <div class="insights-grid">

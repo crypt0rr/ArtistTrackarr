@@ -868,7 +868,7 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 	}
 	body, _ = io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if !strings.Contains(string(body), "<strong>2</strong>") || strings.Contains(string(body), "First Artist") {
+	if !strings.Contains(string(body), "<strong>2</strong>") || !strings.Contains(string(body), "Watchlist assurance") || !strings.Contains(string(body), "First Artist") {
 		t.Fatalf("dashboard count/list body=%q", body)
 	}
 
@@ -1747,6 +1747,16 @@ func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.
 		!strings.Contains(page, "Next check") || !strings.Contains(page, `data-refresh-url="/admin/provider-health"`) ||
 		strings.Contains(page, "retry after 20m") {
 		t.Fatalf("provider health admin rendering missing live details: %q", page)
+	}
+	response, err = client.Get(server.URL + "/admin/diagnostics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnosticBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(diagnosticBody), "ArtistTrackarr release assurance report") ||
+		strings.Contains(string(diagnosticBody), "retry after 20m") {
+		t.Fatalf("diagnostic report status/body=%d %q", response.StatusCode, diagnosticBody)
 	}
 }
 

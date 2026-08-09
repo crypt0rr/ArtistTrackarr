@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/crypt0rr/artist-tracker/internal/jobs"
 	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -69,6 +72,25 @@ func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 		a.logger.Debug("provider health response interrupted", "error", err)
 	}
 }
+
+func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := a.store.Diagnostics(r.Context())
+	if err != nil {
+		a.logger.Error("system diagnostics failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
+		return
+	}
+	var runner jobs.RunnerStatus
+	if a.jobs != nil {
+		runner = a.jobs.Status()
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `inline; filename="artisttrackarr-diagnostics.txt"`)
+	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner)); err != nil {
+		a.logger.Debug("system diagnostics response interrupted", "error", err)
+	}
+}
 func (a *App) adminData(r *http.Request) PageData {
 	const pageSize = 50
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -99,6 +121,12 @@ func (a *App) adminData(r *http.Request) PageData {
 	failed = a.pageStoreError(r, &d, "Household administration", "followed artists", err) || failed
 	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
+	d.Diagnostics, err = a.store.Diagnostics(r.Context())
+	failed = a.pageStoreError(r, &d, "Household administration", "system diagnostics", err) || failed
+	if a.jobs != nil {
+		d.RunnerStatus = a.jobs.Status()
+	}
+	d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus)
 	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
 	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
@@ -116,6 +144,40 @@ func (a *App) adminData(r *http.Request) PageData {
 		d.AdminNextPage = page + 1
 	}
 	return d
+}
+
+func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus) string {
+	var report strings.Builder
+	report.WriteString("ArtistTrackarr release assurance report\n")
+	fmt.Fprintf(&report, "Generated: %s\n", snapshot.CheckedAt.Format(time.RFC3339))
+	fmt.Fprintf(&report, "Database: %s (schema %d)\n", diagnosticHealthLabel(snapshot.DatabaseHealthy), snapshot.SchemaVersion)
+	fmt.Fprintf(&report, "Followed artists: %d\n", snapshot.FollowedArtists)
+	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)
+	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)
+	fmt.Fprintf(&report, "Running syncs: %d\n", snapshot.RunningSyncs)
+	fmt.Fprintf(&report, "Pending deliveries: %d\n", snapshot.PendingDeliveries)
+	fmt.Fprintf(&report, "Failed deliveries: %d\n", snapshot.FailedDeliveries)
+	fmt.Fprintf(&report, "Application events (24h): %d\n", snapshot.RecentLogEntries)
+	fmt.Fprintf(&report, "Scheduler: %s\n", diagnosticHealthLabel(runner.Running))
+	if runner.LastActivityAt != nil {
+		fmt.Fprintf(&report, "Scheduler last activity: %s\n", runner.LastActivityAt.Format(time.RFC3339))
+	}
+	report.WriteString("Providers:\n")
+	for _, provider := range snapshot.Providers {
+		fmt.Fprintf(&report, "- %s: %s", provider.Provider, provider.Status)
+		if provider.NextCheckAt != nil {
+			fmt.Fprintf(&report, "; next check %s", provider.NextCheckAt.Format(time.RFC3339))
+		}
+		report.WriteByte('\n')
+	}
+	return report.String()
+}
+
+func diagnosticHealthLabel(healthy bool) string {
+	if healthy {
+		return "healthy"
+	}
+	return "unavailable"
 }
 func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {

@@ -99,10 +99,14 @@
     form.querySelector("[data-service]").addEventListener("change", refresh);
     refresh();
   }
-  const copy = document.querySelector("[data-copy]");
-  if (copy) copy.addEventListener("click", async () => {
-    await navigator.clipboard.writeText(document.querySelector("[data-copy-value]").value);
-    copy.textContent = "Copied";
+  document.querySelectorAll("[data-copy]").forEach((copy) => {
+    const target = document.querySelector(copy.dataset.copyTarget || "[data-copy-value]");
+    if (!target) return;
+    copy.addEventListener("click", async () => {
+      const value = "value" in target ? target.value : target.textContent;
+      await navigator.clipboard.writeText(value);
+      copy.textContent = "Copied";
+    });
   });
 
   document.querySelectorAll("[data-multi-follow]").forEach((multi) => {
