@@ -629,6 +629,15 @@ func (a *App) data(r *http.Request, title string) PageData {
 	if session, ok := currentSession(r); ok {
 		u := session.User
 		d.User = &u
+		if count, err := a.store.ReleaseInboxUnreadCount(r.Context(), session.User.ID, time.Now().UTC()); err != nil {
+			// The badge is optional navigation chrome. Keep the page usable when
+			// its count lookup is temporarily unavailable, while retaining a
+			// structured diagnostic for operators.
+			a.logger.Error("navigation inbox count lookup failed", "path", r.URL.Path,
+				"request_id", middleware.GetReqID(r.Context()), "error", err)
+		} else {
+			d.InboxUnreadCount = count
+		}
 	}
 	return d
 }
