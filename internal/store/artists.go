@@ -74,14 +74,36 @@ func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error
 			return false, err
 		}
 	}
+	// Keep the policy row present even for a legacy follow that predates the
+	// policy migration. INSERT OR IGNORE also avoids resetting an existing
+	// policy.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
+		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return n > 0, nil
 }
 func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
-	result, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
-	return changedOrNotFound(result, err)
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
+	if err != nil {
+		return err
+	}
+	if err := changedOrNotFound(result, nil); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artistID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provider, providerID, name, providerURL, imageURL string) (ArtistResolution, bool, error) {
@@ -255,6 +277,12 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		return Artist{}, false, err
 	}
 	added, _ := follow.RowsAffected()
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
+		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, resolution.UserID, artist.ID, now); err != nil {
+		_ = tx.Rollback()
+		return Artist{}, false, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`,
 		resolution.ID, resolution.UserID); err != nil {
 		_ = tx.Rollback()

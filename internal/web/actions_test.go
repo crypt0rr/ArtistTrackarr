@@ -183,6 +183,100 @@ func TestArtistActionsReadyAndLogout(t *testing.T) {
 	}
 }
 
+func TestArtistNotificationRuleActionsAreOwnerScoped(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "rule-route-artist", Name: "Rule Route Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	otherArtist, err := database.UpsertArtist(ctx, store.Artist{MBID: "rule-route-artist-two", Name: "Rule Route Artist Two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, user.ID, otherArtist.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := client.Get(server.URL + "/artists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageBytes, readErr := io.ReadAll(page.Body)
+	_ = page.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	body := string(pageBytes)
+	if !strings.Contains(body, "Select all visible") || !strings.Contains(body, "Account defaults") {
+		t.Fatalf("artists page omitted notification controls: %q", body)
+	}
+	csrf := getCSRF(t, client, server.URL+"/artists")
+	response := postForm(t, client, server.URL+"/artists/"+strconv.FormatInt(artist.ID, 10)+"/notification-rule", url.Values{
+		"_csrf": {csrf}, "delivery_mode": {"digest"}, "include_primary": {"on"}, "albums": {"on"},
+		"eps": {"on"}, "singles": {"on"}, "compilations": {"on"}, "announcements": {"on"}, "release_day": {"on"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("rule update status=%d", response.StatusCode)
+	}
+	rule, err := database.FollowNotificationRule(ctx, user.ID, artist.ID)
+	if err != nil || rule.DeliveryMode != store.FollowDeliveryDigest || rule.IncludeFeatured {
+		t.Fatalf("updated rule=%#v err=%v", rule, err)
+	}
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response = postForm(t, client, server.URL+"/artists/notification-rules/batch", url.Values{
+		"_csrf": {csrf}, "artist_ids": {strconv.FormatInt(artist.ID, 10), strconv.FormatInt(otherArtist.ID, 10)}, "delivery_mode": {"immediate"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("batch rule update status=%d", response.StatusCode)
+	}
+	for _, artistID := range []int64{artist.ID, otherArtist.ID} {
+		rule, err = database.FollowNotificationRule(ctx, user.ID, artistID)
+		if err != nil || rule.DeliveryMode != store.FollowDeliveryImmediate {
+			t.Fatalf("batch rule artist=%d rule=%#v err=%v", artistID, rule, err)
+		}
+	}
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response = postForm(t, client, server.URL+"/artists/"+strconv.FormatInt(artist.ID, 10)+"/notification-rule/pause", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("pause status=%d", response.StatusCode)
+	}
+	rule, err = database.FollowNotificationRule(ctx, user.ID, artist.ID)
+	if err != nil || rule.PausedUntil == nil {
+		t.Fatalf("paused rule=%#v err=%v", rule, err)
+	}
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response = postForm(t, client, server.URL+"/artists/"+strconv.FormatInt(artist.ID, 10)+"/notification-rule/resume", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("resume status=%d", response.StatusCode)
+	}
+	rule, err = database.FollowNotificationRule(ctx, user.ID, artist.ID)
+	if err != nil || rule.PausedUntil != nil {
+		t.Fatalf("resumed rule=%#v err=%v", rule, err)
+	}
+	bad := noRedirectClient(client)
+	csrf = getCSRF(t, client, server.URL+"/artists")
+	response, err = bad.PostForm(server.URL+"/artists/999999/notification-rule", url.Values{"_csrf": {csrf}, "delivery_mode": {"off"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign/missing rule status=%d", response.StatusCode)
+	}
+}
+
 func TestITunesFollowBatchAndCancellation(t *testing.T) {
 	const firstID = "101"
 	const secondID = "202"

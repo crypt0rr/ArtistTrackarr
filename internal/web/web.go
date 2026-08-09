@@ -3,6 +3,7 @@ package web
 import (
 	"html/template"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
@@ -83,6 +84,7 @@ type PageData struct {
 	ManualSyncs              []store.ManualSyncRequest
 	Import                   *store.ImportJob
 	FollowCount              int
+	FollowRules              map[int64]store.FollowNotificationRule
 	ListenBrainzArtists      []store.Artist
 	GenreBreakdown           []store.ArtistBreakdown
 	CountryBreakdown         []store.ArtistBreakdown
@@ -151,6 +153,26 @@ type PageData struct {
 	TokenEmail               string
 	SpotifyOn                bool
 	ProviderNotice           string
+}
+
+func followDeliveryLabel(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case store.FollowDeliveryImmediate:
+		return "Immediate only"
+	case store.FollowDeliveryDigest:
+		return "Digest only"
+	case store.FollowDeliveryOff:
+		return "No notifications"
+	default:
+		return "Account defaults"
+	}
+}
+
+func followRuleSummary(rule store.FollowNotificationRule) string {
+	if rule.PausedUntil != nil {
+		return "Paused until " + rule.PausedUntil.Format("2006-01-02 15:04")
+	}
+	return followDeliveryLabel(rule.DeliveryMode)
 }
 
 type CalendarDay struct {

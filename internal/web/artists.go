@@ -57,6 +57,136 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/artists?message=Synchronization+queued", http.StatusSeeOther)
 }
+
+func parseFollowArtistID(r *http.Request) (int64, error) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		return 0, errors.New("invalid artist")
+	}
+	return id, nil
+}
+
+func followRuleFromForm(r *http.Request, rule store.FollowNotificationRule) store.FollowNotificationRule {
+	rule.DeliveryMode = strings.TrimSpace(r.FormValue("delivery_mode"))
+	rule.IncludePrimary = r.FormValue("include_primary") == "on"
+	rule.IncludeFeatured = r.FormValue("include_featured") == "on"
+	rule.Albums = r.FormValue("albums") == "on"
+	rule.EPs = r.FormValue("eps") == "on"
+	rule.Singles = r.FormValue("singles") == "on"
+	rule.Compilations = r.FormValue("compilations") == "on"
+	rule.Announcements = r.FormValue("announcements") == "on"
+	rule.ReleaseDay = r.FormValue("release_day") == "on"
+	return rule
+}
+
+func (a *App) updateArtistNotificationRule(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := parseFollowArtistID(r)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	rule, err := a.store.FollowNotificationRule(r.Context(), session.User.ID, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		a.logger.Error("load artist notification rule failed", "user_id", session.User.ID, "artist_id", id, "error", err)
+		http.Error(w, "artist notification rule could not be loaded", http.StatusInternalServerError)
+		return
+	}
+	rule = followRuleFromForm(r, rule)
+	if err := a.store.UpdateFollowNotificationRule(r.Context(), session.User.ID, id, rule); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/artists?message=Notification+rule+updated", http.StatusSeeOther)
+}
+
+func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	seen := make(map[int64]struct{})
+	var artistIDs []int64
+	for _, raw := range r.Form["artist_ids"] {
+		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil || id < 1 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		artistIDs = append(artistIDs, id)
+	}
+	if len(artistIDs) == 0 {
+		http.Redirect(w, r, "/artists?message=Select+at+least+one+artist", http.StatusSeeOther)
+		return
+	}
+	if len(artistIDs) > 50 {
+		http.Redirect(w, r, "/artists?message=Select+no+more+than+50+artists", http.StatusSeeOther)
+		return
+	}
+	changed, err := a.store.SetFollowNotificationDeliveryMode(r.Context(), session.User.ID, artistIDs, r.FormValue("delivery_mode"))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/artists?message="+url.QueryEscape(fmt.Sprintf("Notification mode updated for %d artists", changed)), http.StatusSeeOther)
+}
+
+func (a *App) pauseArtistNotifications(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := parseFollowArtistID(r)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	days := 7
+	if value, parseErr := strconv.Atoi(r.FormValue("days")); parseErr == nil && value >= 1 && value <= 365 {
+		days = value
+	}
+	until := time.Now().UTC().AddDate(0, 0, days)
+	if err := a.store.PauseFollowNotificationRule(r.Context(), session.User.ID, id, &until); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/artists?message="+url.QueryEscape(fmt.Sprintf("Notifications paused for %d days", days)), http.StatusSeeOther)
+}
+
+func (a *App) resumeArtistNotifications(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	id, err := parseFollowArtistID(r)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := a.store.PauseFollowNotificationRule(r.Context(), session.User.ID, id, nil); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/artists?message=Notifications+resumed", http.StatusSeeOther)
+}
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
 	target := "/artists"
 	if query := strings.TrimSpace(r.URL.Query().Get("q")); query != "" {

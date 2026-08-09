@@ -56,20 +56,62 @@
 
 <section class="page-head artists-list-head"><div><p class="eyebrow">Your watchlist</p><h2>Followed artists</h2><p>Alphabetically sorted, with provider links and synchronization status.</p></div><span class="badge">{{.FollowCount}} followed</span></section>
 <section class="panel">
+  <form id="bulk-follow-rules" method="post" action="/artists/notification-rules/batch" class="bulk-rule-form" data-bulk-rule-form>
+    {{template "csrf" .}}
+    <label class="bulk-select-all"><input type="checkbox" data-bulk-select-all> Select all visible</label>
+    <label>Selected notification mode
+      <select name="delivery_mode">
+        <option value="inherit">Account defaults</option>
+        <option value="immediate">Immediate only</option>
+        <option value="digest">Digest only</option>
+        <option value="off">No notifications</option>
+      </select>
+    </label>
+    <button class="secondary" type="submit">Apply to selected</button>
+    <small><span data-bulk-selected-count>0 selected</span> · Select up to 50 artists. Release history and provider polling are unchanged.</small>
+  </form>
   {{if .Artists}}<div class="list">
   {{range .Artists}}<article class="list-row">
     <div class="artist-summary">
+      <label class="artist-rule-select"><input type="checkbox" name="artist_ids" value="{{.ID}}" form="bulk-follow-rules" data-bulk-artist-choice><span class="sr-only">Select {{.Name}} for notification settings</span></label>
       {{if .SpotifyImageURL}}<img class="avatar" src="{{.SpotifyImageURL}}" alt="" referrerpolicy="no-referrer">{{else}}<span class="avatar">{{initial .Name}}</span>{{end}}
       <span><strong>{{.Name}}</strong><span>{{if .Type}}{{.Type}}{{end}}{{if .Country}} · {{.Country}}{{end}}{{if .Disambiguation}} · {{.Disambiguation}}{{end}}</span>
       {{if .Genres}}<small>Genres: {{join .Genres ", "}}</small>{{end}}
       {{if .ListenCheckedAt}}<small title="Exact counts: {{.ListenCount}} listens, {{.ListenUsers}} listeners">ListenBrainz: {{compactCount .ListenCount}} listens · {{compactCount .ListenUsers}} listeners</small>{{end}}
       <small>{{if .BaselineSynced}}Release catalog synchronized{{else}}Initial release synchronization pending{{end}}{{if .LastCheckedAt}} · Last checked {{.LastCheckedAt.Format "2006-01-02 15:04"}}{{end}}{{if .SpotifyNextCheckAt}} · Next check {{.SpotifyNextCheckAt.Format "2006-01-02 15:04"}}{{end}}</small></span>
     </div>
-    <div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
+    <div class="artist-row-content"><div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
     <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>
     <a href="https://listenbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
     <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}<button class="secondary">Sync now</button></form>
     <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
+    {{$rule := index $.FollowRules .ID}}
+    <details class="follow-rule-editor"><summary>{{followRuleSummary $rule}}</summary>
+      <form method="post" action="/artists/{{.ID}}/notification-rule" class="follow-rule-form">
+        {{template "csrf" $}}
+        <label>Delivery <select name="delivery_mode">
+          <option value="inherit"{{if eq $rule.DeliveryMode "inherit"}} selected{{end}}>Account defaults</option>
+          <option value="immediate"{{if eq $rule.DeliveryMode "immediate"}} selected{{end}}>Immediate only</option>
+          <option value="digest"{{if eq $rule.DeliveryMode "digest"}} selected{{end}}>Digest only</option>
+          <option value="off"{{if eq $rule.DeliveryMode "off"}} selected{{end}}>No notifications</option>
+        </select></label>
+        <div class="follow-rule-checks">
+          <label><input type="checkbox" name="include_primary"{{if $rule.IncludePrimary}} checked{{end}}> Primary</label>
+          <label><input type="checkbox" name="include_featured"{{if $rule.IncludeFeatured}} checked{{end}}> Featured</label>
+          <label><input type="checkbox" name="albums"{{if $rule.Albums}} checked{{end}}> Albums</label>
+          <label><input type="checkbox" name="eps"{{if $rule.EPs}} checked{{end}}> EPs</label>
+          <label><input type="checkbox" name="singles"{{if $rule.Singles}} checked{{end}}> Singles</label>
+          <label><input type="checkbox" name="compilations"{{if $rule.Compilations}} checked{{end}}> Compilations</label>
+          <label><input type="checkbox" name="announcements"{{if $rule.Announcements}} checked{{end}}> Announcements</label>
+          <label><input type="checkbox" name="release_day"{{if $rule.ReleaseDay}} checked{{end}}> Release day</label>
+        </div>
+        <button class="secondary" type="submit">Save rule</button>
+      </form>
+      <div class="follow-rule-actions">
+        {{if $rule.PausedUntil}}<form method="post" action="/artists/{{.ID}}/notification-rule/resume" class="inline">{{template "csrf" $}}<button class="link" type="submit">Resume now</button></form>
+        {{else}}<form method="post" action="/artists/{{.ID}}/notification-rule/pause" class="inline">{{template "csrf" $}}<input type="hidden" name="days" value="7"><button class="link" type="submit">Pause for 7 days</button></form>{{end}}
+      </div>
+    </details></div>
   </article>{{end}}</div>
   {{else}}<div class="empty">{{if or .GenreFilter .CountryFilter .TypeFilter}}No artists match the selected filters.{{else}}No artists yet. Search above to start your watchlist.{{end}}</div>{{end}}
 </section>
