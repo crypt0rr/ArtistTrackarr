@@ -100,6 +100,10 @@ type PageData struct {
 	CoveragePageLinks        []PaginationLink
 	CoveragePageStart        int
 	CoveragePageEnd          int
+	AssuranceSummary         store.AssuranceSummary
+	Diagnostics              store.DiagnosticsSnapshot
+	RunnerStatus             jobs.RunnerStatus
+	DiagnosticReport         string
 	EvidenceIssues           []store.EvidenceIssue
 	EvidenceIssueCount       int
 	EvidenceIssueUnreadCount int

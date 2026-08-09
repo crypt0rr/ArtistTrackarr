@@ -371,25 +371,69 @@ type ArtistProviderStatus struct {
 }
 
 type ArtistCoverage struct {
-	Artist               Artist
-	OverallStatus        string
-	ProviderStatuses     []ArtistProviderStatus
-	ReleaseCount         int
-	ConfirmedReleases    int
-	SingleSourceReleases int
-	FallbackReleases     int
-	LastObservedAt       *time.Time
-	NextCheckAt          *time.Time
+	Artist                 Artist
+	OverallStatus          string
+	AssuranceStatus        string
+	AssuranceReason        string
+	LastSuccessfulProvider string
+	ProviderStatuses       []ArtistProviderStatus
+	ReleaseCount           int
+	ConfirmedReleases      int
+	SingleSourceReleases   int
+	FallbackReleases       int
+	LastObservedAt         *time.Time
+	NextCheckAt            *time.Time
 }
 
 type CoverageSummary struct {
-	Artists              int
-	FreshArtists         int
-	AttentionArtists     int
-	PendingArtists       int
-	ConfirmedReleases    int
-	SingleSourceReleases int
-	FallbackReleases     int
+	Artists                 int
+	FreshArtists            int
+	AttentionArtists        int
+	PendingArtists          int
+	ConfirmedReleases       int
+	SingleSourceReleases    int
+	FallbackReleases        int
+	HealthyArtists          int
+	DelayedArtists          int
+	DegradedArtists         int
+	PendingAssuranceArtists int
+}
+
+// AssuranceSummary is the actionable, freshness-oriented view of a user's
+// watchlist. AtRisk contains a small severity-ranked subset for dashboard
+// rendering; the complete coverage page remains paginated separately.
+type AssuranceSummary struct {
+	Total    int
+	Healthy  int
+	Delayed  int
+	Degraded int
+	Pending  int
+	AtRisk   []ArtistCoverage
+}
+
+// DiagnosticsSnapshot contains safe operational counters for the admin
+// support view. It intentionally excludes provider error text, credentials,
+// notification bodies, and destination URLs.
+type DiagnosticsSnapshot struct {
+	CheckedAt         time.Time
+	DatabaseHealthy   bool
+	SchemaVersion     int
+	FollowedArtists   int
+	Releases          int
+	QueuedSyncs       int
+	RunningSyncs      int
+	PendingDeliveries int
+	FailedDeliveries  int
+	RecentLogEntries  int
+	Providers         []DiagnosticsProvider
+}
+
+// DiagnosticsProvider is the redacted provider projection used by support
+// reports. Error text and all credentials remain outside this type.
+type DiagnosticsProvider struct {
+	Provider    string
+	Status      string
+	NextCheckAt *time.Time
 }
 
 // ITunesArtworkArtist identifies one artist whose existing iTunes releases

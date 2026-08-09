@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
@@ -44,6 +45,15 @@ type Runner struct {
 	spotifyCooldownUntil  time.Time
 	itunesCooldownLoaded  bool
 	itunesCooldownUntil   time.Time
+	running               atomic.Bool
+	lastActivity          atomic.Int64
+}
+
+// RunnerStatus is a process-local scheduler snapshot for the admin assurance
+// view. It contains no provider credentials or per-artist payloads.
+type RunnerStatus struct {
+	Running        bool
+	LastActivityAt *time.Time
 }
 
 const (
@@ -255,7 +265,10 @@ func (r *Runner) clearITunesProviderCooldown() {
 
 func (r *Runner) Run(ctx context.Context) {
 	r.initLifecycle()
+	r.running.Store(true)
+	r.markActivity()
 	defer func() {
+		r.running.Store(false)
 		r.tasks.Wait()
 		close(r.done)
 	}()
@@ -310,10 +323,27 @@ func (r *Runner) Run(ctx context.Context) {
 // wake-up backlog.
 func (r *Runner) Wake() {
 	r.initLifecycle()
+	r.markActivity()
 	select {
 	case r.wake <- struct{}{}:
 	default:
 	}
+}
+
+// Status returns the scheduler's current lifecycle state. The timestamp is
+// best-effort and is intentionally process-local; persisted provider health
+// remains the source of truth for cooldowns and last successful observations.
+func (r *Runner) Status() RunnerStatus {
+	status := RunnerStatus{Running: r.running.Load()}
+	if nanos := r.lastActivity.Load(); nanos > 0 {
+		value := time.Unix(0, nanos).UTC()
+		status.LastActivityAt = &value
+	}
+	return status
+}
+
+func (r *Runner) markActivity() {
+	r.lastActivity.Store(time.Now().UTC().UnixNano())
 }
 
 // Done closes when Run has stopped and no background tick can access the
@@ -324,6 +354,7 @@ func (r *Runner) Done() <-chan struct{} {
 }
 
 func (r *Runner) startTask(ctx context.Context, name string, guard *sync.Mutex, work func(context.Context)) {
+	r.markActivity()
 	if !guard.TryLock() {
 		r.logger.Debug("background task skipped", "task", name, "reason", "already running")
 		return

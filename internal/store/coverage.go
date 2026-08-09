@@ -106,12 +106,107 @@ func (s *Store) FollowedArtistCoveragePage(ctx context.Context, userID int64, li
 }
 
 func (s *Store) CoverageSummary(ctx context.Context, userID int64) (CoverageSummary, error) {
+	summary, _, err := s.CoverageOverview(ctx, userID, 0)
+	return summary, err
+}
+
+// CoverageOverview returns the summary used by the dashboard and Trust
+// Center in one batched projection. This avoids repeating the followed-artist,
+// provider-status, and release-stat queries when both views are rendered.
+func (s *Store) CoverageOverview(ctx context.Context, userID int64, limit int) (CoverageSummary, AssuranceSummary, error) {
+	artists, err := s.followedArtistsForCoverage(ctx, userID)
+	if err != nil {
+		return CoverageSummary{}, AssuranceSummary{}, err
+	}
+	coverage, err := s.coverageForArtists(ctx, artists)
+	if err != nil {
+		return CoverageSummary{}, AssuranceSummary{}, err
+	}
+	return summarizeCoverage(coverage), summarizeAssurance(coverage, limit), nil
+}
+
+// WatchlistAssurance returns the complete owner-scoped assurance counts and a
+// small severity-ranked list for dashboard use. The underlying projections
+// are batched, matching the Trust Center's query behavior.
+func (s *Store) WatchlistAssurance(ctx context.Context, userID int64, limit int) (AssuranceSummary, error) {
+	_, summary, err := s.CoverageOverview(ctx, userID, limit)
+	return summary, err
+}
+
+func summarizeCoverage(coverage []ArtistCoverage) CoverageSummary {
+	summary := CoverageSummary{Artists: len(coverage)}
+	for _, item := range coverage {
+		summary.ConfirmedReleases += item.ConfirmedReleases
+		summary.SingleSourceReleases += item.SingleSourceReleases
+		summary.FallbackReleases += item.FallbackReleases
+		switch item.AssuranceStatus {
+		case "healthy":
+			summary.HealthyArtists++
+		case "delayed":
+			summary.DelayedArtists++
+		case "degraded":
+			summary.DegradedArtists++
+		default:
+			summary.PendingAssuranceArtists++
+		}
+		switch item.OverallStatus {
+		case "fresh", "confirmed":
+			summary.FreshArtists++
+		case "attention":
+			summary.AttentionArtists++
+		default:
+			summary.PendingArtists++
+		}
+	}
+	return summary
+}
+
+func summarizeAssurance(coverage []ArtistCoverage, limit int) AssuranceSummary {
+	if limit < 1 {
+		limit = 5
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	summary := AssuranceSummary{Total: len(coverage)}
+	for _, item := range coverage {
+		switch item.AssuranceStatus {
+		case "healthy":
+			summary.Healthy++
+		case "delayed":
+			summary.Delayed++
+		case "degraded":
+			summary.Degraded++
+		default:
+			summary.Pending++
+		}
+	}
+	sort.SliceStable(coverage, func(i, j int) bool {
+		left, right := assuranceSeverity(coverage[i].AssuranceStatus), assuranceSeverity(coverage[j].AssuranceStatus)
+		if left != right {
+			return left < right
+		}
+		return strings.ToLower(coverage[i].Artist.Name) < strings.ToLower(coverage[j].Artist.Name)
+	})
+	for _, item := range coverage {
+		if item.AssuranceStatus == "healthy" {
+			break
+		}
+		if len(summary.AtRisk) == limit {
+			break
+		}
+		summary.AtRisk = append(summary.AtRisk, item)
+	}
+	return summary
+}
+
+func (s *Store) followedArtistsForCoverage(ctx context.Context, userID int64) ([]Artist, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,
 		a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,
 		a.spotify_next_check_at,f.baseline_synced_at
 		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE f.user_id=?`, userID)
 	if err != nil {
-		return CoverageSummary{}, err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var artists []Artist
@@ -120,7 +215,7 @@ func (s *Store) CoverageSummary(ctx context.Context, userID int64) (CoverageSumm
 		var sid, surl, image, checked, spotifyNext, baseline sql.NullString
 		if err := rows.Scan(&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type,
 			&artist.Country, &artist.Disambiguation, &sid, &surl, &image, &checked, &spotifyNext, &baseline); err != nil {
-			return CoverageSummary{}, err
+			return nil, err
 		}
 		artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
 		if checked.Valid {
@@ -135,28 +230,9 @@ func (s *Store) CoverageSummary(ctx context.Context, userID int64) (CoverageSumm
 		artists = append(artists, artist)
 	}
 	if err := rows.Err(); err != nil {
-		return CoverageSummary{}, err
+		return nil, err
 	}
-	coverage, err := s.coverageForArtists(ctx, artists)
-	if err != nil {
-		return CoverageSummary{}, err
-	}
-	var summary CoverageSummary
-	summary.Artists = len(coverage)
-	for _, item := range coverage {
-		summary.ConfirmedReleases += item.ConfirmedReleases
-		summary.SingleSourceReleases += item.SingleSourceReleases
-		summary.FallbackReleases += item.FallbackReleases
-		switch item.OverallStatus {
-		case "fresh", "confirmed":
-			summary.FreshArtists++
-		case "attention":
-			summary.AttentionArtists++
-		default:
-			summary.PendingArtists++
-		}
-	}
-	return summary, nil
+	return artists, nil
 }
 
 func (s *Store) coverageForArtists(ctx context.Context, artists []Artist) ([]ArtistCoverage, error) {
@@ -176,6 +252,7 @@ func (s *Store) coverageForArtists(ctx context.Context, artists []Artist) ([]Art
 		return nil, err
 	}
 	result := make([]ArtistCoverage, 0, len(artists))
+	now := time.Now().UTC()
 	for _, artist := range artists {
 		item := ArtistCoverage{Artist: artist, ProviderStatuses: statuses[artist.ID]}
 		ProviderStatusOrder(item.ProviderStatuses)
@@ -188,9 +265,55 @@ func (s *Store) coverageForArtists(ctx context.Context, artists []Artist) ([]Art
 		}
 		item.NextCheckAt = earliestCoverageCheck(item.ProviderStatuses)
 		item.OverallStatus = coverageStatus(item)
+		item.AssuranceStatus, item.AssuranceReason, item.LastSuccessfulProvider = coverageAssurance(item, now)
 		result = append(result, item)
 	}
 	return result, nil
+}
+
+const coverageFreshnessWindow = 48 * time.Hour
+
+func coverageAssurance(item ArtistCoverage, now time.Time) (string, string, string) {
+	var latestSuccess *time.Time
+	provider := ""
+	for _, status := range item.ProviderStatuses {
+		if status.LastSuccessAt != nil && (latestSuccess == nil || status.LastSuccessAt.After(*latestSuccess)) {
+			value := *status.LastSuccessAt
+			latestSuccess = &value
+			provider = status.Provider
+		}
+	}
+	for _, status := range item.ProviderStatuses {
+		if status.Status == "failed" || status.Status == "cooldown" {
+			return "degraded", "A provider is unavailable or rate-limited; fallback data may still be available.", provider
+		}
+	}
+	if latestSuccess == nil {
+		if item.LastObservedAt != nil && now.Sub(*item.LastObservedAt) <= coverageFreshnessWindow {
+			return "healthy", "Recent release data is available.", provider
+		}
+		if item.ReleaseCount > 0 {
+			return "delayed", "Release history exists, but a recent provider check is not recorded.", provider
+		}
+		return "pending", "Waiting for the first successful provider observation.", provider
+	}
+	if now.Sub(*latestSuccess) > coverageFreshnessWindow {
+		return "delayed", "The latest successful provider check is more than 48 hours old.", provider
+	}
+	return "healthy", "Recent provider data is available.", provider
+}
+
+func assuranceSeverity(status string) int {
+	switch status {
+	case "degraded":
+		return 0
+	case "delayed":
+		return 1
+	case "pending":
+		return 2
+	default:
+		return 3
+	}
 }
 
 func (s *Store) artistProviderStatuses(ctx context.Context, ids []int64) (map[int64][]ArtistProviderStatus, error) {

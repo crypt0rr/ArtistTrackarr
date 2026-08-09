@@ -10,9 +10,15 @@
   <article class="trust-summary-card {{if .CoverageSummary.AttentionArtists}}attention{{end}}"><span class="eyebrow">Attention</span><strong>{{.CoverageSummary.AttentionArtists}}</strong><span>provider issues</span></article>
   <article class="trust-summary-card"><span class="eyebrow">Provenance</span><strong>{{.CoverageSummary.ConfirmedReleases}}</strong><span>multi-source releases</span></article>
 </section>
+<section class="assurance-strip" aria-label="Watchlist assurance summary">
+  <div><span class="eyebrow">Assurance</span><strong>{{.CoverageSummary.HealthyArtists}}</strong><span>healthy</span></div>
+  <div class="delayed"><strong>{{.CoverageSummary.DelayedArtists}}</strong><span>delayed</span></div>
+  <div class="degraded"><strong>{{.CoverageSummary.DegradedArtists}}</strong><span>degraded</span></div>
+  <div class="pending"><strong>{{.CoverageSummary.PendingAssuranceArtists}}</strong><span>pending first check</span></div>
+</section>
 <section class="panel trust-explainer">
   <p><strong>How to read this page</strong></p>
-  <p>Confirmed releases were observed by more than one provider. Fallback-only data is still useful, but may need a canonical confirmation later. Provider health and cooldowns are shown per artist; a manual sync uses the normal provider order and notification rules.</p>
+  <p>Assurance describes freshness and availability: healthy means recent provider data, delayed means the last successful check is older than 48 hours, and degraded means a provider is unavailable or rate-limited. Confirmed releases were observed by more than one provider. A manual sync uses the normal provider order and notification rules.</p>
 </section>
 <section class="panel coverage-panel">
   <div class="section-head"><div><p class="eyebrow">Artist coverage</p><h2>Provider confidence</h2></div>{{if .CoverageSummary.Artists}}<span class="badge">{{.CoveragePageStart}}–{{.CoveragePageEnd}} of {{.CoverageSummary.Artists}}</span>{{end}}</div>
@@ -23,6 +29,7 @@
         <span class="badge coverage-status {{coverageStatusClass .OverallStatus}}">{{coverageStatusLabel .OverallStatus}}</span>
       </div>
       <div class="coverage-meta"><span>{{.ReleaseCount}} releases</span><span>{{.ConfirmedReleases}} confirmed</span><span>{{.SingleSourceReleases}} single source</span><span>{{.FallbackReleases}} iTunes-only</span>{{if .LastObservedAt}}<span>Last observed {{formatProviderTime .LastObservedAt}}</span>{{end}}{{if .NextCheckAt}}<span>Next check {{formatProviderTime .NextCheckAt}}</span>{{end}}</div>
+      <div class="coverage-assurance"><span class="badge {{assuranceStatusClass .AssuranceStatus}}">{{assuranceStatusLabel .AssuranceStatus}}</span><span>{{.AssuranceReason}}</span>{{if .LastSuccessfulProvider}}<span>Latest {{providerLabel .LastSuccessfulProvider}}</span>{{end}}</div>
       <div class="coverage-links">
         {{if .Artist.SpotifyURL}}<a href="{{.Artist.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
         {{if .Artist.MBID}}<a href="https://musicbrainz.org/artist/{{.Artist.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a><a href="https://listenbrainz.org/artist/{{.Artist.MBID}}/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>{{end}}

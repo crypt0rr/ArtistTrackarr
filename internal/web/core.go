@@ -99,6 +99,32 @@ func providerHealthError(p store.ProviderHealth) string {
 	return message
 }
 
+func assuranceStatusLabel(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "healthy":
+		return "Healthy"
+	case "delayed":
+		return "Delayed"
+	case "degraded":
+		return "Degraded"
+	default:
+		return "Pending"
+	}
+}
+
+func assuranceStatusClass(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "healthy":
+		return "sent"
+	case "degraded":
+		return "failed"
+	case "delayed":
+		return "ambiguous"
+	default:
+		return "pending"
+	}
+}
+
 func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
 	return providerHealthPayload{
 		Provider: p.Provider, Status: providerHealthStatus(p), StatusClass: providerHealthClass(p),
@@ -175,6 +201,8 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"providerHealthStatus": providerHealthStatus,
 		"providerHealthClass":  providerHealthClass,
 		"providerHealthError":  providerHealthError,
+		"assuranceStatusLabel": assuranceStatusLabel,
+		"assuranceStatusClass": assuranceStatusClass,
 		"destinationHealthClass": func(status string) string {
 			switch strings.ToLower(status) {
 			case "healthy":
@@ -507,6 +535,7 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/sync/retry", a.queueRetrySync)
 			admin.Post("/admin/sync/artists/{id}", a.queueArtistSync)
 			admin.Get("/admin/provider-health", a.providerHealth)
+			admin.Get("/admin/diagnostics", a.diagnostics)
 		})
 	})
 	return r
