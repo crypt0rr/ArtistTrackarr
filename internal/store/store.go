@@ -99,6 +99,43 @@ type NotificationPreferences struct {
 	HoldConflictingNotifications bool
 }
 
+// FollowNotificationRule controls how one followed artist contributes to a
+// member's notification stream. The inherit mode preserves the account-wide
+// notification and digest preferences; other modes let a member make a noisy
+// or especially important follow more specific without changing shared
+// release data.
+type FollowNotificationRule struct {
+	UserID          int64
+	ArtistID        int64
+	DeliveryMode    string
+	IncludePrimary  bool
+	IncludeFeatured bool
+	Albums          bool
+	EPs             bool
+	Singles         bool
+	Compilations    bool
+	Announcements   bool
+	ReleaseDay      bool
+	PausedUntil     *time.Time
+	UpdatedAt       time.Time
+}
+
+const (
+	FollowDeliveryInherit   = "inherit"
+	FollowDeliveryImmediate = "immediate"
+	FollowDeliveryDigest    = "digest"
+	FollowDeliveryOff       = "off"
+)
+
+func defaultFollowNotificationRule(userID, artistID int64, now time.Time) FollowNotificationRule {
+	return FollowNotificationRule{
+		UserID: userID, ArtistID: artistID, DeliveryMode: FollowDeliveryInherit,
+		IncludePrimary: true, IncludeFeatured: true, Albums: true, EPs: true,
+		Singles: true, Compilations: true, Announcements: true, ReleaseDay: true,
+		UpdatedAt: now,
+	}
+}
+
 type AdminUser struct {
 	ID               int64
 	Email            string

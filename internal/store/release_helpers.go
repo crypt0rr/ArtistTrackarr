@@ -440,38 +440,69 @@ func comparableReleaseDate(value string) (time.Time, bool) {
 func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
 	var p NotificationPreferences
 	var albums, eps, singles, announcements, releaseDay, holdConflicts int
-	var primary string
-	err := tx.QueryRowContext(ctx, `SELECT p.albums,p.eps,p.singles,p.announcements,p.release_day,p.hold_conflicting_notifications,rg.primary_type FROM notification_preferences p JOIN release_groups rg ON rg.id=? WHERE p.user_id=?`, releaseID, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts, &primary)
-	if err == nil {
-		p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
-		p.HoldConflictingNotifications = holdConflicts != 0
-		if !releaseTypeEnabled(p, primary) || (eventType == "announcement" && !p.Announcements) || (eventType == "release_day" && !p.ReleaseDay) {
+	var primary, role, mode string
+	var includePrimary, includeFeatured int
+	var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
+	var paused, updated sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(p.albums,1),COALESCE(p.eps,1),COALESCE(p.singles,1),
+		COALESCE(p.announcements,1),COALESCE(p.release_day,1),COALESCE(p.hold_conflicting_notifications,0),
+		rg.primary_type,COALESCE(rg.artist_credit_role,'primary'),
+		COALESCE(nr.delivery_mode,'inherit'),COALESCE(nr.include_primary,1),COALESCE(nr.include_featured,1),
+		COALESCE(nr.albums,1),COALESCE(nr.eps,1),COALESCE(nr.singles,1),COALESCE(nr.compilations,1),
+		COALESCE(nr.announcements,1),COALESCE(nr.release_day,1),nr.paused_until,COALESCE(nr.updated_at,'')
+		FROM release_groups rg
+		JOIN follows f ON f.user_id=? AND f.artist_id=rg.artist_id
+		LEFT JOIN notification_preferences p ON p.user_id=?
+		LEFT JOIN follow_notification_rules nr ON nr.user_id=? AND nr.artist_id=rg.artist_id
+		WHERE rg.id=?`, userID, userID, userID, releaseID).Scan(&albums, &eps, &singles, &announcements, &releaseDay,
+		&holdConflicts, &primary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
+		&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// The owner no longer follows this artist (or the release was
+			// removed). Do not create an orphaned notification event.
 			return nil
 		}
-		if p.HoldConflictingNotifications {
-			if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
-				return err
-			}
-			return nil
-		}
+		return err
 	}
-	return insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
+	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+	p.HoldConflictingNotifications = holdConflicts != 0
+	rule := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, 0)
+	if !releaseTypeEnabled(p, primary) || !rule.AllowsContent(primary, role, eventType, now) {
+		return nil
+	}
+	if p.HoldConflictingNotifications && rule.queuesImmediate(now) {
+		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
+			return err
+		}
+		return nil
+	}
+	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, rule.queuesImmediate(now))
 }
 
 func insertNotificationEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
+	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true)
+}
+
+func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, queueDeliveries bool) error {
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO notification_events
 		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
 		userID, releaseID, eventType, title, body, timeText(now))
 	if err != nil {
 		return err
 	}
-	n, _ := result.RowsAffected()
-	if n == 0 {
-		return nil
-	}
-	eventID, err := result.LastInsertId()
+	n, err := result.RowsAffected()
 	if err != nil {
 		return err
+	}
+	eventID, _ := result.LastInsertId()
+	if n == 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events WHERE user_id=? AND release_group_id=? AND event_type=?`, userID, releaseID, eventType).Scan(&eventID); err != nil {
+			return err
+		}
+	}
+	if !queueDeliveries {
+		return nil
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,next_attempt_at)
 		SELECT ?,id,'pending',? FROM destinations WHERE user_id=? AND enabled=1`, eventID, timeText(now), userID)

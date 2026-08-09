@@ -123,11 +123,21 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		if err != nil {
 			return queued, err
 		}
+		rules, err := s.FollowNotificationRules(ctx, user.ID, nil)
+		if err != nil {
+			return queued, err
+		}
 		var releases []CalendarRelease
 		for _, item := range items {
-			if releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType) {
-				releases = append(releases, item)
+			rule, ok := rules[item.ArtistID]
+			if !ok {
+				rule = defaultFollowNotificationRule(user.ID, item.ArtistID, now.UTC())
 			}
+			if !releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType) ||
+				!rule.AllowsContent(item.PrimaryType, item.ArtistCreditRole, "", now) || !rule.belongsInDigest(now) {
+				continue
+			}
+			releases = append(releases, item)
 		}
 		if len(releases) == 0 {
 			continue

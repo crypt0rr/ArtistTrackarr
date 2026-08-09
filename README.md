@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.30.0`, which is also displayed by local
+footer. The current release is `v0.31.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -132,6 +132,17 @@ bounded timeout and re-check every redirect against the outbound-target safety
 policy. Message bodies and encrypted destination URLs are never stored in the
 health projection.
 
+Each followed artist can also have an owner-scoped notification rule. Use the
+artist list to keep an artist on the account defaults, deliver only through
+the immediate queue, include them only in the configured digest, or turn their
+notifications off while retaining the release in the inbox. Rules can narrow
+alerts to primary or featured credits and to albums, EPs, singles, or
+compilations, and a follow can be paused for seven days. Existing account-wide
+notification preferences remain the defaults for follows using **Account
+defaults**; provider polling and release history are never changed by a rule.
+The artist page also supports applying a delivery mode to up to 50 selected
+follows at once.
+
 When `PUBLIC_URL` uses HTTPS, the application sends HSTS and a restrictive
 Permissions-Policy header. With `LOG_LEVEL=debug`, sanitized request-completion
 records include the request ID, route pattern, status, duration, and response
@@ -145,7 +156,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.30.0` publishes `0.30.0`, `0.30`, and `latest`.
+- Pushing a tag such as `v0.31.0` publishes `0.31.0`, `0.31`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -153,7 +164,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.30.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.31.0 docker compose up -d
 ```
 
 ## Configuration

@@ -125,6 +125,28 @@
     refresh();
   });
 
+  document.querySelectorAll("[data-bulk-rule-form]").forEach((bulk) => {
+    const choices = [...document.querySelectorAll("[data-bulk-artist-choice]")];
+    const selectAll = bulk.querySelector("[data-bulk-select-all]");
+    const count = bulk.querySelector("[data-bulk-selected-count]");
+    const submit = bulk.querySelector("button[type=submit]");
+    const refresh = () => {
+      const selected = choices.filter((choice) => choice.checked).length;
+      if (count) count.textContent = `${selected} selected`;
+      if (submit) submit.disabled = selected === 0 || selected > 50;
+      if (selectAll) {
+        selectAll.checked = selected > 0 && selected === choices.length;
+        selectAll.indeterminate = selected > 0 && selected < choices.length;
+      }
+    };
+    selectAll?.addEventListener("change", () => {
+      choices.forEach((choice) => { choice.checked = selectAll.checked; });
+      refresh();
+    });
+    choices.forEach((choice) => choice.addEventListener("change", refresh));
+    refresh();
+  });
+
   const deliveryScroll = document.querySelector("[data-delivery-scroll]");
   if (deliveryScroll) {
     const sizeDeliveryLog = () => {

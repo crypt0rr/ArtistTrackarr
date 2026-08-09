@@ -154,9 +154,11 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			}
 			return v
 		},
-		"formatTime":     func(v time.Time) string { return v.Format("2006-01-02 15:04") },
-		"compactCount":   compactCount,
-		"calendarStatus": calendarReleaseStatus,
+		"formatTime":          func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"compactCount":        compactCount,
+		"followDeliveryLabel": followDeliveryLabel,
+		"followRuleSummary":   followRuleSummary,
+		"calendarStatus":      calendarReleaseStatus,
 		"calendarStatusClass": func(release store.CalendarRelease) string {
 			status := calendarReleaseStatus(release)
 			switch status {
@@ -474,6 +476,10 @@ func (a *App) Handler() http.Handler {
 		private.Post("/artists/follow/spotify/batch", a.followSpotifyBatch)
 		private.Post("/artists/follow/itunes", a.followITunes)
 		private.Post("/artists/follow/itunes/batch", a.followITunesBatch)
+		private.Post("/artists/notification-rules/batch", a.updateArtistNotificationRuleBatch)
+		private.Post("/artists/{id}/notification-rule", a.updateArtistNotificationRule)
+		private.Post("/artists/{id}/notification-rule/pause", a.pauseArtistNotifications)
+		private.Post("/artists/{id}/notification-rule/resume", a.resumeArtistNotifications)
 		private.Post("/artists/{id}/delete", a.unfollow)
 		private.Post("/artists/{id}/sync", a.syncArtist)
 		private.Get("/artist-resolutions/{id}", a.artistResolution)
@@ -717,6 +723,12 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	}
 	d.Artists, err = a.store.FollowedArtistsFilteredPage(r.Context(), session.User.ID, d.GenreFilter, d.CountryFilter, d.TypeFilter, pageSize, (page-1)*pageSize)
 	failed = a.pageStoreError(r, d, "Artists", "followed artist list", err) || failed
+	artistIDs := make([]int64, 0, len(d.Artists))
+	for _, artist := range d.Artists {
+		artistIDs = append(artistIDs, artist.ID)
+	}
+	d.FollowRules, err = a.store.FollowNotificationRules(r.Context(), session.User.ID, artistIDs)
+	failed = a.pageStoreError(r, d, "Artists", "follow notification rules", err) || failed
 	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
 	failed = a.pageStoreError(r, d, "Artists", "genre breakdown", err) || failed
 	d.CountryBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")

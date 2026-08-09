@@ -134,6 +134,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 		t.Fatal(err)
 	}
 	artistID, _ := artistResult.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`, userID, artistID, nowText()); err != nil {
+		t.Fatal(err)
+	}
 	releaseResult, err := db.Exec(`INSERT INTO release_groups(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at,spotify_id,source) VALUES('spotify:legacy',?,'Legacy','Album','',0,'',?,?,?,'spotify')`, artistID, nowText(), nowText(), "legacy")
 	if err != nil {
 		t.Fatal(err)
@@ -186,6 +189,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=20`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("delivery assurance migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=21`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("follow notification rules migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var digestTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
 		t.Fatalf("release digest table missing: %v", err)
@@ -193,6 +199,17 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	var assuranceTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_attempts'`).Scan(&assuranceTable); err != nil {
 		t.Fatalf("delivery attempts table missing: %v", err)
+	}
+	var rulesTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='follow_notification_rules'`).Scan(&rulesTable); err != nil {
+		t.Fatalf("follow notification rules table missing: %v", err)
+	}
+	var migratedRules int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM follow_notification_rules`).Scan(&migratedRules); err != nil {
+		t.Fatalf("follow notification rules backfill failed: %v", err)
+	}
+	if migratedRules == 0 {
+		t.Fatal("follow notification rules migration did not backfill existing follows")
 	}
 	var digestEnabled int
 	if err := db.QueryRow(`SELECT release_digest_enabled FROM notification_preferences WHERE user_id=?`, userID).Scan(&digestEnabled); err != nil || digestEnabled != 0 {

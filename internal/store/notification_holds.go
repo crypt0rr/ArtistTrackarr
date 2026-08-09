@@ -93,6 +93,9 @@ func drainNotificationHoldsTx(ctx context.Context, tx *sql.Tx, userID, releaseID
 	}
 	_ = rows.Close()
 	for _, item := range holds {
+		// A hold was created only after the normal rule and preference checks
+		// passed. Releasing it is an explicit review action (or a resolved
+		// conflict), so bypass the hold check and queue the retained event.
 		if err := insertNotificationEventTx(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now); err != nil {
 			return err
 		}
