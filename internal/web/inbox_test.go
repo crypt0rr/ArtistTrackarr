@@ -136,3 +136,45 @@ func TestReleaseInboxPageAndStateAction(t *testing.T) {
 		t.Fatalf("cross-user evidence action created %d review rows", reviews)
 	}
 }
+
+func TestInboxBadgeAppearsAcrossAuthenticatedPages(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "web-nav-badge-artist", Name: "Web Nav Badge Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	result, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at,source)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "web-nav-badge-release", artist.ID, "Web Nav Badge Release", "Single", "[]", "2026-08-09", 3,
+		"https://musicbrainz.org/release-group/web-nav-badge-release", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), "itunes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := result.LastInsertId()
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at)
+		VALUES(?,?,?,?,?,?)`, user.ID, releaseID, "announcement", "Web nav badge announcement", "body", now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/artists", "/calendar", "/coverage", "/settings"} {
+		response, err := client.Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		page := string(body)
+		if response.StatusCode != http.StatusOK || !strings.Contains(page, `class="nav-count">1</span>`) {
+			t.Fatalf("%s status=%d missing unread inbox badge: %q", path, response.StatusCode, page)
+		}
+	}
+}
