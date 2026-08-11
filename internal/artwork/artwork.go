@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,14 +71,16 @@ type call struct {
 }
 
 type Cache struct {
-	root      string
-	baseURL   string
-	client    *http.Client
-	now       func() time.Time
-	semaphore chan struct{}
-	mu        sync.Mutex
-	inflight  map[string]*call
-	pruneMu   sync.Mutex
+	root                 string
+	baseURL              string
+	client               *http.Client
+	now                  func() time.Time
+	semaphore            chan struct{}
+	mu                   sync.Mutex
+	inflight             map[string]*call
+	pruneMu              sync.Mutex
+	circuitFailureStreak int
+	circuitUntil         time.Time
 }
 
 func NewCache(root string, options ...Option) (*Cache, error) {
@@ -150,6 +153,12 @@ func (c *Cache) cached(mbid string) (Asset, bool) {
 func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	imagePath, missingPath := c.paths(mbid)
 	stale, _ := os.ReadFile(imagePath)
+	c.mu.Lock()
+	if c.circuitUntil.After(c.now()) {
+		c.mu.Unlock()
+		return fallback(stale, "circuit-open")
+	}
+	c.mu.Unlock()
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
@@ -165,31 +174,76 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	request.Header.Set("User-Agent", version.UserAgent)
 	response, err := c.client.Do(request)
 	if err != nil {
+		c.recordTransientFailure()
 		return fallback(stale, "upstream-error")
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode == http.StatusNotFound {
+		c.resetCircuit()
 		_ = os.Remove(imagePath)
 		_ = c.writeCacheFile(missingPath, nil)
 		return placeholderAsset("missing")
 	}
 	if response.StatusCode != http.StatusOK {
+		c.recordTransientFailureAfter(response)
 		return fallback(stale, "upstream-error")
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxImageBytes+1))
 	if err != nil || len(data) == 0 || len(data) > maxImageBytes {
+		c.recordTransientFailure()
 		return fallback(stale, "invalid")
 	}
 	contentType := http.DetectContentType(data)
 	if !allowedImageType(contentType) {
+		c.recordTransientFailure()
 		return fallback(stale, "invalid")
 	}
 	if err := c.writeCacheFile(imagePath, data); err != nil {
+		c.recordTransientFailure()
 		return fallback(data, "uncached")
 	}
+	c.resetCircuit()
 	_ = os.Remove(missingPath)
 	return Asset{Data: data, ContentType: contentType, Status: "fetched", MaxAge: successTTL}
+}
+
+func (c *Cache) resetCircuit() {
+	c.mu.Lock()
+	c.circuitFailureStreak = 0
+	c.circuitUntil = time.Time{}
+	c.mu.Unlock()
+}
+
+func (c *Cache) recordTransientFailure() {
+	c.recordTransientFailureAfter(nil)
+}
+
+func (c *Cache) recordTransientFailureAfter(response *http.Response) {
+	delay := time.Minute
+	if response != nil {
+		if seconds, err := strconv.Atoi(strings.TrimSpace(response.Header.Get("Retry-After"))); err == nil && seconds > 0 {
+			delay = time.Duration(seconds) * time.Second
+		}
+	}
+	c.mu.Lock()
+	c.circuitFailureStreak++
+	backoff := time.Minute * time.Duration(1<<min(c.circuitFailureStreak-1, 5))
+	if backoff > 30*time.Minute {
+		backoff = 30 * time.Minute
+	}
+	if delay > backoff {
+		backoff = delay
+	}
+	if backoff > 30*time.Minute {
+		backoff = 30 * time.Minute
+	}
+	// A single upstream blip should still be retried on the next request;
+	// open the circuit only after a short consecutive-failure streak.
+	if c.circuitFailureStreak >= 3 {
+		c.circuitUntil = c.now().Add(backoff)
+	}
+	c.mu.Unlock()
 }
 
 // Prune removes stale entries and then oldest entries until both cache limits

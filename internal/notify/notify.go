@@ -31,6 +31,11 @@ type ShoutrrrSender struct {
 	// process-wide net/http client for several services, so this timeout also
 	// protects those providers from hanging forever.
 	SendTimeout time.Duration
+	// client is owned by this sender. Shoutrrr 0.8 still uses
+	// http.DefaultClient for a few services, so Send temporarily scopes this
+	// client around the call while holding notificationHTTPClientMu and restores
+	// the previous global immediately afterwards.
+	client *http.Client
 }
 
 const DefaultSendTimeout = 15 * time.Second
@@ -65,6 +70,36 @@ func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
 	}
 }
 
+func newHTTPClient(timeout time.Duration, allowPrivateTargets bool) *http.Client {
+	if timeout <= 0 {
+		timeout = DefaultSendTimeout
+	}
+	transport := http.DefaultTransport
+	if base, ok := transport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("notification redirect limit exceeded")
+			}
+			if err := validateOutboundTarget(req.Context(), req.URL.String(), allowPrivateTargets, true); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
+func (s ShoutrrrSender) httpClient() *http.Client {
+	if s.client != nil {
+		return s.client
+	}
+	return newHTTPClient(s.sendTimeout(), s.AllowPrivateTargets)
+}
+
 func (s ShoutrrrSender) sendTimeout() time.Duration {
 	if s.SendTimeout <= 0 {
 		return DefaultSendTimeout
@@ -92,6 +127,16 @@ func (s ShoutrrrSender) Send(ctx context.Context, serviceURL, title, body string
 	if err := validateOutboundTarget(sendCtx, serviceURL, s.AllowPrivateTargets, true); err != nil {
 		return err
 	}
+	// Several Shoutrrr services dereference http.DefaultClient internally.
+	// Scope the sender-owned client only for this operation and restore the
+	// caller's client even when Shoutrrr returns an error or panics.
+	notificationHTTPClientMu.Lock()
+	previousClient := http.DefaultClient
+	http.DefaultClient = s.httpClient()
+	defer func() {
+		http.DefaultClient = previousClient
+		notificationHTTPClientMu.Unlock()
+	}()
 	sender, err := shoutrrr.CreateSender(serviceURL)
 	if err != nil {
 		return err

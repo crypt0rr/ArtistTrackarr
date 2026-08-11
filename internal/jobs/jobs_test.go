@@ -369,6 +369,24 @@ func TestBackgroundTaskGuardPreventsOverlap(t *testing.T) {
 	}
 }
 
+func TestBackgroundTaskPanicIsRecoveredAndGuardReleased(t *testing.T) {
+	runner := &Runner{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var guard sync.Mutex
+	runner.startTask(context.Background(), "panic-test", &guard, func(context.Context) { panic("provider secret https://example.test/token=redacted") })
+	runner.tasks.Wait()
+	if !guard.TryLock() {
+		t.Fatal("task guard remained locked after panic recovery")
+	}
+	guard.Unlock()
+	// A second task proves the scheduler can continue after the panic.
+	var called atomic.Bool
+	runner.startTask(context.Background(), "after-panic", &guard, func(context.Context) { called.Store(true) })
+	runner.tasks.Wait()
+	if !called.Load() {
+		t.Fatal("task did not run after recovered panic")
+	}
+}
+
 func TestRunnerShutdownWaitsForTrackedTasks(t *testing.T) {
 	runner := testRunner(resolutionTestStore(t), &resolutionCatalog{})
 	ctx, cancel := context.WithCancel(context.Background())

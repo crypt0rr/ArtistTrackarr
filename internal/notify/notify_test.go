@@ -206,7 +206,11 @@ func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
 	defer server.Close()
 	ConfigureHTTPClient(10*time.Millisecond, true)
 	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 10 * time.Millisecond}
+	before := http.DefaultClient
 	if err := sender.Send(context.Background(), "generic+"+server.URL+"/slow", "title", "body"); err == nil {
 		t.Fatal("slow notification was not bounded by the client timeout")
+	}
+	if http.DefaultClient != before {
+		t.Fatal("notification send leaked its scoped HTTP client into the application")
 	}
 }

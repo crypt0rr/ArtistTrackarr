@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -95,7 +96,6 @@ func main() {
 	} else if !errors.Is(healthErr, sql.ErrNoRows) {
 		logger.Warn("restore iTunes provider cooldown failed", "error", healthErr)
 	}
-	notify.ConfigureHTTPClient(notify.DefaultSendTimeout, cfg.AllowPrivateNotificationTargets)
 	sender := notify.ShoutrrrSender{AllowPrivateTargets: cfg.AllowPrivateNotificationTargets}
 	var runnerOptions []jobs.Option
 	if spotify != nil {
@@ -122,41 +122,63 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
+	// Bind before announcing readiness. A failed bind is a startup failure,
+	// not a background serve error, and must never make the container appear
+	// healthy while no listener exists.
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		logger.Error("bind HTTP listener failed", "address", cfg.ListenAddr, "error", err)
+		logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		logErr := applicationLogs.Close(logDrainCtx)
+		cancelLogDrain()
+		if logErr != nil {
+			// The process is terminating, but do not close SQLite while the
+			// asynchronous sink may still be writing to it.
+			databaseClosed = true
+			os.Exit(1)
+		}
+		_ = database.Close()
+		databaseClosed = true
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go runner.Run(ctx)
-	serverDone := make(chan struct{})
+	serverDone := make(chan error, 1)
 	go func() {
-		defer close(serverDone)
-		logger.Info("server listening", "address", cfg.ListenAddr, "public_url", cfg.PublicURL.String())
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http server failed", "error", err)
+		logger.Info("server listening", "address", listener.Addr().String(), "public_url", cfg.PublicURL.String())
+		serveErr := server.Serve(listener)
+		serverDone <- serveErr
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			logger.Error("http server failed", "error", serveErr)
 			stop()
 		}
 	}()
 	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	// HTTP and background work have independent budgets. A slow client must
+	// not consume the entire runner shutdown window (and vice versa).
+	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 20*time.Second)
+	if err := server.Shutdown(httpShutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
 	serverStopped := false
+	serverFailed := false
 	select {
-	case <-serverDone:
+	case serveErr := <-serverDone:
 		serverStopped = true
-	case <-shutdownCtx.Done():
+		serverFailed = serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed)
+	case <-httpShutdownCtx.Done():
 		stdoutLogger.Error("http server did not stop before shutdown deadline")
 	}
-	select {
-	case <-runner.Done():
-	case <-shutdownCtx.Done():
-		stdoutLogger.Error("background runner did not stop before shutdown deadline")
-	}
+	cancelHTTP()
 	runnerStopped := false
+	runnerShutdownCtx, cancelRunner := context.WithTimeout(context.Background(), 20*time.Second)
 	select {
 	case <-runner.Done():
 		runnerStopped = true
-	case <-shutdownCtx.Done():
+		cancelRunner()
+	case <-runnerShutdownCtx.Done():
+		cancelRunner()
 	}
 	logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
 	logErr := applicationLogs.Close(logDrainCtx)
@@ -179,5 +201,8 @@ func main() {
 	databaseClosed = true
 	if err := database.Close(); err != nil {
 		stdoutLogger.Error("close database", "error", err)
+	}
+	if serverFailed {
+		os.Exit(1)
 	}
 }

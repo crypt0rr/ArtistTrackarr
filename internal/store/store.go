@@ -276,6 +276,7 @@ type ReleaseDetail struct {
 	Release
 	Observations []ReleaseObservation
 	Credits      []ReleaseCredit
+	Timeline     []ReleaseTimelineEntry
 }
 
 // CalendarRelease is an owner-scoped release projection used by the calendar
@@ -374,6 +375,19 @@ type ReleaseObservation struct {
 	Provider   string
 	ProviderID string
 	ObservedAt time.Time
+}
+
+// ReleaseTimelineEntry is a redacted, owner-scoped explanation of the
+// observations and decisions that shaped a release. It deliberately contains
+// normalized summaries only; provider payloads, credentials, and notification
+// bodies never enter the timeline projection.
+type ReleaseTimelineEntry struct {
+	Kind       string
+	Provider   string
+	Role       string
+	Status     string
+	Summary    string
+	OccurredAt time.Time
 }
 
 type ReleaseBatch struct {

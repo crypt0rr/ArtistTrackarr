@@ -52,6 +52,7 @@ func TestReleaseInboxPageAndStateAction(t *testing.T) {
 		!strings.Contains(page, "Keep every release in view") ||
 		!strings.Contains(page, "Web Inbox Release") ||
 		!strings.Contains(page, "iTunes only") ||
+		!strings.Contains(page, `href="/releases/`+fmt.Sprint(releaseID)+`">Why this alert?</a>`) ||
 		!strings.Contains(page, `action="/inbox/`+fmt.Sprint(releaseID)+`/read"`) {
 		t.Fatalf("inbox status/body=%d %q", response.StatusCode, page)
 	}

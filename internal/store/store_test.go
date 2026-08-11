@@ -195,6 +195,15 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=22`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("release credits migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=23`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("review hot indexes migration marker=%d err=%v", migrationsApplied, err)
+	}
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id"} {
+		var found string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
+			t.Fatalf("migration index %q missing: %v", indexName, err)
+		}
+	}
 	var digestTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
 		t.Fatalf("release digest table missing: %v", err)
@@ -1079,9 +1088,15 @@ func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.AddDestination(ctx, userID, "Phone", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 7, 30, 7, 1, 0, 0, time.UTC) // 09:01 in Amsterdam.
 	releases := []Release{{
 		MBID: "today", Title: "Today", PrimaryType: "Album",
+		FirstReleaseDate: "2026-07-30", DatePrecision: 3,
+	}, {
+		MBID: "today-ep", Title: "Today EP", PrimaryType: "EP",
 		FirstReleaseDate: "2026-07-30", DatePrecision: 3,
 	}}
 	if err := s.ApplyReleaseSync(ctx, artist, releases, now); err != nil {
@@ -1093,7 +1108,14 @@ func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 	if err := s.QueueDueReleaseDays(ctx, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	assertEventCount(t, s, userID, "release_day", 1)
+	assertEventCount(t, s, userID, "release_day", 2)
+	var deliveries int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries`).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 2 {
+		t.Fatalf("release-day deliveries=%d, want two unique fan-outs", deliveries)
+	}
 }
 
 func TestRenameDestinationIsOwnerScopedAndPreservesCredentials(t *testing.T) {

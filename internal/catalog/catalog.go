@@ -117,6 +117,18 @@ type HTTPStatusError struct {
 	Text     string
 }
 
+// CatalogLimitError indicates that a provider advertised more pages than we
+// are willing to request in one synchronization. Callers should retry later;
+// partial catalog results must never be applied as if they were complete.
+type CatalogLimitError struct {
+	Provider string
+	Pages    int
+}
+
+func (e *CatalogLimitError) Error() string {
+	return fmt.Sprintf("%s catalog exceeded the %d-page safety limit", e.Provider, e.Pages)
+}
+
 func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("%s returned %s", e.Provider, e.Text)
 }
@@ -350,9 +362,16 @@ func (m *MusicBrainz) ResolveExternalArtist(ctx context.Context, externalURL str
 func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.Release, error) {
 	var all []store.Release
 	offset := 0
+	const pageSize = 100
+	const maxPages = 100
+	page := 0
 	for {
-		endpoint := fmt.Sprintf("%s/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep%%7Csingle&release-group-status=website-default&limit=100&offset=%d",
-			m.baseURL, url.QueryEscape(mbid), offset)
+		page++
+		if page > maxPages {
+			return nil, &CatalogLimitError{Provider: "MusicBrainz", Pages: maxPages}
+		}
+		endpoint := fmt.Sprintf("%s/ws/2/release-group?fmt=json&artist=%s&type=album%%7Cep%%7Csingle&release-group-status=website-default&limit=%d&offset=%d",
+			m.baseURL, url.QueryEscape(mbid), pageSize, offset)
 		var response struct {
 			Count         int `json:"release-group-count"`
 			ReleaseGroups []struct {
@@ -594,6 +613,7 @@ type Spotify struct {
 	artistCacheTTL   time.Duration
 	maxSearchCache   int
 	maxArtistCache   int
+	maxReleaseCache  int
 }
 
 type spotifyReleaseCache struct {
@@ -698,7 +718,7 @@ func NewSpotify(id, secret string, market ...string) *Spotify {
 		searchCache: make(map[string]spotifySearchCache), artistCache: make(map[string]spotifyArtistCache),
 		searchCalls: make(map[string]*spotifySearchCall), artistCalls: make(map[string]*spotifyArtistCall),
 		searchCacheTTL: 10 * time.Minute, emptySearchTTL: 2 * time.Minute, artistCacheTTL: 24 * time.Hour,
-		maxSearchCache: 256, maxArtistCache: 512,
+		maxSearchCache: 256, maxArtistCache: 512, maxReleaseCache: 512,
 	}
 }
 
@@ -1209,6 +1229,9 @@ func (s *Spotify) cachedReleases(artistID, since string) ([]store.Release, bool)
 	defer s.cacheMu.Unlock()
 	cached, ok := s.releaseCache[artistID]
 	if !ok || time.Since(cached.observedAt) >= s.cacheTTL || (since != "" && (cached.oldestDate == "" || cached.oldestDate > since)) {
+		if ok && time.Since(cached.observedAt) >= s.cacheTTL {
+			delete(s.releaseCache, artistID)
+		}
 		return nil, false
 	}
 	return append([]store.Release(nil), cached.releases...), true
@@ -1223,6 +1246,20 @@ func (s *Spotify) cacheReleases(artistID string, releases []store.Release) {
 	}
 	s.cacheMu.Lock()
 	s.releaseCache[artistID] = spotifyReleaseCache{observedAt: time.Now(), oldestDate: oldest, releases: append([]store.Release(nil), releases...)}
+	maxEntries := s.maxReleaseCache
+	if maxEntries <= 0 {
+		maxEntries = 512
+	}
+	for len(s.releaseCache) > maxEntries {
+		oldestKey := ""
+		var oldestTime time.Time
+		for key, entry := range s.releaseCache {
+			if oldestKey == "" || entry.observedAt.Before(oldestTime) {
+				oldestKey, oldestTime = key, entry.observedAt
+			}
+		}
+		delete(s.releaseCache, oldestKey)
+	}
 	s.cacheMu.Unlock()
 }
 
