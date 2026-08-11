@@ -615,7 +615,7 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	ics := string(body)
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/calendar; charset=utf-8" ||
 		response.Header.Get("Content-Disposition") != `attachment; filename="artisttrackarr-releases.ics"` ||
-		response.Header.Get("Cache-Control") != "private, max-age=300" ||
+		response.Header.Get("Cache-Control") != "no-store" ||
 		!strings.Contains(ics, "BEGIN:VCALENDAR") || !strings.Contains(ics, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
 		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
 		!strings.Contains(ics, "https://music.apple.com/us/album/calendar-web-release") {

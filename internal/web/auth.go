@@ -126,7 +126,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.store.ClearLoginFailures(r.Context(), key)
-	raw, _, err := a.store.CreateSession(r.Context(), user.ID, 30*24*time.Hour)
+	raw, _, err := a.store.CreateSession(r.Context(), user.ID, sessionLifetime)
 	if err != nil {
 		a.logger.Error("create session", "user_id", user.ID, "error", err)
 		http.Error(w, "could not create session", http.StatusInternalServerError)
@@ -135,7 +135,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: "artist_session", Value: security.SignedToken(a.cfg.SessionSecret, raw), Path: "/",
 		HttpOnly: true, Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
-		MaxAge: int((30 * 24 * time.Hour).Seconds()),
+		MaxAge: int(sessionLifetime.Seconds()),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

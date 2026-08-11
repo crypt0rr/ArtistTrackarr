@@ -199,8 +199,13 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(manualCutoff)}, &stats.ManualSyncs},
 		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(manualCutoff)}, &stats.ImportJobs},
 	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return stats, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, statement := range statements {
-		result, err := s.DB.ExecContext(ctx, statement.query, statement.args...)
+		result, err := tx.ExecContext(ctx, statement.query, statement.args...)
 		if err != nil {
 			return stats, err
 		}
@@ -209,6 +214,9 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 			return stats, err
 		}
 		*statement.out = count
+	}
+	if err := tx.Commit(); err != nil {
+		return stats, err
 	}
 	return stats, nil
 }

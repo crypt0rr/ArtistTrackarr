@@ -65,6 +65,24 @@ func TestProviderHealthPresentationHelpers(t *testing.T) {
 	}
 }
 
+func TestLocalReturnPathRejectsExternalAndOutOfScopeValues(t *testing.T) {
+	tests := []struct {
+		value, prefix, want string
+	}{
+		{value: "/inbox?state=unread", prefix: "/inbox", want: "/inbox?state=unread"},
+		{value: "https://evil.example/", prefix: "/", want: "/"},
+		{value: "//evil.example/", prefix: "/", want: "/"},
+		{value: "/\\\\evil.example", prefix: "/", want: "/"},
+		{value: "/artists", prefix: "/inbox", want: "/inbox"},
+		{value: "/inbox-other", prefix: "/inbox", want: "/inbox"},
+	}
+	for _, test := range tests {
+		if got := localReturnPath(test.value, test.prefix, test.want); got != test.want {
+			t.Errorf("localReturnPath(%q,%q)=%q, want %q", test.value, test.prefix, got, test.want)
+		}
+	}
+}
+
 func TestProviderTimeValueAcceptsSupportedShapes(t *testing.T) {
 	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	if got, ok := providerTimeValue(now); !ok || !got.Equal(now) {
@@ -220,7 +238,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 	providerTime := now.Add(-time.Hour)
 	resolution := &store.ArtistResolution{ID: 1, UserID: user.ID, Provider: "spotify", ProviderID: "spotify-template", DisplayName: artist.Name, ProviderURL: "https://open.spotify.com/artist/template", Status: "review", Candidates: []store.ResolutionCandidate{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}}}
 	data := PageData{
-		Title: "Template smoke", Version: "dev", User: user, CSRF: "csrf", SetupNeeded: true, Query: "template",
+		Title: "Template smoke", Version: "dev", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true, Query: "template",
 		Artists: []store.Artist{artist}, Results: []catalog.ArtistResult{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}},
 		SpotifyResults: []catalog.SpotifyArtist{{ID: "spotify-template", Name: artist.Name, URL: "https://open.spotify.com/artist/template"}},
 		ITunesResults:  []catalog.ITunesArtist{{ID: "123", Name: artist.Name, URL: "https://music.apple.com/us/artist/template/123"}}, UpcomingReleases: []store.Release{release}, RecentReleases: []store.Release{release},

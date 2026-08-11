@@ -39,14 +39,27 @@ type App struct {
 	loginLimiter     *fixedWindowLimiter
 	tokenLimiter     *fixedWindowLimiter
 	discoveryLimiter *fixedWindowLimiter
+	importLimiter    *fixedWindowLimiter
 	providerLimiter  *fixedWindowLimiter
 	loginSlots       chan struct{}
+}
+
+// UserView is the deliberately narrow projection exposed to templates. The
+// persistence model contains PasswordHash for authentication, but rendering
+// code should never receive credential material by accident.
+type UserView struct {
+	ID           int64
+	Email        string
+	Username     string
+	Role         string
+	Timezone     string
+	ReminderTime string
 }
 
 type PageData struct {
 	Title                    string
 	Version                  string
-	User                     *store.User
+	User                     *UserView
 	CSRF                     string
 	Error                    string
 	Message                  string

@@ -185,6 +185,11 @@ func validSpotifyArtistURL(value string) (*url.URL, bool) {
 
 func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
+	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+	if a.importLimiter != nil && !a.importLimiter.Allow(key) {
+		rateLimited(w, 3600, "artist imports are temporarily rate limited; try again later")
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		a.renderImportError(w, r, "Select an ArtistTrackarr CSV file.")

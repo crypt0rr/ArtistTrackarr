@@ -44,8 +44,9 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.35.0`, which is also displayed by local
-builds and release images. Operational timestamps are stored
+footer. The current release is `v0.36.0`; release images display the injected
+semantic version while local builds identify themselves as `dev`. Operational
+timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
 
@@ -55,14 +56,16 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.35.0 reliability release makes release-day fan-out idempotent, isolates
-panics in scheduled and delivery work, and applies persisted MusicBrainz
-cooldowns with bounded provider retries. Provider caches and catalog pagination
-are bounded so an unusually large catalog cannot exhaust memory or silently
-apply incomplete results. ListenBrainz retries transient responses with the
-ArtistTrackarr User-Agent and keeps prior aggregate values when a response
-omits an artist; Cover Art Archive failures retain stale artwork or the local
-placeholder without negative-caching transient outages.
+The v0.36.0 hardening release tightens startup validation, request handling,
+build identity, and operational safety without changing release semantics. The
+previous reliability work also recovers from panics in scheduled and delivery
+work, applies persisted MusicBrainz cooldowns with bounded provider retries,
+and bounds provider caches and catalog pagination so unusually large catalogs
+cannot exhaust memory or silently apply incomplete results. ListenBrainz
+retries transient responses with the ArtistTrackarr User-Agent and keeps prior
+aggregate values when a response omits an artist; Cover Art Archive failures
+retain stale artwork or the local placeholder without negative-caching
+transient outages.
 
 The v0.23.0 hardening defaults keep setup and login attempts bounded, accept
 forwarded client addresses only from explicitly trusted proxy networks, and
@@ -183,15 +186,17 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.35.0` publishes `0.35.0`, `0.35`, and `latest`.
+- Pushing a tag such as `v0.36.0` publishes `0.36.0`, `0.36`, and `latest`.
 
-The application version is kept in the source and updated with each release,
-so local and published images show the same release number in the interface.
+Release images receive their version through the Docker build's `APP_VERSION`
+argument. Tag builds inject the semantic tag (without the leading `v`), while
+branch and local builds use `dev` or `dev-<short-sha>` so development images are
+not confused with a release.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.35.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.36.0 docker compose up -d
 ```
 
 ## Configuration
@@ -209,6 +214,7 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.35.0 docker compose up 
 | `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
 | `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
+| `ITUNES_MARKET` | no | `US` | Two-letter Apple/iTunes storefront used for fallback searches and release lookups. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
 | `TRUST_PROXY` | no | `false` | Trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
@@ -264,7 +270,7 @@ endpoint when available. Artists are assigned stable polling offsets so a large
 watch list is spread across the day instead of queried in one burst.
 Apple/iTunes release observations are best-effort and are matched by canonical artist name. Collections are classified as Album, EP, or Single using track-count/title heuristics. Apple artwork URLs are accepted only from Apple hosts, loaded directly with attribution, and never downloaded or retained as image bytes. Existing artwork gaps are backfilled one artist at a time using the same conservative limiter. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
 
-iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `SPOTIFY_MARKET` (default `US`), and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.
+iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `ITUNES_MARKET` (default `US`) independently of Spotify, and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.
 
 Successful Spotify checks also adapt per artist. A catalog change returns the
 artist to the configured `SPOTIFY_POLL_INTERVAL`; unchanged artists back off

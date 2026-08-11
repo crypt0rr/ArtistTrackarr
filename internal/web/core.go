@@ -456,6 +456,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		loginLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
 		tokenLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
 		discoveryLimiter: newFixedWindowLimiter(30, 5*time.Minute),
+		importLimiter:    newFixedWindowLimiter(5, time.Hour),
 		providerLimiter:  newFixedWindowLimiter(30, 10*time.Minute),
 		loginSlots:       make(chan struct{}, 8),
 	}, nil
@@ -512,7 +513,7 @@ func timelineStatusClass(status string) string {
 }
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), a.requestLogging)
+	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
@@ -603,6 +604,9 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=()")
+		if !strings.HasPrefix(r.URL.Path, "/static/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		if a.cfg.PublicURL != nil && strings.EqualFold(a.cfg.PublicURL.Scheme, "https") {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
@@ -646,7 +650,7 @@ func (a *App) csrf(next http.Handler) http.Handler {
 			http.SetCookie(w, &http.Cookie{
 				Name: name, Value: security.SignedToken(a.cfg.SessionSecret, raw), Path: "/",
 				HttpOnly: true, Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteStrictMode,
-				MaxAge: int((24 * time.Hour).Seconds()),
+				MaxAge: int(sessionLifetime.Seconds()),
 			})
 		}
 		if r.Method == http.MethodPost {
@@ -704,14 +708,37 @@ func currentSession(r *http.Request) (store.Session, bool) {
 	return session, ok
 }
 
+const sessionLifetime = 30 * 24 * time.Hour
+
+// localReturnPath accepts only an absolute path on this application. It
+// rejects scheme-relative URLs, hosts, control characters, and paths outside
+// the intended workflow so form redirects cannot become open redirects.
+func localReturnPath(value, prefix, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\\\r\n") || strings.HasPrefix(value, "//") || !strings.HasPrefix(value, "/") {
+		return fallback
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Path == "" || strings.HasPrefix(parsed.Path, "//") {
+		return fallback
+	}
+	if prefix != "" && parsed.Path != prefix && !strings.HasPrefix(parsed.Path, strings.TrimSuffix(prefix, "/")+"/") {
+		return fallback
+	}
+	return parsed.RequestURI()
+}
+
 func (a *App) data(r *http.Request, title string) PageData {
+	csrf, _ := r.Context().Value(csrfKey).(string)
 	d := PageData{
-		Title: title, Version: version.Current, CSRF: r.Context().Value(csrfKey).(string),
+		Title: title, Version: version.Current, CSRF: csrf,
 		Message: r.URL.Query().Get("message"), SpotifyOn: a.spotify != nil,
 	}
 	if session, ok := currentSession(r); ok {
-		u := session.User
-		d.User = &u
+		d.User = &UserView{
+			ID: session.User.ID, Email: session.User.Email, Username: session.User.Username,
+			Role: session.User.Role, Timezone: session.User.Timezone, ReminderTime: session.User.ReminderTime,
+		}
 		if count, err := a.store.ReleaseInboxUnreadCount(r.Context(), session.User.ID, time.Now().UTC()); err != nil {
 			// The badge is optional navigation chrome. Keep the page usable when
 			// its count lookup is temporarily unavailable, while retaining a

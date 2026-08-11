@@ -6,9 +6,10 @@ import (
 	"embed"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 //go:embed migrations/*.sql
@@ -19,11 +20,14 @@ var migrations embed.FS
 // is committing, which keeps dashboard requests from queueing behind provider
 // synchronization work.
 type Store struct {
-	DB     *sql.DB
-	Reader *sql.DB
+	DB       *sql.DB
+	Reader   *sql.DB
+	readerMu sync.RWMutex
 }
 
 func (s *Store) readerDB() *sql.DB {
+	s.readerMu.RLock()
+	defer s.readerMu.RUnlock()
 	if s.Reader != nil {
 		return s.Reader
 	}
@@ -64,6 +68,15 @@ func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
 func sqliteBusy(err error) bool {
 	if err == nil {
 		return false
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		// SQLite result codes use the low byte for the primary result. BUSY
+		// (5) and LOCKED (6) are retryable even when an extended code is set.
+		code := sqliteErr.Code() & 0xff
+		if code == 5 || code == 6 {
+			return true
+		}
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "database is locked") ||

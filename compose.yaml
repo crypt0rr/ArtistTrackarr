@@ -24,6 +24,7 @@ services:
       SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
       SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
       SPOTIFY_MARKET: "${SPOTIFY_MARKET:-US}"
+      ITUNES_MARKET: "${ITUNES_MARKET:-US}"
     secrets:
       - setup_token
       - encryption_key

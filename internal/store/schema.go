@@ -360,10 +360,13 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	return tx.Commit()
 }
 func (s *Store) Close() error {
+	s.readerMu.Lock()
+	reader := s.Reader
+	s.Reader = nil
+	s.readerMu.Unlock()
 	var readerErr error
-	if s.Reader != nil {
-		readerErr = s.Reader.Close()
-		s.Reader = nil
+	if reader != nil {
+		readerErr = reader.Close()
 	}
 	if s.DB == nil {
 		return readerErr
