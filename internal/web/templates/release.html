@@ -28,7 +28,7 @@
       </div>
     </div>
   </section>
-  <section class="panel release-history-panel"><p class="eyebrow">Provider observations</p><h2>Release history</h2>{{if .Observations}}<div class="list">{{range .Observations}}<div class="list-row"><strong>{{.Provider}}</strong><small>{{.ProviderID}} · {{formatTime .ObservedAt}}</small></div>{{end}}</div>{{else}}<div class="empty">No provider observations recorded.</div>{{end}}</section>
+  <section class="panel release-history-panel"><p class="eyebrow">Provider observations</p><h2>Release history</h2>{{if .Observations}}<div class="list">{{range .Observations}}<div class="list-row"><strong>{{.Provider}}</strong><small>{{.ProviderID}} · {{formatTime .ObservedAt}}</small></div>{{end}}</div>{{else}}<div class="empty">No provider observations recorded.</div>{{end}}{{if .Credits}}<div class="release-credit-history"><p class="eyebrow">Artist credits</p>{{range .Credits}}<div class="list-row"><div><strong>{{creditRoleLabel .Role}}</strong>{{if .TrackTitle}}<small>{{.TrackTitle}}</small>{{end}}</div><small>{{providerLabel .Provider}}{{if .CreditName}} · {{.CreditName}}{{end}}{{if .Confidence}} · {{.Confidence}}{{end}}</small></div>{{end}}</div>{{end}}</section>
 </section>
 {{end}}
 {{end}}

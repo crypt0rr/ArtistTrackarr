@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.32.0`, which is also displayed by local
+footer. The current release is `v0.33.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -165,7 +165,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.32.0` publishes `0.32.0`, `0.32`, and `latest`.
+- Pushing a tag such as `v0.33.0` publishes `0.33.0`, `0.33`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -173,7 +173,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.32.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.33.0 docker compose up -d
 ```
 
 ## Configuration
@@ -221,6 +221,18 @@ compilation. Existing follows receive a one-time appearance baseline during
 their first successful post-upgrade Spotify sync; new followers retain the
 normal single-release onboarding notification. Featured alerts represent the
 containing release rather than individual tracks.
+
+ArtistTrackarr also keeps a source-agnostic credit graph for followed artists.
+Spotify's `appears_on` results, iTunes multi-artist song credits, and
+MusicBrainz recording artist credits are normalized into primary, featured, and
+guest evidence for the containing release. A guest credit includes its track
+context where the provider supplies one, while notifications remain one
+release-level event and continue to use the existing deduplication and
+baseline rules. Existing follows are baselined once per provider and credit
+role so an upgrade cannot flood the inbox with historical collaborations;
+newly observed future or recent guest releases are eligible for the normal
+announcement and release-day reminders. Follow rules that include featured
+appearances also include guest credits.
 
 To keep Spotify Development Mode usage low, release observation normally reads
 the newest Spotify artist-albums page and only walks older pages when the stored

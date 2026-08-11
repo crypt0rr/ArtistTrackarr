@@ -33,8 +33,9 @@ func saveMusicBrainzReleaseTx(
 			err = nil
 		} else if err == nil {
 			existed = true
-			_, err = tx.ExecContext(ctx, `UPDATE release_groups SET mbid=?,source='both',artist_credit_role='primary' WHERE id=?`,
-				release.MBID, releaseID)
+			_, err = tx.ExecContext(ctx, `UPDATE release_groups SET mbid=?,source='both',
+				artist_credit_role=CASE WHEN ?='primary' THEN 'primary' ELSE artist_credit_role END WHERE id=?`,
+				release.MBID, normalizedArtistCreditRole(release.ArtistCreditRole), releaseID)
 		}
 	}
 	if err != nil {
@@ -48,7 +49,7 @@ func saveMusicBrainzReleaseTx(
 			VALUES(?,?,?,?,?,?,?,?,?,'musicbrainz',?,?)`,
 			release.MBID, artistID, release.Title, release.PrimaryType, string(secondary),
 			release.FirstReleaseDate, release.DatePrecision, release.MusicBrainzURL,
-			"primary", timeText(observed), timeText(observed))
+			normalizedArtistCreditRole(release.ArtistCreditRole), timeText(observed), timeText(observed))
 		if insertErr != nil {
 			return syncedRelease{}, insertErr
 		}
@@ -58,11 +59,12 @@ func saveMusicBrainzReleaseTx(
 			title=?,primary_type=?,secondary_types=?,
 			first_release_date=CASE WHEN ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=MAX(date_precision,?),musicbrainz_url=?,
-			artist_credit_role='primary',
+			artist_credit_role=CASE WHEN ?='primary' THEN 'primary' ELSE artist_credit_role END,
 			source=CASE WHEN spotify_id IS NULL AND itunes_id IS NULL THEN 'musicbrainz' ELSE 'both' END,updated_at=?
 			WHERE id=?`,
 			release.Title, release.PrimaryType, string(secondary),
 			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision, release.MusicBrainzURL,
+			normalizedArtistCreditRole(release.ArtistCreditRole),
 			timeText(observed), releaseID)
 		if err != nil {
 			return syncedRelease{}, err
@@ -71,8 +73,13 @@ func saveMusicBrainzReleaseTx(
 	if err := upsertProviderObservationTx(ctx, tx, "musicbrainz", release.MBID, releaseID, release, observed); err != nil {
 		return syncedRelease{}, err
 	}
+	creditNew, err := upsertReleaseCreditsTx(ctx, tx, "musicbrainz", artistID, releaseID, release, observed)
+	if err != nil {
+		return syncedRelease{}, err
+	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
-	return syncedRelease{release: saved, isNew: !existed, provider: "musicbrainz"}, err
+	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
+	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "musicbrainz"}, err
 }
 func saveSpotifyReleaseTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
@@ -132,8 +139,13 @@ func saveSpotifyReleaseTx(
 	if err := upsertProviderObservationTx(ctx, tx, "spotify", release.SpotifyID, releaseID, release, observed); err != nil {
 		return syncedRelease{}, err
 	}
+	creditNew, err := upsertReleaseCreditsTx(ctx, tx, "spotify", artistID, releaseID, release, observed)
+	if err != nil {
+		return syncedRelease{}, err
+	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
-	return syncedRelease{release: saved, isNew: !existed, provider: "spotify"}, err
+	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
+	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "spotify"}, err
 }
 func saveITunesReleaseTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
@@ -166,11 +178,11 @@ func saveITunesReleaseTx(
 		result, insertErr := tx.ExecContext(ctx, `INSERT INTO release_groups
 			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
 			 musicbrainz_url,itunes_id,itunes_url,itunes_artwork_url,itunes_artwork_checked_at,
-			 itunes_artwork_next_check_at,source,first_observed_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'itunes',?,?)`,
+			 itunes_artwork_next_check_at,artist_credit_role,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'itunes',?,?)`,
 			"itunes:"+release.ITunesID, artistID, release.Title, release.PrimaryType, string(secondary),
 			release.FirstReleaseDate, release.DatePrecision, "", release.ITunesID, release.ITunesURL,
-			artworkURL, timeText(observed), timeText(observed.Add(30*24*time.Hour)),
+			artworkURL, timeText(observed), timeText(observed.Add(30*24*time.Hour)), normalizedArtistCreditRole(release.ArtistCreditRole),
 			timeText(observed), timeText(observed))
 		if insertErr != nil {
 			return syncedRelease{}, insertErr
@@ -187,12 +199,14 @@ func saveITunesReleaseTx(
 			secondary_types=CASE WHEN source='itunes' THEN ? ELSE secondary_types END,
 			first_release_date=CASE WHEN source='itunes' AND ?>=date_precision THEN ? ELSE first_release_date END,
 			date_precision=CASE WHEN source='itunes' THEN MAX(date_precision,?) ELSE date_precision END,
+			artist_credit_role=CASE WHEN artist_credit_role='primary' OR ?='primary' THEN 'primary' ELSE 'featured' END,
 			source=CASE WHEN source IN ('musicbrainz','spotify') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,
 			release.ITunesID, release.ITunesURL, artworkURL, artworkURL,
 			timeText(observed), artworkURL, timeText(observed.Add(30*24*time.Hour)),
 			release.Title, release.PrimaryType, string(secondary),
 			release.DatePrecision, release.FirstReleaseDate, release.DatePrecision,
+			normalizedArtistCreditRole(release.ArtistCreditRole),
 			timeText(observed), releaseID)
 		if err != nil {
 			return syncedRelease{}, err
@@ -201,8 +215,189 @@ func saveITunesReleaseTx(
 	if err := upsertProviderObservationTx(ctx, tx, "itunes", release.ITunesID, releaseID, release, observed); err != nil {
 		return syncedRelease{}, err
 	}
+	creditNew, err := upsertReleaseCreditsTx(ctx, tx, "itunes", artistID, releaseID, release, observed)
+	if err != nil {
+		return syncedRelease{}, err
+	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
-	return syncedRelease{release: saved, isNew: !existed, provider: "itunes"}, err
+	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
+	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "itunes"}, err
+}
+
+// upsertReleaseCreditsTx persists provider-backed credit evidence without
+// deleting older observations. The returned flag is true only when a new
+// non-primary credit was discovered, which lets the existing notification
+// pipeline alert on a newly discovered collaboration without treating every
+// unchanged provider response as a new release.
+func upsertReleaseCreditsTx(
+	ctx context.Context, tx *sql.Tx, provider string, artistID, releaseID int64,
+	release Release, observed time.Time,
+) (bool, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	providerID := releaseProviderID(provider, release)
+	if providerID == "" {
+		return false, nil
+	}
+	credits := append([]ReleaseCredit(nil), release.Credits...)
+	if len(credits) == 0 {
+		role := normalizedCreditRole(release.ArtistCreditRole)
+		credits = []ReleaseCredit{{Role: role, ProviderID: providerID, ProviderURL: releaseProviderURL(provider, release)}}
+	}
+	creditNew := false
+	for _, credit := range credits {
+		role := normalizedCreditRole(credit.Role)
+		creditID := strings.TrimSpace(credit.ProviderID)
+		if creditID == "" {
+			creditID = providerID
+		}
+		if creditID == "" {
+			continue
+		}
+		trackTitle := strings.TrimSpace(credit.TrackTitle)
+		creditName := strings.TrimSpace(credit.CreditName)
+		providerURL := strings.TrimSpace(credit.ProviderURL)
+		if providerURL == "" {
+			providerURL = releaseProviderURL(provider, release)
+		}
+		confidence := strings.ToLower(strings.TrimSpace(credit.Confidence))
+		if confidence != "probable" && confidence != "inferred" {
+			confidence = "confirmed"
+		}
+		var exists int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM release_credits
+			WHERE release_group_id=? AND artist_id=? AND provider=? AND provider_id=? AND role=? AND track_title=? LIMIT 1`,
+			releaseID, artistID, provider, creditID, role, trackTitle).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			if role != "primary" {
+				creditNew = true
+			}
+		} else if err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO release_credits(
+			release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,
+			provider_url,confidence,first_seen_at,last_seen_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(release_group_id,artist_id,provider,provider_id,role,track_title)
+			DO UPDATE SET credit_name=CASE WHEN excluded.credit_name<>'' THEN excluded.credit_name ELSE release_credits.credit_name END,
+			provider_url=CASE WHEN excluded.provider_url<>'' THEN excluded.provider_url ELSE release_credits.provider_url END,
+			confidence=excluded.confidence,last_seen_at=excluded.last_seen_at`,
+			releaseID, artistID, provider, creditID, role, trackTitle, creditName,
+			providerURL, confidence, timeText(observed), timeText(observed)); err != nil {
+			return false, err
+		}
+	}
+	return creditNew, nil
+}
+
+func releaseProviderID(provider string, release Release) string {
+	switch provider {
+	case "spotify":
+		return strings.TrimSpace(release.SpotifyID)
+	case "itunes":
+		return strings.TrimSpace(release.ITunesID)
+	case "musicbrainz":
+		return strings.TrimSpace(release.MBID)
+	default:
+		return ""
+	}
+}
+
+func releaseProviderURL(provider string, release Release) string {
+	switch provider {
+	case "spotify":
+		return strings.TrimSpace(release.SpotifyURL)
+	case "itunes":
+		return strings.TrimSpace(release.ITunesURL)
+	case "musicbrainz":
+		return strings.TrimSpace(release.MusicBrainzURL)
+	default:
+		return ""
+	}
+}
+
+func normalizedCreditRole(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "guest":
+		return "guest"
+	case "featured", "appearance", "appears_on":
+		return "featured"
+	default:
+		return "primary"
+	}
+}
+
+func releaseHasNonPrimaryCredit(release Release) bool {
+	if normalizedCreditRole(release.ArtistCreditRole) != "primary" {
+		return true
+	}
+	for _, credit := range release.Credits {
+		if normalizedCreditRole(credit.Role) != "primary" {
+			return true
+		}
+	}
+	return false
+}
+
+func releaseCreditRoles(release Release, provider string) []string {
+	roles := make(map[string]bool)
+	for _, credit := range release.Credits {
+		if strings.TrimSpace(credit.Provider) != "" && !strings.EqualFold(strings.TrimSpace(credit.Provider), provider) {
+			continue
+		}
+		role := normalizedCreditRole(credit.Role)
+		if role != "primary" {
+			roles[role] = true
+		}
+	}
+	if len(roles) == 0 && releaseHasNonPrimaryCredit(release) {
+		roles[normalizedCreditRole(release.ArtistCreditRole)] = true
+	}
+	result := make([]string, 0, len(roles))
+	for role := range roles {
+		result = append(result, role)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func mergeReleaseCredits(existing, incoming []ReleaseCredit) []ReleaseCredit {
+	result := append([]ReleaseCredit(nil), existing...)
+	seen := make(map[string]bool, len(result))
+	for _, credit := range result {
+		seen[strings.ToLower(strings.TrimSpace(credit.Provider))+"\x00"+strings.TrimSpace(credit.ProviderID)+"\x00"+
+			strings.ToLower(strings.TrimSpace(credit.Role))+"\x00"+strings.TrimSpace(credit.TrackTitle)] = true
+	}
+	for _, credit := range incoming {
+		key := strings.ToLower(strings.TrimSpace(credit.Provider)) + "\x00" + strings.TrimSpace(credit.ProviderID) + "\x00" +
+			strings.ToLower(strings.TrimSpace(credit.Role)) + "\x00" + strings.TrimSpace(credit.TrackTitle)
+		if key == "\x00\x00\x00" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, credit)
+	}
+	return result
+}
+
+// ensureCreditBaselineTx returns true when this call created the baseline.
+// Baselines are owner-scoped and provider/role-specific so one provider's
+// historical backlog cannot suppress a newly observed credit from another.
+func ensureCreditBaselineTx(ctx context.Context, tx *sql.Tx, userID, artistID int64,
+	provider, role string, observed time.Time) (bool, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	role = normalizedCreditRole(role)
+	if role == "primary" || (provider != "spotify" && provider != "itunes" && provider != "musicbrainz") {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_credit_baselines
+		(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`,
+		userID, artistID, provider, role, timeText(observed))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
 }
 func validITunesArtworkURL(value string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
@@ -293,15 +488,17 @@ func upsertReleaseProviderEvidenceTx(
 }
 func releasePayloadHash(release Release) string {
 	secondary, _ := json.Marshal(release.SecondaryTypes)
+	credits, _ := json.Marshal(release.Credits)
 	payloadHash := sha256.Sum256([]byte(release.Title + "\x00" + release.PrimaryType + "\x00" +
 		string(secondary) + "\x00" + release.FirstReleaseDate + "\x00" + release.SpotifyURL + "\x00" +
-		release.ITunesURL + "\x00" + release.ITunesArtworkURL + "\x00" + normalizedArtistCreditRole(release.ArtistCreditRole)))
+		release.ITunesURL + "\x00" + release.ITunesArtworkURL + "\x00" + normalizedArtistCreditRole(release.ArtistCreditRole) +
+		"\x00" + string(credits)))
 	return fmt.Sprintf("%x", payloadHash)
 }
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
 	var release Release
 	var secondary, observed string
-	var sourceCount int
+	var sourceCount, guestCreditCount int
 	var observedProviders, lastObserved sql.NullString
 	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL, artistCreditRole sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
@@ -309,12 +506,13 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 		itunes_id,itunes_url,itunes_artwork_url,artist_credit_role,source,first_observed_at,
 		(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
 		(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
-		(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=release_groups.id)
+		(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
+		(SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=release_groups.id AND rc.role='guest')
 		FROM release_groups WHERE id=?`, releaseID).Scan(
 		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
 		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
 		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &artistCreditRole, &release.Source, &observed,
-		&sourceCount, &observedProviders, &lastObserved,
+		&sourceCount, &observedProviders, &lastObserved, &guestCreditCount,
 	)
 	if err != nil {
 		return Release{}, err
@@ -326,6 +524,7 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	release.ArtistCreditRole = normalizedArtistCreditRole(artistCreditRole.String)
 	release.FirstObservedAt, _ = parseTime(observed)
 	release.SourceCount = sourceCount
+	release.GuestCreditCount = guestCreditCount
 	release.Sources = splitReleaseProviders(observedProviders.String)
 	release.Confidence = releaseConfidence(release.Source, sourceCount)
 	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
@@ -375,8 +574,13 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 	today := dayUTC(observed)
 	start, _ := comparableReleaseDate(release.FirstReleaseDate)
 	link := releaseExternalURL(release)
+	creditRole, trackTitle := releaseMessageCredit(release)
 	if eventType == "release_day" {
-		if release.ArtistCreditRole == "featured" {
+		if creditRole == "guest" {
+			return "Guest appearance released today: " + release.Title,
+				fmt.Sprintf("%s is credited on %q, released today%s.\n%s", artist.Name, release.Title, creditTrackSuffix(trackTitle), link)
+		}
+		if creditRole == "featured" {
 			return "Featured appearance released today: " + release.Title,
 				fmt.Sprintf("%s appears on %q, released today.\n%s", artist.Name, release.Title, link)
 		}
@@ -384,7 +588,12 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 			fmt.Sprintf("%s's %q is out today.\n%s", artist.Name, release.Title, link)
 	}
 	if start.After(today) {
-		if release.ArtistCreditRole == "featured" {
+		if creditRole == "guest" {
+			return "Upcoming guest appearance from " + artist.Name,
+				fmt.Sprintf("%s is credited on %q, expected %s%s.\n%s", artist.Name, release.Title,
+					release.FirstReleaseDate, creditTrackSuffix(trackTitle), link)
+		}
+		if creditRole == "featured" {
 			return "Upcoming featured appearance from " + artist.Name,
 				fmt.Sprintf("%s appears on %q, expected %s.\n%s", artist.Name, release.Title,
 					release.FirstReleaseDate, link)
@@ -393,7 +602,12 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 			fmt.Sprintf("%s's %q is expected %s.\n%s", artist.Name, release.Title,
 				release.FirstReleaseDate, link)
 	}
-	if release.ArtistCreditRole == "featured" {
+	if creditRole == "guest" {
+		return "Latest guest appearance from " + artist.Name,
+			fmt.Sprintf("%s is credited on %q (%s)%s.\n%s", artist.Name, release.Title,
+				release.FirstReleaseDate, creditTrackSuffix(trackTitle), link)
+	}
+	if creditRole == "featured" {
 		return "Latest featured appearance from " + artist.Name,
 			fmt.Sprintf("%s appears on %q (%s).\n%s", artist.Name, release.Title,
 				release.FirstReleaseDate, link)
@@ -404,7 +618,13 @@ func initialReleaseMessage(artist Artist, release Release, eventType string, obs
 }
 
 func releaseAnnouncementMessage(artist Artist, release Release) (string, string) {
-	if release.ArtistCreditRole == "featured" {
+	creditRole, trackTitle := releaseMessageCredit(release)
+	if creditRole == "guest" {
+		return "New guest appearance from " + artist.Name,
+			fmt.Sprintf("%s is credited on %q for %s%s.\n%s", artist.Name, release.Title,
+				release.FirstReleaseDate, creditTrackSuffix(trackTitle), releaseExternalURL(release))
+	}
+	if creditRole == "featured" {
 		return "New featured appearance from " + artist.Name,
 			fmt.Sprintf("%s appears on %q for %s.\n%s", artist.Name, release.Title,
 				release.FirstReleaseDate, releaseExternalURL(release))
@@ -412,6 +632,35 @@ func releaseAnnouncementMessage(artist Artist, release Release) (string, string)
 	return "New release from " + artist.Name,
 		fmt.Sprintf("%s has announced %q for %s.\n%s", artist.Name, release.Title,
 			release.FirstReleaseDate, releaseExternalURL(release))
+}
+
+func releaseMessageCredit(release Release) (role, trackTitle string) {
+	role = normalizedCreditRole(release.ArtistCreditRole)
+	// The release-level primary projection intentionally wins when Spotify
+	// exposes the same item through both its catalogue and appears_on. The
+	// graph still retains both evidence rows, but the user should not receive a
+	// guest label for their own primary release.
+	if role == "primary" {
+		return role, ""
+	}
+	for _, credit := range release.Credits {
+		candidate := normalizedCreditRole(credit.Role)
+		if candidate == "guest" {
+			return "guest", strings.TrimSpace(credit.TrackTitle)
+		}
+		if candidate == "featured" {
+			role = "featured"
+		}
+	}
+	return role, ""
+}
+
+func creditTrackSuffix(trackTitle string) string {
+	trackTitle = strings.TrimSpace(trackTitle)
+	if trackTitle == "" {
+		return ""
+	}
+	return fmt.Sprintf(" on the track %q", trackTitle)
 }
 func releaseExternalURL(release Release) string {
 	if release.SpotifyURL != "" {
@@ -520,12 +769,13 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	var observedProviders, lastObserved sql.NullString
 	var truthState, truthProvider, truthProviderID, truthReason, truthUpdatedAt sql.NullString
 	var truthIssueCount int
+	var guestCreditCount int
 	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL, artistCreditRole sql.NullString
 	destinations := []any{&r.ID, &r.MBID, &r.ArtistID, &r.ArtistName, &r.Title, &r.PrimaryType,
 		&secondary, &r.FirstReleaseDate, &r.DatePrecision, &r.MusicBrainzURL,
 		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &artistCreditRole, &r.Source, &observed,
 		&sourceCount, &observedProviders, &lastObserved, &truthState, &truthProvider, &truthProviderID,
-		&truthReason, &truthUpdatedAt, &truthIssueCount}
+		&truthReason, &truthUpdatedAt, &truthIssueCount, &guestCreditCount}
 	destinations = append(destinations, extra...)
 	if err := row.Scan(destinations...); err != nil {
 		return r, err
@@ -546,6 +796,7 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	r.TruthReason = truthReason.String
 	r.TruthUpdatedAt = parseTruthUpdatedAt(truthUpdatedAt)
 	r.TruthIssueCount = truthIssueCount
+	r.GuestCreditCount = guestCreditCount
 	r.TruthState = releaseTruthState(truthState.String, r.Source, sourceCount, r.Sources, truthIssueCount)
 	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
 		r.LastObservedAt = parsed

@@ -200,7 +200,9 @@ func buildDigestBody(releases []CalendarRelease, frequency string) string {
 	fmt.Fprintf(&builder, "Your %s ArtistTrackarr release digest:\n", frequency)
 	for _, item := range releases {
 		status := calendarConfidenceLabel(item.Release, item.Held)
-		if item.ArtistCreditRole == "featured" {
+		if item.ArtistCreditRole == "featured" && item.GuestCreditCount > 0 {
+			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Guest appearance; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
+		} else if item.ArtistCreditRole == "featured" {
 			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Featured appearance; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
 		} else {
 			fmt.Fprintf(&builder, "- %s — %s — %s (%s; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
