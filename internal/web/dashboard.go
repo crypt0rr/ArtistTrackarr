@@ -88,5 +88,10 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "release", d, http.StatusInternalServerError)
 		return
 	}
+	d.ReleaseDetail.Timeline, err = a.store.ReleaseTimeline(r.Context(), session.User.ID, id)
+	if a.pageStoreError(r, &d, "Release details", "release assurance timeline", err) {
+		a.render(w, "release", d, http.StatusInternalServerError)
+		return
+	}
 	a.render(w, "release", d, http.StatusOK)
 }

@@ -205,12 +205,21 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 func matchingReleaseIDTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, candidate Release, spotifyOnly bool,
 ) (int64, error) {
+	// Provider IDs are the preferred identity. This fallback is deliberately
+	// narrow: only records for the same artist, provider family, type, date,
+	// and precision are candidates before the normalized title comparison.
+	if candidate.DatePrecision == 0 || strings.TrimSpace(candidate.FirstReleaseDate) == "" ||
+		strings.TrimSpace(candidate.PrimaryType) == "" {
+		return 0, sql.ErrNoRows
+	}
 	sourceClause := "source IN ('musicbrainz','spotify','itunes','both')"
 	if spotifyOnly {
 		sourceClause = "source IN ('spotify','itunes')"
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,title,primary_type,first_release_date,date_precision
-		FROM release_groups WHERE artist_id=? AND `+sourceClause, artistID)
+		FROM release_groups WHERE artist_id=? AND `+sourceClause+`
+		AND primary_type=? AND date_precision=? AND first_release_date=?`,
+		artistID, candidate.PrimaryType, candidate.DatePrecision, candidate.FirstReleaseDate)
 	if err != nil {
 		return 0, err
 	}

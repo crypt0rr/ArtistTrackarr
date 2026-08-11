@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.33.0`, which is also displayed by local
+footer. The current release is `v0.35.0`, which is also displayed by local
 builds and release images. Operational timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -54,6 +54,15 @@ orderly fashion before SQLite is closed. Routine page loads return a generic
 error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
+
+The v0.35.0 reliability release makes release-day fan-out idempotent, isolates
+panics in scheduled and delivery work, and applies persisted MusicBrainz
+cooldowns with bounded provider retries. Provider caches and catalog pagination
+are bounded so an unusually large catalog cannot exhaust memory or silently
+apply incomplete results. ListenBrainz retries transient responses with the
+ArtistTrackarr User-Agent and keeps prior aggregate values when a response
+omits an artist; Cover Art Archive failures retain stale artwork or the local
+placeholder without negative-caching transient outages.
 
 The v0.23.0 hardening defaults keep setup and login attempts bounded, accept
 forwarded client addresses only from explicitly trusted proxy networks, and
@@ -125,6 +134,15 @@ can confirm a provider, notify anyway, or discard the alert. The default remains
 immediate delivery, and informational gaps such as a missing canonical
 observation do not block notifications.
 
+Release details include a **Release Assurance Timeline**. This owner-scoped,
+redacted view explains when each provider observed a release, which primary,
+featured, or guest credits were recorded, how evidence reviews and household
+truth decisions changed confidence, and whether notifications were held,
+queued, sent, or failed. It is derived from existing observations and audit
+projections; provider payloads, credentials, and notification bodies are never
+shown or stored in the timeline. The inbox links directly to this explanation
+for each alert.
+
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
 hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
@@ -165,7 +183,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.33.0` publishes `0.33.0`, `0.33`, and `latest`.
+- Pushing a tag such as `v0.35.0` publishes `0.35.0`, `0.35`, and `latest`.
 
 The application version is kept in the source and updated with each release,
 so local and published images show the same release number in the interface.
@@ -173,7 +191,7 @@ so local and published images show the same release number in the interface.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.33.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.35.0 docker compose up -d
 ```
 
 ## Configuration

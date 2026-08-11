@@ -496,41 +496,11 @@ func releasePayloadHash(release Release) string {
 	return fmt.Sprintf("%x", payloadHash)
 }
 func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, error) {
-	var release Release
-	var secondary, observed string
-	var sourceCount, guestCreditCount int
-	var observedProviders, lastObserved sql.NullString
-	var spotifyID, spotifyURL, spotifyImageURL, itunesID, itunesURL, itunesArtworkURL, artistCreditRole sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT id,mbid,artist_id,title,primary_type,secondary_types,
-		first_release_date,date_precision,musicbrainz_url,spotify_id,spotify_url,spotify_image_url,
-		itunes_id,itunes_url,itunes_artwork_url,artist_credit_role,source,first_observed_at,
-		(SELECT COUNT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
-		(SELECT GROUP_CONCAT(DISTINCT po.provider) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
-		(SELECT MAX(po.observed_at) FROM provider_observations po WHERE po.release_group_id=release_groups.id),
-		(SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=release_groups.id AND rc.role='guest')
-		FROM release_groups WHERE id=?`, releaseID).Scan(
-		&release.ID, &release.MBID, &release.ArtistID, &release.Title, &release.PrimaryType, &secondary,
-		&release.FirstReleaseDate, &release.DatePrecision, &release.MusicBrainzURL,
-		&spotifyID, &spotifyURL, &spotifyImageURL, &itunesID, &itunesURL, &itunesArtworkURL, &artistCreditRole, &release.Source, &observed,
-		&sourceCount, &observedProviders, &lastObserved, &guestCreditCount,
-	)
-	if err != nil {
-		return Release{}, err
-	}
-	_ = json.Unmarshal([]byte(secondary), &release.SecondaryTypes)
-	release.SpotifyID, release.SpotifyURL, release.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImageURL.String
-	release.ITunesID, release.ITunesURL = itunesID.String, itunesURL.String
-	release.ITunesArtworkURL = itunesArtworkURL.String
-	release.ArtistCreditRole = normalizedArtistCreditRole(artistCreditRole.String)
-	release.FirstObservedAt, _ = parseTime(observed)
-	release.SourceCount = sourceCount
-	release.GuestCreditCount = guestCreditCount
-	release.Sources = splitReleaseProviders(observedProviders.String)
-	release.Confidence = releaseConfidence(release.Source, sourceCount)
-	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
-		release.LastObservedAt = parsed
-	}
-	return release, nil
+	// Keep transaction reads byte-for-byte aligned with dashboard/inbox reads.
+	// This avoids silently dropping nullable provider, truth, guest-credit, or
+	// artwork fields when a newly saved release is returned to the caller.
+	return scanReleaseWithExtra(tx.QueryRowContext(ctx,
+		`SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE rg.id=?`, releaseID))
 }
 func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
 	var zero syncedRelease
@@ -753,7 +723,10 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 	if !queueDeliveries {
 		return nil
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,next_attempt_at)
+	// The event insert is idempotent, so the delivery fan-out must be too. A
+	// repeated release-day queue run should never turn an already queued event
+	// into a duplicate-delivery error (or duplicate rows).
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(event_id,destination_id,status,next_attempt_at)
 		SELECT ?,id,'pending',? FROM destinations WHERE user_id=? AND enabled=1`, eventID, timeText(now), userID)
 	return err
 }

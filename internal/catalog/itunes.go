@@ -31,14 +31,16 @@ type ITunes struct {
 	requestInterval time.Duration
 	wait            func(context.Context, time.Duration) error
 
-	cacheMu        sync.Mutex
-	searchCache    map[string]itunesSearchCache
-	releaseCache   map[string]itunesReleaseCache
-	searchCalls    map[string]*itunesSearchCall
-	releaseCalls   map[string]*itunesReleaseCall
-	searchTTL      time.Duration
-	emptySearchTTL time.Duration
-	releaseTTL     time.Duration
+	cacheMu         sync.Mutex
+	searchCache     map[string]itunesSearchCache
+	releaseCache    map[string]itunesReleaseCache
+	searchCalls     map[string]*itunesSearchCall
+	releaseCalls    map[string]*itunesReleaseCall
+	searchTTL       time.Duration
+	emptySearchTTL  time.Duration
+	releaseTTL      time.Duration
+	maxSearchCache  int
+	maxReleaseCache int
 }
 
 type ITunesArtist struct {
@@ -77,13 +79,15 @@ func (e *ITunesAPIError) Error() string {
 }
 
 type itunesSearchCache struct {
-	expiresAt time.Time
-	results   []ITunesArtist
+	observedAt time.Time
+	expiresAt  time.Time
+	results    []ITunesArtist
 }
 
 type itunesReleaseCache struct {
-	expiresAt time.Time
-	results   []store.Release
+	observedAt time.Time
+	expiresAt  time.Time
+	results    []store.Release
 }
 
 type itunesSearchCall struct {
@@ -139,6 +143,8 @@ func NewITunes(country string) *ITunes {
 		searchTTL:       10 * time.Minute,
 		emptySearchTTL:  2 * time.Minute,
 		releaseTTL:      24 * time.Hour,
+		maxSearchCache:  256,
+		maxReleaseCache: 512,
 	}
 }
 
@@ -313,50 +319,66 @@ func (i *ITunes) artistReleases(ctx context.Context, artistName string) ([]store
 	if artistID == "" {
 		return nil, fmt.Errorf("iTunes artist %q was not found", artistName)
 	}
-	endpoint := i.baseURL + "/lookup?id=" + url.QueryEscape(artistID) +
-		"&country=" + url.QueryEscape(i.country) + "&entity=album&limit=200"
-	var response itunesResponse
-	if err := i.getJSON(ctx, "iTunes artist albums", endpoint, &response); err != nil {
-		return nil, err
-	}
-	result := make([]store.Release, 0, len(response.Results))
+	const pageSize = 200
+	const maxPages = 100
+	result := make([]store.Release, 0)
 	seen := make(map[string]bool)
-	for _, item := range response.Results {
-		if item.WrapperType != "collection" || item.CollectionType != "Album" ||
-			item.CollectionID <= 0 || strings.TrimSpace(item.CollectionName) == "" ||
-			strings.TrimSpace(item.ReleaseDate) == "" {
-			continue
+	for page := 0; page < maxPages; page++ {
+		offset := page * pageSize
+		endpoint := i.baseURL + "/lookup?id=" + url.QueryEscape(artistID) +
+			"&country=" + url.QueryEscape(i.country) + "&entity=album&limit=" + strconv.Itoa(pageSize) + "&offset=" + strconv.Itoa(offset)
+		var response itunesResponse
+		if err := i.getJSON(ctx, "iTunes artist albums", endpoint, &response); err != nil {
+			return nil, err
 		}
-		if item.CollectionArtistName != "" && !strings.EqualFold(strings.TrimSpace(item.CollectionArtistName), artistName) {
-			continue
+		collectionCount := 0
+		for _, item := range response.Results {
+			// Lookup responses may include the artist object alongside the
+			// collection rows. Count only collections when deciding whether a
+			// full page was returned; otherwise a page of 199 albums plus the
+			// artist row would cause an unnecessary extra request.
+			if item.WrapperType == "collection" {
+				collectionCount++
+			}
+			if item.WrapperType != "collection" || item.CollectionType != "Album" ||
+				item.CollectionID <= 0 || strings.TrimSpace(item.CollectionName) == "" ||
+				strings.TrimSpace(item.ReleaseDate) == "" {
+				continue
+			}
+			if item.CollectionArtistName != "" && !strings.EqualFold(strings.TrimSpace(item.CollectionArtistName), artistName) {
+				continue
+			}
+			id := strconv.FormatInt(item.CollectionID, 10)
+			if seen[id] {
+				continue
+			}
+			date, precision := iTunesDate(item.ReleaseDate)
+			if date == "" {
+				continue
+			}
+			primaryType := iTunesReleaseType(item.CollectionName, item.TrackCount)
+			releaseURL := strings.TrimSpace(item.CollectionViewURL)
+			if releaseURL == "" {
+				releaseURL = "https://itunes.apple.com/album/id" + id
+			}
+			seen[id] = true
+			result = append(result, store.Release{
+				MBID:             "itunes:" + id,
+				Title:            strings.TrimSpace(item.CollectionName),
+				PrimaryType:      primaryType,
+				FirstReleaseDate: date,
+				DatePrecision:    precision,
+				ITunesID:         id,
+				ITunesURL:        releaseURL,
+				ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
+				Source:           "itunes",
+			})
 		}
-		id := strconv.FormatInt(item.CollectionID, 10)
-		if seen[id] {
-			continue
+		if collectionCount < pageSize {
+			return result, nil
 		}
-		date, precision := iTunesDate(item.ReleaseDate)
-		if date == "" {
-			continue
-		}
-		primaryType := iTunesReleaseType(item.CollectionName, item.TrackCount)
-		releaseURL := strings.TrimSpace(item.CollectionViewURL)
-		if releaseURL == "" {
-			releaseURL = "https://itunes.apple.com/album/id" + id
-		}
-		seen[id] = true
-		result = append(result, store.Release{
-			MBID:             "itunes:" + id,
-			Title:            strings.TrimSpace(item.CollectionName),
-			PrimaryType:      primaryType,
-			FirstReleaseDate: date,
-			DatePrecision:    precision,
-			ITunesID:         id,
-			ITunesURL:        releaseURL,
-			ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
-			Source:           "itunes",
-		})
 	}
-	return result, nil
+	return nil, &CatalogLimitError{Provider: "iTunes", Pages: maxPages}
 }
 
 // ArtistReleaseCredits performs one bounded song search to find iTunes tracks
@@ -657,7 +679,22 @@ func (i *ITunes) cacheSearchLocked(key string, results []ITunesArtist) {
 	if len(results) == 0 && i.emptySearchTTL > 0 {
 		ttl = i.emptySearchTTL
 	}
-	i.searchCache[key] = itunesSearchCache{expiresAt: time.Now().Add(ttl), results: cloneITunesArtists(results)}
+	now := time.Now()
+	i.searchCache[key] = itunesSearchCache{observedAt: now, expiresAt: now.Add(ttl), results: cloneITunesArtists(results)}
+	maxEntries := i.maxSearchCache
+	if maxEntries <= 0 {
+		maxEntries = 256
+	}
+	for len(i.searchCache) > maxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for candidate, entry := range i.searchCache {
+			if oldestKey == "" || entry.observedAt.Before(oldest) {
+				oldestKey, oldest = candidate, entry.observedAt
+			}
+		}
+		delete(i.searchCache, oldestKey)
+	}
 }
 
 func (i *ITunes) cachedReleases(key string) ([]store.Release, bool) {
@@ -674,5 +711,20 @@ func (i *ITunes) cachedReleases(key string) ([]store.Release, bool) {
 }
 
 func (i *ITunes) cacheReleasesLocked(key string, results []store.Release) {
-	i.releaseCache[key] = itunesReleaseCache{expiresAt: time.Now().Add(i.releaseTTL), results: cloneITunesReleases(results)}
+	now := time.Now()
+	i.releaseCache[key] = itunesReleaseCache{observedAt: now, expiresAt: now.Add(i.releaseTTL), results: cloneITunesReleases(results)}
+	maxEntries := i.maxReleaseCache
+	if maxEntries <= 0 {
+		maxEntries = 512
+	}
+	for len(i.releaseCache) > maxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for candidate, entry := range i.releaseCache {
+			if oldestKey == "" || entry.observedAt.Before(oldest) {
+				oldestKey, oldest = candidate, entry.observedAt
+			}
+		}
+		delete(i.releaseCache, oldestKey)
+	}
 }

@@ -972,6 +972,18 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	}
 }
 
+func TestNeutralizeCSVCellPreventsFormulaInterpretation(t *testing.T) {
+	for _, value := range []string{"=HYPERLINK(\"https://example.test\")", "+1", "-1", "@cmd", "  =formula"} {
+		got := neutralizeCSVCell(value)
+		if !strings.HasPrefix(got, "'") {
+			t.Fatalf("formula-leading value %q was not neutralized: %q", value, got)
+		}
+	}
+	if got := neutralizeCSVCell("safe"); got != "safe" {
+		t.Fatalf("safe CSV value changed to %q", got)
+	}
+}
+
 func TestArtistsPagePaginatesAndPreservesFilters(t *testing.T) {
 	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	ctx := context.Background()
@@ -1571,6 +1583,7 @@ func TestReleaseDetailRendersITunesReleaseWithProviderLinks(t *testing.T) {
 		"layout":    strings.Contains(page, `class="grid two release-layout"`),
 		"summary":   strings.Contains(page, `class="release-detail-summary"`),
 		"history":   strings.Contains(page, `release-history-panel`),
+		"timeline":  strings.Contains(page, "Release assurance") && strings.Contains(page, "What happened"),
 		"title":     strings.Contains(page, "Detail Album"),
 		"source":    strings.Contains(page, "Source: iTunes"),
 		"art":       strings.Contains(page, `src="https://is1.mzstatic.com/image/250x250bb.jpg"`),

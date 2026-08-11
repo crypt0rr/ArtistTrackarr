@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,34 +21,37 @@ import (
 )
 
 type Runner struct {
-	store                 *store.Store
-	catalog               catalog.CatalogProvider
-	spotify               catalog.SpotifyReleaseProvider
-	itunes                catalog.ITunesReleaseProvider
-	listenbrainz          catalog.ListenBrainzProvider
-	artwork               *artwork.Cache
-	normalizer            catalog.ReleaseNormalizer
-	sender                notify.NotificationSender
-	cipher                *security.Cipher
-	interval              time.Duration
-	spotifyInterval       time.Duration
-	logger                *slog.Logger
-	syncMu                sync.Mutex
-	syncTaskMu            sync.Mutex
-	deliveryTaskMu        sync.Mutex
-	releaseDayTaskMu      sync.Mutex
-	maintenanceTaskMu     sync.Mutex
-	tasks                 sync.WaitGroup
-	lifecycleOnce         sync.Once
-	wake                  chan struct{}
-	done                  chan struct{}
-	providerMu            sync.Mutex
-	spotifyCooldownLoaded bool
-	spotifyCooldownUntil  time.Time
-	itunesCooldownLoaded  bool
-	itunesCooldownUntil   time.Time
-	running               atomic.Bool
-	lastActivity          atomic.Int64
+	store                     *store.Store
+	catalog                   catalog.CatalogProvider
+	spotify                   catalog.SpotifyReleaseProvider
+	itunes                    catalog.ITunesReleaseProvider
+	listenbrainz              catalog.ListenBrainzProvider
+	artwork                   *artwork.Cache
+	normalizer                catalog.ReleaseNormalizer
+	sender                    notify.NotificationSender
+	cipher                    *security.Cipher
+	interval                  time.Duration
+	spotifyInterval           time.Duration
+	logger                    *slog.Logger
+	syncMu                    sync.Mutex
+	syncTaskMu                sync.Mutex
+	deliveryTaskMu            sync.Mutex
+	releaseDayTaskMu          sync.Mutex
+	maintenanceTaskMu         sync.Mutex
+	tasks                     sync.WaitGroup
+	lifecycleOnce             sync.Once
+	wake                      chan struct{}
+	done                      chan struct{}
+	providerMu                sync.Mutex
+	spotifyCooldownLoaded     bool
+	spotifyCooldownUntil      time.Time
+	itunesCooldownLoaded      bool
+	itunesCooldownUntil       time.Time
+	musicBrainzCooldownLoaded bool
+	musicBrainzCooldownUntil  time.Time
+	musicBrainzFailureStreak  int
+	running                   atomic.Bool
+	lastActivity              atomic.Int64
 }
 
 // RunnerStatus is a process-local scheduler snapshot for the admin assurance
@@ -263,6 +268,62 @@ func (r *Runner) clearITunesProviderCooldown() {
 	r.providerMu.Unlock()
 }
 
+func (r *Runner) musicBrainzProviderCooldown(ctx context.Context, now time.Time) (time.Time, error) {
+	r.providerMu.Lock()
+	if r.musicBrainzCooldownLoaded {
+		until := r.musicBrainzCooldownUntil
+		r.providerMu.Unlock()
+		if until.After(now) {
+			return until, nil
+		}
+		return time.Time{}, nil
+	}
+	r.providerMu.Unlock()
+	health, err := r.store.ProviderHealthByName(ctx, "musicbrainz")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	var until time.Time
+	if err == nil && health.NextCheckAt != nil {
+		until = *health.NextCheckAt
+	}
+	r.providerMu.Lock()
+	r.musicBrainzCooldownLoaded = true
+	r.musicBrainzCooldownUntil = until
+	r.providerMu.Unlock()
+	if until.After(now) {
+		return until, nil
+	}
+	return time.Time{}, nil
+}
+
+func (r *Runner) setMusicBrainzCooldown(until time.Time) {
+	r.providerMu.Lock()
+	r.musicBrainzCooldownLoaded = true
+	r.musicBrainzCooldownUntil = until
+	r.providerMu.Unlock()
+}
+
+func (r *Runner) clearMusicBrainzCooldown() {
+	r.providerMu.Lock()
+	r.musicBrainzCooldownLoaded = true
+	r.musicBrainzCooldownUntil = time.Time{}
+	r.musicBrainzFailureStreak = 0
+	r.providerMu.Unlock()
+}
+
+func (r *Runner) musicBrainzFailureDelay() time.Duration {
+	r.providerMu.Lock()
+	r.musicBrainzFailureStreak++
+	streak := r.musicBrainzFailureStreak
+	r.providerMu.Unlock()
+	delay := time.Minute * time.Duration(1<<min(streak-1, 6))
+	if r.interval > 0 && delay > r.interval {
+		return r.interval
+	}
+	return delay
+}
+
 func (r *Runner) Run(ctx context.Context) {
 	r.initLifecycle()
 	r.running.Store(true)
@@ -363,8 +424,47 @@ func (r *Runner) startTask(ctx context.Context, name string, guard *sync.Mutex, 
 	go func() {
 		defer r.tasks.Done()
 		defer guard.Unlock()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				r.logPanic("scheduled task", name, recovered)
+			}
+		}()
 		work(ctx)
 	}()
+}
+
+// logPanic keeps scheduler failures isolated. Panic values and stack traces
+// are bounded and redacted before they reach the structured log sink; the
+// scheduler itself remains alive so one malformed provider response cannot
+// stop unrelated jobs.
+func (r *Runner) logPanic(scope string, name string, recovered any) {
+	message := notify.RedactError(fmt.Errorf("%v", recovered))
+	if len(message) > 512 {
+		message = message[:512] + "..."
+	}
+	stack := notify.RedactError(errors.New(string(debug.Stack())))
+	if len(stack) > 2048 {
+		stack = stack[:2048] + "..."
+	}
+	if r.logger != nil {
+		r.logger.Error("background panic recovered", "scope", scope, "task", name, "panic", message, "stack", stack)
+	}
+}
+
+func (r *Runner) safeDelivery(ctx context.Context, now time.Time, item deliveryWork) (result deliveryResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.logPanic("notification delivery", "worker", recovered)
+			result = deliveryResult{failed: true, err: errors.New("notification delivery panic recovered")}
+		}
+	}()
+	if item.normal != nil {
+		return r.deliverOne(ctx, now, *item.normal)
+	}
+	if item.digest != nil {
+		return r.deliverDigestOne(ctx, now, *item.digest)
+	}
+	return deliveryResult{failed: true, err: errors.New("empty notification delivery")}
 }
 
 func (r *Runner) launchSync(ctx context.Context) {
@@ -556,14 +656,22 @@ func (r *Runner) refreshListenBrainz(ctx context.Context, now time.Time) (int, e
 		return 0, err
 	}
 	byID := make(map[int64]store.ListenBrainzStats, len(ids))
+	missingIDs := make([]int64, 0)
 	for _, artist := range eligible {
 		stats, ok := values[strings.ToLower(strings.TrimSpace(artist.MBID))]
 		if !ok {
-			stats = catalog.ListenBrainzArtistStats{MBID: artist.MBID}
+			// ListenBrainz may legitimately omit an MBID from a successful
+			// response. Do not overwrite known totals with zeros; just move the
+			// next refresh forward while retaining the previous row.
+			missingIDs = append(missingIDs, artist.ID)
+			continue
 		}
 		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: stats.TotalListenCount, TotalUserCount: stats.TotalUserCount}
 	}
 	if err := r.store.SaveListenBrainzStats(ctx, byID, now, now.Add(24*time.Hour)); err != nil {
+		return 0, err
+	}
+	if err := r.store.ScheduleListenBrainzRefresh(ctx, missingIDs, now.Add(24*time.Hour)); err != nil {
 		return 0, err
 	}
 	_ = r.store.UpsertProviderHealth(ctx, "listenbrainz", true, nil, false, false, "")
@@ -966,12 +1074,7 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 		go func() {
 			defer workers.Done()
 			for item := range work {
-				var result deliveryResult
-				if item.normal != nil {
-					result = r.deliverOne(ctx, now, *item.normal)
-				} else if item.digest != nil {
-					result = r.deliverDigestOne(ctx, now, *item.digest)
-				}
+				result := r.safeDelivery(ctx, now, item)
 				results <- result
 			}
 		}()

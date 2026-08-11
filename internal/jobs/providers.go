@@ -216,6 +216,7 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	}
 	if cooldown.After(now) {
 		observation.status = "cooldown"
+		observation.cooldown = cooldown
 		observation.nextCheckAt = &cooldown
 		r.logger.Debug("iTunes check suppressed by provider cooldown", "artist_id", artist.ID,
 			"retry_after", cooldown.Sub(now).String())
@@ -268,6 +269,17 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 
 func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, now time.Time) (providerObservation, error) {
 	observation := providerObservation{provider: "musicbrainz"}
+	cooldown, err := r.musicBrainzProviderCooldown(ctx, now)
+	if err != nil {
+		return observation, err
+	}
+	if cooldown.After(now) {
+		observation.status = "cooldown"
+		observation.nextCheckAt = &cooldown
+		r.logger.Debug("MusicBrainz check suppressed by provider cooldown", "artist_id", artist.ID,
+			"retry_after", cooldown.Sub(now).String())
+		return observation, nil
+	}
 	observation.attempted = true
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 	if err == nil {
@@ -283,10 +295,13 @@ func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, no
 		observation.releases = releases
 		observation.status = "healthy"
 		observation.nextCheckAt = timePtr(now.Add(r.interval))
+		r.clearMusicBrainzCooldown()
 		_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
 		return observation, nil
 	}
-	retryAt := now.Add(providerFailureRetryDelay(nil, r.interval))
+	retryAt := now.Add(r.musicBrainzFailureDelay())
+	r.setMusicBrainzCooldown(retryAt)
+	observation.cooldown = retryAt
 	_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &retryAt, false, false, sanitizedProviderError(err))
 	observation.err = err
 	observation.status = "failed"

@@ -539,6 +539,29 @@ func (s *Store) SaveListenBrainzStats(ctx context.Context, stats map[int64]Liste
 	}
 	return tx.Commit()
 }
+
+// ScheduleListenBrainzRefresh advances refresh timestamps for artists that
+// were absent from an otherwise successful provider response. Existing
+// aggregate totals are intentionally untouched.
+func (s *Store) ScheduleListenBrainzRefresh(ctx context.Context, artistIDs []int64, next time.Time) error {
+	if len(artistIDs) == 0 {
+		return nil
+	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, artistID := range artistIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at)
+			VALUES(?,?, '',0,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,updated_at=excluded.updated_at`,
+			artistID, timeText(next), timeText(next)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ScheduleListenBrainzRetry(ctx context.Context, artistIDs []int64, next time.Time, message string) error {
 	for _, artistID := range artistIDs {
 		if _, err := s.DB.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,last_error=excluded.last_error,attempts=artist_listenbrainz_stats.attempts+1,updated_at=excluded.updated_at`, artistID, timeText(next), message, nowText()); err != nil {

@@ -659,12 +659,37 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	})
 	for _, artist := range artists {
 		musicBrainzURL := "https://musicbrainz.org/artist/" + artist.MBID
-		_ = writer.Write([]string{
+		_ = writer.Write(neutralizeCSVRow([]string{
 			musicBrainzURL, artist.Name, artist.MBID, musicBrainzURL, artist.SpotifyID, artist.SpotifyURL,
-		})
+		}))
 	}
 	writer.Flush()
 	if err := writer.Error(); err != nil {
 		a.logger.Warn("write artist export failed", "user_id", session.User.ID, "error", err)
 	}
+}
+
+// neutralizeCSVCell prevents spreadsheet applications from interpreting
+// provider-controlled values as formulas when a household backup is opened.
+// The leading apostrophe is part of the exported value and is understood by
+// common spreadsheet programs as an explicit text marker.
+func neutralizeCSVCell(value string) string {
+	trimmed := strings.TrimLeft(value, " \t\r\n")
+	if trimmed == "" {
+		return value
+	}
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	default:
+		return value
+	}
+}
+
+func neutralizeCSVRow(row []string) []string {
+	result := make([]string, len(row))
+	for index, value := range row {
+		result[index] = neutralizeCSVCell(value)
+	}
+	return result
 }

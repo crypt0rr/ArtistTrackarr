@@ -198,6 +198,8 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		},
 		"formatProviderTime":   providerHealthTime,
 		"providerTimeAttr":     providerHealthTimeAttr,
+		"timelineKindLabel":    timelineKindLabel,
+		"timelineStatusClass":  timelineStatusClass,
 		"providerHealthStatus": providerHealthStatus,
 		"providerHealthClass":  providerHealthClass,
 		"providerHealthError":  providerHealthError,
@@ -467,6 +469,45 @@ func providerDisplayLabel(provider string) string {
 		return "iTunes"
 	default:
 		return "MusicBrainz"
+	}
+}
+
+func timelineKindLabel(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "observation":
+		return "Provider observation"
+	case "credit":
+		return "Artist credit"
+	case "evidence":
+		return "Evidence review"
+	case "decision":
+		return "Truth decision"
+	case "notification":
+		return "Notification"
+	case "delivery":
+		return "Delivery"
+	case "hold":
+		return "Notification hold"
+	case "rule":
+		return "Follow rule"
+	case "inbox":
+		return "Inbox state"
+	default:
+		return "Release activity"
+	}
+}
+
+func timelineStatusClass(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch {
+	case status == "sent", status == "confirmed", status == "observed", status == "active", status == "recorded", status == "released", status == "read":
+		return "sent"
+	case status == "failed", status == "discarded", strings.Contains(status, "critical"):
+		return "failed"
+	case status == "pending", status == "held", status == "snoozed", strings.Contains(status, "warning"):
+		return "ambiguous"
+	default:
+		return "pending"
 	}
 }
 func (a *App) Handler() http.Handler {
