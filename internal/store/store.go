@@ -219,6 +219,12 @@ type Release struct {
 	// provider. Spotify can return releases through appears_on when the
 	// artist is featured on another artist's release.
 	ArtistCreditRole string
+	// Credits contains provider-specific credit evidence for this release. It
+	// is populated on newly observed releases and on release-detail views; the
+	// release-level ArtistCreditRole remains the compatibility projection used
+	// by existing notification rules and queries.
+	Credits          []ReleaseCredit
+	GuestCreditCount int
 	Source           string
 	SourceCount      int
 	Sources          []string
@@ -231,6 +237,26 @@ type Release struct {
 	TruthIssueCount  int
 	LastObservedAt   *time.Time
 	FirstObservedAt  time.Time
+}
+
+// ReleaseCredit records why a followed artist is associated with a release.
+// A release can have several provider-backed credits (for example a primary
+// Spotify credit and a guest MusicBrainz recording credit). Credit evidence is
+// append-only apart from its last-seen timestamp so provider outages never
+// erase a previously trustworthy relationship.
+type ReleaseCredit struct {
+	ID             int64
+	ReleaseGroupID int64
+	ArtistID       int64
+	Provider       string
+	ProviderID     string
+	Role           string
+	TrackTitle     string
+	CreditName     string
+	ProviderURL    string
+	Confidence     string
+	FirstSeenAt    time.Time
+	LastSeenAt     time.Time
 }
 
 // ReleaseTruthDecision is an explicit, reversible source choice for a
@@ -249,6 +275,7 @@ type ReleaseTruthDecision struct {
 type ReleaseDetail struct {
 	Release
 	Observations []ReleaseObservation
+	Credits      []ReleaseCredit
 }
 
 // CalendarRelease is an owner-scoped release projection used by the calendar
@@ -589,9 +616,10 @@ type ArtistResolution struct {
 }
 
 type syncedRelease struct {
-	release  Release
-	isNew    bool
-	provider string
+	release   Release
+	isNew     bool
+	creditNew bool
+	provider  string
 }
 
 const artistResolutionColumns = `id,user_id,provider,provider_id,display_name,provider_url,image_url,status,
@@ -608,4 +636,5 @@ const releaseSelectColumns = `rg.id,rg.mbid,rg.artist_id,a.name,rg.title,rg.prim
 	COALESCE((SELECT selected_provider_id FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
 	COALESCE((SELECT reason FROM release_truth_decisions td WHERE td.release_group_id=rg.id),''),
 	(SELECT updated_at FROM release_truth_decisions td WHERE td.release_group_id=rg.id),
-	(SELECT COUNT(*) FROM release_evidence_issues ei WHERE ei.release_group_id=rg.id AND ei.status='open' AND ei.severity IN ('warning','critical'))`
+	(SELECT COUNT(*) FROM release_evidence_issues ei WHERE ei.release_group_id=rg.id AND ei.status='open' AND ei.severity IN ('warning','critical')),
+	(SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=rg.id AND rc.role='guest')`

@@ -226,6 +226,14 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
 	if err == nil {
 		r.clearITunesProviderCooldown()
+		if creditProvider, ok := r.itunes.(catalog.ReleaseCreditProvider); ok {
+			credits, creditErr := creditProvider.ArtistReleaseCredits(ctx, artist.Name, releases)
+			if creditErr != nil {
+				r.logger.Debug("iTunes credit enrichment failed", "artist_id", artist.ID, "error", creditErr)
+			} else {
+				releases = append(releases, credits...)
+			}
+		}
 		observation.succeeded = true
 		observation.releases = releases
 		observation.status = "healthy"
@@ -263,6 +271,14 @@ func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, no
 	observation.attempted = true
 	releases, err := r.catalog.ArtistReleases(ctx, artist.MBID)
 	if err == nil {
+		if creditProvider, ok := r.catalog.(catalog.ReleaseCreditProvider); ok {
+			credits, creditErr := creditProvider.ArtistReleaseCredits(ctx, artist.MBID, releases)
+			if creditErr != nil {
+				r.logger.Debug("MusicBrainz credit enrichment failed", "artist_id", artist.ID, "error", creditErr)
+			} else {
+				releases = append(releases, credits...)
+			}
+		}
 		observation.succeeded = true
 		observation.releases = releases
 		observation.status = "healthy"

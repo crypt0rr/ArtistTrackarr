@@ -170,6 +170,55 @@ func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 	}
 }
 
+func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
+	const artistID = "11111111-1111-4111-8111-111111111111"
+	const groupID = "22222222-2222-4222-8222-222222222222"
+	const recordingID = "33333333-3333-4333-8333-333333333333"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/ws/2/recording" || !strings.Contains(request.URL.Query().Get("query"), "arid:"+artistID) {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"release-group-list":[{"id":"`+groupID+`","title":"Collab album","primary-type":"Album","first-release-date":"2026-09-01"}]}]}`)
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	credits, err := mb.ArtistReleaseCredits(context.Background(), artistID, nil)
+	if err != nil || len(credits) != 1 || credits[0].MBID != groupID || credits[0].ArtistCreditRole != "featured" || len(credits[0].Credits) != 1 {
+		t.Fatalf("credits=%#v err=%v", credits, err)
+	}
+	credit := credits[0].Credits[0]
+	if credit.Role != "guest" || credit.ProviderID != recordingID || credit.TrackTitle != "Collab track" {
+		t.Fatalf("credit=%#v", credit)
+	}
+}
+
+func TestITunesReleaseCreditsRequireAnExplicitMultiArtistCredit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" || request.URL.Query().Get("entity") != "song" {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"resultCount":2,"results":[
+			{"wrapperType":"track","trackId":101,"trackName":"Solo","artistName":"Fridayy","collectionId":9,"collectionName":"Solo album","collectionViewUrl":"https://music.apple.com/us/album/solo","releaseDate":"2026-08-01T00:00:00Z","trackCount":10},
+			{"wrapperType":"track","trackId":102,"trackName":"Guest","artistName":"Fridayy & Other","collectionId":10,"collectionName":"Guest album","collectionViewUrl":"https://music.apple.com/us/album/guest","releaseDate":"2026-09-01T00:00:00Z","trackCount":12}
+		]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	credits, err := itunes.ArtistReleaseCredits(context.Background(), "Fridayy", nil)
+	if err != nil || len(credits) != 1 || credits[0].ITunesID != "10" || len(credits[0].Credits) != 1 {
+		t.Fatalf("credits=%#v err=%v", credits, err)
+	}
+	if credit := credits[0].Credits[0]; credit.Role != "guest" || credit.TrackTitle != "Guest" || credit.ProviderID != "102" {
+		t.Fatalf("credit=%#v", credit)
+	}
+}
+
 func TestCatalogProviderErrorsAndIdentifiers(t *testing.T) {
 	if got := (&HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusBadGateway, Text: "502 Bad Gateway"}).Error(); got != "MusicBrainz returned 502 Bad Gateway" {
 		t.Fatalf("HTTPStatusError=%q", got)
@@ -984,7 +1033,7 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 		releases[2].DatePrecision != 2 ||
 		releases[3].PrimaryType != "Album" || len(releases[3].SecondaryTypes) != 1 ||
 		releases[3].SecondaryTypes[0] != "Compilation" ||
-		releases[4].ArtistCreditRole != "featured" || releases[0].ArtistCreditRole != "primary" {
+		releases[4].ArtistCreditRole != "featured" || releases[0].ArtistCreditRole != "primary" || len(releases[0].Credits) != 2 {
 		t.Fatalf("unexpected Spotify releases: %#v", releases)
 	}
 }
@@ -1032,6 +1081,17 @@ func TestAlbumEPNormalizer(t *testing.T) {
 	got := (AlbumEPNormalizer{}).Normalize(input)
 	if len(got) != 3 || got[0].MBID != "album" || got[1].MBID != "ep" || got[2].MBID != "single" {
 		t.Fatalf("unexpected normalized releases: %#v", got)
+	}
+}
+
+func TestAlbumEPNormalizerMergesCreditsForOneRelease(t *testing.T) {
+	input := []store.Release{
+		{MBID: "album", PrimaryType: "Album", ArtistCreditRole: "featured", Credits: []store.ReleaseCredit{{Provider: "musicbrainz", ProviderID: "recording-1", Role: "guest", TrackTitle: "First"}}},
+		{MBID: "album", PrimaryType: "Album", ArtistCreditRole: "featured", Credits: []store.ReleaseCredit{{Provider: "musicbrainz", ProviderID: "recording-2", Role: "guest", TrackTitle: "Second"}}},
+	}
+	got := (AlbumEPNormalizer{}).Normalize(input)
+	if len(got) != 1 || len(got[0].Credits) != 2 {
+		t.Fatalf("normalized release=%#v", got)
 	}
 }
 

@@ -61,11 +61,16 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			key := saved.provider + "\x00" + fmt.Sprint(saved.release.ID)
 			if index, exists := savedIndexes[key]; exists {
 				previous := savedReleases[index]
+				saved.release.Credits = mergeReleaseCredits(previous.release.Credits, saved.release.Credits)
+				saved.creditNew = previous.creditNew || saved.creditNew
 				if previous.release.ArtistCreditRole == "primary" && saved.release.ArtistCreditRole == "featured" {
 					previous.isNew = previous.isNew || saved.isNew
+					previous.creditNew = previous.creditNew || saved.creditNew
+					previous.release.Credits = saved.release.Credits
 					savedReleases[index] = previous
 				} else {
 					saved.isNew = saved.isNew || previous.isNew
+					saved.creditNew = saved.creditNew || previous.creditNew
 					savedReleases[index] = saved
 				}
 			} else {
@@ -120,6 +125,14 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 					return err
 				}
 			}
+			for _, item := range savedReleases {
+				for _, role := range releaseCreditRoles(item.release, item.provider) {
+					if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+				}
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
 				timeText(observed), follower.id, artist.ID); err != nil {
 				_ = tx.Rollback()
@@ -143,11 +156,27 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			if item.provider == "spotify" && !follower.spotifyBaseline {
 				continue
 			}
-			if item.provider == "spotify" && item.release.ArtistCreditRole == "featured" && !follower.spotifyAppearanceBaseline {
+			skipHistoricalCredit := false
+			for _, role := range releaseCreditRoles(item.release, item.provider) {
+				created, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed)
+				if err != nil {
+					_ = tx.Rollback()
+					return err
+				}
+				skipHistoricalCredit = skipHistoricalCredit || created
+			}
+			// A release can legitimately be both a primary catalogue entry and
+			// a featured/guest result. A newly created primary release must still
+			// notify, while a newly discovered credit on an existing primary
+			// release remains suppressed by the one-time credit baseline.
+			if skipHistoricalCredit && item.release.ArtistCreditRole != "primary" {
+				continue
+			}
+			if skipHistoricalCredit && item.creditNew && !item.isNew {
 				continue
 			}
 			date, full := releaseDate(item.release.FirstReleaseDate)
-			if !item.isNew || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
+			if (!item.isNew && !item.creditNew) || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
 				continue
 			}
 			title, body := releaseAnnouncementMessage(artist, item.release)
@@ -227,7 +256,8 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	from := today.AddDate(0, 0, -1).Format("2006-01-02")
 	to := today.AddDate(0, 0, 1).Format("2006-01-02")
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT f.user_id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
-		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role
+		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role,
+		 (SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=rg.id AND rc.role='guest')
 		FROM follows f JOIN users u ON u.id=f.user_id JOIN release_groups rg ON rg.artist_id=f.artist_id
 		JOIN artists a ON a.id=rg.artist_id
 		WHERE rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
@@ -241,13 +271,14 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		musicBrainzURL             string
 		spotifyURL, itunesURL      sql.NullString
 		artistCreditRole           string
+		guestCreditCount           int
 	}
 	var candidates []due
 	for rows.Next() {
 		var d due
 		if err := rows.Scan(
 			&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
-			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole,
+			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole, &d.guestCreditCount,
 		); err != nil {
 			_ = rows.Close()
 			return err
@@ -266,7 +297,10 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		}
 		body := fmt.Sprintf("%s's %q is out today.", d.artist, d.title)
 		title := "Released today: " + d.title
-		if d.artistCreditRole == "featured" {
+		if d.artistCreditRole == "featured" && d.guestCreditCount > 0 {
+			body = fmt.Sprintf("%s is credited on %q, released today.", d.artist, d.title)
+			title = "Guest appearance released today: " + d.title
+		} else if d.artistCreditRole == "featured" {
 			body = fmt.Sprintf("%s appears on %q, released today.", d.artist, d.title)
 			title = "Featured appearance released today: " + d.title
 		}
@@ -389,5 +423,29 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 		o.ObservedAt, _ = parseTime(ts)
 		d.Observations = append(d.Observations, o)
 	}
-	return d, obs.Err()
+	if err := obs.Err(); err != nil {
+		return d, err
+	}
+	credits, err := s.readerDB().QueryContext(ctx, `SELECT rc.id,rc.release_group_id,rc.artist_id,
+		rc.provider,rc.provider_id,rc.role,rc.track_title,rc.credit_name,rc.provider_url,
+		rc.confidence,rc.first_seen_at,rc.last_seen_at
+		FROM release_credits rc JOIN follows f ON f.artist_id=rc.artist_id
+		WHERE f.user_id=? AND rc.release_group_id=? ORDER BY rc.role,rc.provider,rc.track_title`, userID, releaseID)
+	if err != nil {
+		return d, err
+	}
+	defer func() { _ = credits.Close() }()
+	for credits.Next() {
+		var credit ReleaseCredit
+		var firstSeen, lastSeen string
+		if err := credits.Scan(&credit.ID, &credit.ReleaseGroupID, &credit.ArtistID, &credit.Provider,
+			&credit.ProviderID, &credit.Role, &credit.TrackTitle, &credit.CreditName, &credit.ProviderURL,
+			&credit.Confidence, &firstSeen, &lastSeen); err != nil {
+			return d, err
+		}
+		credit.FirstSeenAt, _ = parseTime(firstSeen)
+		credit.LastSeenAt, _ = parseTime(lastSeen)
+		d.Credits = append(d.Credits, credit)
+	}
+	return d, credits.Err()
 }

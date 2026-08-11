@@ -401,9 +401,22 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		},
 		"releaseCreditLabel": func(r store.Release) string {
 			if strings.EqualFold(strings.TrimSpace(r.ArtistCreditRole), "featured") {
+				if r.GuestCreditCount > 0 {
+					return "Guest appearance"
+				}
 				return "Featured appearance"
 			}
 			return ""
+		},
+		"creditRoleLabel": func(role string) string {
+			switch strings.ToLower(strings.TrimSpace(role)) {
+			case "guest":
+				return "Guest credit"
+			case "featured":
+				return "Featured appearance"
+			default:
+				return "Primary credit"
+			}
 		},
 		"sourceLabel": func(r store.Release) string {
 			switch r.Source {

@@ -192,6 +192,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=21`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("follow notification rules migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=22`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("release credits migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var digestTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_digest_runs'`).Scan(&digestTable); err != nil {
 		t.Fatalf("release digest table missing: %v", err)
@@ -230,6 +233,14 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	var holdsTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='notification_holds'`).Scan(&holdsTable); err != nil {
 		t.Fatalf("notification holds table missing: %v", err)
+	}
+	var creditsTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_credits'`).Scan(&creditsTable); err != nil {
+		t.Fatalf("release credits table missing: %v", err)
+	}
+	var creditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM release_credits WHERE release_group_id=?`, releaseID).Scan(&creditCount); err != nil || creditCount != 1 {
+		t.Fatalf("legacy release credit count=%d err=%v", creditCount, err)
 	}
 	var normalizedLogTime string
 	if err := db.QueryRow(`SELECT created_at FROM application_logs WHERE message=?`, "legacy timestamp").Scan(&normalizedLogTime); err != nil {
@@ -835,6 +846,57 @@ func TestSpotifyAppearanceBaselineSuppressesHistoricalFeaturedReleases(t *testin
 	if err := s.DB.QueryRow(`SELECT artist_credit_role FROM release_provider_evidence
 		WHERE provider='spotify' AND provider_id=?`, newFeatured.SpotifyID).Scan(&evidenceRole); err != nil || evidenceRole != "featured" {
 		t.Fatalf("featured evidence role=%q err=%v", evidenceRole, err)
+	}
+}
+
+func TestGuestCreditBaselineAndReleaseDetail(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _ := s.CreateUser(ctx, "guest@example.com", "unused", "member", "UTC", "")
+	artist, _ := s.UpsertArtist(ctx, Artist{MBID: "guest-artist-id", Name: "Fridayy"})
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	historical := Release{
+		MBID: "itunes:historical-guest", ITunesID: "historical-guest", ITunesURL: "https://music.apple.com/us/album/historical",
+		Title: "Historical Album", PrimaryType: "Album", FirstReleaseDate: "2020-01-01", DatePrecision: 3,
+		ArtistCreditRole: "featured", Source: "itunes",
+		Credits: []ReleaseCredit{{Provider: "itunes", ProviderID: "track-old", Role: "guest", TrackTitle: "Old collaboration", CreditName: "Fridayy & Other", Confidence: "probable"}},
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{historical}}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+	var baseline string
+	if err := s.DB.QueryRow(`SELECT baseline_synced_at FROM follow_credit_baselines WHERE user_id=? AND artist_id=? AND provider='itunes' AND role='guest'`, userID, artist.ID).Scan(&baseline); err != nil || baseline == "" {
+		t.Fatalf("guest baseline=%q err=%v", baseline, err)
+	}
+	future := historical
+	future.MBID, future.ITunesID, future.ITunesURL = "itunes:future-guest", "future-guest", "https://music.apple.com/us/album/future"
+	future.Title, future.FirstReleaseDate = "Future collaboration", "2026-08-05"
+	future.Credits = []ReleaseCredit{{Provider: "itunes", ProviderID: "track-new", Role: "guest", TrackTitle: "New collaboration", CreditName: "Fridayy & Other", Confidence: "probable"}}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{historical, future}}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+	var title, body string
+	if err := s.DB.QueryRow(`SELECT title,body FROM notification_events WHERE user_id=?`, userID).Scan(&title, &body); err != nil {
+		t.Fatal(err)
+	}
+	if title != "New guest appearance from Fridayy" || !strings.Contains(body, "New collaboration") {
+		t.Fatalf("unexpected guest notification title=%q body=%q", title, body)
+	}
+	var releaseID int64
+	if err := s.DB.QueryRow(`SELECT id FROM release_groups WHERE itunes_id='future-guest'`).Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := s.ReleaseDetail(ctx, userID, releaseID)
+	if err != nil || len(detail.Credits) != 1 || detail.Credits[0].Role != "guest" {
+		t.Fatalf("guest detail=%#v err=%v", detail.Credits, err)
 	}
 }
 

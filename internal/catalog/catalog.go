@@ -29,6 +29,14 @@ type ReleaseNormalizer interface {
 	Normalize([]store.Release) []store.Release
 }
 
+// ReleaseCreditProvider optionally enriches a successful release observation
+// with track-level or non-primary artist credits. Credit enrichment is kept
+// separate from ArtistReleases so a provider can fail or cool down without
+// discarding an otherwise successful release batch.
+type ReleaseCreditProvider interface {
+	ArtistReleaseCredits(context.Context, string, []store.Release) ([]store.Release, error)
+}
+
 type SpotifyProvider interface {
 	SearchArtists(context.Context, string) ([]SpotifyArtist, error)
 	Artist(context.Context, string) (SpotifyArtist, error)
@@ -382,6 +390,126 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 	return all, nil
 }
 
+// ArtistReleaseCredits searches MusicBrainz recordings for appearances by an
+// artist and projects them onto their containing release groups. The search is
+// deliberately bounded to one request and only returns recordings with an
+// explicit multi-artist credit; primary release-group results remain owned by
+// ArtistReleases. Missing release-group metadata is ignored rather than
+// guessing an identity.
+func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, known []store.Release) ([]store.Release, error) {
+	if !validMBID(mbid) {
+		return nil, errors.New("invalid MusicBrainz artist ID")
+	}
+	endpoint := m.baseURL + "/ws/2/recording?fmt=json&limit=100&query=" +
+		url.QueryEscape("arid:"+mbid)
+	var response struct {
+		Recordings []struct {
+			ID            string `json:"id"`
+			Title         string `json:"title"`
+			ArtistCredits []struct {
+				Name   string `json:"name"`
+				Artist *struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"artist"`
+			} `json:"artist-credit"`
+			ReleaseGroups []struct {
+				ID               string   `json:"id"`
+				Title            string   `json:"title"`
+				PrimaryType      string   `json:"primary-type"`
+				SecondaryTypes   []string `json:"secondary-types"`
+				FirstReleaseDate string   `json:"first-release-date"`
+			} `json:"release-group-list"`
+			Releases []struct {
+				ReleaseGroup *struct {
+					ID               string   `json:"id"`
+					Title            string   `json:"title"`
+					PrimaryType      string   `json:"primary-type"`
+					SecondaryTypes   []string `json:"secondary-types"`
+					FirstReleaseDate string   `json:"first-release-date"`
+				} `json:"release-group"`
+			} `json:"release-list"`
+		} `json:"recordings"`
+	}
+	if err := m.getJSON(ctx, endpoint, &response); err != nil {
+		return nil, err
+	}
+	knownByID := make(map[string]store.Release, len(known))
+	for _, release := range known {
+		knownByID[strings.TrimSpace(release.MBID)] = release
+	}
+	result := make([]store.Release, 0)
+	seen := make(map[string]bool)
+	for _, recording := range response.Recordings {
+		if !validMBID(recording.ID) || strings.TrimSpace(recording.Title) == "" || len(recording.ArtistCredits) < 2 {
+			continue
+		}
+		credited := false
+		creditName := ""
+		for _, credit := range recording.ArtistCredits {
+			if credit.Artist != nil && strings.EqualFold(strings.TrimSpace(credit.Artist.ID), mbid) {
+				credited = true
+				creditName = strings.TrimSpace(credit.Name)
+				if creditName == "" {
+					creditName = strings.TrimSpace(credit.Artist.Name)
+				}
+				break
+			}
+		}
+		if !credited {
+			continue
+		}
+		groups := recording.ReleaseGroups
+		if len(groups) == 0 {
+			for _, release := range recording.Releases {
+				if release.ReleaseGroup == nil {
+					continue
+				}
+				groups = append(groups, *release.ReleaseGroup)
+			}
+		}
+		for _, group := range groups {
+			groupID := strings.TrimSpace(group.ID)
+			if !validMBID(groupID) || seen[groupID+"\x00"+recording.ID] {
+				continue
+			}
+			seen[groupID+"\x00"+recording.ID] = true
+			release, ok := knownByID[groupID]
+			if !ok {
+				if strings.TrimSpace(group.PrimaryType) == "" || strings.TrimSpace(group.Title) == "" {
+					continue
+				}
+				precision := releaseDatePrecision(group.FirstReleaseDate)
+				release = store.Release{
+					MBID: groupID, Title: strings.TrimSpace(group.Title), PrimaryType: strings.TrimSpace(group.PrimaryType),
+					SecondaryTypes: append([]string(nil), group.SecondaryTypes...), FirstReleaseDate: strings.TrimSpace(group.FirstReleaseDate),
+					DatePrecision: precision, MusicBrainzURL: "https://musicbrainz.org/release-group/" + groupID,
+				}
+			}
+			release.ArtistCreditRole = "featured"
+			release.Credits = append(release.Credits, store.ReleaseCredit{
+				Provider: "musicbrainz", ProviderID: recording.ID, Role: "guest", TrackTitle: strings.TrimSpace(recording.Title),
+				CreditName: creditName, ProviderURL: "https://musicbrainz.org/recording/" + recording.ID, Confidence: "confirmed",
+			})
+			result = append(result, release)
+		}
+	}
+	return result, nil
+}
+
+func releaseDatePrecision(value string) int {
+	switch len(strings.TrimSpace(value)) {
+	case 4:
+		return 1
+	case 7:
+		return 2
+	case 10:
+		return 3
+	default:
+		return 0
+	}
+}
+
 type AlbumEPNormalizer struct{}
 
 func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
@@ -395,8 +523,13 @@ func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
 			continue
 		}
 		if index, ok := seen[release.MBID]; ok {
+			// A recording/collection search can return the same release once per
+			// credited track. Preserve every credit while retaining the release-level
+			// primary/featured precedence used by the existing normalizer.
+			output[index].Credits = mergeReleaseCredits(output[index].Credits, release.Credits)
 			if strings.EqualFold(strings.TrimSpace(output[index].ArtistCreditRole), "featured") &&
 				!strings.EqualFold(strings.TrimSpace(release.ArtistCreditRole), "featured") {
+				release.Credits = mergeReleaseCredits(output[index].Credits, release.Credits)
 				output[index] = release
 			}
 			continue
@@ -405,6 +538,30 @@ func (AlbumEPNormalizer) Normalize(input []store.Release) []store.Release {
 		output = append(output, release)
 	}
 	return output
+}
+
+func mergeReleaseCredits(existing, incoming []store.ReleaseCredit) []store.ReleaseCredit {
+	if len(incoming) == 0 {
+		return existing
+	}
+	merged := append([]store.ReleaseCredit(nil), existing...)
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, credit := range existing {
+		seen[releaseCreditKey(credit)] = struct{}{}
+	}
+	for _, credit := range incoming {
+		key := releaseCreditKey(credit)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, credit)
+	}
+	return merged
+}
+
+func releaseCreditKey(credit store.ReleaseCredit) string {
+	return strings.Join([]string{credit.Provider, credit.ProviderID, credit.Role, credit.TrackTitle}, "\x00")
 }
 
 type Spotify struct {
@@ -1009,12 +1166,17 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 				DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
 				SpotifyID:     item.ID, SpotifyURL: item.ExternalURLs["spotify"],
 				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
+				Credits: []store.ReleaseCredit{{Provider: "spotify", ProviderID: item.ID, Role: role,
+					ProviderURL: item.ExternalURLs["spotify"], Confidence: "confirmed"}},
 			}
 			if existing, ok := seen[item.ID]; ok {
 				// Spotify can expose one release in both the artist's primary
 				// catalogue and appears_on. Keep one record and prefer the
-				// direct release-level credit when both are present.
+				// direct release-level credit when both are present, while
+				// retaining the provider evidence for the graph.
+				result[existing].Credits = mergeReleaseCredits(result[existing].Credits, candidate.Credits)
 				if result[existing].ArtistCreditRole == "featured" && role == "primary" {
+					candidate.Credits = append([]store.ReleaseCredit(nil), result[existing].Credits...)
 					result[existing] = candidate
 				}
 				continue

@@ -108,6 +108,8 @@ type itunesResult struct {
 	CollectionID         int64  `json:"collectionId"`
 	CollectionName       string `json:"collectionName"`
 	CollectionViewURL    string `json:"collectionViewUrl"`
+	TrackID              int64  `json:"trackId"`
+	TrackName            string `json:"trackName"`
 	ArtworkURL100        string `json:"artworkUrl100"`
 	ArtworkURL60         string `json:"artworkUrl60"`
 	TrackCount           int    `json:"trackCount"`
@@ -355,6 +357,101 @@ func (i *ITunes) artistReleases(ctx context.Context, artistName string) ([]store
 		})
 	}
 	return result, nil
+}
+
+// ArtistReleaseCredits performs one bounded song search to find iTunes tracks
+// whose credited artist string includes the followed artist alongside another
+// artist. It intentionally does not treat an exact artist-name match as a
+// guest credit because those releases are already returned by ArtistReleases.
+func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, known []store.Release) ([]store.Release, error) {
+	if i == nil {
+		return nil, errors.New("iTunes is not configured")
+	}
+	artistName = strings.TrimSpace(artistName)
+	if artistName == "" {
+		return nil, errors.New("artist name is required")
+	}
+	endpoint := i.baseURL + "/search?term=" + url.QueryEscape(artistName) +
+		"&country=" + url.QueryEscape(i.country) +
+		"&media=music&entity=song&attribute=artistTerm&limit=50"
+	var response itunesResponse
+	if err := i.getJSON(ctx, "iTunes artist credits", endpoint, &response); err != nil {
+		return nil, err
+	}
+	knownByID := make(map[string]store.Release, len(known))
+	for _, release := range known {
+		if strings.TrimSpace(release.ITunesID) != "" {
+			knownByID[strings.TrimSpace(release.ITunesID)] = release
+		}
+	}
+	result := make([]store.Release, 0)
+	seen := make(map[string]bool)
+	for _, item := range response.Results {
+		if item.WrapperType != "track" || item.CollectionID <= 0 || item.TrackID <= 0 ||
+			strings.TrimSpace(item.TrackName) == "" || strings.TrimSpace(item.CollectionName) == "" ||
+			strings.TrimSpace(item.ReleaseDate) == "" || !creditIncludesArtist(item.ArtistName, artistName) ||
+			strings.EqualFold(strings.TrimSpace(item.ArtistName), artistName) {
+			continue
+		}
+		collectionID := strconv.FormatInt(item.CollectionID, 10)
+		trackID := strconv.FormatInt(item.TrackID, 10)
+		key := collectionID + "\x00" + trackID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		release, ok := knownByID[collectionID]
+		if !ok {
+			date, precision := iTunesDate(item.ReleaseDate)
+			if date == "" {
+				continue
+			}
+			releaseURL := strings.TrimSpace(item.CollectionViewURL)
+			if releaseURL == "" {
+				releaseURL = "https://itunes.apple.com/album/id" + collectionID
+			}
+			release = store.Release{
+				MBID: "itunes:" + collectionID, Title: strings.TrimSpace(item.CollectionName),
+				PrimaryType:      iTunesReleaseType(item.CollectionName, item.TrackCount),
+				FirstReleaseDate: date, DatePrecision: precision, ITunesID: collectionID, ITunesURL: releaseURL,
+				ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
+			}
+		}
+		release.ArtistCreditRole = "featured"
+		release.Credits = append(release.Credits, store.ReleaseCredit{
+			Provider: "itunes", ProviderID: trackID, Role: "guest", TrackTitle: strings.TrimSpace(item.TrackName),
+			CreditName: strings.TrimSpace(item.ArtistName), ProviderURL: strings.TrimSpace(release.ITunesURL), Confidence: "probable",
+		})
+		result = append(result, release)
+	}
+	return result, nil
+}
+
+func creditIncludesArtist(credit, artist string) bool {
+	credit = normalizeCreditText(credit)
+	artist = normalizeCreditText(artist)
+	if credit == "" || artist == "" || len([]rune(artist)) < 3 {
+		return false
+	}
+	return strings.Contains(" "+credit+" ", " "+artist+" ")
+}
+
+func normalizeCreditText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	space := true
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			space = false
+			continue
+		}
+		if !space {
+			b.WriteByte(' ')
+			space = true
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func firstNonEmpty(values ...string) string {
