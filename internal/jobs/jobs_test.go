@@ -294,6 +294,10 @@ func TestCadenceWrappersHandleEmptyQueuesAndArtworkMaintenance(t *testing.T) {
 	runner.runReleaseDayQueue(ctx)
 	runner.runDeliveryCadence(ctx)
 	runner.runMaintenance(ctx)
+	metrics := runner.Status().Metrics
+	if metrics.ResolutionRuns != 1 || metrics.SyncRuns != 1 || metrics.ReleaseDayRuns != 1 || metrics.DeliveryBatches != 1 || metrics.MaintenanceRuns != 1 {
+		t.Fatalf("cadence metrics=%#v", metrics)
+	}
 	closed := resolutionTestStore(t)
 	if err := closed.Close(); err != nil {
 		t.Fatal(err)

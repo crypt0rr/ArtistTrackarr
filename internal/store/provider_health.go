@@ -20,6 +20,31 @@ func ProviderHealthStaleAfter(provider string) time.Duration {
 	}
 }
 
+// ProviderHealthStaleAfterCadence derives the freshness window from the
+// configured polling cadence. A provider is considered stale after two missed
+// checks, while retaining the historical defaults for callers that do not have
+// configuration context (such as migration and store fixtures).
+func ProviderHealthStaleAfterCadence(provider string, pollInterval, spotifyInterval time.Duration) time.Duration {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	var cadence time.Duration
+	switch provider {
+	case "musicbrainz", "itunes":
+		cadence = pollInterval
+	case "spotify", "listenbrainz":
+		cadence = spotifyInterval
+	default:
+		return ProviderHealthStaleAfter(provider)
+	}
+	if cadence <= 0 {
+		return ProviderHealthStaleAfter(provider)
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	if cadence > maxDuration/2 {
+		return maxDuration
+	}
+	return cadence * 2
+}
+
 // ProviderHealthStatus is the single status policy used by both the web
 // health view and administrator diagnostics. A failure newer than the last
 // success always wins; an old success becomes stale rather than remaining

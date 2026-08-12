@@ -141,6 +141,7 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 		return observation, err
 	}
 	if cooldown.After(now) {
+		r.metrics.RecordProviderCooldown("spotify")
 		observation.suppressed = true
 		observation.cooldown = cooldown
 		observation.status = "cooldown"
@@ -215,6 +216,7 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 		return observation, err
 	}
 	if cooldown.After(now) {
+		r.metrics.RecordProviderCooldown("itunes")
 		observation.status = "cooldown"
 		observation.cooldown = cooldown
 		observation.nextCheckAt = &cooldown
@@ -274,6 +276,7 @@ func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, no
 		return observation, err
 	}
 	if cooldown.After(now) {
+		r.metrics.RecordProviderCooldown("musicbrainz")
 		observation.status = "cooldown"
 		observation.nextCheckAt = &cooldown
 		r.logger.Debug("MusicBrainz check suppressed by provider cooldown", "artist_id", artist.ID,

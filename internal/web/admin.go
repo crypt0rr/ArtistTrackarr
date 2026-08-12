@@ -64,7 +64,7 @@ func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	response := make([]providerHealthPayload, 0, len(health))
 	for _, provider := range health {
-		response = append(response, providerHealthPayloadFor(provider))
+		response = append(response, providerHealthPayloadForConfig(provider, a.cfg))
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -162,6 +162,20 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	if runner.LastActivityAt != nil {
 		fmt.Fprintf(&report, "Scheduler last activity: %s\n", runner.LastActivityAt.Format(time.RFC3339))
 	}
+	fmt.Fprintf(&report, "Scheduler wakes: %d; overlaps: %d; recovered panics: %d\n",
+		runner.Metrics.WakeSignals, runner.Metrics.TaskOverlaps, runner.Metrics.TaskPanics)
+	fmt.Fprintf(&report, "Sync runs: %d; due: %d; succeeded: %d; failed: %d\n",
+		runner.Metrics.SyncRuns, runner.Metrics.SyncDue, runner.Metrics.SyncSucceeded, runner.Metrics.SyncFailed)
+	fmt.Fprintf(&report, "Delivery batches: %d; attempted: %d; sent: %d; failed: %d\n",
+		runner.Metrics.DeliveryBatches, runner.Metrics.DeliveryAttempted,
+		runner.Metrics.DeliverySent, runner.Metrics.DeliveryFailed)
+	if runner.Metrics.DeliveryBatches > 0 {
+		fmt.Fprintf(&report, "Delivery average batch duration: %s\n",
+			runner.Metrics.DeliveryLatency/time.Duration(runner.Metrics.DeliveryBatches))
+	}
+	fmt.Fprintf(&report, "Provider cooldown skips: Spotify %d; iTunes %d; MusicBrainz %d\n",
+		runner.Metrics.SpotifyCooldownSkips, runner.Metrics.ITunesCooldownSkips,
+		runner.Metrics.MusicBrainzCooldownSkips)
 	report.WriteString("Providers:\n")
 	for _, provider := range snapshot.Providers {
 		fmt.Fprintf(&report, "- %s: %s", provider.Provider, provider.Status)

@@ -88,6 +88,32 @@ func TestParseTrustedProxyNetworks(t *testing.T) {
 	}
 }
 
+func TestParseBoolAcceptsOnlyExplicitValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "true", value: "true", want: true},
+		{name: "mixed case true", value: " TrUe ", want: true},
+		{name: "false", value: "false", want: false},
+		{name: "mixed case false", value: " FaLsE ", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseBool("TEST_FLAG", test.value)
+			if err != nil || got != test.want {
+				t.Fatalf("parseBool(%q) = %v, %v; want %v", test.value, got, err, test.want)
+			}
+		})
+	}
+	for _, value := range []string{"", "yes", "no", "1", "0", "enabled"} {
+		if got, err := parseBool("TEST_FLAG", value); err == nil || got {
+			t.Fatalf("parseBool(%q) = %v, %v; want a validation error", value, got, err)
+		}
+	}
+}
+
 func TestLoadRejectsUntrustedHTTPAndProxyWithoutNetworks(t *testing.T) {
 	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
@@ -239,6 +265,9 @@ func TestLoadRejectsInvalidRuntimeConfiguration(t *testing.T) {
 		{name: "poll interval", set: func() { t.Setenv("POLL_INTERVAL", "30m") }, want: "POLL_INTERVAL"},
 		{name: "Spotify credentials", set: func() { t.Setenv("SPOTIFY_CLIENT_ID", "client-id") }, want: "SPOTIFY_CLIENT_ID"},
 		{name: "market", set: func() { t.Setenv("SPOTIFY_MARKET", "USA") }, want: "SPOTIFY_MARKET"},
+		{name: "trust proxy boolean", set: func() { t.Setenv("TRUST_PROXY", "yes") }, want: "TRUST_PROXY"},
+		{name: "insecure HTTP boolean", set: func() { t.Setenv("ALLOW_INSECURE_HTTP", "enabled") }, want: "ALLOW_INSECURE_HTTP"},
+		{name: "private target boolean", set: func() { t.Setenv("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "1") }, want: "ALLOW_PRIVATE_NOTIFICATION_TARGETS"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

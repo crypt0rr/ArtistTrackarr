@@ -64,12 +64,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	allowInsecureHTTP := strings.EqualFold(strings.TrimSpace(env("ALLOW_INSECURE_HTTP", "false")), "true")
+	allowInsecureHTTP, err := parseBool("ALLOW_INSECURE_HTTP", env("ALLOW_INSECURE_HTTP", "false"))
+	if err != nil {
+		return Config{}, err
+	}
 	trustedProxyNetworks, err := parseTrustedProxyNetworks(env("TRUSTED_PROXY_CIDRS", ""))
 	if err != nil {
 		return Config{}, err
 	}
-	trustProxy := strings.EqualFold(strings.TrimSpace(env("TRUST_PROXY", "false")), "true")
+	trustProxy, err := parseBool("TRUST_PROXY", env("TRUST_PROXY", "false"))
+	if err != nil {
+		return Config{}, err
+	}
 	if trustProxy && len(trustedProxyNetworks) == 0 {
 		return Config{}, errors.New("TRUST_PROXY=true requires TRUSTED_PROXY_CIDRS")
 	}
@@ -100,11 +106,15 @@ func Load() (Config, error) {
 		TrustProxy:                      trustProxy,
 		TrustedProxyNetworks:            trustedProxyNetworks,
 		AllowInsecureHTTP:               allowInsecureHTTP,
-		AllowPrivateNotificationTargets: strings.EqualFold(strings.TrimSpace(env("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "false")), "true"),
+		AllowPrivateNotificationTargets: false,
 		SpotifyClientID:                 strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
 		SpotifySecret:                   spotifySecret,
 		SpotifyMarket:                   strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
 		ITunesMarket:                    strings.ToUpper(strings.TrimSpace(env("ITUNES_MARKET", "US"))),
+	}
+	cfg.AllowPrivateNotificationTargets, err = parseBool("ALLOW_PRIVATE_NOTIFICATION_TARGETS", env("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "false"))
+	if err != nil {
+		return Config{}, err
 	}
 	cfg.LogLevel, err = parseLogLevel(env("LOG_LEVEL", "info"))
 	if err != nil {
@@ -139,6 +149,17 @@ func validateMarket(name, value string) error {
 		return fmt.Errorf("%s must be a two-letter ISO country code", name)
 	}
 	return nil
+}
+
+func parseBool(name, value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
 }
 
 func parseTrustedProxyNetworks(value string) ([]*net.IPNet, error) {

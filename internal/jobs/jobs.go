@@ -15,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/metrics"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -33,6 +34,7 @@ type Runner struct {
 	interval                  time.Duration
 	spotifyInterval           time.Duration
 	logger                    *slog.Logger
+	metrics                   *metrics.Registry
 	syncMu                    sync.Mutex
 	syncTaskMu                sync.Mutex
 	deliveryTaskMu            sync.Mutex
@@ -59,6 +61,7 @@ type Runner struct {
 type RunnerStatus struct {
 	Running        bool
 	LastActivityAt *time.Time
+	Metrics        metrics.Snapshot
 }
 
 const (
@@ -148,6 +151,7 @@ func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.Re
 	runner := &Runner{
 		store: s, catalog: provider, normalizer: normalizer, sender: sender,
 		cipher: cipher, interval: interval, spotifyInterval: 24 * time.Hour, logger: logger,
+		metrics: metrics.New(),
 	}
 	runner.initLifecycle()
 	for _, option := range options {
@@ -163,6 +167,9 @@ func (r *Runner) initLifecycle() {
 		}
 		if r.done == nil {
 			r.done = make(chan struct{})
+		}
+		if r.metrics == nil {
+			r.metrics = metrics.New()
 		}
 	})
 }
@@ -387,6 +394,7 @@ func (r *Runner) Wake() {
 	r.markActivity()
 	select {
 	case r.wake <- struct{}{}:
+		r.metrics.RecordWake()
 	default:
 	}
 }
@@ -395,7 +403,7 @@ func (r *Runner) Wake() {
 // best-effort and is intentionally process-local; persisted provider health
 // remains the source of truth for cooldowns and last successful observations.
 func (r *Runner) Status() RunnerStatus {
-	status := RunnerStatus{Running: r.running.Load()}
+	status := RunnerStatus{Running: r.running.Load(), Metrics: r.metrics.Snapshot()}
 	if nanos := r.lastActivity.Load(); nanos > 0 {
 		value := time.Unix(0, nanos).UTC()
 		status.LastActivityAt = &value
@@ -415,8 +423,10 @@ func (r *Runner) Done() <-chan struct{} {
 }
 
 func (r *Runner) startTask(ctx context.Context, name string, guard *sync.Mutex, work func(context.Context)) {
+	r.initLifecycle()
 	r.markActivity()
 	if !guard.TryLock() {
+		r.metrics.RecordTaskOverlap()
 		r.logger.Debug("background task skipped", "task", name, "reason", "already running")
 		return
 	}
@@ -426,6 +436,7 @@ func (r *Runner) startTask(ctx context.Context, name string, guard *sync.Mutex, 
 		defer guard.Unlock()
 		defer func() {
 			if recovered := recover(); recovered != nil {
+				r.metrics.RecordTaskPanic()
 				r.logPanic("scheduled task", name, recovered)
 			}
 		}()
@@ -495,8 +506,12 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 	}
 	resolutionSummary, err := r.resolveArtistResolutions(ctx, time.Now().UTC())
 	if err != nil {
+		r.metrics.RecordResolution(resolutionSummary.Processed, resolutionSummary.Followed,
+			resolutionSummary.Review, resolutionSummary.Pending, resolutionSummary.Failed)
 		r.logger.Error("artist resolution failed", "error", err)
 	} else {
+		r.metrics.RecordResolution(resolutionSummary.Processed, resolutionSummary.Followed,
+			resolutionSummary.Review, resolutionSummary.Pending, resolutionSummary.Failed)
 		r.logger.Info("artist resolution processing completed",
 			"processed", resolutionSummary.Processed, "followed", resolutionSummary.Followed,
 			"review", resolutionSummary.Review, "pending", resolutionSummary.Pending,
@@ -504,8 +519,12 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 	}
 	syncSummary, err := r.syncArtists(ctx, time.Now().UTC())
 	if err != nil {
+		r.metrics.RecordSync(syncSummary.Due, syncSummary.Succeeded, syncSummary.Failed,
+			syncSummary.Changed, syncSummary.Unchanged, syncSummary.Backoff)
 		r.logger.Error("catalog sync failed", "error", err)
 	} else {
+		r.metrics.RecordSync(syncSummary.Due, syncSummary.Succeeded, syncSummary.Failed,
+			syncSummary.Changed, syncSummary.Unchanged, syncSummary.Backoff)
 		r.logger.Info("catalog synchronization completed",
 			"due", syncSummary.Due, "succeeded", syncSummary.Succeeded,
 			"failed", syncSummary.Failed, "changed", syncSummary.Changed,
@@ -525,6 +544,7 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 }
 
 func (r *Runner) runMaintenance(ctx context.Context) {
+	r.metrics.RecordMaintenance()
 	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
@@ -549,6 +569,7 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 }
 
 func (r *Runner) runReleaseDayQueue(ctx context.Context) {
+	r.metrics.RecordReleaseDay()
 	now := time.Now().UTC()
 	if err := r.store.QueueDueReleaseDays(ctx, now); err != nil {
 		r.logger.Error("release-day scheduling failed", "error", err)
@@ -564,7 +585,9 @@ func (r *Runner) runReleaseDayQueue(ctx context.Context) {
 
 func (r *Runner) runDeliveryCadence(ctx context.Context) {
 	now := time.Now().UTC()
+	started := time.Now()
 	deliverySummary, err := r.deliver(ctx, now)
+	r.metrics.RecordDelivery(deliverySummary.Attempted, deliverySummary.Sent, deliverySummary.Failed, time.Since(started))
 	if err != nil {
 		r.logger.Error("notification delivery failed", "error", err)
 	} else if deliverySummary.Attempted > 0 {
