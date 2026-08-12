@@ -327,7 +327,7 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	for _, provider := range health {
 		snapshot.Providers = append(snapshot.Providers, DiagnosticsProvider{
 			Provider:    provider.Provider,
-			Status:      ProviderHealthStatus(provider, snapshot.CheckedAt, ProviderHealthStaleAfter(provider.Provider)),
+			Status:      ProviderHealthStatus(provider, snapshot.CheckedAt, s.providerHealthStaleAfter(provider.Provider)),
 			NextCheckAt: provider.NextCheckAt,
 		})
 	}

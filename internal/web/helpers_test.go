@@ -65,6 +65,15 @@ func TestProviderHealthPresentationHelpers(t *testing.T) {
 	}
 }
 
+func TestProviderHealthPresentationUsesConfiguredCadence(t *testing.T) {
+	old := time.Now().UTC().Add(-5 * time.Hour)
+	cfg := config.Config{PollInterval: time.Hour, SpotifyPollInterval: 2 * time.Hour}
+	status := providerHealthStatusFor(store.ProviderHealth{Provider: "spotify", LastSuccessAt: &old}, cfg)
+	if status != "stale" {
+		t.Fatalf("Spotify status=%q, want stale after two configured checks", status)
+	}
+}
+
 func TestLocalReturnPathRejectsExternalAndOutOfScopeValues(t *testing.T) {
 	tests := []struct {
 		value, prefix, want string

@@ -49,6 +49,7 @@ func main() {
 		logger.Error("open database", "error", err)
 		os.Exit(1)
 	}
+	database.SetProviderHealthCadences(cfg.PollInterval, cfg.SpotifyPollInterval)
 	databaseClosed := false
 	defer func() {
 		if !databaseClosed {

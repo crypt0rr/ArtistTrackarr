@@ -36,3 +36,18 @@ func TestProviderHealthStaleAfterDefaults(t *testing.T) {
 		t.Fatalf("unknown stale threshold=%v", got)
 	}
 }
+
+func TestProviderHealthStaleAfterFollowsConfiguredCadence(t *testing.T) {
+	if got := ProviderHealthStaleAfterCadence("musicbrainz", 2*time.Hour, 24*time.Hour); got != 4*time.Hour {
+		t.Fatalf("MusicBrainz freshness=%v, want 4h", got)
+	}
+	if got := ProviderHealthStaleAfterCadence("spotify", 6*time.Hour, 3*time.Hour); got != 6*time.Hour {
+		t.Fatalf("Spotify freshness=%v, want 6h", got)
+	}
+	if got := ProviderHealthStaleAfterCadence("spotify", 0, 0); got != 48*time.Hour {
+		t.Fatalf("default Spotify freshness=%v, want 48h", got)
+	}
+	if got := ProviderHealthStaleAfterCadence("other", time.Hour, time.Hour); got != 24*time.Hour {
+		t.Fatalf("unknown provider freshness=%v, want 24h", got)
+	}
+}

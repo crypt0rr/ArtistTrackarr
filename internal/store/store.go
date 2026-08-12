@@ -20,11 +20,32 @@ var migrations embed.FS
 // is committing, which keeps dashboard requests from queueing behind provider
 // synchronization work.
 type Store struct {
-	DB        *sql.DB
-	Reader    *sql.DB
-	readerMu  sync.RWMutex
-	closeOnce sync.Once
-	closeErr  error
+	DB                  *sql.DB
+	Reader              *sql.DB
+	readerMu            sync.RWMutex
+	healthMu            sync.RWMutex
+	pollInterval        time.Duration
+	spotifyPollInterval time.Duration
+	closeOnce           sync.Once
+	closeErr            error
+}
+
+// SetProviderHealthCadences supplies the configured polling intervals used by
+// diagnostics when deciding whether a successful provider check is stale. A
+// zero value keeps the conservative historical defaults for tests and
+// internal callers that construct a Store directly.
+func (s *Store) SetProviderHealthCadences(pollInterval, spotifyInterval time.Duration) {
+	s.healthMu.Lock()
+	s.pollInterval = pollInterval
+	s.spotifyPollInterval = spotifyInterval
+	s.healthMu.Unlock()
+}
+
+func (s *Store) providerHealthStaleAfter(provider string) time.Duration {
+	s.healthMu.RLock()
+	pollInterval, spotifyInterval := s.pollInterval, s.spotifyPollInterval
+	s.healthMu.RUnlock()
+	return ProviderHealthStaleAfterCadence(provider, pollInterval, spotifyInterval)
 }
 
 func (s *Store) readerDB() *sql.DB {

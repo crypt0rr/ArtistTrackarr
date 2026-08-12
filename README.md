@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.39.0`; release images display the injected
+footer. The current release is `v0.40.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -57,7 +57,10 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.39.0 operational-confidence release adds checksum-protected backups,
+The v0.40.0 operations release adds strict boolean configuration validation,
+polling-cadence-aware provider freshness, and bounded scheduler, provider, and
+delivery metrics in the administrator diagnostics report. The v0.39.0
+operational-confidence release adds checksum-protected backups,
 restore state verification, pinned Docker helper images, an authenticated
 container smoke rehearsal, and freshness-aware provider health reporting. The
 v0.38.0 hardening release adds paused-destination admission, credit-aware
@@ -108,6 +111,12 @@ are confirmed by multiple sources or currently rely on a fallback, provider
 cooldowns, and the next scheduled check. Use **Sync now** for a followed artist
 to queue the normal provider strategy; it does not bypass rate limits or alter
 notification deduplication.
+
+Provider health freshness follows the configured polling cadence and becomes
+stale after two missed checks. The administrator diagnostics report also shows
+bounded process-local scheduler, provider-cooldown, and delivery counters;
+these counters never include credentials, URLs, notification bodies, or
+provider payloads.
 
 The dashboard and Trust Center also include **Watchlist assurance**. Each
 followed artist is classified as healthy, delayed, degraded, or pending from
@@ -199,7 +208,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.39.0` publishes `0.39.0`, `0.39`, and `latest`.
+- Pushing a tag such as `v0.40.0` publishes `0.40.0`, `0.40`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -209,7 +218,7 @@ not confused with a release.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.39.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.40.0 docker compose up -d
 ```
 
 ## Configuration
@@ -230,10 +239,10 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.39.0 docker compose up 
 | `ITUNES_MARKET` | no | `US` | Two-letter Apple/iTunes storefront used for fallback searches and release lookups. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
-| `TRUST_PROXY` | no | `false` | Trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
+| `TRUST_PROXY` | no | `false` | Strict boolean (`true`/`false`); trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
 | `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated proxy networks, for example `127.0.0.1/32,10.0.0.0/8`; required when `TRUST_PROXY=true`. |
-| `ALLOW_INSECURE_HTTP` | no | `false` | Explicitly permits a non-local HTTP `PUBLIC_URL`; use only on a trusted, isolated network. |
-| `ALLOW_PRIVATE_NOTIFICATION_TARGETS` | no | `false` | Explicitly permits ntfy/Gotify/SMTP/webhook destinations resolving to private networks. |
+| `ALLOW_INSECURE_HTTP` | no | `false` | Strict boolean (`true`/`false`); explicitly permits a non-local HTTP `PUBLIC_URL`. |
+| `ALLOW_PRIVATE_NOTIFICATION_TARGETS` | no | `false` | Strict boolean (`true`/`false`); explicitly permits destinations resolving to private networks. |
 | `LOG_LEVEL` | no | `info` | JSON log threshold: `debug`, `info`, `warn`, or `error`. |
 | `TZ` | no | `UTC` | Container/system timezone for runtime logs and local process time, e.g. `Europe/Amsterdam`. |
 
@@ -403,7 +412,7 @@ the restored data remains usable:
 
 ```console
 APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
-  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.39.0 \
+  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.40.0 \
   ./scripts/restore-smoke.sh artist-trackarr-backup.tgz
 ```
 

@@ -29,6 +29,11 @@ func providerHealthStatus(p store.ProviderHealth) string {
 	return store.ProviderHealthStatus(p, time.Now().UTC(), store.ProviderHealthStaleAfter(p.Provider))
 }
 
+func providerHealthStatusFor(p store.ProviderHealth, cfg config.Config) string {
+	return store.ProviderHealthStatus(p, time.Now().UTC(),
+		store.ProviderHealthStaleAfterCadence(p.Provider, cfg.PollInterval, cfg.SpotifyPollInterval))
+}
+
 func providerHealthClass(p store.ProviderHealth) string {
 	switch providerHealthStatus(p) {
 	case "healthy":
@@ -121,6 +126,20 @@ func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
 	}
 }
 
+func providerHealthPayloadForConfig(p store.ProviderHealth, cfg config.Config) providerHealthPayload {
+	payload := providerHealthPayloadFor(p)
+	payload.Status = providerHealthStatusFor(p, cfg)
+	switch payload.Status {
+	case "healthy":
+		payload.StatusClass = "sent"
+	case "quota limited", "rate limited", "stale":
+		payload.StatusClass = "ambiguous"
+	default:
+		payload.StatusClass = "failed"
+	}
+	return payload
+}
+
 // compactCount makes large aggregate counts easier to scan while the exact
 // value remains available through the surrounding element's title/label.
 func compactCount(value int64) string {
@@ -184,8 +203,17 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"providerTimeAttr":     providerHealthTimeAttr,
 		"timelineKindLabel":    timelineKindLabel,
 		"timelineStatusClass":  timelineStatusClass,
-		"providerHealthStatus": providerHealthStatus,
-		"providerHealthClass":  providerHealthClass,
+		"providerHealthStatus": func(p store.ProviderHealth) string { return providerHealthStatusFor(p, cfg) },
+		"providerHealthClass": func(p store.ProviderHealth) string {
+			switch providerHealthStatusFor(p, cfg) {
+			case "healthy":
+				return "sent"
+			case "quota limited", "rate limited", "stale":
+				return "ambiguous"
+			default:
+				return "failed"
+			}
+		},
 		"providerHealthError":  providerHealthError,
 		"assuranceStatusLabel": assuranceStatusLabel,
 		"assuranceStatusClass": assuranceStatusClass,

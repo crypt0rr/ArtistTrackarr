@@ -30,6 +30,10 @@
     <div><strong>{{.Diagnostics.RecentLogEntries}}</strong><span>application events (24h)</span></div>
     <div><strong>{{.Diagnostics.FollowedArtists}}</strong><span>followed artists</span></div>
     <div><strong>{{.Diagnostics.Releases}}</strong><span>known releases</span></div>
+    <div><strong>{{.RunnerStatus.Metrics.SyncRuns}}</strong><span>sync runs</span></div>
+    <div><strong>{{.RunnerStatus.Metrics.DeliveryAttempted}}</strong><span>deliveries attempted</span></div>
+    <div><strong>{{.RunnerStatus.Metrics.DeliveryFailed}}</strong><span>deliveries failed</span></div>
+    <div><strong>{{.RunnerStatus.Metrics.TaskPanics}}</strong><span>recovered task panics</span></div>
   </div>
   <details class="diagnostic-details"><summary>Copy safe support report</summary>
     <label for="diagnostic-report">Report</label><textarea id="diagnostic-report" class="diagnostic-report" readonly>{{.DiagnosticReport}}</textarea>

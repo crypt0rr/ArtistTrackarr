@@ -107,4 +107,27 @@ func TestDiagnosticsReturnsSafeOperationalCounters(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsUsesConfiguredProviderCadence(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	s.SetProviderHealthCadences(time.Hour, 2*time.Hour)
+	old := time.Now().UTC().Add(-5 * time.Hour)
+	if err := s.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE provider_health SET last_success_at=?, updated_at=? WHERE provider=?`,
+		timeText(old), timeText(old), "spotify"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range snapshot.Providers {
+		if provider.Provider == "spotify" && provider.Status != "stale" {
+			t.Fatalf("Spotify status=%q, want stale with 2h cadence", provider.Status)
+		}
+	}
+}
+
 func timePtr(value time.Time) *time.Time { return &value }
