@@ -44,7 +44,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.36.0`; release images display the injected
+footer. The current release is `v0.37.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -56,7 +56,12 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.36.0 hardening release tightens startup validation, request handling,
+The v0.37.0 hardening release adds synchronized Store shutdown, transactional
+manual-sync admission, and bounded concurrent CSV imports. These controls keep
+manual work from starving scheduled synchronization or the SQLite writer while
+preserving the existing routes and notification behavior.
+
+The v0.36.0 hardening release tightened startup validation, request handling,
 build identity, and operational safety without changing release semantics. The
 previous reliability work also recovers from panics in scheduled and delivery
 work, applies persisted MusicBrainz cooldowns with bounded provider retries,
@@ -186,7 +191,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.36.0` publishes `0.36.0`, `0.36`, and `latest`.
+- Pushing a tag such as `v0.37.0` publishes `0.37.0`, `0.37`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -196,7 +201,7 @@ not confused with a release.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.36.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.37.0 docker compose up -d
 ```
 
 ## Configuration
@@ -298,7 +303,10 @@ and 500 data rows, validate canonical MusicBrainz and optional Spotify
 identities locally, and process rows independently. Added rows are followed
 and scheduled for the normal baseline sync; invalid rows remain visible in the
 owner-only import results page and do not prevent valid rows from being
-applied. Provider calls are never made during the upload request.
+applied. At most two uploads are processed concurrently and manual sync work
+is admitted through a bounded queue, so large imports cannot starve scheduled
+work or the SQLite writer. Provider calls are never made during the upload
+request.
 
 The account menu shows each member's unique username and links to personal
 Settings, where they can update their username, timezone, release-day reminder

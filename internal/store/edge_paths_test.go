@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +17,30 @@ func TestStoreOpenRejectsMissingParentAndCloseHandlesNilHandles(t *testing.T) {
 	}
 	if err := (&Store{}).Close(); err != nil {
 		t.Fatalf("nil store close error=%v", err)
+	}
+}
+
+func TestStoreCloseIsIdempotentAcrossConcurrentCallers(t *testing.T) {
+	s := testStore(t)
+	const callers = 8
+	errs := make(chan error, callers)
+	var wait sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs <- s.Close()
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent close error=%v", err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second close error=%v", err)
 	}
 }
 

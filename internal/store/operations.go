@@ -13,6 +13,11 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/logging"
 )
 
+// maxQueuedManualSyncRequests prevents repeated manual-sync actions from
+// starving normal scheduled work. Requests for the same artist are still
+// coalesced by CreateManualSyncRequest before this global cap is checked.
+const maxQueuedManualSyncRequests = 100
+
 func (s *Store) InsertApplicationLog(ctx context.Context, entry logging.Entry) error {
 	attrs, err := json.Marshal(entry.Attributes)
 	if err != nil {
@@ -66,6 +71,11 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 	if scope != "artist" && scope != "retry" {
 		return ManualSyncRequest{}, errors.New("invalid sync scope")
 	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return ManualSyncRequest{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var q string
 	var args []any
 	if scope == "artist" {
@@ -78,17 +88,32 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 		q = `SELECT id FROM manual_sync_requests WHERE scope='retry' AND status IN ('queued','running') LIMIT 1`
 	}
 	var existing int64
-	if err := s.DB.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
+	if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
 		return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
 	} else if err != sql.ErrNoRows {
 		return ManualSyncRequest{}, err
 	}
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", nowText())
+	var queued int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'`).Scan(&queued); err != nil {
+		return ManualSyncRequest{}, err
+	}
+	if queued >= maxQueuedManualSyncRequests {
+		return ManualSyncRequest{}, ErrManualSyncQueueFull
+	}
+	now := nowText()
+	res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
 	if err != nil {
 		return ManualSyncRequest{}, err
 	}
-	id, _ := res.LastInsertId()
-	return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: time.Now().UTC()}, nil
+	id, err := res.LastInsertId()
+	if err != nil {
+		return ManualSyncRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ManualSyncRequest{}, err
+	}
+	created, _ := parseTime(now)
+	return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
 }
 func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
 	if limit < 1 {

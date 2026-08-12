@@ -40,6 +40,7 @@ type App struct {
 	tokenLimiter     *fixedWindowLimiter
 	discoveryLimiter *fixedWindowLimiter
 	importLimiter    *fixedWindowLimiter
+	importSlots      chan struct{}
 	providerLimiter  *fixedWindowLimiter
 	loginSlots       chan struct{}
 }

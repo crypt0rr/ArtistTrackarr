@@ -2,11 +2,38 @@ package web
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
+
+func TestImportConcurrencyGateBoundsConcurrentUploads(t *testing.T) {
+	a := &App{importSlots: make(chan struct{}, maxConcurrentImports)}
+	for i := 0; i < maxConcurrentImports; i++ {
+		if !a.acquireImportSlot(httptest.NewRecorder()) {
+			t.Fatalf("slot %d was unexpectedly rejected", i)
+		}
+	}
+	blocked := httptest.NewRecorder()
+	if a.acquireImportSlot(blocked) {
+		t.Fatal("third concurrent import was accepted")
+	}
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked import status=%d, want %d", blocked.Code, http.StatusTooManyRequests)
+	}
+	if blocked.Header().Get("Retry-After") != "30" {
+		t.Fatalf("blocked import retry-after=%q, want 30", blocked.Header().Get("Retry-After"))
+	}
+	a.releaseImportSlot()
+	if !a.acquireImportSlot(httptest.NewRecorder()) {
+		t.Fatal("released import slot was not reusable")
+	}
+	a.releaseImportSlot()
+	a.releaseImportSlot()
+}
 
 func TestParseArtistTrackarrCSVRoundTripAndReorderedColumns(t *testing.T) {
 	mbid := "11111111-1111-4111-8111-111111111111"
