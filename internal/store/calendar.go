@@ -29,8 +29,7 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 			WHERE nh.user_id=? AND nh.release_group_id=rg.id AND nh.status='held')
 		FROM release_groups rg
 		JOIN artists a ON a.id=rg.artist_id
-		JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE f.user_id=? AND `+calendarPreferredProvider+`
+		WHERE `+followedReleasePredicate("?")+` AND `+calendarPreferredProvider+`
 		AND rg.date_precision=3 AND length(rg.first_release_date)=10
 		AND rg.first_release_date BETWEEN ? AND ?
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
@@ -49,6 +48,10 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 		}
 		item.CalendarDate = item.FirstReleaseDate
 		item.Held = held != 0
+		item.FollowedArtists, err = s.followedReleaseArtists(ctx, userID, item.ID)
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
@@ -171,7 +174,9 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		}
 		deliveryResult, err := tx.ExecContext(ctx, `INSERT INTO release_digest_deliveries
 			(run_id,destination_id,status,next_attempt_at)
-			SELECT ?,id,'pending',? FROM destinations WHERE user_id=? AND enabled=1`, runID, timeText(now), user.ID)
+			SELECT ?,d.id,'pending',? FROM destinations d
+			LEFT JOIN destination_health dh ON dh.destination_id=d.id
+			WHERE d.user_id=? AND d.enabled=1 AND `+destinationAdmissionPredicate, runID, timeText(now), user.ID)
 		if err != nil {
 			_ = tx.Rollback()
 			return queued, err
@@ -200,12 +205,17 @@ func buildDigestBody(releases []CalendarRelease, frequency string) string {
 	fmt.Fprintf(&builder, "Your %s ArtistTrackarr release digest:\n", frequency)
 	for _, item := range releases {
 		status := calendarConfidenceLabel(item.Release, item.Held)
+		artistName := item.ArtistName
+		association := ""
+		if len(item.FollowedArtists) > 0 {
+			association = "; followed association(s): " + strings.Join(item.FollowedArtists, ", ")
+		}
 		if item.ArtistCreditRole == "featured" && item.GuestCreditCount > 0 {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Guest appearance; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
+			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Guest appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else if item.ArtistCreditRole == "featured" {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Featured appearance; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
+			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Featured appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; %s)", item.CalendarDate, item.ArtistName, item.Title, item.PrimaryType, status)
+			fmt.Fprintf(&builder, "- %s — %s — %s (%s; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		}
 		if link := releaseExternalURL(item.Release); link != "" {
 			builder.WriteString("\n  ")

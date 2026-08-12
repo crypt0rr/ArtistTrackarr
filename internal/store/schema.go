@@ -92,9 +92,6 @@ func (s *Store) migrate(ctx context.Context) error {
 			if err := s.migrateITunesFallback(ctx); err != nil {
 				return fmt.Errorf("migration %d: %w", version, err)
 			}
-			if _, err := s.DB.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, version, nowText()); err != nil {
-				return err
-			}
 			continue
 		}
 		if version == 11 {
@@ -263,6 +260,8 @@ func (s *Store) migrateUsernames(ctx context.Context, body []byte) error {
 	return tx.Commit()
 }
 
+var migrationFaultHook func(string) error
+
 // migrateITunesFallback rebuilds the two tables whose provider CHECK
 // constraints need to accept iTunes. SQLite cannot alter CHECK constraints in
 // place, so the tables are copied while foreign-key enforcement is temporarily
@@ -277,7 +276,16 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	rollback := func(err error) error { _ = tx.Rollback(); return err }
+	if err := s.migrateITunesFallbackTx(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateITunesFallbackTx(ctx context.Context, tx *sql.Tx) error {
+	rollback := func(err error) error { return err }
+	var err error
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE release_groups_itunes (
 		id INTEGER PRIMARY KEY,
 		mbid TEXT NOT NULL UNIQUE,
@@ -358,7 +366,13 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, `CREATE INDEX artist_resolutions_due ON artist_resolutions(status, next_attempt_at)`); err != nil {
 		return rollback(err)
 	}
-	return tx.Commit()
+	if migrationFaultHook != nil {
+		if err := migrationFaultHook("itunes-after-rebuild"); err != nil {
+			return rollback(err)
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(8,?)`, nowText())
+	return rollback(err)
 }
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {

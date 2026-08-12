@@ -3,6 +3,7 @@ services:
     container_name: artist-trackarr
     image: "${ARTIST_TRACKARR_IMAGE:-ghcr.io/crypt0rr/artist-trackarr:latest}"
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
       - "${ARTIST_TRACKARR_BIND:-127.0.0.1}:8080:8080"
     environment:

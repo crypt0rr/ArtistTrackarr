@@ -35,7 +35,9 @@ type ShoutrrrSender struct {
 	// http.DefaultClient for a few services, so Send temporarily scopes this
 	// client around the call while holding notificationHTTPClientMu and restores
 	// the previous global immediately afterwards.
-	client *http.Client
+	client   *http.Client
+	lookupIP func(context.Context, string, string) ([]net.IP, error)
+	dial     func(context.Context, string, string) (net.Conn, error)
 }
 
 const DefaultSendTimeout = 15 * time.Second
@@ -56,13 +58,13 @@ func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
 		transport = base.Clone()
 	}
 	http.DefaultClient = &http.Client{
-		Transport: transport,
+		Transport: safeTransport(transport, allowPrivateTargets, net.DefaultResolver.LookupIP, (&net.Dialer{Timeout: timeout}).DialContext),
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("notification redirect limit exceeded")
 			}
-			if err := validateOutboundTarget(req.Context(), req.URL.String(), allowPrivateTargets, true); err != nil {
+			if err := validateOutboundTargetWithLookup(req.Context(), req.URL.String(), allowPrivateTargets, true, net.DefaultResolver.LookupIP); err != nil {
 				return err
 			}
 			return nil
@@ -70,7 +72,10 @@ func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
 	}
 }
 
-func newHTTPClient(timeout time.Duration, allowPrivateTargets bool) *http.Client {
+func newHTTPClient(timeout time.Duration, allowPrivateTargets bool,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) *http.Client {
 	if timeout <= 0 {
 		timeout = DefaultSendTimeout
 	}
@@ -78,14 +83,20 @@ func newHTTPClient(timeout time.Duration, allowPrivateTargets bool) *http.Client
 	if base, ok := transport.(*http.Transport); ok {
 		transport = base.Clone()
 	}
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: timeout}).DialContext
+	}
 	return &http.Client{
-		Transport: transport,
+		Transport: safeTransport(transport, allowPrivateTargets, lookup, dial),
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("notification redirect limit exceeded")
 			}
-			if err := validateOutboundTarget(req.Context(), req.URL.String(), allowPrivateTargets, true); err != nil {
+			if err := validateOutboundTargetWithLookup(req.Context(), req.URL.String(), allowPrivateTargets, true, lookup); err != nil {
 				return err
 			}
 			return nil
@@ -97,7 +108,61 @@ func (s ShoutrrrSender) httpClient() *http.Client {
 	if s.client != nil {
 		return s.client
 	}
-	return newHTTPClient(s.sendTimeout(), s.AllowPrivateTargets)
+	return newHTTPClient(s.sendTimeout(), s.AllowPrivateTargets, s.lookupIP, s.dial)
+}
+
+func safeTransport(base http.RoundTripper, allowPrivate bool,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) http.RoundTripper {
+	transport, ok := base.(*http.Transport)
+	if !ok {
+		fallback, fallbackOK := http.DefaultTransport.(*http.Transport)
+		if !fallbackOK {
+			return base
+		}
+		transport = fallback.Clone()
+	}
+	transport = transport.Clone()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialApproved(ctx, network, address, allowPrivate, lookup, dial)
+	}
+	return transport
+}
+
+func dialApproved(ctx context.Context, network, address string, allowPrivate bool,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, errors.New("notification destination address is invalid")
+	}
+	if isBlockedHost(host, allowPrivate) {
+		return nil, errors.New("notification destination cannot dial a local or private network")
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ips, err := lookup(lookupCtx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("notification destination host could not be resolved")
+	}
+	var lastErr error
+	for _, ip := range ips {
+		if isBlockedIP(ip, allowPrivate) {
+			lastErr = errors.New("notification destination resolved to a local or private network")
+			continue
+		}
+		conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	if lastErr == nil {
+		lastErr = errors.New("notification destination could not be reached")
+	}
+	return nil, lastErr
 }
 
 func (s ShoutrrrSender) sendTimeout() time.Duration {
@@ -119,23 +184,40 @@ func (s ShoutrrrSender) Validate(serviceURL string) error {
 }
 
 func (s ShoutrrrSender) Send(ctx context.Context, serviceURL, title, body string) error {
+	return s.send(ctx, serviceURL, title, body, nil)
+}
+
+// send performs one notification send. observer is intentionally internal and
+// is used by the benchmark to measure time waiting for and holding the
+// Shoutrrr compatibility mutex without adding production-facing metrics or
+// changing the NotificationSender interface.
+func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string,
+	observer func(queueWait, clientHold time.Duration),
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
 	defer cancel()
-	if err := validateOutboundTarget(sendCtx, serviceURL, s.AllowPrivateTargets, true); err != nil {
+	if err := validateOutboundTargetWithLookup(sendCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP); err != nil {
 		return err
 	}
 	// Several Shoutrrr services dereference http.DefaultClient internally.
 	// Scope the sender-owned client only for this operation and restore the
 	// caller's client even when Shoutrrr returns an error or panics.
+	queueStarted := time.Now()
 	notificationHTTPClientMu.Lock()
+	queueWait := time.Since(queueStarted)
 	previousClient := http.DefaultClient
 	http.DefaultClient = s.httpClient()
+	holdStarted := time.Now()
 	defer func() {
+		holdTime := time.Since(holdStarted)
 		http.DefaultClient = previousClient
 		notificationHTTPClientMu.Unlock()
+		if observer != nil {
+			observer(queueWait, holdTime)
+		}
 	}()
 	sender, err := shoutrrr.CreateSender(serviceURL)
 	if err != nil {
@@ -172,6 +254,12 @@ func RedactError(err error) string {
 }
 
 func validateOutboundTarget(ctx context.Context, serviceURL string, allowPrivate, resolve bool) error {
+	return validateOutboundTargetWithLookup(ctx, serviceURL, allowPrivate, resolve, net.DefaultResolver.LookupIP)
+}
+
+func validateOutboundTargetWithLookup(ctx context.Context, serviceURL string, allowPrivate, resolve bool,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+) error {
 	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
 	if err != nil {
 		return errors.New("notification destination is invalid")
@@ -188,7 +276,10 @@ func validateOutboundTarget(ctx context.Context, serviceURL string, allowPrivate
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", host)
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	ips, err := lookup(lookupCtx, "ip", host)
 	if err != nil {
 		return errors.New("notification destination host could not be resolved")
 	}

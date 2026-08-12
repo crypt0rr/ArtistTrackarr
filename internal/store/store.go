@@ -235,6 +235,10 @@ type Release struct {
 	// provider. Spotify can return releases through appears_on when the
 	// artist is featured on another artist's release.
 	ArtistCreditRole string
+	// FollowedArtists lists the member's followed artists associated with this
+	// release. It is populated on detail/message projections and is not used as
+	// the canonical release artist identity.
+	FollowedArtists []string
 	// Credits contains provider-specific credit evidence for this release. It
 	// is populated on newly observed releases and on release-detail views; the
 	// release-level ArtistCreditRole remains the compatibility projection used

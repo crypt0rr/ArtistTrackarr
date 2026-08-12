@@ -198,7 +198,10 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=23`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("review hot indexes migration marker=%d err=%v", migrationsApplied, err)
 	}
-	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id"} {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=24`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("assurance indexes migration marker=%d err=%v", migrationsApplied, err)
+	}
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
 			t.Fatalf("migration index %q missing: %v", indexName, err)
@@ -906,6 +909,83 @@ func TestGuestCreditBaselineAndReleaseDetail(t *testing.T) {
 	detail, err := s.ReleaseDetail(ctx, userID, releaseID)
 	if err != nil || len(detail.Credits) != 1 || detail.Credits[0].Role != "guest" {
 		t.Fatalf("guest detail=%#v err=%v", detail.Credits, err)
+	}
+}
+
+func TestCreditOwnerAssociationsCreateOneEventAndExposeRelease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "credit-owner@example.com", "unused", "member", "UTC", "credit-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.UpsertArtist(ctx, Artist{MBID: "credit-primary", Name: "Primary Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := s.UpsertArtist(ctx, Artist{MBID: "credit-guest", Name: "Guest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, primary.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, guest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Inbox", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "credit-release", primary.ID, "Shared Release", "Single", "[]", "2026-08-10", 3,
+		"https://musicbrainz.org/release-group/credit-release", "spotify", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := result.LastInsertId()
+	for _, association := range []struct {
+		artistID   int64
+		role       string
+		provider   string
+		providerID string
+	}{
+		{primary.ID, "primary", "spotify", "shared-release"},
+		{guest.ID, "featured", "spotify", "shared-release"},
+	} {
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_credits(
+			release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,provider_url,confidence,first_seen_at,last_seen_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, releaseID, association.artistID, association.provider, association.providerID,
+			association.role, "", "", "https://open.spotify.com/album/shared-release", "confirmed", nowText(), nowText()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "New shared release", "A body", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "New shared release", "A body", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+	var body string
+	if err := s.DB.QueryRowContext(ctx, `SELECT body FROM notification_events WHERE user_id=? AND release_group_id=?`, userID, releaseID).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, "Followed artist association(s): Guest Artist (featured), Primary Artist (primary)") {
+		t.Fatalf("association text=%q", body)
+	}
+	var deliveryCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE event_id IN (SELECT id FROM notification_events WHERE user_id=? AND release_group_id=?)`, userID, releaseID).Scan(&deliveryCount); err != nil || deliveryCount != 1 {
+		t.Fatalf("delivery count=%d err=%v, want one household delivery", deliveryCount, err)
+	}
+	recent, err := s.RecentReleases(ctx, userID, 10)
+	if err != nil || len(recent) != 1 || recent[0].ID != releaseID {
+		t.Fatalf("owner recent releases=%#v err=%v", recent, err)
+	}
+	detail, err := s.ReleaseDetail(ctx, userID, releaseID)
+	if err != nil || len(detail.FollowedArtists) != 2 || detail.FollowedArtists[0] != "Guest Artist (featured)" || detail.FollowedArtists[1] != "Primary Artist (primary)" {
+		t.Fatalf("owner release detail=%#v err=%v", detail.FollowedArtists, err)
 	}
 }
 

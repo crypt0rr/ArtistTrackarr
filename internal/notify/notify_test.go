@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -212,5 +213,83 @@ func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
 	}
 	if http.DefaultClient != before {
 		t.Fatal("notification send leaked its scoped HTTP client into the application")
+	}
+}
+
+func TestDialApprovedRevalidatesResolvedAddressesAtConnectionTime(t *testing.T) {
+	lookup := func(context.Context, string, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	dialCalled := false
+	_, err := dialApproved(context.Background(), "tcp", "hooks.example:443", false, lookup, func(context.Context, string, string) (net.Conn, error) {
+		dialCalled = true
+		return nil, nil
+	})
+	if err == nil || dialCalled {
+		t.Fatalf("resolved private address was dialed: err=%v called=%v", err, dialCalled)
+	}
+
+	left, right := net.Pipe()
+	defer func() { _ = left.Close(); _ = right.Close() }()
+	dialCalled = false
+	_, err = dialApproved(context.Background(), "tcp", "hooks.example:443", true, lookup, func(context.Context, string, string) (net.Conn, error) {
+		dialCalled = true
+		return left, nil
+	})
+	if err != nil || !dialCalled {
+		t.Fatalf("private-target opt-in did not reach injected dialer: err=%v called=%v", err, dialCalled)
+	}
+}
+
+func TestHTTPClientUsesResolverSeamForRedirectAndDial(t *testing.T) {
+	lookup := func(context.Context, string, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	dialCalled := false
+	client := newHTTPClient(time.Second, false, lookup, func(context.Context, string, string) (net.Conn, error) {
+		dialCalled = true
+		return nil, errors.New("dial should not be attempted for a blocked address")
+	})
+	request, err := http.NewRequest(http.MethodGet, "http://hooks.example/hook", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "local or private") {
+		t.Fatalf("blocked resolved address error=%v", err)
+	}
+	if dialCalled {
+		t.Fatal("transport dialer was called after resolver rejected the address")
+	}
+}
+
+func BenchmarkShoutrrrSendSerialization(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: time.Second}
+	serviceURL := "generic+" + server.URL + "/hook"
+	b.ReportAllocs()
+	var queueWaitNanos, clientHoldNanos int64
+	var sends int64
+	observer := func(queueWait, clientHold time.Duration) {
+		atomic.AddInt64(&queueWaitNanos, queueWait.Nanoseconds())
+		atomic.AddInt64(&clientHoldNanos, clientHold.Nanoseconds())
+		atomic.AddInt64(&sends, 1)
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := sender.send(context.Background(), serviceURL, "benchmark", "body", observer); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+	b.StopTimer()
+	count := atomic.LoadInt64(&sends)
+	if count > 0 {
+		b.ReportMetric(float64(atomic.LoadInt64(&queueWaitNanos))/float64(count), "queue-wait-ns/op")
+		b.ReportMetric(float64(atomic.LoadInt64(&clientHoldNanos))/float64(count), "client-mutex-ns/op")
 	}
 }

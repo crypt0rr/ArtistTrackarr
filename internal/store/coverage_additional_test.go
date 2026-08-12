@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -50,6 +52,32 @@ func TestFollowMovesInitialSyncForwardOnlyOnce(t *testing.T) {
 	}
 	if second != first {
 		t.Fatalf("duplicate follow moved next check from %q to %q", first, second)
+	}
+}
+
+func TestValidateDestinationCiphertextsDetectsWrongKeyWithoutLeakingData(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "destination-key@example.com", "hash", "member", "UTC", "destination-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Webhook", "generic", []byte("ciphertext")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ValidateDestinationCiphertexts(ctx, func(value []byte) (string, error) {
+		if string(value) != "ciphertext" {
+			t.Fatalf("decryptor received %q", value)
+		}
+		return "https://example.invalid", nil
+	}); err != nil {
+		t.Fatalf("valid ciphertext rejected: %v", err)
+	}
+	err = s.ValidateDestinationCiphertexts(ctx, func([]byte) (string, error) {
+		return "", errors.New("authentication failed: secret ciphertext")
+	})
+	if err == nil || !strings.Contains(err.Error(), "destination 1 cannot be decrypted") || strings.Contains(err.Error(), "secret ciphertext") {
+		t.Fatalf("wrong-key error=%v", err)
 	}
 }
 
@@ -931,6 +959,84 @@ func TestITunesFallbackMigrationRollsBackOnLegacySchemaError(t *testing.T) {
 	var table string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='release_groups_itunes'`).Scan(&table); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("failed migration left temporary table %q (err=%v)", table, err)
+	}
+}
+
+func TestITunesFallbackMigrationFaultRollsBackBeforeMarkerAndCanRerun(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "itunes-fault.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+	for _, name := range []string{
+		"001_initial.sql", "002_artist_resolutions.sql", "003_spotify_releases.sql",
+		"004_provider_scheduling.sql", "005_reliability.sql", "006_notification_preferences.sql",
+		"007_adaptive_spotify_polling.sql",
+	} {
+		body, readErr := migrations.ReadFile("migrations/" + name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if _, err := db.ExecContext(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+		var version int
+		if _, err := fmt.Sscanf(name, "%03d_", &version); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)`, version, nowText()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	migrationFaultHook = func(stage string) error {
+		if stage == "itunes-after-rebuild" {
+			return errors.New("injected iTunes migration interruption")
+		}
+		return nil
+	}
+	if err := (&Store{DB: db}).migrateITunesFallback(ctx); err == nil || !strings.Contains(err.Error(), "injected") {
+		t.Fatalf("faulted migration error=%v", err)
+	}
+	migrationFaultHook = nil
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("faulted migration inserted marker count=%d", count)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='release_groups_itunes'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("faulted migration left rebuilt table behind")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='release_groups'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("faulted migration removed the legacy release table")
+	}
+	if err := (&Store{DB: db}).migrateITunesFallback(ctx); err != nil {
+		t.Fatalf("rerun migration failed: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("rerun marker count=%d err=%v", count, err)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("foreign_key_check reported a violation after rerun")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -670,10 +670,14 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 		COALESCE(nr.albums,1),COALESCE(nr.eps,1),COALESCE(nr.singles,1),COALESCE(nr.compilations,1),
 		COALESCE(nr.announcements,1),COALESCE(nr.release_day,1),nr.paused_until,COALESCE(nr.updated_at,'')
 		FROM release_groups rg
-		JOIN follows f ON f.user_id=? AND f.artist_id=rg.artist_id
+		JOIN follows f ON f.user_id=? AND (f.artist_id=rg.artist_id OR EXISTS (
+			SELECT 1 FROM release_credits owner_credit
+			WHERE owner_credit.release_group_id=rg.id AND owner_credit.artist_id=f.artist_id
+		))
 		LEFT JOIN notification_preferences p ON p.user_id=?
-		LEFT JOIN follow_notification_rules nr ON nr.user_id=? AND nr.artist_id=rg.artist_id
-		WHERE rg.id=?`, userID, userID, userID, releaseID).Scan(&albums, &eps, &singles, &announcements, &releaseDay,
+		LEFT JOIN follow_notification_rules nr ON nr.user_id=? AND nr.artist_id=f.artist_id
+		WHERE rg.id=?
+		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END LIMIT 1`, userID, userID, userID, releaseID).Scan(&albums, &eps, &singles, &announcements, &releaseDay,
 		&holdConflicts, &primary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
 		&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated)
 	if err != nil {
@@ -682,13 +686,17 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 			// removed). Do not create an orphaned notification event.
 			return nil
 		}
-		return err
+		return fmt.Errorf("load notification rule for release: %w", err)
 	}
 	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
 	p.HoldConflictingNotifications = holdConflicts != 0
 	rule := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, 0)
 	if !releaseTypeEnabled(p, primary) || !rule.AllowsContent(primary, role, eventType, now) {
 		return nil
+	}
+	title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
+	if err != nil {
+		return err
 	}
 	if p.HoldConflictingNotifications && rule.queuesImmediate(now) {
 		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
@@ -697,6 +705,18 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 		return nil
 	}
 	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, rule.queuesImmediate(now))
+}
+
+func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, title, body string) (string, string, error) {
+	var names sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT `+followedReleaseCreditNames+` FROM release_groups rg WHERE rg.id=?`, userID, releaseID).Scan(&names)
+	if err != nil {
+		return title, body, fmt.Errorf("decorate release message: %w", err)
+	}
+	if !names.Valid || strings.TrimSpace(names.String) == "" {
+		return title, body, nil
+	}
+	return title, strings.TrimSpace(body) + "\nFollowed artist association(s): " + names.String, nil
 }
 
 func insertNotificationEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
@@ -727,7 +747,9 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 	// repeated release-day queue run should never turn an already queued event
 	// into a duplicate-delivery error (or duplicate rows).
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(event_id,destination_id,status,next_attempt_at)
-		SELECT ?,id,'pending',? FROM destinations WHERE user_id=? AND enabled=1`, eventID, timeText(now), userID)
+		SELECT ?,d.id,'pending',? FROM destinations d
+		LEFT JOIN destination_health dh ON dh.destination_id=d.id
+		WHERE d.user_id=? AND d.enabled=1 AND `+destinationAdmissionPredicate, eventID, timeText(now), userID)
 	return err
 }
 
