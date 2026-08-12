@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
+umask 077
 CDPATH=''
+
+HELPER_IMAGE=${RESTORE_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}
 
 # Rehearse restoring a backup into an isolated Docker volume. The original
 # encryption key is intentionally required: encrypted notification targets
@@ -20,6 +23,7 @@ port=${RESTORE_SMOKE_PORT:-18080}
 volume="artist-trackarr-restore-$$"
 container="artist-trackarr-restore-$$"
 archive_path=$(cd -- "$(dirname -- "$archive")" && pwd)/$(basename -- "$archive")
+checksum_path="$archive_path.sha256"
 
 cleanup() {
 	docker rm -f "$container" >/dev/null 2>&1 || true
@@ -28,8 +32,25 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 docker volume create "$volume" >/dev/null
-docker run --rm -v "$volume:/data" -v "$archive_path:/backup/restore.tgz:ro" alpine:3.24 \
+if [ -s "$checksum_path" ]; then
+	(
+		cd "$(dirname -- "$archive_path")"
+		sha256sum -c "$(basename -- "$checksum_path")"
+	)
+else
+	echo "restore: checksum sidecar is absent; accepting a legacy archive" >&2
+fi
+docker run --rm -v "$volume:/data" -v "$archive_path:/backup/restore.tgz:ro" "$HELPER_IMAGE" \
 	sh -ec 'tar xzf /backup/restore.tgz -C /data; test -s /data/artist-tracker.db; apk add --no-cache sqlite >/dev/null; test -z "$(sqlite3 /data/artist-tracker.db "PRAGMA foreign_key_check;")"'
+
+state_fingerprint() {
+	docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec '
+		apk add --no-cache sqlite >/dev/null
+		sqlite3 -noheader -separator "|" /data/artist-tracker.db \
+			"SELECT (SELECT count(*) FROM schema_migrations),(SELECT count(*) FROM users),(SELECT count(*) FROM artists),(SELECT count(*) FROM follows),(SELECT count(*) FROM release_groups),(SELECT count(*) FROM destinations);" \
+			| sha256sum | cut -d" " -f1
+	'
+}
 
 docker run -d --name "$container" --network host -v "$volume:/data" \
 	-e LISTEN_ADDR=":$port" -e PUBLIC_URL="http://127.0.0.1:$port" \
@@ -61,4 +82,17 @@ if [ "$(docker inspect -f '{{.State.ExitCode}}' "$container")" != "0" ]; then
 fi
 docker start "$container" >/dev/null
 wait_ready
-echo "restore: readiness, foreign-key check, key-preserving startup, and restart persistence passed"
+before_fingerprint=$(state_fingerprint)
+docker stop --time 60 "$container" >/dev/null
+if [ "$(docker inspect -f '{{.State.ExitCode}}' "$container")" != "0" ]; then
+	echo "restore: application did not shut down cleanly after verification" >&2
+	exit 1
+fi
+docker start "$container" >/dev/null
+wait_ready
+after_fingerprint=$(state_fingerprint)
+if [ "$before_fingerprint" != "$after_fingerprint" ]; then
+	echo "restore: database state changed across restart" >&2
+	exit 1
+fi
+echo "restore: readiness, foreign-key check, key-preserving startup, and restart persistence passed (state $after_fingerprint)"
