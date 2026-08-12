@@ -1,5 +1,7 @@
 package version
 
-const Current = "0.35.0"
+// Current is overridden for release images with -ldflags. Local builds are
+// intentionally identified as dev so they cannot be mistaken for a release.
+var Current = "dev"
 
-const UserAgent = "ArtistTrackarr/" + Current
+var UserAgent = "ArtistTrackarr/" + Current

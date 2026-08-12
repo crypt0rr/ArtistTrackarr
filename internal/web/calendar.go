@@ -100,7 +100,7 @@ func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
 	builder.WriteString("END:VCALENDAR\r\n")
 	w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-releases.ics"`)
-	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(builder.String()))
 }
 

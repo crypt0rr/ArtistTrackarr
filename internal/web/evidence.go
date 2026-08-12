@@ -165,10 +165,7 @@ func (a *App) evidenceIssueStateAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "release evidence issue could not be updated", http.StatusInternalServerError)
 		return
 	}
-	redirect := r.FormValue("return")
-	if !strings.HasPrefix(redirect, "/coverage/issues") {
-		redirect = "/coverage/issues"
-	}
+	redirect := localReturnPath(r.FormValue("return"), "/coverage/issues", "/coverage/issues")
 	separator := "?"
 	if strings.Contains(redirect, "?") {
 		separator = "&"

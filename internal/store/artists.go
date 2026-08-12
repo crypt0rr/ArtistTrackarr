@@ -563,12 +563,20 @@ func (s *Store) ScheduleListenBrainzRefresh(ctx context.Context, artistIDs []int
 }
 
 func (s *Store) ScheduleListenBrainzRetry(ctx context.Context, artistIDs []int64, next time.Time, message string) error {
+	if len(artistIDs) == 0 {
+		return nil
+	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, artistID := range artistIDs {
-		if _, err := s.DB.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,last_error=excluded.last_error,attempts=artist_listenbrainz_stats.attempts+1,updated_at=excluded.updated_at`, artistID, timeText(next), message, nowText()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,last_error=excluded.last_error,attempts=artist_listenbrainz_stats.attempts+1,updated_at=excluded.updated_at`, artistID, timeText(next), message, nowText()); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit int) ([]Artist, error) {
 	if limit < 1 || limit > 20 {
@@ -699,12 +707,25 @@ func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (Spotif
 	return state, err
 }
 func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, now time.Time, interval time.Duration, changed, upcoming bool) error {
-	state, err := s.SpotifyPollingState(ctx, artistID)
+	tx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	streak := state.UnchangedChecks
-	lastChange := state.LastChangeAt
+	var streak int
+	var last sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).Scan(&streak, &last); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	var lastChange *time.Time
+	if last.Valid {
+		parsed, parseErr := parseTime(last.String)
+		if parseErr != nil {
+			_ = tx.Rollback()
+			return parseErr
+		}
+		lastChange = &parsed
+	}
 	if changed {
 		streak = 0
 		t := now
@@ -727,10 +748,6 @@ func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, 
 		}
 	}
 	next := now.Add(delay)
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
 		timeText(next), streak, nullableTime(lastChange), artistID); err != nil {
 		_ = tx.Rollback()

@@ -72,7 +72,7 @@ func main() {
 	}
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret, cfg.SpotifyMarket)
-	itunes := catalog.NewITunes(cfg.SpotifyMarket)
+	itunes := catalog.NewITunes(cfg.ITunesMarket)
 	listenBrainz := catalog.NewListenBrainz()
 	var spotifyProvider catalog.SpotifyProvider
 	if spotify != nil {
@@ -116,6 +116,7 @@ func main() {
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           app.Handler(),
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      2 * time.Minute,

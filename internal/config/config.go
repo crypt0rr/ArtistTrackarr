@@ -28,12 +28,13 @@ type Config struct {
 	SpotifyClientID                 string
 	SpotifySecret                   string
 	SpotifyMarket                   string
+	ITunesMarket                    string
 	LogLevel                        slog.Level
 }
 
 func Load() (Config, error) {
-	publicURL, err := url.Parse(env("PUBLIC_URL", "http://localhost:8080"))
-	if err != nil || publicURL.Scheme == "" || publicURL.Host == "" {
+	publicURL, err := url.Parse(strings.TrimSpace(env("PUBLIC_URL", "http://localhost:8080")))
+	if err != nil || publicURL.Scheme == "" || publicURL.Host == "" || publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" || (publicURL.Path != "" && publicURL.Path != "/") {
 		return Config{}, errors.New("PUBLIC_URL must be an absolute http(s) URL")
 	}
 	if !strings.EqualFold(publicURL.Scheme, "http") && !strings.EqualFold(publicURL.Scheme, "https") {
@@ -68,17 +69,28 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	trustProxy := strings.EqualFold(env("TRUST_PROXY", "false"), "true")
+	trustProxy := strings.EqualFold(strings.TrimSpace(env("TRUST_PROXY", "false")), "true")
 	if trustProxy && len(trustedProxyNetworks) == 0 {
 		return Config{}, errors.New("TRUST_PROXY=true requires TRUSTED_PROXY_CIDRS")
 	}
 	if strings.EqualFold(publicURL.Scheme, "http") && !isLocalHost(publicURL.Hostname()) && !allowInsecureHTTP {
 		return Config{}, errors.New("PUBLIC_URL must use HTTPS unless it points to localhost or ALLOW_INSECURE_HTTP=true")
 	}
+	listenAddr := strings.TrimSpace(env("LISTEN_ADDR", ":8080"))
+	if listenAddr == "" {
+		return Config{}, errors.New("LISTEN_ADDR must not be empty")
+	}
+	if _, err := net.ResolveTCPAddr("tcp", listenAddr); err != nil {
+		return Config{}, fmt.Errorf("LISTEN_ADDR must be a valid TCP address: %w", err)
+	}
+	databasePath := strings.TrimSpace(env("DATABASE_PATH", "/data/artist-tracker.db"))
+	if databasePath == "" {
+		return Config{}, errors.New("DATABASE_PATH must not be empty")
+	}
 	cfg := Config{
-		ListenAddr:                      env("LISTEN_ADDR", ":8080"),
+		ListenAddr:                      listenAddr,
 		PublicURL:                       publicURL,
-		DatabasePath:                    env("DATABASE_PATH", "/data/artist-tracker.db"),
+		DatabasePath:                    databasePath,
 		SetupToken:                      setupToken,
 		EncryptionKey:                   encryptionKey,
 		SessionSecret:                   sessionSecret,
@@ -92,6 +104,7 @@ func Load() (Config, error) {
 		SpotifyClientID:                 strings.TrimSpace(env("SPOTIFY_CLIENT_ID", "")),
 		SpotifySecret:                   spotifySecret,
 		SpotifyMarket:                   strings.ToUpper(strings.TrimSpace(env("SPOTIFY_MARKET", "US"))),
+		ITunesMarket:                    strings.ToUpper(strings.TrimSpace(env("ITUNES_MARKET", "US"))),
 	}
 	cfg.LogLevel, err = parseLogLevel(env("LOG_LEVEL", "info"))
 	if err != nil {
@@ -103,18 +116,29 @@ func Load() (Config, error) {
 	if len(cfg.EncryptionKey) < 32 || len(cfg.SessionSecret) < 32 {
 		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must each be at least 32 characters")
 	}
+	if cfg.EncryptionKey == cfg.SessionSecret {
+		return Config{}, errors.New("APP_ENCRYPTION_KEY and SESSION_SECRET must be different values")
+	}
 	if cfg.MusicBrainzContact == "" {
 		return Config{}, errors.New("MUSICBRAINZ_CONTACT is required")
 	}
 	if (cfg.SpotifyClientID == "") != (cfg.SpotifySecret == "") {
 		return Config{}, errors.New("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be configured together")
 	}
-	if len(cfg.SpotifyMarket) != 2 ||
-		cfg.SpotifyMarket[0] < 'A' || cfg.SpotifyMarket[0] > 'Z' ||
-		cfg.SpotifyMarket[1] < 'A' || cfg.SpotifyMarket[1] > 'Z' {
-		return Config{}, errors.New("SPOTIFY_MARKET must be a two-letter ISO country code")
+	if err := validateMarket("SPOTIFY_MARKET", cfg.SpotifyMarket); err != nil {
+		return Config{}, err
+	}
+	if err := validateMarket("ITUNES_MARKET", cfg.ITunesMarket); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func validateMarket(name, value string) error {
+	if len(value) != 2 || value[0] < 'A' || value[0] > 'Z' || value[1] < 'A' || value[1] > 'Z' {
+		return fmt.Errorf("%s must be a two-letter ISO country code", name)
+	}
+	return nil
 }
 
 func parseTrustedProxyNetworks(value string) ([]*net.IPNet, error) {

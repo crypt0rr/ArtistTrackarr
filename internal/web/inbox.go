@@ -147,10 +147,7 @@ func (a *App) inboxStateAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "release inbox could not be updated", http.StatusInternalServerError)
 		return
 	}
-	redirect := r.FormValue("return")
-	if !strings.HasPrefix(redirect, "/inbox") {
-		redirect = "/inbox"
-	}
+	redirect := localReturnPath(r.FormValue("return"), "/inbox", "/inbox")
 	separator := "?"
 	if strings.Contains(redirect, "?") {
 		separator = "&"

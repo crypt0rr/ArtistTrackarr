@@ -3,8 +3,8 @@ package version
 import "testing"
 
 func TestCurrentReleaseVersion(t *testing.T) {
-	if Current != "0.35.0" {
-		t.Fatalf("Current=%q, want 0.35.0", Current)
+	if Current != "dev" {
+		t.Fatalf("Current=%q, want the local-build fallback dev", Current)
 	}
 }
 

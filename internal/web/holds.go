@@ -38,10 +38,7 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "notification hold could not be updated", http.StatusInternalServerError)
 		return
 	}
-	redirect := r.FormValue("return")
-	if redirect == "" || !strings.HasPrefix(redirect, "/") || strings.HasPrefix(redirect, "//") {
-		redirect = "/"
-	}
+	redirect := localReturnPath(r.FormValue("return"), "/", "/")
 	message := "Notification released"
 	if action == "discard" {
 		message = "Notification discarded"
