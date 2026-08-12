@@ -326,32 +326,12 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	snapshot.Providers = make([]DiagnosticsProvider, 0, len(health))
 	for _, provider := range health {
 		snapshot.Providers = append(snapshot.Providers, DiagnosticsProvider{
-			Provider: provider.Provider, Status: diagnosticsProviderStatus(provider), NextCheckAt: provider.NextCheckAt,
+			Provider:    provider.Provider,
+			Status:      ProviderHealthStatus(provider, snapshot.CheckedAt, ProviderHealthStaleAfter(provider.Provider)),
+			NextCheckAt: provider.NextCheckAt,
 		})
 	}
 	return snapshot, nil
-}
-
-func diagnosticsProviderStatus(provider ProviderHealth) string {
-	latestFailure := provider.LastFailureAt != nil &&
-		(provider.LastSuccessAt == nil || !provider.LastFailureAt.Before(*provider.LastSuccessAt))
-	if latestFailure {
-		switch {
-		case provider.QuotaExceeded:
-			return "quota limited"
-		case provider.RateLimited:
-			return "rate limited"
-		default:
-			return "degraded"
-		}
-	}
-	if provider.LastSuccessAt != nil {
-		return "healthy"
-	}
-	if provider.LastFailureAt != nil {
-		return "unavailable"
-	}
-	return "no success yet"
 }
 func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())

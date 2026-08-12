@@ -15,8 +15,12 @@ fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
 
 tooling-check:
-	@marker=$$(printf '@%s' latest); if rg -n "$$marker" .github Dockerfile; then \
+	@marker=$$(printf '@%s' latest); if rg -n "$$marker" .github Dockerfile scripts; then \
 		echo "unpinned tool reference found" >&2; \
+		exit 1; \
+	fi
+	@if rg -n --pcre2 '\b(?:golang|alpine):[^@[:space:]]+(?:[[:space:]]|$$)' Dockerfile scripts; then \
+		echo "unpinned container helper reference found" >&2; \
 		exit 1; \
 	fi
 

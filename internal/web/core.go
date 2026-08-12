@@ -26,25 +26,7 @@ import (
 )
 
 func providerHealthStatus(p store.ProviderHealth) string {
-	latestFailure := p.LastFailureAt != nil &&
-		(p.LastSuccessAt == nil || !p.LastFailureAt.Before(*p.LastSuccessAt))
-	if latestFailure {
-		switch {
-		case p.QuotaExceeded:
-			return "quota limited"
-		case p.RateLimited:
-			return "rate limited"
-		default:
-			return "degraded"
-		}
-	}
-	if p.LastSuccessAt != nil {
-		return "healthy"
-	}
-	if p.LastFailureAt != nil {
-		return "unavailable"
-	}
-	return "no success yet"
+	return store.ProviderHealthStatus(p, time.Now().UTC(), store.ProviderHealthStaleAfter(p.Provider))
 }
 
 func providerHealthClass(p store.ProviderHealth) string {
@@ -52,6 +34,8 @@ func providerHealthClass(p store.ProviderHealth) string {
 	case "healthy":
 		return "sent"
 	case "quota limited", "rate limited":
+		return "ambiguous"
+	case "stale":
 		return "ambiguous"
 	default:
 		return "failed"

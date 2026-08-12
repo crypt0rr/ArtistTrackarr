@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
+umask 077
 CDPATH=''
+
+# Pin the helper image so backups do not silently change behavior when Alpine
+# publishes a new tag. The manifest digest supports the runtime architectures.
+HELPER_IMAGE=${BACKUP_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}
 
 # Resolve the volume mounted at /data from the Compose app container instead
 # of guessing the project-prefixed Docker volume name.
@@ -8,6 +13,7 @@ service=${COMPOSE_SERVICE:-app}
 output=${1:-artist-trackarr-backup.tgz}
 output_dir=$(cd -- "$(dirname -- "$output")" && pwd)
 output_file="$output_dir/$(basename -- "$output")"
+checksum_file="$output_file.sha256"
 container_id=""
 restart_needed=0
 
@@ -51,11 +57,16 @@ fi
 restart_needed=1
 docker compose stop "$service" >/dev/null
 
-if ! docker run --rm --volumes-from "$container_id" alpine:3.24 sh -ec 'test -s /data/artist-tracker.db'; then
+if ! docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec 'test -s /data/artist-tracker.db'; then
 	echo "backup: /data/artist-tracker.db is missing or empty" >&2
 	exit 1
 fi
 
-docker run --rm --volumes-from "$container_id" -v "$output_dir:/backup" alpine:3.24 \
+docker run --rm --volumes-from "$container_id" -v "$output_dir:/backup" "$HELPER_IMAGE" \
 	tar czf "/backup/$(basename -- "$output_file")" -C /data .
-echo "backup: wrote $output_file from volume $mount_name"
+(
+	cd "$output_dir"
+	sha256sum "$(basename -- "$output_file")" > "$(basename -- "$checksum_file")"
+)
+chmod 600 "$output_file" "$checksum_file"
+echo "backup: wrote $output_file and $checksum_file from volume $mount_name"
