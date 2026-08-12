@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -360,22 +361,23 @@ func (s *Store) migrateITunesFallback(ctx context.Context) error {
 	return tx.Commit()
 }
 func (s *Store) Close() error {
-	s.readerMu.Lock()
-	reader := s.Reader
-	s.Reader = nil
-	s.readerMu.Unlock()
-	var readerErr error
-	if reader != nil {
-		readerErr = reader.Close()
-	}
-	if s.DB == nil {
-		return readerErr
-	}
-	writerErr := s.DB.Close()
-	if writerErr != nil {
-		return writerErr
-	}
-	return readerErr
+	s.closeOnce.Do(func() {
+		s.readerMu.Lock()
+		reader := s.Reader
+		s.Reader = nil
+		s.readerMu.Unlock()
+
+		var readerErr error
+		if reader != nil {
+			readerErr = reader.Close()
+		}
+		var writerErr error
+		if s.DB != nil {
+			writerErr = s.DB.Close()
+		}
+		s.closeErr = errors.Join(writerErr, readerErr)
+	})
+	return s.closeErr
 }
 func (s *Store) Healthy(ctx context.Context) error {
 	var one int

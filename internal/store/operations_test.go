@@ -4,12 +4,83 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/logging"
 )
+
+func TestManualSyncAdmissionIsAtomicAndBounded(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "manual-admission@example.com", "hash", "member", "UTC", "manual-admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "manual-admission-artist", Name: "Manual Admission Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 16
+	requests := make(chan ManualSyncRequest, callers)
+	errs := make(chan error, callers)
+	var wait sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			request, requestErr := s.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID)
+			requests <- request
+			errs <- requestErr
+		}()
+	}
+	wait.Wait()
+	close(requests)
+	close(errs)
+	var firstID int64
+	for request := range requests {
+		if firstID == 0 {
+			firstID = request.ID
+		}
+		if request.ID != firstID {
+			t.Fatalf("concurrent duplicate request IDs=%d and %d", firstID, request.ID)
+		}
+	}
+	for requestErr := range errs {
+		if requestErr != nil {
+			t.Fatalf("concurrent request error=%v", requestErr)
+		}
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE scope='artist' AND artist_id=? AND status='queued'`, artist.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("queued duplicate count=%d, want 1", count)
+	}
+
+	for i := 0; i < maxQueuedManualSyncRequests-1; i++ {
+		queuedArtist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: "manual-admission-" + strconv.Itoa(i), Name: "Queued Artist"})
+		if upsertErr != nil {
+			t.Fatal(upsertErr)
+		}
+		if _, requestErr := s.CreateManualSyncRequest(ctx, userID, "artist", &queuedArtist.ID); requestErr != nil {
+			t.Fatalf("fill queue at %d: %v", i, requestErr)
+		}
+	}
+
+	lastArtist, err := s.UpsertArtist(ctx, Artist{MBID: "manual-admission-last", Name: "Last Queued Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateManualSyncRequest(ctx, userID, "artist", &lastArtist.ID); !errors.Is(err, ErrManualSyncQueueFull) {
+		t.Fatalf("full queue error=%v, want %v", err, ErrManualSyncQueueFull)
+	}
+}
 
 func TestOperationalLogsAndManualSyncLifecycle(t *testing.T) {
 	ctx := context.Background()

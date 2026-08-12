@@ -457,6 +457,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		tokenLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
 		discoveryLimiter: newFixedWindowLimiter(30, 5*time.Minute),
 		importLimiter:    newFixedWindowLimiter(5, time.Hour),
+		importSlots:      make(chan struct{}, maxConcurrentImports),
 		providerLimiter:  newFixedWindowLimiter(30, 10*time.Minute),
 		loginSlots:       make(chan struct{}, 8),
 	}, nil

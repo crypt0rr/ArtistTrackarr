@@ -20,9 +20,11 @@ var migrations embed.FS
 // is committing, which keeps dashboard requests from queueing behind provider
 // synchronization work.
 type Store struct {
-	DB       *sql.DB
-	Reader   *sql.DB
-	readerMu sync.RWMutex
+	DB        *sql.DB
+	Reader    *sql.DB
+	readerMu  sync.RWMutex
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (s *Store) readerDB() *sql.DB {
@@ -165,6 +167,7 @@ var (
 	ErrAdminRequired                 = errors.New("administrator access is required")
 	ErrCannotDeleteSelf              = errors.New("you cannot delete your own account")
 	ErrLastAdmin                     = errors.New("the last administrator cannot be deleted")
+	ErrManualSyncQueueFull           = errors.New("manual synchronization queue is full; try again later")
 	ErrInvalidUsername               = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
 	ErrUsernameTaken                 = errors.New("that username is already in use")
 	ErrInvalidNotificationHoldAction = errors.New("invalid notification hold action")

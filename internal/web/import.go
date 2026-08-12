@@ -21,6 +21,7 @@ import (
 const (
 	maxArtistImportBytes = 1 << 20
 	maxArtistImportRows  = 500
+	maxConcurrentImports = 2
 )
 
 var requiredArtistImportColumns = [...]string{
@@ -185,6 +186,10 @@ func validSpotifyArtistURL(value string) (*url.URL, bool) {
 
 func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
+	if !a.acquireImportSlot(w) {
+		return
+	}
+	defer a.releaseImportSlot()
 	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
 	if a.importLimiter != nil && !a.importLimiter.Allow(key) {
 		rateLimited(w, 3600, "artist imports are temporarily rate limited; try again later")
@@ -231,6 +236,29 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
+}
+
+func (a *App) acquireImportSlot(w http.ResponseWriter) bool {
+	if a.importSlots == nil {
+		return true
+	}
+	select {
+	case a.importSlots <- struct{}{}:
+		return true
+	default:
+		// Imports perform up to 500 independent writes. Refuse excess work
+		// immediately instead of queueing unbounded requests behind SQLite's
+		// single writer connection.
+		rateLimited(w, 30, "artist imports are busy; try again shortly")
+		return false
+	}
+}
+
+func (a *App) releaseImportSlot() {
+	if a.importSlots == nil {
+		return
+	}
+	<-a.importSlots
 }
 
 func (a *App) renderImportError(w http.ResponseWriter, r *http.Request, message string) {
