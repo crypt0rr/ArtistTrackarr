@@ -148,8 +148,21 @@ func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	if got.Status != "degraded" || got.ConsecutiveFailures != 1 || got.LastError == "" || strings.Contains(got.LastError, "example.test") {
 		t.Fatalf("destination health=%#v", got)
 	}
+	for attemptNumber := 2; attemptNumber <= 5; attemptNumber++ {
+		attempt, err := s.StartDeliveryAttempt(ctx, int64(40+attemptNumber), 0, destination, attemptNumber, now.Add(time.Duration(attemptNumber)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FinishDeliveryAttempt(ctx, attempt, destination.ID, false, "delivery failed", &next, now.Add(time.Duration(attemptNumber)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	health, err = s.DestinationHealthByUser(ctx, userID)
+	if err != nil || health[destination.ID].Status != "paused" {
+		t.Fatalf("destination was not paused after five failures: health=%#v err=%v", health, err)
+	}
 	admin, err := s.AdminDestinationHealth(ctx)
-	if err != nil || len(admin) != 1 || admin[0].UserEmail != "health@example.com" || admin[0].Status != "degraded" {
+	if err != nil || len(admin) != 1 || admin[0].UserEmail != "health@example.com" || admin[0].Status != "paused" {
 		t.Fatalf("admin health=%#v err=%v", admin, err)
 	}
 	artist, err := s.UpsertArtist(ctx, Artist{MBID: "health-artist", Name: "Health Artist"})
@@ -171,13 +184,42 @@ func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`, eventID, destination.ID, "failed", 5, timeText(now.Add(time.Hour)), "old failure"); err != nil {
 		t.Fatal(err)
 	}
-	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 1 {
-		t.Fatalf("retry count=%d err=%v", count, err)
+	if due, err := s.DueDeliveries(ctx, now.Add(2*time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("paused destination returned normal due deliveries=%#v err=%v", due, err)
+	}
+	digest, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs(user_id,frequency,period_start,title,body,release_count,status,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		userID, "daily", "2026-08-08", "Digest", "Body", 1, "pending", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestID, _ := digest.LastInsertId()
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`, digestID, destination.ID, "failed", timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.DueDigestDeliveries(ctx, now.Add(2*time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("paused destination returned digest due deliveries=%#v err=%v", due, err)
+	}
+	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 2 {
+		t.Fatalf("retry count=%d err=%v, want normal and digest rows", count, err)
 	}
 	var status string
 	var attempts int
 	if err := s.DB.QueryRowContext(ctx, `SELECT status,attempts FROM deliveries WHERE event_id=?`, eventID).Scan(&status, &attempts); err != nil || status != "pending" || attempts != 0 {
 		t.Fatalf("requeued delivery status=%q attempts=%d err=%v", status, attempts, err)
+	}
+	var digestStatus string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE run_id=?`, digestID).Scan(&digestStatus); err != nil || digestStatus != "pending" {
+		t.Fatalf("requeued digest status=%q err=%v", digestStatus, err)
+	}
+	health, err = s.DestinationHealthByUser(ctx, userID)
+	if err != nil || health[destination.ID].Status != "healthy" {
+		t.Fatalf("manual retry did not clear pause: health=%#v err=%v", health, err)
+	}
+	if due, err := s.DueDeliveries(ctx, now.Add(2*time.Hour), 10); err != nil || len(due) != 1 {
+		t.Fatalf("healthy destination did not resume normal deliveries=%#v err=%v", due, err)
+	}
+	if due, err := s.DueDigestDeliveries(ctx, now.Add(2*time.Hour), 10); err != nil || len(due) != 1 {
+		t.Fatalf("healthy destination did not resume digest deliveries=%#v err=%v", due, err)
 	}
 	if _, err := s.RetryFailedDeliveries(ctx, userID+1, destination.ID, now); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("cross-user retry error=%v", err)

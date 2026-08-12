@@ -65,6 +65,10 @@ func main() {
 		logger.Error("create credential cipher", "error", err)
 		os.Exit(1)
 	}
+	if err := database.ValidateDestinationCiphertexts(context.Background(), cipher.Decrypt); err != nil {
+		logger.Error("validate encrypted notification destinations", "error", err)
+		os.Exit(1)
+	}
 	artworkCache, err := artwork.NewCache(filepath.Join(filepath.Dir(cfg.DatabasePath), "covers"))
 	if err != nil {
 		logger.Error("initialize artwork cache", "error", err)

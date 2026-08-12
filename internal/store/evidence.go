@@ -365,15 +365,14 @@ func evidenceIssueFilters(status, state, issueType, severity string, now time.Ti
 	return where, args, nil
 }
 
-const evidenceIssueSelect = `SELECT i.id,i.release_group_id,rg.artist_id,a.name,rg.title,
+var evidenceIssueSelect = `SELECT i.id,i.release_group_id,rg.artist_id,a.name,rg.title,
 	i.issue_type,i.severity,i.fingerprint,i.summary,i.evidence_json,i.status,
 	COALESCE(r.state,'unread'),r.snoozed_until,i.first_seen_at,i.last_seen_at,i.resolved_at
 	FROM release_evidence_issues i
 	JOIN release_groups rg ON rg.id=i.release_group_id
 	JOIN artists a ON a.id=rg.artist_id
-	JOIN follows f ON f.artist_id=rg.artist_id
-	LEFT JOIN release_evidence_reviews r ON r.issue_id=i.id AND r.user_id=f.user_id
-	WHERE f.user_id=?`
+	LEFT JOIN release_evidence_reviews r ON r.issue_id=i.id AND r.user_id=?
+	WHERE ` + followedReleasePredicate("?")
 
 func (s *Store) EvidenceIssues(ctx context.Context, userID int64, status, state, issueType, severity string, limit, offset int, now time.Time) ([]EvidenceIssue, error) {
 	if limit < 1 {
@@ -389,7 +388,7 @@ func (s *Store) EvidenceIssues(ctx context.Context, userID int64, status, state,
 	if err != nil {
 		return nil, err
 	}
-	args := []any{userID}
+	args := []any{userID, userID}
 	args = append(args, filterArgs...)
 	args = append(args, limit, offset)
 	rows, err := s.readerDB().QueryContext(ctx, evidenceIssueSelect+where+` ORDER BY CASE i.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,i.last_seen_at DESC,i.id DESC LIMIT ? OFFSET ?`, args...)
@@ -413,14 +412,13 @@ func (s *Store) EvidenceIssueCount(ctx context.Context, userID int64, status, st
 	if err != nil {
 		return 0, err
 	}
-	args := []any{userID}
+	args := []any{userID, userID}
 	args = append(args, filterArgs...)
 	var count int
 	err = s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM release_evidence_issues i
 		JOIN release_groups rg ON rg.id=i.release_group_id
-		JOIN follows f ON f.artist_id=rg.artist_id
-		LEFT JOIN release_evidence_reviews r ON r.issue_id=i.id AND r.user_id=f.user_id
-		WHERE f.user_id=?`+where, args...).Scan(&count)
+		LEFT JOIN release_evidence_reviews r ON r.issue_id=i.id AND r.user_id=?
+		WHERE `+followedReleasePredicate("?")+where, args...).Scan(&count)
 	return count, err
 }
 
@@ -433,7 +431,7 @@ func (s *Store) EvidenceIssuesForRelease(ctx context.Context, userID, releaseID 
 	if err != nil {
 		return nil, err
 	}
-	args := []any{userID, releaseID}
+	args := []any{userID, userID, releaseID}
 	args = append(args, filterArgs...)
 	rows, err := s.readerDB().QueryContext(ctx, evidenceIssueSelect+` AND i.release_group_id=?`+where+` ORDER BY i.id DESC`, args...)
 	if err != nil {
@@ -502,8 +500,7 @@ func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64
 	var releaseID int64
 	err = tx.QueryRowContext(ctx, `SELECT i.release_group_id FROM release_evidence_issues i
 		JOIN release_groups rg ON rg.id=i.release_group_id
-		JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE i.id=? AND f.user_id=? LIMIT 1`, issueID, userID).Scan(&releaseID)
+		WHERE i.id=? AND `+followedReleasePredicate("?")+` LIMIT 1`, issueID, userID).Scan(&releaseID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	}

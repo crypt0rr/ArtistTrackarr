@@ -356,18 +356,27 @@ func (s *Store) coverageReleaseStats(ctx context.Context, ids []int64) (map[int6
 		for _, id := range ids[start:end] {
 			args = append(args, id)
 		}
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,COUNT(*),
+		queryArgs := append(append([]any(nil), args...), args...)
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT followed_artist_id,COUNT(*),
 			SUM(CASE WHEN provider_count>=2 THEN 1 ELSE 0 END),
 			SUM(CASE WHEN provider_count=1 THEN 1 ELSE 0 END),
 			SUM(CASE WHEN provider_count=1 AND itunes_provider=1 THEN 1 ELSE 0 END),MAX(last_observed_at)
 			FROM (
-				SELECT rg.id,rg.artist_id,COUNT(DISTINCT po.provider) AS provider_count,
+				SELECT rg.id,rg.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
 					MAX(po.observed_at) AS last_observed_at,
 					MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
 				FROM release_groups rg LEFT JOIN provider_observations po ON po.release_group_id=rg.id
 				WHERE rg.artist_id IN (`+placeholders+`)
 				GROUP BY rg.id,rg.artist_id
-			) grouped GROUP BY artist_id`, args...)
+				UNION
+				SELECT rg.id,rc.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
+					MAX(po.observed_at) AS last_observed_at,
+					MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
+				FROM release_groups rg JOIN release_credits rc ON rc.release_group_id=rg.id
+				LEFT JOIN provider_observations po ON po.release_group_id=rg.id
+				WHERE rc.artist_id IN (`+placeholders+`)
+				GROUP BY rg.id,rc.artist_id
+			) grouped GROUP BY followed_artist_id`, queryArgs...)
 		if err != nil {
 			return nil, err
 		}

@@ -195,6 +195,36 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 	}
 }
 
+func TestMusicBrainzReleaseCreditsPaginatesWithoutApplyingPartialResults(t *testing.T) {
+	const artistID = "11111111-1111-4111-8111-111111111111"
+	const groupID = "22222222-2222-4222-8222-222222222222"
+	const recordingID = "33333333-3333-4333-8333-333333333333"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/ws/2/recording" || !strings.Contains(request.URL.Query().Get("query"), "arid:"+artistID) {
+			http.NotFound(w, request)
+			return
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("offset") == "100" {
+			_, _ = io.WriteString(w, `{"recording-count":101,"recordings":[]}`)
+			return
+		}
+		if request.URL.Query().Get("offset") != "0" {
+			t.Fatalf("unexpected credit offset=%q", request.URL.Query().Get("offset"))
+		}
+		_, _ = io.WriteString(w, `{"recording-count":101,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"release-group-list":[{"id":"`+groupID+`","title":"Collab album","primary-type":"Album","first-release-date":"2026-09-01"}]}]}`)
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	credits, err := mb.ArtistReleaseCredits(context.Background(), artistID, nil)
+	if err != nil || len(credits) != 1 || requests.Load() != 2 {
+		t.Fatalf("credits=%#v err=%v requests=%d", credits, err, requests.Load())
+	}
+}
+
 func TestITunesReleaseCreditsRequireAnExplicitMultiArtistCredit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/search" || request.URL.Query().Get("entity") != "song" {

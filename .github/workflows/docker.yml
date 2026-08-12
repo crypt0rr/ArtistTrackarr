@@ -40,6 +40,56 @@ jobs:
           cache-from: type=gha,scope=artist-trackarr-test
           cache-to: type=gha,mode=max,scope=artist-trackarr-test
 
+      - name: Build runtime image
+        run: docker build --tag artist-trackarr:ci .
+
+      - name: Smoke test startup, persistence, and graceful shutdown
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="artist-trackarr-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container="artist-trackarr-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          port=18080
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          docker run -d --name "$container" --network host -v "$volume:/data" \
+            -e LISTEN_ADDR=":$port" \
+            -e PUBLIC_URL="http://127.0.0.1:$port" \
+            -e ALLOW_INSECURE_HTTP=true \
+            -e MUSICBRAINZ_CONTACT="ci@example.invalid" \
+            -e SETUP_TOKEN="ci-setup-token-123456789012345678901234567890" \
+            -e APP_ENCRYPTION_KEY="ci-encryption-key-123456789012345678901234567890" \
+            -e SESSION_SECRET="ci-session-secret-123456789012345678901234567890" \
+            -e POLL_INTERVAL=1h -e SPOTIFY_POLL_INTERVAL=1h \
+            artist-trackarr:ci >/dev/null
+          for attempt in {1..90}; do
+            if curl --fail --silent "http://127.0.0.1:$port/readyz" >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 90 ]]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+          docker stop --time 60 "$container" >/dev/null
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$container")" = 0
+          docker start "$container" >/dev/null
+          for attempt in {1..90}; do
+            if curl --fail --silent "http://127.0.0.1:$port/readyz" >/dev/null; then
+              exit 0
+            fi
+            if [[ "$attempt" == 90 ]]; then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+
   quality:
     name: Native race and vulnerability checks
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')

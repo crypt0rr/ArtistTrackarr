@@ -28,10 +28,11 @@ deployment:
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
    first administrator with a unique username.
 
-Application data is stored in the legacy-named `artist-tracker-data` Docker
-volume so existing installations can upgrade without moving their data. The
-app supports a single running replica. Docker Compose names that container
-`artist-trackarr` for predictable logs and administration commands.
+Application data remains on the existing Compose volume mapping so upgrades do
+not move user data. Docker Compose names the container `artist-trackarr` for
+predictable logs and administration commands. Use the backup helper below to
+resolve the project-prefixed volume mounted at `/data`; do not guess its Docker
+volume name.
 
 Release-group artwork follows a validated cascade: Spotify artwork first,
 then direct Apple/iTunes artwork, then Cover Art Archive artwork for real
@@ -44,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.37.0`; release images display the injected
+footer. The current release is `v0.38.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -56,8 +57,9 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.37.0 hardening release adds synchronized Store shutdown, transactional
-manual-sync admission, and bounded concurrent CSV imports. These controls keep
+The v0.38.0 hardening release adds paused-destination admission, credit-aware
+owner visibility, atomic migration recovery, connection-time notification
+target checks, and a volume-resolving backup workflow. These controls keep
 manual work from starving scheduled synchronization or the SQLite writer while
 preserving the existing routes and notification behavior.
 
@@ -154,9 +156,12 @@ for each alert.
 The scheduler checks due synchronization and release-day work once per minute,
 delivers notifications every ten seconds, and runs transient-state maintenance
 hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
-files, removing stale and oldest entries first. Up to four notification
-deliveries may run at the same time; SQLite keeps one serialized writer and a
-small read-only pool so dashboard queries do not queue behind provider work.
+files, removing stale and oldest entries first. Notification delivery is
+scheduled through a bounded four-worker queue, while the Shoutrrr 0.8
+compatibility adapter serializes the underlying HTTP client send and restores
+the process default after each operation. SQLite keeps one serialized writer
+and a small read-only pool so dashboard queries do not queue behind provider
+work.
 
 Delivery assurance records every normal and digest attempt, keeps a durable
 health state for each destination, and pauses destinations after five
@@ -191,7 +196,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.37.0` publishes `0.37.0`, `0.37`, and `latest`.
+- Pushing a tag such as `v0.38.0` publishes `0.38.0`, `0.38`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -201,7 +206,7 @@ not confused with a release.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.37.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.38.0 docker compose up -d
 ```
 
 ## Configuration
@@ -366,17 +371,31 @@ network addresses to prevent an invited user from using notifications as an
 SSRF proxy. Set `ALLOW_PRIVATE_NOTIFICATION_TARGETS=true` only when all
 household members are trusted and local notification services are required.
 
-For a consistent backup, stop the container and archive the Docker volume:
+For a consistent backup, use the repository helper. It stops the app, resolves
+the volume actually mounted at `/data`, refuses missing or empty databases, and
+always attempts to restart the service. The archive contains the complete
+persistent data directory:
 
 ```console
-docker compose stop app
-docker run --rm -v artist-tracker-data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/artist-tracker-backup.tgz -C /data .
-docker compose start app
+./scripts/backup.sh artist-trackarr-backup.tgz
 ```
 
-Restore into an empty volume while the app is stopped. Embedded migrations run
-automatically during upgrades.
+Restore into an empty Compose volume while the app is stopped, keep the
+original `APP_ENCRYPTION_KEY` available, and run the temporary restore
+rehearsal before replacing production data. The key is required to decrypt
+existing notification destinations. Embedded migrations run automatically
+during upgrades; the rehearsal must pass SQLite foreign-key checks and
+`/readyz` before the restored instance is considered usable.
+
+The rehearsal uses an isolated Docker volume, starts the selected image,
+stops it with the configured grace period, and starts it again to verify that
+the restored data remains usable:
+
+```console
+APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
+  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.38.0 \
+  ./scripts/restore-smoke.sh artist-trackarr-backup.tgz
+```
 
 ## Development
 

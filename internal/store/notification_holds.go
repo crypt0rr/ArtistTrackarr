@@ -62,14 +62,15 @@ func drainResolvedNotificationHoldsTx(ctx context.Context, tx *sql.Tx, releaseID
 // drainNotificationHoldsTx creates the normal event/delivery rows and marks
 // matching holds released. userID=0 means all owners of the release.
 func drainNotificationHoldsTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, now time.Time) error {
-	query := `SELECT id,user_id,event_type,title,body FROM notification_holds
-		WHERE release_group_id=? AND status='held'`
+	query := `SELECT h.id,h.user_id,h.event_type,h.title,h.body
+		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
+		WHERE h.release_group_id=? AND ` + followedReleasePredicate("h.user_id") + ` AND h.status='held'`
 	args := []any{releaseID}
 	if userID > 0 {
-		query += ` AND user_id=?`
+		query += ` AND h.user_id=?`
 		args = append(args, userID)
 	}
-	query += ` ORDER BY id`
+	query += ` ORDER BY h.id`
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -118,8 +119,7 @@ func (s *Store) NotificationHolds(ctx context.Context, userID int64, limit int) 
 		h.event_type,h.title,h.body,h.reason,h.issue_fingerprint,h.planned_at,h.status,h.created_at,h.released_at
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
 		JOIN artists a ON a.id=rg.artist_id
-		JOIN follows f ON f.user_id=h.user_id AND f.artist_id=rg.artist_id
-		WHERE h.user_id=? AND h.status='held'
+		WHERE h.user_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'
 		ORDER BY h.created_at DESC,h.id DESC LIMIT ?`, userID, limit)
 	if err != nil {
 		return nil, err
@@ -141,9 +141,9 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT h.id,h.user_id,h.release_group_id,a.name,rg.title,
 		h.event_type,h.title,h.body,h.reason,h.issue_fingerprint,h.planned_at,h.status,h.created_at,h.released_at
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
-		JOIN artists a ON a.id=rg.artist_id JOIN follows f ON f.user_id=h.user_id AND f.artist_id=rg.artist_id
-		WHERE h.user_id=? AND h.release_group_id=? AND h.status='held'
-		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID)
+		JOIN artists a ON a.id=rg.artist_id
+		WHERE h.user_id=? AND h.release_group_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'
+		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -174,9 +174,8 @@ func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int6
 	var releaseID int64
 	var eventType, title, body string
 	if err := tx.QueryRowContext(ctx, `SELECT h.release_group_id,h.event_type,h.title,h.body
-		FROM notification_holds h JOIN follows f ON f.user_id=h.user_id
-		JOIN release_groups rg ON rg.id=h.release_group_id AND rg.artist_id=f.artist_id
-		WHERE h.id=? AND h.user_id=? AND h.status='held'`, holdID, userID).Scan(&releaseID, &eventType, &title, &body); err != nil {
+		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
+		WHERE h.id=? AND h.user_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'`, holdID, userID, userID).Scan(&releaseID, &eventType, &title, &body); err != nil {
 		return err
 	}
 	now := time.Now().UTC()

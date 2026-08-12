@@ -401,7 +401,11 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 				DatePrecision: precision, MusicBrainzURL: "https://musicbrainz.org/release-group/" + item.ID,
 			})
 		}
-		offset += len(response.ReleaseGroups)
+		// Advance by the requested page size.  MusicBrainz's count is the
+		// authoritative pagination boundary; using the number returned can
+		// repeatedly request overlapping pages when an upstream response is
+		// short but still reports more records.
+		offset += pageSize
 		if offset >= response.Count || len(response.ReleaseGroups) == 0 {
 			break
 		}
@@ -411,109 +415,122 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 
 // ArtistReleaseCredits searches MusicBrainz recordings for appearances by an
 // artist and projects them onto their containing release groups. The search is
-// deliberately bounded to one request and only returns recordings with an
-// explicit multi-artist credit; primary release-group results remain owned by
-// ArtistReleases. Missing release-group metadata is ignored rather than
-// guessing an identity.
+// paginated to completion up to a generous safety cap and only returns
+// recordings with an explicit multi-artist credit; primary release-group
+// results remain owned by ArtistReleases. Missing release-group metadata is
+// ignored rather than guessing an identity.
 func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, known []store.Release) ([]store.Release, error) {
 	if !validMBID(mbid) {
 		return nil, errors.New("invalid MusicBrainz artist ID")
 	}
-	endpoint := m.baseURL + "/ws/2/recording?fmt=json&limit=100&query=" +
-		url.QueryEscape("arid:"+mbid)
-	var response struct {
-		Recordings []struct {
-			ID            string `json:"id"`
-			Title         string `json:"title"`
-			ArtistCredits []struct {
-				Name   string `json:"name"`
-				Artist *struct {
-					ID   string `json:"id"`
-					Name string `json:"name"`
-				} `json:"artist"`
-			} `json:"artist-credit"`
-			ReleaseGroups []struct {
-				ID               string   `json:"id"`
-				Title            string   `json:"title"`
-				PrimaryType      string   `json:"primary-type"`
-				SecondaryTypes   []string `json:"secondary-types"`
-				FirstReleaseDate string   `json:"first-release-date"`
-			} `json:"release-group-list"`
-			Releases []struct {
-				ReleaseGroup *struct {
-					ID               string   `json:"id"`
-					Title            string   `json:"title"`
-					PrimaryType      string   `json:"primary-type"`
-					SecondaryTypes   []string `json:"secondary-types"`
-					FirstReleaseDate string   `json:"first-release-date"`
-				} `json:"release-group"`
-			} `json:"release-list"`
-		} `json:"recordings"`
-	}
-	if err := m.getJSON(ctx, endpoint, &response); err != nil {
-		return nil, err
-	}
+	const pageSize = 100
+	const maxPages = 100
+	offset := 0
 	knownByID := make(map[string]store.Release, len(known))
 	for _, release := range known {
 		knownByID[strings.TrimSpace(release.MBID)] = release
 	}
 	result := make([]store.Release, 0)
 	seen := make(map[string]bool)
-	for _, recording := range response.Recordings {
-		if !validMBID(recording.ID) || strings.TrimSpace(recording.Title) == "" || len(recording.ArtistCredits) < 2 {
-			continue
+	for page := 0; page < maxPages; page++ {
+		endpoint := fmt.Sprintf("%s/ws/2/recording?fmt=json&limit=%d&offset=%d&query=%s",
+			m.baseURL, pageSize, offset, url.QueryEscape("arid:"+mbid))
+		var response struct {
+			Count      int `json:"recording-count"`
+			Recordings []struct {
+				ID            string `json:"id"`
+				Title         string `json:"title"`
+				ArtistCredits []struct {
+					Name   string `json:"name"`
+					Artist *struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"artist"`
+				} `json:"artist-credit"`
+				ReleaseGroups []struct {
+					ID               string   `json:"id"`
+					Title            string   `json:"title"`
+					PrimaryType      string   `json:"primary-type"`
+					SecondaryTypes   []string `json:"secondary-types"`
+					FirstReleaseDate string   `json:"first-release-date"`
+				} `json:"release-group-list"`
+				Releases []struct {
+					ReleaseGroup *struct {
+						ID               string   `json:"id"`
+						Title            string   `json:"title"`
+						PrimaryType      string   `json:"primary-type"`
+						SecondaryTypes   []string `json:"secondary-types"`
+						FirstReleaseDate string   `json:"first-release-date"`
+					} `json:"release-group"`
+				} `json:"release-list"`
+			} `json:"recordings"`
 		}
-		credited := false
-		creditName := ""
-		for _, credit := range recording.ArtistCredits {
-			if credit.Artist != nil && strings.EqualFold(strings.TrimSpace(credit.Artist.ID), mbid) {
-				credited = true
-				creditName = strings.TrimSpace(credit.Name)
-				if creditName == "" {
-					creditName = strings.TrimSpace(credit.Artist.Name)
-				}
-				break
-			}
+		if err := m.getJSON(ctx, endpoint, &response); err != nil {
+			return nil, err
 		}
-		if !credited {
-			continue
-		}
-		groups := recording.ReleaseGroups
-		if len(groups) == 0 {
-			for _, release := range recording.Releases {
-				if release.ReleaseGroup == nil {
-					continue
-				}
-				groups = append(groups, *release.ReleaseGroup)
-			}
-		}
-		for _, group := range groups {
-			groupID := strings.TrimSpace(group.ID)
-			if !validMBID(groupID) || seen[groupID+"\x00"+recording.ID] {
+		for _, recording := range response.Recordings {
+			if !validMBID(recording.ID) || strings.TrimSpace(recording.Title) == "" || len(recording.ArtistCredits) < 2 {
 				continue
 			}
-			seen[groupID+"\x00"+recording.ID] = true
-			release, ok := knownByID[groupID]
-			if !ok {
-				if strings.TrimSpace(group.PrimaryType) == "" || strings.TrimSpace(group.Title) == "" {
-					continue
-				}
-				precision := releaseDatePrecision(group.FirstReleaseDate)
-				release = store.Release{
-					MBID: groupID, Title: strings.TrimSpace(group.Title), PrimaryType: strings.TrimSpace(group.PrimaryType),
-					SecondaryTypes: append([]string(nil), group.SecondaryTypes...), FirstReleaseDate: strings.TrimSpace(group.FirstReleaseDate),
-					DatePrecision: precision, MusicBrainzURL: "https://musicbrainz.org/release-group/" + groupID,
+			credited := false
+			creditName := ""
+			for _, credit := range recording.ArtistCredits {
+				if credit.Artist != nil && strings.EqualFold(strings.TrimSpace(credit.Artist.ID), mbid) {
+					credited = true
+					creditName = strings.TrimSpace(credit.Name)
+					if creditName == "" {
+						creditName = strings.TrimSpace(credit.Artist.Name)
+					}
+					break
 				}
 			}
-			release.ArtistCreditRole = "featured"
-			release.Credits = append(release.Credits, store.ReleaseCredit{
-				Provider: "musicbrainz", ProviderID: recording.ID, Role: "guest", TrackTitle: strings.TrimSpace(recording.Title),
-				CreditName: creditName, ProviderURL: "https://musicbrainz.org/recording/" + recording.ID, Confidence: "confirmed",
-			})
-			result = append(result, release)
+			if !credited {
+				continue
+			}
+			groups := recording.ReleaseGroups
+			if len(groups) == 0 {
+				for _, release := range recording.Releases {
+					if release.ReleaseGroup == nil {
+						continue
+					}
+					groups = append(groups, *release.ReleaseGroup)
+				}
+			}
+			for _, group := range groups {
+				groupID := strings.TrimSpace(group.ID)
+				if !validMBID(groupID) || seen[groupID+"\x00"+recording.ID] {
+					continue
+				}
+				seen[groupID+"\x00"+recording.ID] = true
+				release, ok := knownByID[groupID]
+				if !ok {
+					if strings.TrimSpace(group.PrimaryType) == "" || strings.TrimSpace(group.Title) == "" {
+						continue
+					}
+					precision := releaseDatePrecision(group.FirstReleaseDate)
+					release = store.Release{
+						MBID: groupID, Title: strings.TrimSpace(group.Title), PrimaryType: strings.TrimSpace(group.PrimaryType),
+						SecondaryTypes: append([]string(nil), group.SecondaryTypes...), FirstReleaseDate: strings.TrimSpace(group.FirstReleaseDate),
+						DatePrecision: precision, MusicBrainzURL: "https://musicbrainz.org/release-group/" + groupID,
+					}
+				}
+				release.ArtistCreditRole = "featured"
+				release.Credits = append(release.Credits, store.ReleaseCredit{
+					Provider: "musicbrainz", ProviderID: recording.ID, Role: "guest", TrackTitle: strings.TrimSpace(recording.Title),
+					CreditName: creditName, ProviderURL: "https://musicbrainz.org/recording/" + recording.ID, Confidence: "confirmed",
+				})
+				result = append(result, release)
+			}
+		}
+		// Advance by the requested page size for the same reason as the
+		// release-group browse above: a short, non-empty page must not cause
+		// the next request to overlap the current page.
+		offset += pageSize
+		if len(response.Recordings) == 0 || response.Count <= offset {
+			return result, nil
 		}
 	}
-	return result, nil
+	return nil, &CatalogLimitError{Provider: "MusicBrainz", Pages: maxPages}
 }
 
 func releaseDatePrecision(value string) int {
@@ -1135,9 +1152,12 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	// pagination aligned with the provider's limit so a sync is not rejected
 	// with a 400 Invalid limit response.
 	const pageSize = 10
+	const maxPages = 100
 	var result []store.Release
 	seen := make(map[string]int)
-	for offset := 0; offset < 1000; offset += pageSize {
+	complete := false
+	for page := 0; page < maxPages; page++ {
+		offset := page * pageSize
 		endpoint := fmt.Sprintf(
 			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation%%2Cappears_on&market=%s&limit=%d&offset=%d",
 			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
@@ -1205,8 +1225,12 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 			result = append(result, candidate)
 		}
 		if since == "" || oldest == "" || oldest <= since || len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
+			complete = true
 			break
 		}
+	}
+	if !complete {
+		return nil, &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
 	}
 	s.cacheReleases(artistID, result)
 	return result, nil

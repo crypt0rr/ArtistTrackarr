@@ -4,12 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// destinationAdmissionPredicate is shared by event/digest fan-out and both
+// due-delivery readers. A destination's historical failures are informational;
+// only the explicit persisted paused state blocks new work.
+const destinationAdmissionPredicate = `COALESCE(dh.status,'healthy')<>'paused'`
 
 var (
 	deliveryURLPattern        = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
@@ -31,6 +37,35 @@ func (s *Store) AddDestination(ctx context.Context, userID int64, name, service 
 		VALUES(?,?,?,?,?)`, userID, name, service, encrypted, nowText())
 	return err
 }
+
+// ValidateDestinationCiphertexts verifies that every persisted destination can
+// be opened with the configured application key. It deliberately returns only
+// the destination ID and a generic error; ciphertext and provider credentials
+// never enter logs or user-facing responses. Startup uses this check during
+// restore rehearsals so a wrong key cannot produce a seemingly healthy but
+// unusable application.
+func (s *Store) ValidateDestinationCiphertexts(ctx context.Context, decrypt func([]byte) (string, error)) error {
+	if decrypt == nil {
+		return errors.New("destination decryptor is required")
+	}
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,encrypted_url FROM destinations ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id int64
+		var encrypted []byte
+		if err := rows.Scan(&id, &encrypted); err != nil {
+			return err
+		}
+		if _, err := decrypt(encrypted); err != nil {
+			return fmt.Errorf("destination %d cannot be decrypted", id)
+		}
+	}
+	return rows.Err()
+}
+
 func (s *Store) RenameDestination(ctx context.Context, userID, destinationID int64, name string) error {
 	name, err := destinationName(name)
 	if err != nil {
@@ -73,9 +108,7 @@ func (s *Store) Destinations(ctx context.Context, userID int64) ([]Destination, 
 // healthy until their first delivery attempt.
 func (s *Store) DestinationHealthByUser(ctx context.Context, userID int64) (map[int64]DestinationHealth, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,
-		CASE WHEN COALESCE(h.status,'healthy')='healthy' AND (
-			(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='failed')+
-			(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='failed'))>0 THEN 'degraded' ELSE COALESCE(h.status,'healthy') END,
+		COALESCE(h.status,'healthy'),
 		COALESCE(h.consecutive_failures,0),
 		(SELECT COUNT(*) FROM deliveries WHERE destination_id=d.id AND status='pending')+
 		(SELECT COUNT(*) FROM release_digest_deliveries WHERE destination_id=d.id AND status='pending'),
@@ -270,8 +303,10 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 		dst.id,dst.user_id,dst.name,dst.service,dst.encrypted_url,dst.enabled,
 		e.title,e.body,e.event_type,rg.title
 		FROM deliveries d JOIN destinations dst ON dst.id=d.destination_id
+		LEFT JOIN destination_health dh ON dh.destination_id=dst.id
 		JOIN notification_events e ON e.id=d.event_id JOIN release_groups rg ON rg.id=e.release_group_id
-		WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1 ORDER BY d.next_attempt_at LIMIT ?`,
+		WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1
+		AND `+destinationAdmissionPredicate+` ORDER BY d.next_attempt_at LIMIT ?`,
 		timeText(now), limit)
 	if err != nil {
 		return nil, err
@@ -304,7 +339,9 @@ func (s *Store) DueDigestDeliveries(ctx context.Context, now time.Time, limit in
 		FROM release_digest_deliveries dd
 		JOIN release_digest_runs r ON r.id=dd.run_id
 		JOIN destinations dst ON dst.id=dd.destination_id
+		LEFT JOIN destination_health dh ON dh.destination_id=dst.id
 		WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
+		AND `+destinationAdmissionPredicate+`
 		ORDER BY dd.next_attempt_at,dd.id LIMIT ?`, timeText(now), limit)
 	if err != nil {
 		return nil, err

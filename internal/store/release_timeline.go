@@ -17,8 +17,7 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 	var exists int
 	err := s.readerDB().QueryRowContext(ctx, `SELECT 1
 		FROM release_groups rg
-		JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE rg.id=? AND f.user_id=? LIMIT 1`, releaseID, userID).Scan(&exists)
+		WHERE rg.id=? AND `+followedReleasePredicate("?")+` LIMIT 1`, releaseID, userID).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
 	}
@@ -250,9 +249,16 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 	var ruleMode string
 	var includePrimary, includeFeatured, albums, eps, singles, compilations, announcements, releaseDay int
 	var pausedUntil, ruleUpdated string
-	err = s.readerDB().QueryRowContext(ctx, `SELECT delivery_mode,include_primary,include_featured,
-		albums,eps,singles,compilations,announcements,release_day,COALESCE(paused_until,''),updated_at
-		FROM follow_notification_rules WHERE user_id=? AND artist_id=(SELECT artist_id FROM release_groups WHERE id=?)`, userID, releaseID).
+	err = s.readerDB().QueryRowContext(ctx, `SELECT r.delivery_mode,r.include_primary,r.include_featured,
+		r.albums,r.eps,r.singles,r.compilations,r.announcements,r.release_day,COALESCE(r.paused_until,''),r.updated_at
+		FROM follow_notification_rules r
+		JOIN follows f ON f.user_id=r.user_id AND f.artist_id=r.artist_id
+		JOIN release_groups rg ON rg.id=?
+		WHERE r.user_id=? AND (f.artist_id=rg.artist_id OR EXISTS (
+			SELECT 1 FROM release_credits owner_credit
+			WHERE owner_credit.release_group_id=rg.id AND owner_credit.artist_id=f.artist_id
+		))
+		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END,r.artist_id LIMIT 1`, releaseID, userID).
 		Scan(&ruleMode, &includePrimary, &includeFeatured, &albums, &eps, &singles, &compilations, &announcements, &releaseDay, &pausedUntil, &ruleUpdated)
 	if err == nil {
 		when, parseErr := parseTime(ruleUpdated)

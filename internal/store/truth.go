@@ -40,8 +40,8 @@ func (s *Store) SetReleaseTruthDecision(ctx context.Context, userID, releaseID i
 		WHEN 'itunes' THEN rg.itunes_id
 		WHEN 'musicbrainz' THEN rg.mbid
 		END
-		FROM release_groups rg JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE rg.id=? AND f.user_id=?`, provider, releaseID, userID).Scan(&providerID)
+		FROM release_groups rg
+		WHERE rg.id=? AND `+followedReleasePredicate("?")+``, provider, releaseID, userID).Scan(&providerID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	}
@@ -81,8 +81,7 @@ func (s *Store) ClearReleaseTruthDecision(ctx context.Context, userID, releaseID
 	defer func() { _ = tx.Rollback() }()
 	var exists int
 	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM release_groups rg
-		JOIN follows f ON f.artist_id=rg.artist_id
-		WHERE rg.id=? AND f.user_id=? LIMIT 1`, releaseID, userID).Scan(&exists); err != nil {
+		WHERE rg.id=? AND `+followedReleasePredicate("?")+` LIMIT 1`, releaseID, userID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return sql.ErrNoRows
 		}

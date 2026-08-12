@@ -8,15 +8,14 @@ import (
 	"time"
 )
 
-const releaseInboxFrom = `
+var releaseInboxFrom = `
 	FROM release_groups rg
 	JOIN artists a ON a.id=rg.artist_id
-	JOIN follows f ON f.artist_id=rg.artist_id
-	JOIN notification_events e ON e.user_id=f.user_id AND e.release_group_id=rg.id
-	LEFT JOIN user_release_states s ON s.user_id=f.user_id AND s.release_group_id=rg.id
-	WHERE f.user_id=? AND e.id=(
+	JOIN notification_events e ON e.user_id=? AND e.release_group_id=rg.id
+	LEFT JOIN user_release_states s ON s.user_id=e.user_id AND s.release_group_id=rg.id
+	WHERE ` + followedReleasePredicate("?") + ` AND e.id=(
 		SELECT latest.id FROM notification_events latest
-		WHERE latest.user_id=? AND latest.release_group_id=rg.id
+		WHERE latest.user_id=e.user_id AND latest.release_group_id=rg.id
 		ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1
 	)`
 
@@ -133,10 +132,10 @@ func (s *Store) SetReleaseInboxState(ctx context.Context, userID, releaseID int6
 	}
 	defer func() { _ = tx.Rollback() }()
 	var exists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM follows f
-		JOIN notification_events e ON e.user_id=f.user_id AND e.release_group_id=?
-		WHERE f.user_id=? AND f.artist_id=(SELECT artist_id FROM release_groups WHERE id=?) LIMIT 1`,
-		releaseID, userID, releaseID).Scan(&exists)
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM notification_events e
+		JOIN release_groups rg ON rg.id=e.release_group_id
+		WHERE e.release_group_id=? AND e.user_id=? AND `+followedReleasePredicate("e.user_id")+` LIMIT 1`,
+		releaseID, userID).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sql.ErrNoRows
 	}
