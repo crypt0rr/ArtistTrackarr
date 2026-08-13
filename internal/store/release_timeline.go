@@ -45,9 +45,9 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			_ = observations.Close()
 			return nil, err
 		}
-		when, parseErr := parseTime(observedAt)
+		when, parseErr := parseStoredTime(observedAt, "release timeline observation observed_at")
 		if parseErr != nil {
-			continue
+			return nil, parseErr
 		}
 		appendEntry(ReleaseTimelineEntry{
 			Kind:       "observation",
@@ -78,9 +78,9 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			_ = credits.Close()
 			return nil, err
 		}
-		when, parseErr := parseTime(lastSeen)
+		when, parseErr := parseStoredTime(lastSeen, "release timeline credit last_seen_at")
 		if parseErr != nil {
-			continue
+			return nil, parseErr
 		}
 		summary := creditTimelineSummary(role, trackTitle, creditName)
 		appendEntry(ReleaseTimelineEntry{
@@ -113,9 +113,9 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			_ = issues.Close()
 			return nil, err
 		}
-		when, parseErr := parseTime(lastSeen)
+		when, parseErr := parseStoredTime(lastSeen, "release timeline evidence last_seen_at")
 		if parseErr != nil {
-			continue
+			return nil, parseErr
 		}
 		if reviewState != "" {
 			status = reviewState
@@ -143,20 +143,21 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 		return nil, err
 	}
 	if decisionExists == 1 {
-		when, parseErr := parseTime(updatedAt)
-		if parseErr == nil {
-			summary := "Household confirmed " + providerLabel(provider) + " as the preferred source"
-			if strings.TrimSpace(reason) != "" {
-				summary += ": " + strings.TrimSpace(reason)
-			}
-			appendEntry(ReleaseTimelineEntry{
-				Kind:       "decision",
-				Provider:   provider,
-				Status:     "confirmed",
-				Summary:    summary,
-				OccurredAt: when,
-			})
+		when, parseErr := parseStoredTime(updatedAt, "release timeline truth updated_at")
+		if parseErr != nil {
+			return nil, parseErr
 		}
+		summary := "Household confirmed " + providerLabel(provider) + " as the preferred source"
+		if strings.TrimSpace(reason) != "" {
+			summary += ": " + strings.TrimSpace(reason)
+		}
+		appendEntry(ReleaseTimelineEntry{
+			Kind:       "decision",
+			Provider:   provider,
+			Status:     "confirmed",
+			Summary:    summary,
+			OccurredAt: when,
+		})
 	}
 
 	notifications, err := s.readerDB().QueryContext(ctx, `SELECT e.event_type,e.title,e.created_at,
@@ -178,9 +179,9 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			_ = notifications.Close()
 			return nil, err
 		}
-		when, parseErr := parseTime(createdAt)
+		when, parseErr := parseStoredTime(createdAt, "release timeline notification created_at")
 		if parseErr != nil {
-			continue
+			return nil, parseErr
 		}
 		status := "queued"
 		switch {
@@ -220,14 +221,18 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			_ = holds.Close()
 			return nil, err
 		}
-		when, parseErr := parseTime(createdAt)
+		when, parseErr := parseStoredTime(createdAt, "release timeline hold created_at")
 		if parseErr != nil {
-			continue
+			return nil, parseErr
 		}
 		summary := notificationEventTypeLabel(eventType) + " held: " + strings.TrimSpace(reason)
 		if status == "released" {
 			summary = notificationEventTypeLabel(eventType) + " hold released"
-			if released, releaseErr := parseTime(releasedAt); releaseErr == nil {
+			if strings.TrimSpace(releasedAt) != "" {
+				released, releaseErr := parseStoredTime(releasedAt, "release timeline hold released_at")
+				if releaseErr != nil {
+					return nil, releaseErr
+				}
 				when = released
 			}
 		} else if status == "discarded" {
@@ -261,11 +266,12 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END,r.artist_id LIMIT 1`, releaseID, userID).
 		Scan(&ruleMode, &includePrimary, &includeFeatured, &albums, &eps, &singles, &compilations, &announcements, &releaseDay, &pausedUntil, &ruleUpdated)
 	if err == nil {
-		when, parseErr := parseTime(ruleUpdated)
-		if parseErr == nil {
-			if summary := notificationRuleSummary(ruleMode, includePrimary, includeFeatured, albums, eps, singles, compilations, announcements, releaseDay, pausedUntil); summary != "" {
-				appendEntry(ReleaseTimelineEntry{Kind: "rule", Status: "active", Summary: summary, OccurredAt: when})
-			}
+		when, parseErr := parseStoredTime(ruleUpdated, "release timeline rule updated_at")
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if summary := notificationRuleSummary(ruleMode, includePrimary, includeFeatured, albums, eps, singles, compilations, announcements, releaseDay, pausedUntil); summary != "" {
+			appendEntry(ReleaseTimelineEntry{Kind: "rule", Status: "active", Summary: summary, OccurredAt: when})
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -275,10 +281,11 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 	err = s.readerDB().QueryRowContext(ctx, `SELECT state,updated_at FROM user_release_states
 		WHERE user_id=? AND release_group_id=?`, userID, releaseID).Scan(&inboxState, &inboxUpdated)
 	if err == nil {
-		when, parseErr := parseTime(inboxUpdated)
-		if parseErr == nil {
-			appendEntry(ReleaseTimelineEntry{Kind: "inbox", Status: inboxState, Summary: "Inbox marked " + inboxState, OccurredAt: when})
+		when, parseErr := parseStoredTime(inboxUpdated, "release timeline inbox updated_at")
+		if parseErr != nil {
+			return nil, parseErr
 		}
+		appendEntry(ReleaseTimelineEntry{Kind: "inbox", Status: inboxState, Summary: "Inbox marked " + inboxState, OccurredAt: when})
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}

@@ -44,7 +44,7 @@ type ImportInput struct {
 
 func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, error) {
 	now := nowText()
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO import_jobs(user_id,created_at) VALUES(?,?)`, userID, now)
+	result, err := s.execWriteContext(ctx, `INSERT INTO import_jobs(user_id,created_at) VALUES(?,?)`, userID, now)
 	if err != nil {
 		return ImportJob{}, err
 	}
@@ -52,7 +52,10 @@ func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, e
 	if err != nil {
 		return ImportJob{}, err
 	}
-	created, _ := parseTime(now)
+	created, err := parseStoredTime(now, "import job created_at")
+	if err != nil {
+		return ImportJob{}, err
+	}
 	return ImportJob{ID: id, UserID: userID, CreatedAt: created}, nil
 }
 
@@ -139,11 +142,15 @@ func insertImportRowTx(ctx context.Context, tx *sql.Tx, row ImportRow) error {
 func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, error) {
 	var job ImportJob
 	var created string
-	if err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,created_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
-		Scan(&job.ID, &job.UserID, &created); err != nil {
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,created_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
+		Scan(&job.ID, &job.UserID, &created)
+	if err != nil {
 		return ImportJob{}, err
 	}
-	job.CreatedAt, _ = parseTime(created)
+	job.CreatedAt, err = parseStoredTime(created, "import job created_at")
+	if err != nil {
+		return ImportJob{}, err
+	}
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,job_id,source_value,display_name,status,artist_id,reason
 		FROM import_rows WHERE job_id=? ORDER BY id`, jobID)
 	if err != nil {

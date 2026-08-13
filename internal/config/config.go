@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -93,6 +94,9 @@ func Load() (Config, error) {
 	if databasePath == "" {
 		return Config{}, errors.New("DATABASE_PATH must not be empty")
 	}
+	if err := validateDatabasePath(databasePath); err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		ListenAddr:                      listenAddr,
 		PublicURL:                       publicURL,
@@ -132,6 +136,9 @@ func Load() (Config, error) {
 	if cfg.MusicBrainzContact == "" {
 		return Config{}, errors.New("MUSICBRAINZ_CONTACT is required")
 	}
+	if strings.ContainsAny(cfg.MusicBrainzContact, "\r\n") || len(cfg.MusicBrainzContact) > 200 {
+		return Config{}, errors.New("MUSICBRAINZ_CONTACT must be a single line of at most 200 characters")
+	}
 	if (cfg.SpotifyClientID == "") != (cfg.SpotifySecret == "") {
 		return Config{}, errors.New("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be configured together")
 	}
@@ -147,6 +154,31 @@ func Load() (Config, error) {
 func validateMarket(name, value string) error {
 	if len(value) != 2 || value[0] < 'A' || value[0] > 'Z' || value[1] < 'A' || value[1] > 'Z' {
 		return fmt.Errorf("%s must be a two-letter ISO country code", name)
+	}
+	return nil
+}
+
+func validateDatabasePath(path string) error {
+	info, err := os.Stat(path)
+	if err == nil {
+		if info.IsDir() {
+			return errors.New("DATABASE_PATH must point to a file, not a directory")
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("DATABASE_PATH cannot be inspected: %w", err)
+	}
+	parent := filepath.Dir(path)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("DATABASE_PATH parent directory does not exist")
+		}
+		return fmt.Errorf("DATABASE_PATH parent directory cannot be inspected: %w", err)
+	}
+	if !parentInfo.IsDir() {
+		return errors.New("DATABASE_PATH parent must be a directory")
 	}
 	return nil
 }

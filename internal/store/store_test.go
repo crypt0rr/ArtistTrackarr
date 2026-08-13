@@ -88,6 +88,27 @@ func TestSQLiteBusyClassification(t *testing.T) {
 	}
 }
 
+func TestStoredTimeParsingRejectsCorruptValues(t *testing.T) {
+	if _, err := parseStoredTime("not-a-time", "test timestamp"); err == nil || !strings.Contains(err.Error(), "test timestamp") {
+		t.Fatalf("parseStoredTime accepted corrupt value: %v", err)
+	}
+	if parsed, err := parseStoredNullableTime(sql.NullString{}, "optional timestamp"); err != nil || parsed != nil {
+		t.Fatalf("empty nullable timestamp = %v, %v; want nil", parsed, err)
+	}
+	if _, err := parseStoredNullableTime(sql.NullString{Valid: true, String: "not-a-time"}, "optional timestamp"); err == nil {
+		t.Fatal("parseStoredNullableTime accepted corrupt value")
+	}
+}
+
+func TestExecWriteContextHonorsCancellation(t *testing.T) {
+	s := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.execWriteContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, nowText(), "INFO", "cancelled", "[]"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled write error=%v, want context.Canceled", err)
+	}
+}
+
 func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")

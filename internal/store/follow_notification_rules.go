@@ -106,13 +106,12 @@ func scanFollowNotificationRule(row interface{ Scan(...any) error }) (FollowNoti
 	rule.IncludePrimary, rule.IncludeFeatured = primary != 0, featured != 0
 	rule.Albums, rule.EPs, rule.Singles, rule.Compilations = albums != 0, eps != 0, singles != 0, compilations != 0
 	rule.Announcements, rule.ReleaseDay = announcements != 0, releaseDay != 0
-	if paused.Valid && strings.TrimSpace(paused.String) != "" {
-		if value, err := parseTime(paused.String); err == nil {
-			rule.PausedUntil = &value
-		}
+	var parseErr error
+	if rule.PausedUntil, parseErr = parseStoredNullableTime(paused, "follow notification rule paused_until"); parseErr != nil {
+		return rule, parseErr
 	}
-	rule.UpdatedAt, _ = parseTime(updated.String)
-	return rule, nil
+	rule.UpdatedAt, parseErr = parseStoredTime(updated.String, "follow notification rule updated_at")
+	return rule, parseErr
 }
 
 // FollowNotificationRules returns rules for the requested follows. A nil or
@@ -339,15 +338,19 @@ func (s *Store) PauseFollowNotificationRule(ctx context.Context, userID, artistI
 	return err
 }
 
-func followRuleFromColumns(mode string, primary, featured, albums, eps, singles, compilations, announcements, releaseDay int, paused string, updated string, userID, artistID int64) FollowNotificationRule {
+func followRuleFromColumns(mode string, primary, featured, albums, eps, singles, compilations, announcements, releaseDay int, paused string, updated string, userID, artistID int64) (FollowNotificationRule, error) {
 	rule := defaultFollowNotificationRule(userID, artistID, time.Now().UTC())
 	rule.DeliveryMode = normalizeFollowDeliveryMode(mode)
 	rule.IncludePrimary, rule.IncludeFeatured = primary != 0, featured != 0
 	rule.Albums, rule.EPs, rule.Singles, rule.Compilations = albums != 0, eps != 0, singles != 0, compilations != 0
 	rule.Announcements, rule.ReleaseDay = announcements != 0, releaseDay != 0
-	if value, err := parseTime(strings.TrimSpace(paused)); err == nil && strings.TrimSpace(paused) != "" {
-		rule.PausedUntil = &value
+	var err error
+	if strings.TrimSpace(paused) != "" {
+		rule.PausedUntil, err = parseStoredNullableTime(sql.NullString{String: paused, Valid: true}, "follow notification rule paused_until")
+		if err != nil {
+			return rule, err
+		}
 	}
-	rule.UpdatedAt, _ = parseTime(updated)
-	return rule
+	rule.UpdatedAt, err = parseStoredTime(updated, "follow notification rule updated_at")
+	return rule, err
 }

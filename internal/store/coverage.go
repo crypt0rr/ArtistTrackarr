@@ -30,7 +30,7 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 	if updated.IsZero() {
 		updated = time.Now().UTC()
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO artist_provider_status
+	_, err := s.execWriteContext(ctx, `INSERT INTO artist_provider_status
 		(artist_id,provider,status,last_attempt_at,last_success_at,last_failure_at,next_check_at,
 		 release_count,last_error,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -56,25 +56,30 @@ func scanArtistProviderStatus(row interface{ Scan(...any) error }) (ArtistProvid
 		&next, &status.ReleaseCount, &status.LastError, &updated); err != nil {
 		return ArtistProviderStatus{}, err
 	}
-	status.LastAttemptAt = parseNullableStatusTime(attempt)
-	status.LastSuccessAt = parseNullableStatusTime(success)
-	status.LastFailureAt = parseNullableStatusTime(failure)
-	status.NextCheckAt = parseNullableStatusTime(next)
+	var parseErr error
+	if status.LastAttemptAt, parseErr = parseStoredNullableTime(attempt, "artist provider last_attempt_at"); parseErr != nil {
+		return ArtistProviderStatus{}, parseErr
+	}
+	if status.LastSuccessAt, parseErr = parseStoredNullableTime(success, "artist provider last_success_at"); parseErr != nil {
+		return ArtistProviderStatus{}, parseErr
+	}
+	if status.LastFailureAt, parseErr = parseStoredNullableTime(failure, "artist provider last_failure_at"); parseErr != nil {
+		return ArtistProviderStatus{}, parseErr
+	}
+	if status.NextCheckAt, parseErr = parseStoredNullableTime(next, "artist provider next_check_at"); parseErr != nil {
+		return ArtistProviderStatus{}, parseErr
+	}
 	if updated.Valid {
-		status.UpdatedAt, _ = parseTime(updated.String)
+		status.UpdatedAt, parseErr = parseStoredTime(updated.String, "artist provider updated_at")
+		if parseErr != nil {
+			return ArtistProviderStatus{}, parseErr
+		}
 	}
 	return status, nil
 }
 
-func parseNullableStatusTime(value sql.NullString) *time.Time {
-	if !value.Valid || strings.TrimSpace(value.String) == "" {
-		return nil
-	}
-	parsed, err := parseTime(value.String)
-	if err != nil {
-		return nil
-	}
-	return &parsed
+func parseNullableStatusTime(value sql.NullString, field string) (*time.Time, error) {
+	return parseStoredNullableTime(value, field)
 }
 
 type coverageReleaseStats struct {
@@ -218,13 +223,12 @@ func (s *Store) followedArtistsForCoverage(ctx context.Context, userID int64) ([
 			return nil, err
 		}
 		artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
-		if checked.Valid {
-			value, _ := parseTime(checked.String)
-			artist.LastCheckedAt = &value
+		var parseErr error
+		if artist.LastCheckedAt, parseErr = parseStoredNullableTime(checked, "coverage artist last_checked_at"); parseErr != nil {
+			return nil, parseErr
 		}
-		if spotifyNext.Valid {
-			value, _ := parseTime(spotifyNext.String)
-			artist.SpotifyNextCheckAt = &value
+		if artist.SpotifyNextCheckAt, parseErr = parseStoredNullableTime(spotifyNext, "coverage artist spotify_next_check_at"); parseErr != nil {
+			return nil, parseErr
 		}
 		artist.BaselineSynced = baseline.Valid
 		artists = append(artists, artist)
@@ -390,7 +394,11 @@ func (s *Store) coverageReleaseStats(ctx context.Context, ids []int64) (map[int6
 			}
 			stats := coverageReleaseStats{ReleaseCount: count, ConfirmedReleases: confirmed,
 				SingleSourceReleases: singleSource, FallbackReleases: fallback}
-			stats.LastObservedAt = parseNullableStatusTime(observed)
+			stats.LastObservedAt, err = parseNullableStatusTime(observed, "coverage last_observed_at")
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
 			result[artistID] = stats
 		}
 		if err := rows.Err(); err != nil {

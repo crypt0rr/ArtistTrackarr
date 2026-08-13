@@ -159,7 +159,10 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var created string
 	err := row.Scan(&u.ID, &u.Email, &u.Username, &u.PasswordHash, &u.Role, &u.Timezone, &u.ReminderTime, &created)
-	u.CreatedAt, _ = parseTime(created)
+	if err != nil {
+		return u, err
+	}
+	u.CreatedAt, err = parseStoredTime(created, "user created_at")
 	return u, err
 }
 func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
@@ -192,7 +195,10 @@ func (s *Store) AdminUsers(ctx context.Context) ([]AdminUser, error) {
 		); err != nil {
 			return nil, err
 		}
-		user.CreatedAt, _ = parseTime(created)
+		user.CreatedAt, err = parseStoredTime(created, "admin user created_at")
+		if err != nil {
+			return nil, err
+		}
 		users = append(users, user)
 	}
 	return users, rows.Err()
@@ -352,7 +358,7 @@ func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Durati
 		return "", "", err
 	}
 	now := time.Now().UTC()
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at)
+	_, err = s.execWriteContext(ctx, `INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at)
 		VALUES(?,?,?,?,?)`, security.Digest(raw), userID, csrf, timeText(now.Add(ttl)), timeText(now))
 	return raw, csrf, err
 }
@@ -364,12 +370,21 @@ func (s *Store) Session(ctx context.Context, raw string) (Session, error) {
 		WHERE s.token_hash=? AND s.expires_at>?`, security.Digest(raw), nowText()).Scan(
 		&session.User.ID, &session.User.Email, &session.User.Username, &session.User.PasswordHash, &session.User.Role,
 		&session.User.Timezone, &session.User.ReminderTime, &created, &session.CSRFToken, &expires)
-	session.User.CreatedAt, _ = parseTime(created)
-	session.ExpiresAt, _ = parseTime(expires)
-	return session, err
+	if err != nil {
+		return session, err
+	}
+	session.User.CreatedAt, err = parseStoredTime(created, "session created_at")
+	if err != nil {
+		return session, err
+	}
+	session.ExpiresAt, err = parseStoredTime(expires, "session expires_at")
+	if err != nil {
+		return session, err
+	}
+	return session, nil
 }
 func (s *Store) DeleteSession(ctx context.Context, raw string) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash=?`, security.Digest(raw))
+	_, err := s.execWriteContext(ctx, `DELETE FROM sessions WHERE token_hash=?`, security.Digest(raw))
 	return err
 }
 func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID *int64, creator int64, ttl time.Duration) (string, error) {
@@ -378,7 +393,7 @@ func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID 
 		return "", err
 	}
 	now := time.Now().UTC()
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO auth_tokens(token_hash,kind,email,user_id,expires_at,created_by,created_at)
+	_, err = s.execWriteContext(ctx, `INSERT INTO auth_tokens(token_hash,kind,email,user_id,expires_at,created_by,created_at)
 		VALUES(?,?,?,?,?,?,?)`, security.Digest(raw), kind, strings.ToLower(strings.TrimSpace(email)), userID,
 		timeText(now.Add(ttl)), creator, timeText(now))
 	return raw, err
@@ -458,23 +473,37 @@ func (s *Store) LoginAllowed(ctx context.Context, key string) (bool, error) {
 	if !blocked.Valid {
 		return true, nil
 	}
-	t, _ := parseTime(blocked.String)
+	t, err := parseStoredTime(blocked.String, "login attempt blocked_until")
+	if err != nil {
+		return false, err
+	}
 	return time.Now().UTC().After(t), nil
 }
 func (s *Store) RecordLoginFailure(ctx context.Context, key string) error {
 	now := time.Now().UTC()
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var failures int
 	var first string
-	err := s.DB.QueryRowContext(ctx, `SELECT failures,first_at FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&failures, &first)
+	err = tx.QueryRowContext(ctx, `SELECT failures,first_at FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&failures, &first)
 	if errors.Is(err, sql.ErrNoRows) {
-		_, err = s.DB.ExecContext(ctx, `INSERT INTO login_attempts(key_hash,failures,first_at) VALUES(?,?,?)`,
+		_, err = tx.ExecContext(ctx, `INSERT INTO login_attempts(key_hash,failures,first_at) VALUES(?,?,?)`,
 			security.Digest(key), 1, timeText(now))
-		return err
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if err != nil {
 		return err
 	}
-	firstAt, _ := parseTime(first)
+	firstAt, err := parseStoredTime(first, "login attempt first_at")
+	if err != nil {
+		return err
+	}
 	if now.Sub(firstAt) > 15*time.Minute {
 		failures = 0
 		firstAt = now
@@ -484,10 +513,13 @@ func (s *Store) RecordLoginFailure(ctx context.Context, key string) error {
 	if failures >= 5 {
 		blocked = timeText(now.Add(15 * time.Minute))
 	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE login_attempts SET failures=?,first_at=?,blocked_until=? WHERE key_hash=?`,
+	_, err = tx.ExecContext(ctx, `UPDATE login_attempts SET failures=?,first_at=?,blocked_until=? WHERE key_hash=?`,
 		failures, timeText(firstAt), blocked, security.Digest(key))
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) ClearLoginFailures(ctx context.Context, key string) {
-	_, _ = s.DB.ExecContext(ctx, `DELETE FROM login_attempts WHERE key_hash=?`, security.Digest(key))
+	_, _ = s.execWriteContext(ctx, `DELETE FROM login_attempts WHERE key_hash=?`, security.Digest(key))
 }

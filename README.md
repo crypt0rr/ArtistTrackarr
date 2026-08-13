@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.40.0`; release images display the injected
+footer. The current release is `v0.41.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -57,7 +57,11 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.40.0 operations release adds strict boolean configuration validation,
+The v0.41.0 persistence-hardening release routes production SQLite writes
+through a bounded busy/locked retry path, rejects malformed operational
+timestamps instead of silently showing zero values, and preflights database
+paths and MusicBrainz contact input before startup. The v0.40.0 operations
+release adds strict boolean configuration validation,
 polling-cadence-aware provider freshness, and bounded scheduler, provider, and
 delivery metrics in the administrator diagnostics report. The v0.39.0
 operational-confidence release adds checksum-protected backups,
@@ -208,7 +212,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.40.0` publishes `0.40.0`, `0.40`, and `latest`.
+- Pushing a tag such as `v0.41.0` publishes `0.41.0`, `0.41`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -218,7 +222,7 @@ not confused with a release.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.40.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.41.0 docker compose up -d
 ```
 
 ## Configuration
@@ -230,14 +234,14 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.40.0 docker compose up 
 | `SETUP_TOKEN` | first run | — | Protects initial administrator creation. |
 | `APP_ENCRYPTION_KEY` | yes | — | Encrypts notification credentials at rest. |
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
-| `MUSICBRAINZ_CONTACT` | yes | — | Contact included in the required MusicBrainz User-Agent. |
+| `MUSICBRAINZ_CONTACT` | yes | — | Single-line contact included in the required MusicBrainz User-Agent; values over 200 characters are rejected. |
 | `POLL_INTERVAL` | no | `6h` | Catalog polling interval; values below one hour are rejected. |
 | `SPOTIFY_POLL_INTERVAL` | no | `24h` | Independent Spotify observation interval; values below one hour are rejected. |
 | `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
 | `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `ITUNES_MARKET` | no | `US` | Two-letter Apple/iTunes storefront used for fallback searches and release lookups. |
-| `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location. |
+| `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location; startup rejects directory paths and missing parent directories. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
 | `TRUST_PROXY` | no | `false` | Strict boolean (`true`/`false`); trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
 | `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated proxy networks, for example `127.0.0.1/32,10.0.0.0/8`; required when `TRUST_PROXY=true`. |
@@ -412,7 +416,7 @@ the restored data remains usable:
 
 ```console
 APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
-  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.40.0 \
+  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.41.0 \
   ./scripts/restore-smoke.sh artist-trackarr-backup.tgz
 ```
 

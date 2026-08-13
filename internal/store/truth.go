@@ -127,13 +127,6 @@ func releaseTruthState(explicitState, source string, sourceCount int, sources []
 	return "observed"
 }
 
-func parseTruthUpdatedAt(value sql.NullString) *time.Time {
-	if !value.Valid || strings.TrimSpace(value.String) == "" {
-		return nil
-	}
-	parsed, err := parseTime(value.String)
-	if err != nil {
-		return nil
-	}
-	return &parsed
+func parseTruthUpdatedAt(value sql.NullString) (*time.Time, error) {
+	return parseStoredNullableTime(value, "release truth updated_at")
 }

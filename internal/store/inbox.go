@@ -84,13 +84,14 @@ func (s *Store) ReleaseInbox(ctx context.Context, userID int64, state, source, p
 		if err != nil {
 			return nil, err
 		}
-		item.EventCreatedAt, _ = parseTime(eventCreated)
+		item.EventCreatedAt, err = parseStoredTime(eventCreated, "inbox event created_at")
+		if err != nil {
+			return nil, err
+		}
 		item.State = stateValue
-		if snoozed.Valid && snoozed.String != "" {
-			when, parseErr := parseTime(snoozed.String)
-			if parseErr == nil {
-				item.SnoozedUntil = &when
-			}
+		item.SnoozedUntil, err = parseStoredNullableTime(snoozed, "inbox snoozed_until")
+		if err != nil {
+			return nil, err
 		}
 		result = append(result, item)
 	}
