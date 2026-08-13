@@ -35,7 +35,10 @@ func evaluateReleaseEvidenceTx(ctx context.Context, tx *sql.Tx, releaseID int64,
 			return err
 		}
 		evidence.ArtistCreditRole = normalizedArtistCreditRole(evidence.ArtistCreditRole)
-		evidence.ObservedAt, _ = parseTime(observedAt)
+		evidence.ObservedAt, err = parseStoredTime(observedAt, "release evidence observed_at")
+		if err != nil {
+			return err
+		}
 		if _, exists := latest[evidence.Provider]; !exists {
 			latest[evidence.Provider] = evidence
 		}
@@ -462,22 +465,27 @@ func scanEvidenceIssue(row interface{ Scan(...any) error }) (EvidenceIssue, erro
 			return item, err
 		}
 	}
-	item.SnoozedUntil = parseNullableStatusTime(snoozed)
-	item.FirstSeenAt = parsedEvidenceTime(firstSeen)
-	item.LastSeenAt = parsedEvidenceTime(lastSeen)
-	item.ResolvedAt = parseNullableStatusTime(resolved)
+	var parseErr error
+	item.SnoozedUntil, parseErr = parseStoredNullableTime(snoozed, "evidence issue snoozed_until")
+	if parseErr != nil {
+		return item, parseErr
+	}
+	item.FirstSeenAt, parseErr = parseStoredTime(firstSeen.String, "evidence issue first_seen_at")
+	if parseErr != nil {
+		return item, parseErr
+	}
+	item.LastSeenAt, parseErr = parseStoredTime(lastSeen.String, "evidence issue last_seen_at")
+	if parseErr != nil {
+		return item, parseErr
+	}
+	item.ResolvedAt, parseErr = parseStoredNullableTime(resolved, "evidence issue resolved_at")
+	if parseErr != nil {
+		return item, parseErr
+	}
 	if item.ReviewState == "snoozed" && item.SnoozedUntil != nil && !item.SnoozedUntil.After(time.Now().UTC()) {
 		item.ReviewState = "unread"
 	}
 	return item, nil
-}
-
-func parsedEvidenceTime(value sql.NullString) time.Time {
-	if !value.Valid {
-		return time.Time{}
-	}
-	parsed, _ := parseTime(value.String)
-	return parsed
 }
 
 func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64, state string, snoozedUntil *time.Time) error {

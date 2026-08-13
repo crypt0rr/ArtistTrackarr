@@ -174,6 +174,25 @@ func TestOperationalLogsAndManualSyncLifecycle(t *testing.T) {
 	}
 }
 
+func TestOperationalScannersRejectCorruptPersistedState(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`,
+		"not-a-time", "INFO", "corrupt", "[]"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplicationLogs(ctx, 10); err == nil {
+		t.Fatal("ApplicationLogs accepted an invalid persisted timestamp")
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO provider_health(provider,updated_at) VALUES(?,?)`, "corrupt", "not-a-time"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProviderHealth(ctx); err == nil {
+		t.Fatal("ProviderHealth accepted an invalid persisted timestamp")
+	}
+}
+
 func TestProviderHealthAndAdminArtistQueries(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ func (s *Store) InsertApplicationLog(ctx context.Context, entry logging.Entry) e
 	if level != "INFO" && level != "WARN" && level != "ERROR" {
 		return nil
 	}
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, entry.Time.UTC().Format(time.RFC3339Nano), level, entry.Message, string(attrs))
+	_, err = s.execWriteContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, entry.Time.UTC().Format(time.RFC3339Nano), level, entry.Message, string(attrs))
 	return err
 }
 func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry, error) {
@@ -51,20 +52,25 @@ func (s *Store) ApplicationLogs(ctx context.Context, limit int) ([]logging.Entry
 		if err := rows.Scan(&ts, &level, &msg, &attrs); err != nil {
 			return nil, err
 		}
-		t, _ := parseTime(ts)
+		t, err := parseStoredTime(ts, "application log created_at")
+		if err != nil {
+			return nil, err
+		}
 		// Rows are stored canonically in UTC. Convert them to the current process
 		// timezone for the web view so they match the container's local display.
 		if strings.HasSuffix(ts, "Z") || strings.HasSuffix(ts, "+00:00") {
 			t = t.In(time.Local)
 		}
 		var fields []logging.Field
-		_ = json.Unmarshal([]byte(attrs), &fields)
+		if err := json.Unmarshal([]byte(attrs), &fields); err != nil {
+			return nil, fmt.Errorf("invalid persisted application log attributes: %w", err)
+		}
 		out = append(out, logging.Entry{Time: t, Level: level, Message: msg, Attributes: fields})
 	}
 	return out, rows.Err()
 }
 func (s *Store) PruneApplicationLogs(ctx context.Context, before time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM application_logs WHERE created_at < ?`, timeText(before))
+	_, err := s.execWriteContext(ctx, `DELETE FROM application_logs WHERE created_at < ?`, timeText(before))
 	return err
 }
 func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope string, artistID *int64) (ManualSyncRequest, error) {
@@ -112,7 +118,10 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 	if err := tx.Commit(); err != nil {
 		return ManualSyncRequest{}, err
 	}
-	created, _ := parseTime(now)
+	created, err := parseStoredTime(now, "manual sync created_at")
+	if err != nil {
+		return ManualSyncRequest{}, err
+	}
 	return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
 }
 func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
@@ -143,7 +152,11 @@ func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]Manua
 			r.ArtistID = &v
 		}
 		r.Status = "running"
-		r.CreatedAt, _ = parseTime(ts)
+		created, parseErr := parseStoredTime(ts, "manual sync created_at")
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		r.CreatedAt = created
 		out = append(out, r)
 		ids = append(ids, r.ID)
 	}
@@ -159,9 +172,12 @@ func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]Manua
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	started, err := parseStoredTime(now, "manual sync started_at")
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
-		t, _ := parseTime(now)
-		out[i].StartedAt = &t
+		out[i].StartedAt = &started
 	}
 	return out, nil
 }
@@ -174,7 +190,7 @@ func (s *Store) CompleteManualSyncRequest(ctx context.Context, id int64, syncErr
 	if len(msg) > 500 {
 		msg = msg[:500]
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE manual_sync_requests SET status=?,finished_at=?,last_error=? WHERE id=?`, status, nowText(), msg, id)
+	_, err := s.execWriteContext(ctx, `UPDATE manual_sync_requests SET status=?,finished_at=?,last_error=? WHERE id=?`, status, nowText(), msg, id)
 	return err
 }
 func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
@@ -195,18 +211,20 @@ func (s *Store) ManualSyncRequests(ctx context.Context, limit int) ([]ManualSync
 		if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &r.Status, &c, &st, &ft, &r.LastError); err != nil {
 			return nil, err
 		}
-		r.CreatedAt, _ = parseTime(c)
+		created, parseErr := parseStoredTime(c, "manual sync created_at")
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		r.CreatedAt = created
 		if aid.Valid {
 			v := aid.Int64
 			r.ArtistID = &v
 		}
-		if st.Valid {
-			v, _ := parseTime(st.String)
-			r.StartedAt = &v
+		if r.StartedAt, parseErr = parseStoredNullableTime(st, "manual sync started_at"); parseErr != nil {
+			return nil, parseErr
 		}
-		if ft.Valid {
-			v, _ := parseTime(ft.String)
-			r.FinishedAt = &v
+		if r.FinishedAt, parseErr = parseStoredNullableTime(ft, "manual sync finished_at"); parseErr != nil {
+			return nil, parseErr
 		}
 		out = append(out, r)
 	}
@@ -218,10 +236,10 @@ func (s *Store) UpsertProviderHealth(ctx context.Context, provider string, succe
 		lastError = lastError[:500]
 	}
 	if success {
-		_, err := s.DB.ExecContext(ctx, `INSERT INTO provider_health(provider,last_success_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_success_at=excluded.last_success_at,last_error='',next_check_at=excluded.next_check_at,rate_limited=0,quota_exceeded=0,updated_at=excluded.updated_at`, provider, now, "", nullableTime(next), 0, 0, now)
+		_, err := s.execWriteContext(ctx, `INSERT INTO provider_health(provider,last_success_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_success_at=excluded.last_success_at,last_error='',next_check_at=excluded.next_check_at,rate_limited=0,quota_exceeded=0,updated_at=excluded.updated_at`, provider, now, "", nullableTime(next), 0, 0, now)
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO provider_health(provider,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_failure_at=excluded.last_failure_at,last_error=excluded.last_error,next_check_at=excluded.next_check_at,rate_limited=excluded.rate_limited,quota_exceeded=excluded.quota_exceeded,updated_at=excluded.updated_at`, provider, now, lastError, nullableTime(next), boolInt(rateLimited), boolInt(quota), now)
+	_, err := s.execWriteContext(ctx, `INSERT INTO provider_health(provider,last_failure_at,last_error,next_check_at,rate_limited,quota_exceeded,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET last_failure_at=excluded.last_failure_at,last_error=excluded.last_error,next_check_at=excluded.next_check_at,rate_limited=excluded.rate_limited,quota_exceeded=excluded.quota_exceeded,updated_at=excluded.updated_at`, provider, now, lastError, nullableTime(next), boolInt(rateLimited), boolInt(quota), now)
 	return err
 }
 
@@ -239,27 +257,21 @@ func (s *Store) ProviderHealthByName(ctx context.Context, provider string) (Prov
 	if err != nil {
 		return p, err
 	}
-	if ls.Valid {
-		v, parseErr := parseTime(ls.String)
-		if parseErr == nil {
-			p.LastSuccessAt = &v
-		}
+	if p.LastSuccessAt, err = parseStoredNullableTime(ls, "provider health last_success_at"); err != nil {
+		return p, err
 	}
-	if lf.Valid {
-		v, parseErr := parseTime(lf.String)
-		if parseErr == nil {
-			p.LastFailureAt = &v
-		}
+	if p.LastFailureAt, err = parseStoredNullableTime(lf, "provider health last_failure_at"); err != nil {
+		return p, err
 	}
-	if n.Valid {
-		v, parseErr := parseTime(n.String)
-		if parseErr == nil {
-			p.NextCheckAt = &v
-		}
+	if p.NextCheckAt, err = parseStoredNullableTime(n, "provider health next_check_at"); err != nil {
+		return p, err
 	}
 	p.RateLimited = rl != 0
 	p.QuotaExceeded = qe != 0
-	p.UpdatedAt, _ = parseTime(u.String)
+	p.UpdatedAt, err = parseStoredTime(u.String, "provider health updated_at")
+	if err != nil {
+		return p, err
+	}
 	return p, nil
 }
 func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
@@ -276,21 +288,20 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 		if err := rows.Scan(&p.Provider, &ls, &lf, &p.LastError, &n, &rl, &qe, &u); err != nil {
 			return nil, err
 		}
-		if ls.Valid {
-			v, _ := parseTime(ls.String)
-			p.LastSuccessAt = &v
+		if p.LastSuccessAt, err = parseStoredNullableTime(ls, "provider health last_success_at"); err != nil {
+			return nil, err
 		}
-		if lf.Valid {
-			v, _ := parseTime(lf.String)
-			p.LastFailureAt = &v
+		if p.LastFailureAt, err = parseStoredNullableTime(lf, "provider health last_failure_at"); err != nil {
+			return nil, err
 		}
-		if n.Valid {
-			v, _ := parseTime(n.String)
-			p.NextCheckAt = &v
+		if p.NextCheckAt, err = parseStoredNullableTime(n, "provider health next_check_at"); err != nil {
+			return nil, err
 		}
 		p.RateLimited = rl != 0
 		p.QuotaExceeded = qe != 0
-		p.UpdatedAt, _ = parseTime(u.String)
+		if p.UpdatedAt, err = parseStoredTime(u.String, "provider health updated_at"); err != nil {
+			return nil, err
+		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -334,21 +345,22 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	return snapshot, nil
 }
 func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())
+	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())
 	return err
 }
 func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {
 	var a Artist
 	var sid, surl, simg, checked, next sql.NullString
 	err := s.readerDB().QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url,last_checked_at,spotify_next_check_at FROM artists WHERE id=?`, id).Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation, &sid, &surl, &simg, &checked, &next)
-	a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, simg.String
-	if checked.Valid {
-		t, _ := parseTime(checked.String)
-		a.LastCheckedAt = &t
+	if err != nil {
+		return a, err
 	}
-	if next.Valid {
-		t, _ := parseTime(next.String)
-		a.SpotifyNextCheckAt = &t
+	a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, simg.String
+	if a.LastCheckedAt, err = parseStoredNullableTime(checked, "artist last_checked_at"); err != nil {
+		return a, err
+	}
+	if a.SpotifyNextCheckAt, err = parseStoredNullableTime(next, "artist spotify_next_check_at"); err != nil {
+		return a, err
 	}
 	return a, err
 }

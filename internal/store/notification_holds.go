@@ -200,13 +200,17 @@ func scanNotificationHold(row interface{ Scan(...any) error }) (NotificationHold
 		&planned, &item.Status, &created, &released); err != nil {
 		return item, err
 	}
-	item.PlannedAt, _ = parseTime(planned.String)
-	item.CreatedAt, _ = parseTime(created.String)
-	if released.Valid && released.String != "" {
-		t, err := parseTime(released.String)
-		if err == nil {
-			item.ReleasedAt = &t
-		}
+	var err error
+	item.PlannedAt, err = parseStoredTime(planned.String, "notification hold planned_at")
+	if err != nil {
+		return item, err
+	}
+	item.CreatedAt, err = parseStoredTime(created.String, "notification hold created_at")
+	if err != nil {
+		return item, err
+	}
+	if item.ReleasedAt, err = parseStoredNullableTime(released, "notification hold released_at"); err != nil {
+		return item, err
 	}
 	return item, nil
 }

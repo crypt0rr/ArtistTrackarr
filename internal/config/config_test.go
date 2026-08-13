@@ -72,6 +72,7 @@ func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
 	if err := os.Setenv("MUSICBRAINZ_CONTACT", "test@example.com"); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("DATABASE_PATH", filepath.Join(t.TempDir(), "artist-tracker.db"))
 	cfg, err := Load()
 	if err != nil || cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("Load() log level = %v, err=%v; want info", cfg.LogLevel, err)
@@ -318,6 +319,25 @@ func TestLoadRejectsUnsafeOrEmptyRuntimeValues(t *testing.T) {
 				t.Fatalf("Load() error=%v; want %q validation", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateDatabasePathRejectsDirectoryAndMissingParent(t *testing.T) {
+	directory := t.TempDir()
+	if err := validateDatabasePath(directory); err == nil || !strings.Contains(err.Error(), "file") {
+		t.Fatalf("directory database path accepted: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing", "artist-tracker.db")
+	if err := validateDatabasePath(missing); err == nil || !strings.Contains(err.Error(), "parent directory") {
+		t.Fatalf("missing database parent accepted: %v", err)
+	}
+}
+
+func TestLoadRejectsUnsafeMusicBrainzContact(t *testing.T) {
+	setLoadBaseline(t)
+	t.Setenv("MUSICBRAINZ_CONTACT", "operator@example.com\nInjected: value")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MUSICBRAINZ_CONTACT") {
+		t.Fatalf("unsafe MusicBrainz contact accepted: %v", err)
 	}
 }
 

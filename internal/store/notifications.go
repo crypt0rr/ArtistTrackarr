@@ -33,7 +33,7 @@ func (s *Store) AddDestination(ctx context.Context, userID int64, name, service 
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at)
+	_, err = s.execWriteContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at)
 		VALUES(?,?,?,?,?)`, userID, name, service, encrypted, nowText())
 	return err
 }
@@ -71,7 +71,7 @@ func (s *Store) RenameDestination(ctx context.Context, userID, destinationID int
 	if err != nil {
 		return err
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE destinations SET name=? WHERE id=? AND user_id=?`,
+	result, err := s.execWriteContext(ctx, `UPDATE destinations SET name=? WHERE id=? AND user_id=?`,
 		name, destinationID, userID)
 	if err != nil {
 		return err
@@ -133,10 +133,19 @@ func (s *Store) DestinationHealthByUser(ctx context.Context, userID int64) (map[
 		}
 		health.Status = status
 		health.LastError = safeDeliveryError(lastError.String)
-		health.LastSuccessAt = parseNullableTime(lastSuccess.String)
-		health.LastFailureAt = parseNullableTime(lastFailure.String)
-		health.NextRetryAt = parseNullableTime(nextRetry.String)
-		health.UpdatedAt, _ = parseTime(updated.String)
+		var parseErr error
+		if health.LastSuccessAt, parseErr = parseStoredNullableTime(lastSuccess, "destination health last_success_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if health.LastFailureAt, parseErr = parseStoredNullableTime(lastFailure, "destination health last_failure_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if health.NextRetryAt, parseErr = parseStoredNullableTime(nextRetry, "destination health next_retry_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if health.UpdatedAt, parseErr = parseStoredTime(updated.String, "destination health updated_at"); parseErr != nil {
+			return nil, parseErr
+		}
 		result[health.DestinationID] = health
 	}
 	return result, rows.Err()
@@ -170,11 +179,20 @@ func (s *Store) AdminDestinationHealth(ctx context.Context) ([]AdminDestinationH
 			&health.FailedCount, &lastSuccess, &lastFailure, &nextRetry, &lastError, &updated); err != nil {
 			return nil, err
 		}
-		health.LastSuccessAt = parseNullableTime(lastSuccess.String)
-		health.LastFailureAt = parseNullableTime(lastFailure.String)
-		health.NextRetryAt = parseNullableTime(nextRetry.String)
+		var parseErr error
+		if health.LastSuccessAt, parseErr = parseStoredNullableTime(lastSuccess, "admin destination health last_success_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if health.LastFailureAt, parseErr = parseStoredNullableTime(lastFailure, "admin destination health last_failure_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if health.NextRetryAt, parseErr = parseStoredNullableTime(nextRetry, "admin destination health next_retry_at"); parseErr != nil {
+			return nil, parseErr
+		}
 		health.LastError = safeDeliveryError(lastError.String)
-		health.UpdatedAt, _ = parseTime(updated.String)
+		if health.UpdatedAt, parseErr = parseStoredTime(updated.String, "admin destination health updated_at"); parseErr != nil {
+			return nil, parseErr
+		}
 		result = append(result, health)
 	}
 	return result, rows.Err()
@@ -190,7 +208,7 @@ func (s *Store) StartDeliveryAttempt(ctx context.Context, deliveryID, digestDeli
 	if attemptNumber < 1 {
 		attemptNumber = 1
 	}
-	result, err := s.DB.ExecContext(ctx, `INSERT INTO delivery_attempts
+	result, err := s.execWriteContext(ctx, `INSERT INTO delivery_attempts
 		(delivery_id,digest_delivery_id,destination_id,destination_name,service,attempt_number,status,started_at)
 		VALUES(?,?,?,?,?,?, 'started',?)`, nullableID(deliveryID), nullableID(digestDeliveryID),
 		nullableID(destination.ID), destination.Name, destination.Service, attemptNumber, timeText(started))
@@ -295,7 +313,7 @@ func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination,
 	return d, err
 }
 func (s *Store) DeleteDestination(ctx context.Context, userID, id int64) error {
-	result, err := s.DB.ExecContext(ctx, `DELETE FROM destinations WHERE user_id=? AND id=?`, userID, id)
+	result, err := s.execWriteContext(ctx, `DELETE FROM destinations WHERE user_id=? AND id=?`, userID, id)
 	return changedOrNotFound(result, err)
 }
 func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
@@ -321,7 +339,10 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 			&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Title, &d.Body, &d.EventType, &d.ReleaseTitle); err != nil {
 			return nil, err
 		}
-		d.NextAttempt, _ = parseTime(next)
+		d.NextAttempt, err = parseStoredTime(next, "delivery next_attempt_at")
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, d)
 	}
 	return result, rows.Err()
@@ -356,13 +377,16 @@ func (s *Store) DueDigestDeliveries(ctx context.Context, now time.Time, limit in
 			&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Title, &d.Body); err != nil {
 			return nil, err
 		}
-		d.NextAttempt, _ = parseTime(next)
+		d.NextAttempt, err = parseStoredTime(next, "digest delivery next_attempt_at")
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, d)
 	}
 	return result, rows.Err()
 }
 func (s *Store) MarkDeliverySent(ctx context.Context, id int64, now time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='sent',attempts=attempts+1,sent_at=?,last_error='' WHERE id=?`,
+	_, err := s.execWriteContext(ctx, `UPDATE deliveries SET status='sent',attempts=attempts+1,sent_at=?,last_error='' WHERE id=?`,
 		timeText(now), id)
 	return err
 }
@@ -376,7 +400,7 @@ func (s *Store) MarkDeliveryFailed(ctx context.Context, id int64, attempts int, 
 	if len(message) > 500 {
 		message = message[:500]
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?`,
+	_, err := s.execWriteContext(ctx, `UPDATE deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=? WHERE id=?`,
 		status, attempts, timeText(now.Add(delay)), message, id)
 	return err
 }
@@ -460,10 +484,12 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 		if h.Destination == "" {
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
-		h.CreatedAt, _ = parseTime(created)
-		if sent.Valid {
-			t, _ := parseTime(sent.String)
-			h.SentAt = &t
+		h.CreatedAt, err = parseStoredTime(created, "delivery history created_at")
+		if err != nil {
+			return nil, err
+		}
+		if h.SentAt, err = parseStoredNullableTime(sent, "delivery history sent_at"); err != nil {
+			return nil, err
 		}
 		result = append(result, h)
 	}
@@ -516,14 +542,15 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 		if h.Destination == "" {
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
-		h.CreatedAt, _ = parseTime(created)
-		if nextAttempt.Valid {
-			t, _ := parseTime(nextAttempt.String)
-			h.NextAttempt = &t
+		h.CreatedAt, err = parseStoredTime(created, "admin delivery history created_at")
+		if err != nil {
+			return nil, err
 		}
-		if sent.Valid {
-			t, _ := parseTime(sent.String)
-			h.SentAt = &t
+		if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "admin delivery history next_attempt_at"); err != nil {
+			return nil, err
+		}
+		if h.SentAt, err = parseStoredNullableTime(sent, "admin delivery history sent_at"); err != nil {
+			return nil, err
 		}
 		result = append(result, h)
 	}
@@ -570,14 +597,16 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 		if h.Destination == "" {
 			h.Destination, h.Status = "No destination configured", "not sent"
 		}
-		h.CreatedAt, _ = parseTime(created.String)
-		if nextAttempt.Valid {
-			t, _ := parseTime(nextAttempt.String)
-			h.NextAttempt = &t
+		var parseErr error
+		h.CreatedAt, parseErr = parseStoredTime(created.String, "admin delivery history created_at")
+		if parseErr != nil {
+			return nil, parseErr
 		}
-		if sent.Valid {
-			t, _ := parseTime(sent.String)
-			h.SentAt = &t
+		if h.NextAttempt, parseErr = parseStoredNullableTime(nextAttempt, "admin delivery history next_attempt_at"); parseErr != nil {
+			return nil, parseErr
+		}
+		if h.SentAt, parseErr = parseStoredNullableTime(sent, "admin delivery history sent_at"); parseErr != nil {
+			return nil, parseErr
 		}
 		result = append(result, h)
 	}
@@ -603,14 +632,15 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 	if h.Destination == "" {
 		h.Destination, h.Status = "No destination configured", "not sent"
 	}
-	h.CreatedAt, _ = parseTime(created.String)
-	if nextAttempt.Valid {
-		t, _ := parseTime(nextAttempt.String)
-		h.NextAttempt = &t
+	h.CreatedAt, err = parseStoredTime(created.String, "delivery detail created_at")
+	if err != nil {
+		return h, err
 	}
-	if sent.Valid {
-		t, _ := parseTime(sent.String)
-		h.SentAt = &t
+	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "delivery detail next_attempt_at"); err != nil {
+		return h, err
+	}
+	if h.SentAt, err = parseStoredNullableTime(sent, "delivery detail sent_at"); err != nil {
+		return h, err
 	}
 	return h, nil
 }
@@ -623,7 +653,7 @@ func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (Noti
 		release_digest_enabled,release_digest_frequency,hold_conflicting_notifications
 		FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &digestEnabled, &digestFrequency, &holdConflicts)
 	if err == sql.ErrNoRows {
-		_, err = s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
+		_, err = s.execWriteContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
 		if err == nil {
 			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = true, true, true, true, true
 			p.DigestFrequency = "weekly"
@@ -637,7 +667,7 @@ func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (Noti
 }
 func (s *Store) UpdateNotificationPreferences(ctx context.Context, p NotificationPreferences) error {
 	p.DigestFrequency = normalizeDigestFrequency(p.DigestFrequency)
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,
+	_, err := s.execWriteContext(ctx, `INSERT INTO notification_preferences(user_id,albums,eps,singles,announcements,release_day,
 		release_digest_enabled,release_digest_frequency,hold_conflicting_notifications,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(user_id) DO UPDATE SET albums=excluded.albums,eps=excluded.eps,singles=excluded.singles,
 		announcements=excluded.announcements,release_day=excluded.release_day,

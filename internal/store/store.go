@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -74,18 +75,42 @@ func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
 		if !sqliteBusy(err) || attempt == 4 {
 			break
 		}
-		delay := time.Duration(25*(1<<attempt)) * time.Millisecond
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, ctx.Err()
-		case <-timer.C:
+		if err := waitWriteRetry(ctx, attempt); err != nil {
+			return nil, err
 		}
 	}
 	return nil, lastErr
+}
+
+// execWriteContext applies the same bounded busy/locked retry policy to
+// single-statement writes that do not need a multi-statement transaction.
+// Keeping this behind Store prevents individual persistence paths from
+// accidentally bypassing SQLite contention handling.
+func (s *Store) execWriteContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	var result sql.Result
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		result, lastErr = s.DB.ExecContext(ctx, query, args...)
+		if lastErr == nil || !sqliteBusy(lastErr) || attempt == 4 {
+			return result, lastErr
+		}
+		if err := waitWriteRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+	return result, lastErr
+}
+
+func waitWriteRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(25*(1<<attempt)) * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func sqliteBusy(err error) bool {
@@ -105,6 +130,28 @@ func sqliteBusy(err error) bool {
 	return strings.Contains(message, "database is locked") ||
 		strings.Contains(message, "database table is locked") ||
 		strings.Contains(message, "database is busy")
+}
+
+// parseStoredTime is used for non-null persisted timestamps whose value is
+// required for a meaningful projection. Returning the corruption error keeps
+// stale/zero times from being presented as trustworthy operational state.
+func parseStoredTime(value, field string) (time.Time, error) {
+	t, err := parseTime(strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid persisted %s: %w", field, err)
+	}
+	return t, nil
+}
+
+func parseStoredNullableTime(value sql.NullString, field string) (*time.Time, error) {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil, nil
+	}
+	t, err := parseStoredTime(value.String, field)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 type User struct {

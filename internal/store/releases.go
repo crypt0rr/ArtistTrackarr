@@ -433,7 +433,10 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 		if err := obs.Scan(&o.Provider, &o.ProviderID, &ts); err != nil {
 			return d, err
 		}
-		o.ObservedAt, _ = parseTime(ts)
+		o.ObservedAt, err = parseStoredTime(ts, "release observation observed_at")
+		if err != nil {
+			return d, err
+		}
 		d.Observations = append(d.Observations, o)
 	}
 	if err := obs.Err(); err != nil {
@@ -456,8 +459,14 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 			&credit.Confidence, &firstSeen, &lastSeen); err != nil {
 			return d, err
 		}
-		credit.FirstSeenAt, _ = parseTime(firstSeen)
-		credit.LastSeenAt, _ = parseTime(lastSeen)
+		credit.FirstSeenAt, err = parseStoredTime(firstSeen, "release credit first_seen_at")
+		if err != nil {
+			return d, err
+		}
+		credit.LastSeenAt, err = parseStoredTime(lastSeen, "release credit last_seen_at")
+		if err != nil {
+			return d, err
+		}
 		d.Credits = append(d.Credits, credit)
 	}
 	return d, credits.Err()

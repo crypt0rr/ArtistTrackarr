@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 
 func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 	now := nowText()
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
+	_, err := s.execWriteContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
 		spotify_id,spotify_url,spotify_image_url,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
@@ -46,12 +47,18 @@ func (s *Store) ArtistByMBID(ctx context.Context, mbid string) (Artist, error) {
 		spotify_id,spotify_url,spotify_image_url,last_checked_at FROM artists WHERE mbid=?`, mbid).Scan(
 		&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
 		&sid, &surl, &image, &checked)
+	if err != nil {
+		return a, err
+	}
 	a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, image.String
 	if checked.Valid {
-		t, _ := parseTime(checked.String)
+		t, parseErr := parseStoredTime(checked.String, "artist last_checked_at")
+		if parseErr != nil {
+			return a, parseErr
+		}
 		a.LastCheckedAt = &t
 	}
-	return a, err
+	return a, nil
 }
 func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error) {
 	tx, err := s.beginWriteTx(ctx)
@@ -116,7 +123,7 @@ func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provid
 		return ArtistResolution{}, false, errors.New(provider + " artist identity is incomplete")
 	}
 	now := nowText()
-	result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO artist_resolutions
+	result, err := s.execWriteContext(ctx, `INSERT OR IGNORE INTO artist_resolutions
 		(user_id,provider,provider_id,display_name,provider_url,image_url,status,next_attempt_at,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,'pending',?,?,?)`,
 		userID, provider, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now)
@@ -133,7 +140,7 @@ func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provid
 
 func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution, error) {
 	var resolution ArtistResolution
-	var candidates, nextAttempt, created, updated string
+	var candidates, created, updated string
 	var nullableNext sql.NullString
 	err := row.Scan(
 		&resolution.ID, &resolution.UserID, &resolution.Provider, &resolution.ProviderID,
@@ -144,17 +151,21 @@ func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution
 		return ArtistResolution{}, err
 	}
 	if candidates != "" {
-		_ = json.Unmarshal([]byte(candidates), &resolution.Candidates)
-	}
-	if nullableNext.Valid {
-		nextAttempt = nullableNext.String
-		parsed, parseErr := parseTime(nextAttempt)
-		if parseErr == nil {
-			resolution.NextAttempt = &parsed
+		if err := json.Unmarshal([]byte(candidates), &resolution.Candidates); err != nil {
+			return ArtistResolution{}, fmt.Errorf("invalid persisted artist resolution candidates: %w", err)
 		}
 	}
-	resolution.CreatedAt, _ = parseTime(created)
-	resolution.UpdatedAt, _ = parseTime(updated)
+	if resolution.NextAttempt, err = parseStoredNullableTime(nullableNext, "artist resolution next_attempt_at"); err != nil {
+		return ArtistResolution{}, err
+	}
+	resolution.CreatedAt, err = parseStoredTime(created, "artist resolution created_at")
+	if err != nil {
+		return ArtistResolution{}, err
+	}
+	resolution.UpdatedAt, err = parseStoredTime(updated, "artist resolution updated_at")
+	if err != nil {
+		return ArtistResolution{}, err
+	}
 	return resolution, nil
 }
 func (s *Store) artistResolutionByProvider(ctx context.Context, userID int64, provider, providerID string) (ArtistResolution, error) {
@@ -205,20 +216,20 @@ func (s *Store) MarkArtistResolutionReview(ctx context.Context, userID, resoluti
 	if err != nil {
 		return err
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE artist_resolutions
+	result, err := s.execWriteContext(ctx, `UPDATE artist_resolutions
 		SET status='review',candidate_json=?,next_attempt_at=NULL,last_error='',updated_at=?
 		WHERE id=? AND user_id=?`, string(payload), nowText(), resolutionID, userID)
 	return changedOrNotFound(result, err)
 }
 func (s *Store) RetryArtistResolution(ctx context.Context, userID, resolutionID int64, attempts int, next time.Time, message string) error {
-	result, err := s.DB.ExecContext(ctx, `UPDATE artist_resolutions
+	result, err := s.execWriteContext(ctx, `UPDATE artist_resolutions
 		SET status='pending',candidate_json='[]',attempts=?,next_attempt_at=?,last_error=?,updated_at=?
 		WHERE id=? AND user_id=?`,
 		attempts, timeText(next), message, nowText(), resolutionID, userID)
 	return changedOrNotFound(result, err)
 }
 func (s *Store) CancelArtistResolution(ctx context.Context, userID, resolutionID int64) error {
-	result, err := s.DB.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`, resolutionID, userID)
+	result, err := s.execWriteContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`, resolutionID, userID)
 	return changedOrNotFound(result, err)
 }
 func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistResolution, artist Artist) (Artist, bool, error) {
@@ -260,9 +271,9 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		return Artist{}, false, err
 	}
 	artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
-	if checked.Valid {
-		parsed, _ := parseTime(checked.String)
-		artist.LastCheckedAt = &parsed
+	if artist.LastCheckedAt, err = parseStoredNullableTime(checked, "artist last_checked_at"); err != nil {
+		_ = tx.Rollback()
+		return Artist{}, false, err
 	}
 	if len(artist.Genres) > 0 {
 		if err := replaceArtistGenresExec(ctx, tx, artist.ID, artist.Genres, "musicbrainz"); err != nil {
@@ -379,13 +390,12 @@ func (s *Store) followedArtistsQuery(ctx context.Context, where []string, args [
 			return nil, err
 		}
 		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, image.String
-		if checked.Valid {
-			t, _ := parseTime(checked.String)
-			a.LastCheckedAt = &t
+		var parseErr error
+		if a.LastCheckedAt, parseErr = parseStoredNullableTime(checked, "artist last_checked_at"); parseErr != nil {
+			return nil, parseErr
 		}
-		if spotifyNext.Valid {
-			t, _ := parseTime(spotifyNext.String)
-			a.SpotifyNextCheckAt = &t
+		if a.SpotifyNextCheckAt, parseErr = parseStoredNullableTime(spotifyNext, "artist spotify_next_check_at"); parseErr != nil {
+			return nil, parseErr
 		}
 		a.BaselineSynced = baseline.Valid
 		result = append(result, a)
@@ -404,7 +414,15 @@ func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, err
 	return count, err
 }
 func (s *Store) replaceArtistGenres(ctx context.Context, artistID int64, genres []string, source string) error {
-	return replaceArtistGenresExec(ctx, s.DB, artistID, genres, source)
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := replaceArtistGenresExec(ctx, tx, artistID, genres, source); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) ArtistGenres(ctx context.Context, artistID int64) ([]string, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT genre FROM artist_genres WHERE artist_id=? ORDER BY weight DESC,genre`, artistID)
@@ -473,17 +491,14 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 				_ = statsRows.Close()
 				return err
 			}
-			if checked.Valid {
-				value, parseErr := parseTime(checked.String)
-				if parseErr == nil {
-					stats.CheckedAt = &value
-				}
+			var parseErr error
+			if stats.CheckedAt, parseErr = parseStoredNullableTime(checked, "ListenBrainz checked_at"); parseErr != nil {
+				_ = statsRows.Close()
+				return parseErr
 			}
-			if next.Valid {
-				value, parseErr := parseTime(next.String)
-				if parseErr == nil {
-					stats.NextCheckAt = &value
-				}
+			if stats.NextCheckAt, parseErr = parseStoredNullableTime(next, "ListenBrainz next_check_at"); parseErr != nil {
+				_ = statsRows.Close()
+				return parseErr
 			}
 			statsByArtist[stats.ArtistID] = stats
 		}
@@ -596,9 +611,9 @@ func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit 
 			return nil, err
 		}
 		artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
-		if checked.Valid {
-			value, _ := parseTime(checked.String)
-			artist.ListenCheckedAt = &value
+		var parseErr error
+		if artist.ListenCheckedAt, parseErr = parseStoredNullableTime(checked, "ListenBrainz checked_at"); parseErr != nil {
+			return nil, parseErr
 		}
 		result = append(result, artist)
 	}
@@ -659,9 +674,8 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 			return nil, err
 		}
 		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImage.String
-		if spotifyNext.Valid {
-			t, _ := parseTime(spotifyNext.String)
-			a.SpotifyNextCheckAt = &t
+		if a.SpotifyNextCheckAt, err = parseStoredNullableTime(spotifyNext, "artist spotify_next_check_at"); err != nil {
+			return nil, err
 		}
 		result = append(result, a)
 	}
@@ -686,7 +700,7 @@ func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.
 	return tx.Commit()
 }
 func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
+	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
 	return err
 }
 func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
@@ -698,11 +712,8 @@ func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (Spotif
 	var last sql.NullString
 	err := s.readerDB().QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).
 		Scan(&state.UnchangedChecks, &last)
-	if last.Valid {
-		t, parseErr := parseTime(last.String)
-		if parseErr == nil {
-			state.LastChangeAt = &t
-		}
+	if state.LastChangeAt, err = parseStoredNullableTime(last, "artist spotify_last_change_at"); err != nil {
+		return state, err
 	}
 	return state, err
 }
@@ -719,12 +730,12 @@ func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, 
 	}
 	var lastChange *time.Time
 	if last.Valid {
-		parsed, parseErr := parseTime(last.String)
+		parsed, parseErr := parseStoredNullableTime(last, "artist spotify_last_change_at")
 		if parseErr != nil {
 			_ = tx.Rollback()
 			return parseErr
 		}
-		lastChange = &parsed
+		lastChange = parsed
 	}
 	if changed {
 		streak = 0
@@ -879,7 +890,7 @@ func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, 
 // ScheduleITunesArtworkRetry applies a bounded durable retry time to all
 // existing artwork gaps for an artist after a transient provider failure.
 func (s *Store) ScheduleITunesArtworkRetry(ctx context.Context, artistID int64, next time.Time) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE release_groups SET
+	_, err := s.execWriteContext(ctx, `UPDATE release_groups SET
 		itunes_artwork_next_check_at=?,itunes_artwork_attempts=itunes_artwork_attempts+1
 		WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`,
 		timeText(next), artistID)

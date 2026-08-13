@@ -690,7 +690,10 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 	}
 	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
 	p.HoldConflictingNotifications = holdConflicts != 0
-	rule := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, 0)
+	rule, err := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, 0)
+	if err != nil {
+		return err
+	}
 	if !releaseTypeEnabled(p, primary) || !rule.AllowsContent(primary, role, eventType, now) {
 		return nil
 	}
@@ -782,19 +785,26 @@ func scanReleaseWithExtra(row releaseRowScanner, extra ...any) (Release, error) 
 	r.ITunesID, r.ITunesURL = itunesID.String, itunesURL.String
 	r.ITunesArtworkURL = itunesArtworkURL.String
 	r.ArtistCreditRole = normalizedArtistCreditRole(artistCreditRole.String)
-	r.FirstObservedAt, _ = parseTime(observed)
+	firstObserved, parseErr := parseStoredTime(observed, "release first_observed_at")
+	if parseErr != nil {
+		return r, parseErr
+	}
+	r.FirstObservedAt = firstObserved
 	r.SourceCount = sourceCount
 	r.Sources = splitReleaseProviders(observedProviders.String)
 	r.Confidence = releaseConfidence(r.Source, sourceCount)
 	r.TruthProvider = truthProvider.String
 	r.TruthProviderID = truthProviderID.String
 	r.TruthReason = truthReason.String
-	r.TruthUpdatedAt = parseTruthUpdatedAt(truthUpdatedAt)
+	r.TruthUpdatedAt, parseErr = parseTruthUpdatedAt(truthUpdatedAt)
+	if parseErr != nil {
+		return r, parseErr
+	}
 	r.TruthIssueCount = truthIssueCount
 	r.GuestCreditCount = guestCreditCount
 	r.TruthState = releaseTruthState(truthState.String, r.Source, sourceCount, r.Sources, truthIssueCount)
-	if parsed := parseNullableStatusTime(lastObserved); parsed != nil {
-		r.LastObservedAt = parsed
+	if r.LastObservedAt, parseErr = parseNullableStatusTime(lastObserved, "release last_observed_at"); parseErr != nil {
+		return r, parseErr
 	}
 	return r, nil
 }
