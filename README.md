@@ -225,7 +225,7 @@ branch and local builds use `dev` or `dev-<short-sha>` so development images are
 not confused with a release.
 
 The module targets Go 1.25 for source compatibility; CI and the Docker build
-use the pinned patched Go 1.25.6 toolchain so local builds and release images
+use the pinned patched Go 1.25.13 toolchain so local builds and release images
 share the same supported language/runtime line.
 
 Pin a deployment to a release by setting the Compose image before starting:
