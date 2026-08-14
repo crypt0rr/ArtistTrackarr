@@ -22,7 +22,12 @@ type providerObservation struct {
 	nextCheckAt *time.Time
 	attempted   bool
 
+	// healthy means the provider request completed successfully. succeeded
+	// means it returned an actionable release batch; an empty catalog is
+	// healthy but intentionally hands control to the next fallback provider.
+	healthy    bool
 	succeeded  bool
+	empty      bool
 	suppressed bool
 	deferred   bool
 	cooldown   time.Time
@@ -38,7 +43,10 @@ type providerStrategyResult struct {
 	providerErrors []error
 
 	spotifySucceeded  bool
+	spotifyHealthy    bool
+	spotifyAttempted  bool
 	itunesSucceeded   bool
+	itunesHealthy     bool
 	spotifySuppressed bool
 	spotifyDeferred   bool
 	spotifyCooldown   time.Time
@@ -62,6 +70,8 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	}
 	r.recordProviderStatus(ctx, artist.ID, spotify, now)
 	result.spotifySucceeded = spotify.succeeded
+	result.spotifyHealthy = spotify.healthy
+	result.spotifyAttempted = spotify.attempted
 	result.spotifySuppressed = spotify.suppressed
 	result.spotifyDeferred = spotify.deferred
 	result.spotifyCooldown = spotify.cooldown
@@ -88,6 +98,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	}
 	r.recordProviderStatus(ctx, artist.ID, itunes, now)
 	result.itunesSucceeded = itunes.succeeded
+	result.itunesHealthy = itunes.healthy
 	result.itunesRateLimit = itunes.itunesRateLimit
 	if itunes.succeeded {
 		result.batches = append(result.batches, store.ReleaseBatch{
@@ -164,10 +175,16 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 			return observation, changedErr
 		}
 		r.clearSpotifyProviderCooldown()
-		observation.succeeded = true
+		observation.healthy = true
+		observation.succeeded = len(releases) > 0
+		observation.empty = len(releases) == 0
 		observation.releases = releases
 		observation.spotifyChanged = changed
-		observation.spotifyUnchanged = !changed
+		// An empty response is a healthy request, but not an unchanged
+		// catalog. Keeping it out of the unchanged signal prevents callers
+		// from treating a fallback-triggering empty result as adaptive
+		// Spotify success.
+		observation.spotifyUnchanged = len(releases) > 0 && !changed
 		observation.status = "healthy"
 		observation.nextCheckAt = timePtr(now.Add(r.spotifyInterval))
 		_ = r.store.UpsertProviderHealth(ctx, "spotify", true, nil, false, false, "")
@@ -237,7 +254,9 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 				releases = append(releases, credits...)
 			}
 		}
-		observation.succeeded = true
+		observation.healthy = true
+		observation.succeeded = len(releases) > 0
+		observation.empty = len(releases) == 0
 		observation.releases = releases
 		observation.status = "healthy"
 		observation.nextCheckAt = timePtr(now.Add(r.interval))
@@ -289,17 +308,33 @@ func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, no
 		if creditProvider, ok := r.catalog.(catalog.ReleaseCreditProvider); ok {
 			credits, creditErr := creditProvider.ArtistReleaseCredits(ctx, artist.MBID, releases)
 			if creditErr != nil {
-				r.logger.Debug("MusicBrainz credit enrichment failed", "artist_id", artist.ID, "error", creditErr)
+				// Credit discovery is a second scheduled MusicBrainz call. Keep
+				// its outage state in the same persisted provider cooldown as the
+				// release lookup so a restart cannot immediately repeat a burst.
+				retryAt := now.Add(r.musicBrainzFailureDelay())
+				r.setMusicBrainzCooldown(retryAt)
+				observation.cooldown = retryAt
+				observation.nextCheckAt = &retryAt
+				observation.status = "degraded"
+				observation.lastError = sanitizedProviderError(creditErr)
+				observation.err = creditErr
+				_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &retryAt, false, false, observation.lastError)
+				r.logger.Warn("MusicBrainz credit observation failed", "artist_id", artist.ID,
+					"retry_after", retryAt.Sub(now).String(), "error", observation.lastError)
 			} else {
 				releases = append(releases, credits...)
 			}
 		}
-		observation.succeeded = true
+		observation.healthy = true
+		observation.succeeded = len(releases) > 0
+		observation.empty = len(releases) == 0
 		observation.releases = releases
-		observation.status = "healthy"
-		observation.nextCheckAt = timePtr(now.Add(r.interval))
-		r.clearMusicBrainzCooldown()
-		_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
+		if observation.status == "" {
+			observation.status = "healthy"
+			observation.nextCheckAt = timePtr(now.Add(r.interval))
+			r.clearMusicBrainzCooldown()
+			_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
+		}
 		return observation, nil
 	}
 	retryAt := now.Add(r.musicBrainzFailureDelay())
@@ -326,14 +361,14 @@ func (r *Runner) recordProviderStatus(ctx context.Context, artistID int64, obser
 	if observation.attempted {
 		attempt = timePtr(now)
 	}
-	if observation.succeeded {
+	if observation.healthy {
 		success = timePtr(now)
 	}
 	if observation.err != nil {
 		failure = timePtr(now)
 	}
 	releaseCount := -1
-	if observation.succeeded {
+	if observation.healthy {
 		releaseCount = len(observation.releases)
 	}
 	if err := r.store.RecordArtistProviderStatus(ctx, store.ArtistProviderStatus{

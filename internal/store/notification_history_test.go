@@ -161,6 +161,20 @@ func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	if err != nil || health[destination.ID].Status != "paused" {
 		t.Fatalf("destination was not paused after five failures: health=%#v err=%v", health, err)
 	}
+	// A send that was already in flight when the fifth failure paused the
+	// circuit must not silently reopen it. Recovery is an explicit operator
+	// action through RetryFailedDeliveries.
+	inFlight, err := s.StartDeliveryAttempt(ctx, 99, 0, destination, 1, now.Add(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishDeliveryAttempt(ctx, inFlight, destination.ID, true, "", nil, now.Add(11*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	health, err = s.DestinationHealthByUser(ctx, userID)
+	if err != nil || health[destination.ID].Status != "paused" {
+		t.Fatalf("in-flight success reopened paused destination: health=%#v err=%v", health, err)
+	}
 	admin, err := s.AdminDestinationHealth(ctx)
 	if err != nil || len(admin) != 1 || admin[0].UserEmail != "health@example.com" || admin[0].Status != "paused" {
 		t.Fatalf("admin health=%#v err=%v", admin, err)
@@ -223,5 +237,262 @@ func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	}
 	if _, err := s.RetryFailedDeliveries(ctx, userID+1, destination.ID, now); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("cross-user retry error=%v", err)
+	}
+}
+
+func TestUnsupportedDestinationRemainsVisibleAndQueuesBlockedWork(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "unsupported-destination@example.com", "hash", "member", "UTC", "unsupported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "unsupported-destination-artist", Name: "Unsupported Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Legacy push", "gotify", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destination := destinations[0]
+	if destination.TransportStatus != "unsupported" || destination.TransportMessage == "" {
+		t.Fatalf("legacy destination status=%q message=%q", destination.TransportStatus, destination.TransportMessage)
+	}
+
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "unsupported-destination-release", Title: "Blocked Album", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-01", DatePrecision: 3,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := s.DB.QueryRowContext(ctx, `SELECT d.status FROM deliveries d JOIN destinations dst ON dst.id=d.destination_id WHERE dst.id=?`, destination.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "blocked" {
+		t.Fatalf("unsupported destination delivery status=%q, want blocked", status)
+	}
+	if due, err := s.DueDeliveries(ctx, now.Add(24*time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("blocked destination returned due deliveries=%#v err=%v", due, err)
+	}
+	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 1 {
+		t.Fatalf("blocked destination retry count=%d err=%v", count, err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE destination_id=?`, destination.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "blocked" {
+		t.Fatalf("unsupported retry status=%q, want blocked", status)
+	}
+	// Replacing the destination's transport is an explicit operator action;
+	// replay then admits the retained event without creating a duplicate.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE destinations SET service='generic',transport_status='supported',transport_message='' WHERE id=?`, destination.ID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 1 {
+		t.Fatalf("recovered destination retry count=%d err=%v", count, err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE destination_id=?`, destination.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("recovered destination status=%q, want pending", status)
+	}
+}
+
+func TestPausingDestinationBlocksQueuedNormalAndDigestWork(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "paused-queue@example.com", "hash", "member", "UTC", "paused-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Primary", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destination := destinations[0]
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "paused-queue-artist", Name: "Paused Queue Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 13, 10, 0, 0, 0, time.UTC)
+	release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "paused-queue-release", artist.ID, "Paused Album", "Album", "[]", "2026-08-13", 3, "https://musicbrainz.org/release-group/paused-queue", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := release.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Paused Album", "body", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := event.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destination.ID, "pending", 0, timeText(now), ""); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs(user_id,frequency,period_start,title,body,release_count,status,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		userID, "daily", "2026-08-13", "Digest", "Body", 1, "pending", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestID, err := digest.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`,
+		digestID, destination.ID, "pending", timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	for attemptNumber := 1; attemptNumber <= 5; attemptNumber++ {
+		attempt, err := s.StartDeliveryAttempt(ctx, int64(500+attemptNumber), 0, destination, attemptNumber, now.Add(time.Duration(attemptNumber)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FinishDeliveryAttempt(ctx, attempt, destination.ID, false, "delivery failed", &now, now.Add(time.Duration(attemptNumber)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var normalStatus, digestStatus string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE event_id=?`, eventID).Scan(&normalStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE run_id=?`, digestID).Scan(&digestStatus); err != nil {
+		t.Fatal(err)
+	}
+	if normalStatus != "blocked" || digestStatus != "blocked" {
+		t.Fatalf("queued work statuses normal=%q digest=%q, want blocked", normalStatus, digestStatus)
+	}
+	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 2 {
+		t.Fatalf("retry count=%d err=%v, want both blocked rows", count, err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE event_id=?`, eventID).Scan(&normalStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE run_id=?`, digestID).Scan(&digestStatus); err != nil {
+		t.Fatal(err)
+	}
+	if normalStatus != "pending" || digestStatus != "pending" {
+		t.Fatalf("replayed work statuses normal=%q digest=%q, want pending", normalStatus, digestStatus)
+	}
+}
+
+func TestDurableDeliveryClaimsRecoverExpiredWork(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateInitialAdmin(ctx, "claims@example.com", "hash", "UTC", "claims-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateInitialAdmin(ctx, "second@example.com", "hash", "UTC", "second-admin"); !errors.Is(err, ErrSetupCompleted) {
+		t.Fatalf("second initial admin error=%v, want ErrSetupCompleted", err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "claims-artist", Name: "Claims Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Primary", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destination := destinations[0]
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "claims-release", artist.ID, "Claims Album", "Album", "[]", "2026-08-13", 3, "https://musicbrainz.org/release-group/claims", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := release.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Claims Album", "body", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := event.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destination.ID, "pending", 0, timeText(now.Add(-time.Minute)), ""); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs(user_id,frequency,period_start,title,body,release_count,status,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		userID, "daily", "2026-08-13", "Digest", "Body", 1, "pending", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestID, err := digest.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`,
+		digestID, destination.ID, "pending", timeText(now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	normal, err := s.ClaimDueDeliveries(ctx, now, 10, "worker-one", time.Minute)
+	if err != nil || len(normal) != 1 || normal[0].ClaimOwner != "worker-one" {
+		t.Fatalf("claimed normal deliveries=%#v err=%v", normal, err)
+	}
+	if again, err := s.ClaimDueDeliveries(ctx, now, 10, "worker-two", time.Minute); err != nil || len(again) != 0 {
+		t.Fatalf("second worker claimed normal delivery=%#v err=%v", again, err)
+	}
+	digests, err := s.ClaimDueDigestDeliveries(ctx, now, 10, "worker-one", time.Minute)
+	if err != nil || len(digests) != 1 || digests[0].ClaimOwner != "worker-one" {
+		t.Fatalf("claimed digest deliveries=%#v err=%v", digests, err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET claim_expires_at=? WHERE event_id=?`, timeText(now.Add(-time.Second)), eventID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE release_digest_deliveries SET claim_expires_at=? WHERE run_id=?`, timeText(now.Add(-time.Second)), digestID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := s.RecoverExpiredWork(ctx, now)
+	if err != nil || recovered != 2 {
+		t.Fatalf("recovered=%d err=%v, want normal and digest claims", recovered, err)
+	}
+	var owner sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT claim_owner FROM deliveries WHERE event_id=?`, eventID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Valid {
+		t.Fatalf("normal delivery claim owner=%q after recovery", owner.String)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT claim_owner FROM release_digest_deliveries WHERE run_id=?`, digestID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Valid {
+		t.Fatalf("digest delivery claim owner=%q after recovery", owner.String)
 	}
 }

@@ -54,6 +54,7 @@ type Runner struct {
 	musicBrainzFailureStreak  int
 	running                   atomic.Bool
 	lastActivity              atomic.Int64
+	workerID                  string
 }
 
 // RunnerStatus is a process-local scheduler snapshot for the admin assurance
@@ -152,6 +153,11 @@ func New(s *store.Store, provider catalog.CatalogProvider, normalizer catalog.Re
 		store: s, catalog: provider, normalizer: normalizer, sender: sender,
 		cipher: cipher, interval: interval, spotifyInterval: 24 * time.Hour, logger: logger,
 		metrics: metrics.New(),
+	}
+	if token, err := security.Token(12); err == nil {
+		runner.workerID = "runner-" + token
+	} else {
+		runner.workerID = fmt.Sprintf("runner-%d", time.Now().UnixNano())
 	}
 	runner.initLifecycle()
 	for _, option := range options {
@@ -340,6 +346,16 @@ func (r *Runner) Run(ctx context.Context) {
 		r.tasks.Wait()
 		close(r.done)
 	}()
+	if recovered, err := r.store.RecoverExpiredWork(ctx, time.Now().UTC()); err != nil {
+		r.logger.Warn("durable work recovery failed", "error", err)
+	} else if recovered > 0 {
+		r.logger.Info("durable work recovered", "rows", recovered)
+	}
+	if reconciled, err := r.store.ReconcileStaleDeliveryAttempts(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
+		r.logger.Warn("stale delivery attempt reconciliation failed", "error", err)
+	} else if reconciled > 0 {
+		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
+	}
 	if ctx.Err() == nil {
 		r.launchSync(ctx)
 		r.launchReleaseDayQueue(ctx)
@@ -545,6 +561,16 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 
 func (r *Runner) runMaintenance(ctx context.Context) {
 	r.metrics.RecordMaintenance()
+	if recovered, err := r.store.RecoverExpiredWork(ctx, time.Now().UTC()); err != nil {
+		r.logger.Warn("durable work recovery failed", "error", err)
+	} else if recovered > 0 {
+		r.logger.Info("durable work recovered", "rows", recovered)
+	}
+	if reconciled, err := r.store.ReconcileStaleDeliveryAttempts(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
+		r.logger.Warn("stale delivery attempt reconciliation failed", "error", err)
+	} else if reconciled > 0 {
+		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
+	}
 	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
@@ -702,7 +728,7 @@ func (r *Runner) refreshListenBrainz(ctx context.Context, now time.Time) (int, e
 }
 
 func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) int {
-	requests, err := r.store.ClaimManualSyncRequests(ctx, 3)
+	requests, err := r.store.ClaimManualSyncRequestsWithLease(ctx, 3, r.workerID, 5*time.Minute)
 	if err != nil {
 		r.logger.Warn("manual synchronization queue failed", "error", err)
 		return 0
@@ -722,7 +748,7 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 				_, syncErr = r.syncArtists(ctx, now)
 			}
 		}
-		if err := r.store.CompleteManualSyncRequest(ctx, req.ID, syncErr); err != nil {
+		if err := r.store.CompleteManualSyncRequestOwned(ctx, req.ID, r.workerID, syncErr); err != nil {
 			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", err)
 		}
 	}
@@ -953,6 +979,33 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		return outcome, nil
 	}
 	if len(strategy.batches) == 0 {
+		// Empty provider catalogs are successful health checks but are not
+		// actionable release observations. Once every fallback provider has
+		// answered successfully, advance the normal artist cadence instead of
+		// treating the empty response as a failure.
+		// A successful empty catalog is safe to treat as a normal cadence only
+		// when every provider that was attempted completed cleanly.  If a
+		// fallback provider failed or is cooling down, keep the artist on a
+		// bounded retry cadence instead of letting an empty response mask the
+		// outage.
+		if len(strategy.providerErrors) == 0 && (strategy.spotifyHealthy || strategy.itunesHealthy) {
+			if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
+				return outcome, err
+			}
+			if spotifyWasDue && strategy.spotifyAttempted {
+				// Empty Spotify results are a healthy request but not an
+				// actionable catalog. They must not enter adaptive backoff;
+				// retry on the bounded failure cadence instead.
+				retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
+				if strategy.spotifyRateLimit != nil {
+					retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
+				}
+				if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
+					return outcome, err
+				}
+			}
+			return outcome, nil
+		}
 		retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
 		if strategy.spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
@@ -979,7 +1032,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		}
 		return outcome, nil
 	}
-	if spotifyWasDue {
+	if spotifyWasDue && strategy.spotifySucceeded {
 		if strategy.spotifyRateLimit != nil {
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
@@ -1002,6 +1055,18 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			return outcome, err
 		}
 		outcome.SpotifyBackoff = outcome.SpotifyUnchanged && !upcoming
+	} else if spotifyWasDue && strategy.spotifyAttempted && !strategy.spotifySucceeded {
+		// A failed or empty Spotify response must not be counted as an
+		// unchanged catalog merely because a fallback provider produced data.
+		// Keep Spotify on the bounded retry cadence and leave adaptive streaks
+		// untouched.
+		retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
+		if strategy.spotifyRateLimit != nil {
+			retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
+		}
+		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
+			return outcome, err
+		}
 	}
 	return outcome, nil
 }
@@ -1072,7 +1137,7 @@ func providerFailureRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interva
 
 func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, error) {
 	var summary deliveryStats
-	deliveries, err := r.store.DueDeliveries(ctx, now, 25)
+	deliveries, err := r.store.ClaimDueDeliveries(ctx, now, 25, r.workerID, 5*time.Minute)
 	if err != nil {
 		return summary, err
 	}
@@ -1080,7 +1145,7 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 	if digestLimit < 0 {
 		digestLimit = 0
 	}
-	digestDeliveries, err := r.store.DueDigestDeliveries(ctx, now, digestLimit)
+	digestDeliveries, err := r.store.ClaimDueDigestDeliveries(ctx, now, digestLimit, r.workerID, 5*time.Minute)
 	if err != nil {
 		return summary, err
 	}
@@ -1167,7 +1232,7 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 		}
 	}
 	if err == nil {
-		if markErr := r.store.MarkDigestDeliverySent(ctx, delivery.ID, now); markErr != nil {
+		if markErr := r.store.MarkDigestDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
 			if attemptID > 0 {
 				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
@@ -1186,7 +1251,7 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	redactedError := notify.RedactError(err)
 	r.logger.Warn("release digest delivery attempt failed",
 		"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDigestDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
+	if markErr := r.store.MarkDigestDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
 		result.err = markErr
 	}
 	if attemptID > 0 {
@@ -1222,7 +1287,7 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 		}
 	}
 	if err == nil {
-		if markErr := r.store.MarkDeliverySent(ctx, delivery.ID, now); markErr != nil {
+		if markErr := r.store.MarkDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
 			if attemptID > 0 {
 				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
@@ -1241,7 +1306,7 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	redactedError := notify.RedactError(err)
 	r.logger.Warn("notification attempt failed",
 		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDeliveryFailed(ctx, delivery.ID, delivery.Attempts+1, redactedError, now); markErr != nil {
+	if markErr := r.store.MarkDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
 		result.err = markErr
 	}
 	if attemptID > 0 {

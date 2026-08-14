@@ -21,8 +21,13 @@ var migrations embed.FS
 // is committing, which keeps dashboard requests from queueing behind provider
 // synchronization work.
 type Store struct {
-	DB                  *sql.DB
-	Reader              *sql.DB
+	DB     *sql.DB
+	Reader *sql.DB
+	// dataDir is set for stores opened through Open and is intentionally empty
+	// for lightweight test fixtures that wrap an existing *sql.DB. Operational
+	// marker files in this directory contain only non-sensitive backup/recovery
+	// timestamps and status labels.
+	dataDir             string
 	readerMu            sync.RWMutex
 	healthMu            sync.RWMutex
 	pollInterval        time.Duration
@@ -236,6 +241,7 @@ var (
 	ErrCannotDeleteSelf              = errors.New("you cannot delete your own account")
 	ErrLastAdmin                     = errors.New("the last administrator cannot be deleted")
 	ErrManualSyncQueueFull           = errors.New("manual synchronization queue is full; try again later")
+	ErrSetupCompleted                = errors.New("setup has already completed")
 	ErrInvalidUsername               = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
 	ErrUsernameTaken                 = errors.New("that username is already in use")
 	ErrInvalidNotificationHoldAction = errors.New("invalid notification hold action")
@@ -389,6 +395,7 @@ type DigestDelivery struct {
 	Body        string
 	Attempts    int
 	NextAttempt time.Time
+	ClaimOwner  string
 }
 
 // NotificationHold is an owner-scoped notification that was kept out of the
@@ -544,17 +551,26 @@ type AssuranceSummary struct {
 // support view. It intentionally excludes provider error text, credentials,
 // notification bodies, and destination URLs.
 type DiagnosticsSnapshot struct {
-	CheckedAt         time.Time
-	DatabaseHealthy   bool
-	SchemaVersion     int
-	FollowedArtists   int
-	Releases          int
-	QueuedSyncs       int
-	RunningSyncs      int
-	PendingDeliveries int
-	FailedDeliveries  int
-	RecentLogEntries  int
-	Providers         []DiagnosticsProvider
+	CheckedAt          time.Time
+	DatabaseHealthy    bool
+	SchemaVersion      int
+	FollowedArtists    int
+	Releases           int
+	QueuedSyncs        int
+	RunningSyncs       int
+	PendingDeliveries  int
+	FailedDeliveries   int
+	RecentLogEntries   int
+	OldestQueueAt      *time.Time
+	StaleClaims        int
+	PausedDestinations int
+	ProviderFailures   int
+	DigestBacklog      int
+	DatabaseBytes      int64
+	LastBackupAt       *time.Time
+	LastRestoreAt      *time.Time
+	LastRestoreResult  string
+	Providers          []DiagnosticsProvider
 }
 
 // DiagnosticsProvider is the redacted provider projection used by support
@@ -580,12 +596,14 @@ type SpotifyPollingState struct {
 }
 
 type Destination struct {
-	ID           int64
-	UserID       int64
-	Name         string
-	Service      string
-	EncryptedURL []byte
-	Enabled      bool
+	ID               int64
+	UserID           int64
+	Name             string
+	Service          string
+	EncryptedURL     []byte
+	Enabled          bool
+	TransportStatus  string
+	TransportMessage string
 }
 
 // DestinationHealth is durable, owner-visible delivery state. It is kept
@@ -596,6 +614,7 @@ type DestinationHealth struct {
 	Status              string
 	ConsecutiveFailures int
 	PendingCount        int
+	BlockedCount        int
 	FailedCount         int
 	LastSuccessAt       *time.Time
 	LastFailureAt       *time.Time
@@ -612,6 +631,7 @@ type AdminDestinationHealth struct {
 	Status              string
 	ConsecutiveFailures int
 	PendingCount        int
+	BlockedCount        int
 	FailedCount         int
 	LastSuccessAt       *time.Time
 	LastFailureAt       *time.Time
@@ -630,6 +650,7 @@ type Delivery struct {
 	NextAttempt  time.Time
 	EventType    string
 	ReleaseTitle string
+	ClaimOwner   string
 }
 
 type DeliveryHistory struct {
@@ -660,15 +681,18 @@ type AdminDeliveryHistory struct {
 }
 
 type ManualSyncRequest struct {
-	ID          int64
-	RequestedBy int64
-	Scope       string
-	ArtistID    *int64
-	Status      string
-	CreatedAt   time.Time
-	StartedAt   *time.Time
-	FinishedAt  *time.Time
-	LastError   string
+	ID             int64
+	RequestedBy    int64
+	Scope          string
+	ArtistID       *int64
+	Status         string
+	CreatedAt      time.Time
+	StartedAt      *time.Time
+	FinishedAt     *time.Time
+	LastError      string
+	LeaseOwner     string
+	LeaseExpiresAt *time.Time
+	AttemptCount   int
 }
 
 type ProviderHealth struct {

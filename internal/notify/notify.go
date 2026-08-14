@@ -22,6 +22,55 @@ type NotificationSender interface {
 	Send(context.Context, string, string, string) error
 }
 
+// ErrUnsupportedTransport is returned before Shoutrrr is allowed to create a
+// sender for transports whose networking cannot be brought under the
+// application's resolver, redirect, and timeout policy.  Keeping this check
+// at both validation and send time also protects destinations created by an
+// older release.
+var ErrUnsupportedTransport = errors.New("notification transport is not supported")
+
+// ValidateTransportPolicy admits only transports for which the application
+// can enforce connection-time target validation.  Discord and Telegram use
+// fixed upstream endpoints; ntfy and generic HTTP(S) use the scoped client
+// below.  Gotify and SMTP are intentionally rejected until transport-owned
+// adapters are available.
+func ValidateTransportPolicy(serviceURL string) error {
+	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || parsed == nil {
+		return ErrUnsupportedTransport
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	switch scheme {
+	case "discord", "telegram", "ntfy":
+		return nil
+	case "generic+http", "generic+https":
+		if parsed.Host == "" {
+			return ErrUnsupportedTransport
+		}
+		return nil
+	default:
+		return ErrUnsupportedTransport
+	}
+}
+
+// CanonicalTransportService gives persistence a stable service label even
+// when a member used the advanced raw-URL field. Generic HTTP(S) URLs are
+// stored as "generic" rather than the UI's "advanced" sentinel.
+func CanonicalTransportService(serviceURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || parsed == nil || strings.TrimSpace(parsed.Scheme) == "" {
+		return "unknown"
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "generic+http", "generic+https":
+		return "generic"
+	case "discord", "telegram", "ntfy":
+		return strings.ToLower(parsed.Scheme)
+	default:
+		return strings.ToLower(parsed.Scheme)
+	}
+}
+
 type ShoutrrrSender struct {
 	// AllowPrivateTargets is an explicit opt-in for self-hosted notification
 	// services on a trusted LAN. It is disabled by default to keep a member
@@ -176,6 +225,9 @@ func (s ShoutrrrSender) Validate(serviceURL string) error {
 	if strings.TrimSpace(serviceURL) == "" {
 		return errors.New("notification URL is required")
 	}
+	if err := ValidateTransportPolicy(serviceURL); err != nil {
+		return err
+	}
 	if err := validateOutboundTarget(context.Background(), serviceURL, s.AllowPrivateTargets, false); err != nil {
 		return err
 	}
@@ -195,6 +247,9 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	observer func(queueWait, clientHold time.Duration),
 ) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateTransportPolicy(serviceURL); err != nil {
 		return err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())

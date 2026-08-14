@@ -29,6 +29,17 @@ type resolutionCatalog struct {
 	releaseCalls atomic.Int32
 }
 
+type musicBrainzCreditCatalog struct {
+	resolutionCatalog
+	creditErr   error
+	creditCalls atomic.Int32
+}
+
+func (f *musicBrainzCreditCatalog) ArtistReleaseCredits(context.Context, string, []store.Release) ([]store.Release, error) {
+	f.creditCalls.Add(1)
+	return nil, f.creditErr
+}
+
 type perArtistCatalog struct {
 	releases map[string][]store.Release
 	errors   map[string]error
@@ -1178,6 +1189,49 @@ func TestPersistedSpotifyCooldownSkipsCallsAfterRestart(t *testing.T) {
 	next, err := time.Parse(time.RFC3339Nano, nextCheck)
 	if err != nil || next.Before(future.Add(-time.Second)) {
 		t.Fatalf("persisted cooldown retry=%q parsed=%v err=%v", nextCheck, next, err)
+	}
+}
+
+func TestMusicBrainzCreditFailurePersistsProviderCooldown(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "credit-cooldown@example.com", "unused", "member", "UTC", "credit-cooldown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "credit-cooldown-artist", Name: "Credit Cooldown Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider := &musicBrainzCreditCatalog{
+		resolutionCatalog: resolutionCatalog{releases: []store.Release{{
+			MBID: "credit-cooldown-release", Title: "Release", PrimaryType: "Album",
+			FirstReleaseDate: "2026-08-01", DatePrecision: 3,
+		}}},
+		creditErr: errors.New("MusicBrainz credit endpoint unavailable"),
+	}
+	runner := testRunner(database, provider)
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if provider.releaseCalls.Load() != 1 || provider.creditCalls.Load() != 1 {
+		t.Fatalf("MusicBrainz calls release=%d credits=%d", provider.releaseCalls.Load(), provider.creditCalls.Load())
+	}
+	health, err := database.ProviderHealthByName(ctx, "musicbrainz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.NextCheckAt == nil || health.LastError == "" {
+		t.Fatalf("credit failure did not persist provider cooldown: %#v", health)
+	}
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if provider.releaseCalls.Load() != 1 || provider.creditCalls.Load() != 1 {
+		t.Fatalf("persisted MusicBrainz cooldown was ignored: release=%d credits=%d", provider.releaseCalls.Load(), provider.creditCalls.Load())
 	}
 }
 

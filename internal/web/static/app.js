@@ -83,17 +83,16 @@
   if (form) {
     const visible = {
       ntfy: ["host", "username", "password", "topic"],
-      email: ["host", "port", "username", "password", "from", "to"],
       discord: ["token", "target"],
       telegram: ["token", "target"],
-      gotify: ["host", "token"],
       generic: ["target"],
       advanced: ["raw_url"]
     };
     const refresh = () => {
       const service = form.querySelector("[data-service]").value;
+      const fields = visible[service] || [];
       form.querySelectorAll("[data-field]").forEach((field) => {
-        field.hidden = !visible[service].includes(field.dataset.field);
+        field.hidden = !fields.includes(field.dataset.field);
       });
     };
     form.querySelector("[data-service]").addEventListener("change", refresh);

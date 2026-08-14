@@ -53,8 +53,8 @@
     <div class="section-head"><div><p class="eyebrow">Delivery</p><h2>Your destinations</h2><p>Credentials are encrypted at rest. Send a test after adding a destination.</p></div><span class="badge">{{len .Destinations}} configured</span></div>
     {{if .Destinations}}<div class="list">{{range .Destinations}}{{$health := index $.DestinationHealth .ID}}<article class="list-row">
       <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span>
-        <span class="destination-health"><span class="badge {{destinationHealthClass $health.Status}}">{{destinationHealthLabel $health.Status}}</span>{{if $health.PendingCount}}<small>{{$health.PendingCount}} pending</small>{{end}}{{if $health.FailedCount}}<small>{{$health.FailedCount}} failed</small>{{end}}{{if $health.ConsecutiveFailures}}<small>{{$health.ConsecutiveFailures}} consecutive failure{{if ne $health.ConsecutiveFailures 1}}s{{end}}</small>{{end}}</span>
-        {{if $health.LastError}}<small class="health-error">{{$health.LastError}}</small>{{end}}
+        <span class="destination-health"><span class="badge {{destinationHealthClass $health.Status}}">{{destinationHealthLabel $health.Status}}</span>{{if $health.PendingCount}}<small>{{$health.PendingCount}} pending</small>{{end}}{{if $health.BlockedCount}}<small>{{$health.BlockedCount}} blocked</small>{{end}}{{if $health.FailedCount}}<small>{{$health.FailedCount}} failed</small>{{end}}{{if $health.ConsecutiveFailures}}<small>{{$health.ConsecutiveFailures}} consecutive failure{{if ne $health.ConsecutiveFailures 1}}s{{end}}</small>{{end}}</span>
+        {{if eq $health.Status "unsupported"}}<small class="health-error">This transport is no longer supported. Replace it with an HTTP(S)-based destination.</small>{{else if $health.LastError}}<small class="health-error">{{$health.LastError}}</small>{{end}}
         {{if $health.NextRetryAt}}<small>Retry after {{formatProviderTime $health.NextRetryAt}}</small>{{end}}
         <details class="rename"><summary>Rename</summary>
           <form method="post" action="/destinations/{{.ID}}/rename" class="rename-form">
@@ -73,10 +73,10 @@
       {{template "csrf" .}}
       <label>Name<input name="name" required placeholder="My phone"></label>
       <label>Service<select name="service" data-service>
-        <option value="ntfy">ntfy</option><option value="email">Email / SMTP</option>
+        <option value="ntfy">ntfy</option>
         <option value="discord">Discord</option><option value="telegram">Telegram</option>
-        <option value="gotify">Gotify</option><option value="generic">Generic webhook</option>
-        <option value="advanced">Advanced Shoutrrr URL</option>
+        <option value="generic">Generic webhook</option>
+        <option value="advanced">Advanced Shoutrrr URL (HTTP only)</option>
       </select></label>
       <div data-field="host"><label>Host<input name="host" placeholder="ntfy.sh"></label></div>
       <div data-field="port"><label>Port<input name="port" placeholder="587"></label></div>
@@ -85,9 +85,8 @@
       <div data-field="token"><label>Token<input name="token" type="password" autocomplete="off"></label></div>
       <div data-field="target"><label>Target / chat / webhook URL<input name="target"></label></div>
       <div data-field="topic"><label>Topic<input name="topic"></label></div>
-      <div data-field="from"><label>From address<input name="from" type="email"></label></div>
-      <div data-field="to"><label>Recipient(s)<input name="to" placeholder="person@example.com"></label></div>
       <div data-field="raw_url"><label>Shoutrrr URL<input name="raw_url" type="password" autocomplete="off"></label></div>
+      <small data-field="raw_url">Advanced URLs must use Discord, Telegram, ntfy, or generic HTTP(S). Gotify and SMTP are not accepted until safe transport adapters are available.</small>
       <button>Add destination</button>
     </form>
   </section>

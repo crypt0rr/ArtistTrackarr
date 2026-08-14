@@ -24,25 +24,27 @@ const (
 )
 
 type App struct {
-	cfg              config.Config
-	store            *store.Store
-	mb               catalog.CatalogProvider
-	spotify          catalog.SpotifyProvider
-	itunes           catalog.ITunesProvider
-	sender           notify.NotificationSender
-	cipher           *security.Cipher
-	artwork          artwork.Provider
-	jobs             *jobs.Runner
-	logger           *slog.Logger
-	templates        *template.Template
-	setupLimiter     *fixedWindowLimiter
-	loginLimiter     *fixedWindowLimiter
-	tokenLimiter     *fixedWindowLimiter
-	discoveryLimiter *fixedWindowLimiter
-	importLimiter    *fixedWindowLimiter
-	importSlots      chan struct{}
-	providerLimiter  *fixedWindowLimiter
-	loginSlots       chan struct{}
+	cfg                     config.Config
+	store                   *store.Store
+	mb                      catalog.CatalogProvider
+	spotify                 catalog.SpotifyProvider
+	itunes                  catalog.ITunesProvider
+	sender                  notify.NotificationSender
+	cipher                  *security.Cipher
+	artwork                 artwork.Provider
+	jobs                    *jobs.Runner
+	logger                  *slog.Logger
+	templates               *template.Template
+	setupLimiter            *fixedWindowLimiter
+	loginLimiter            *fixedWindowLimiter
+	tokenLimiter            *fixedWindowLimiter
+	discoveryLimiter        *fixedWindowLimiter
+	importLimiter           *fixedWindowLimiter
+	importSlots             chan struct{}
+	providerLimiter         *fixedWindowLimiter
+	destinationTestLimiter  *fixedWindowLimiter
+	destinationRetryLimiter *fixedWindowLimiter
+	loginSlots              chan struct{}
 }
 
 // UserView is the deliberately narrow projection exposed to templates. The

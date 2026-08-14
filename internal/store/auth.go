@@ -141,6 +141,53 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 	return id, nil
 }
 
+// CreateInitialAdmin atomically establishes the first account.  The setup
+// handler may be reached concurrently by two browser sessions; checking the
+// count on a read connection before inserting is not sufficient to protect
+// the one-time setup invariant.
+func (s *Store) CreateInitialAdmin(ctx context.Context, email, hash, timezone, username string) (int64, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || !strings.Contains(email, "@") {
+		return 0, errors.New("a valid email address is required")
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return 0, errors.New("invalid IANA timezone")
+	}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		return 0, err
+	}
+	if count != 0 {
+		return 0, ErrSetupCompleted
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = derivedUsername(email, 1, nil)
+	}
+	username, err = validateUsername(username)
+	if err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
+		VALUES(?,?,?,?,?,?)`, email, username, hash, "admin", timezone, nowText())
+	if err != nil {
+		return 0, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 func usernameTakenTx(ctx context.Context, tx *sql.Tx, username string, exceptID int64) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM users WHERE username COLLATE NOCASE=?`
 	args := []any{username}

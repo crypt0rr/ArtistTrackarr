@@ -26,7 +26,14 @@
     <div><strong>{{.Diagnostics.QueuedSyncs}}</strong><span>queued syncs</span></div>
     <div><strong>{{.Diagnostics.RunningSyncs}}</strong><span>running syncs</span></div>
     <div><strong>{{.Diagnostics.PendingDeliveries}}</strong><span>pending deliveries</span></div>
+    <div><strong>{{.Diagnostics.DigestBacklog}}</strong><span>digest backlog</span></div>
     <div><strong>{{.Diagnostics.FailedDeliveries}}</strong><span>failed deliveries</span></div>
+    <div><strong>{{.Diagnostics.StaleClaims}}</strong><span>stale work claims</span></div>
+    <div><strong>{{.Diagnostics.PausedDestinations}}</strong><span>paused destinations</span></div>
+    <div><strong>{{.Diagnostics.ProviderFailures}}</strong><span>provider failures</span></div>
+    <div><strong>{{.Diagnostics.DatabaseBytes}}</strong><span>database bytes</span></div>
+    <div><strong>{{if .Diagnostics.LastBackupAt}}{{formatProviderTime .Diagnostics.LastBackupAt}}{{else}}—{{end}}</strong><span>last backup</span></div>
+    <div><strong>{{if .Diagnostics.LastRestoreAt}}{{.Diagnostics.LastRestoreResult}}{{else}}—{{end}}</strong><span>restore rehearsal</span></div>
     <div><strong>{{.Diagnostics.RecentLogEntries}}</strong><span>application events (24h)</span></div>
     <div><strong>{{.Diagnostics.FollowedArtists}}</strong><span>followed artists</span></div>
     <div><strong>{{.Diagnostics.Releases}}</strong><span>known releases</span></div>
@@ -63,7 +70,7 @@
 <section class="panel destination-admin">
   <div class="section-head"><div><p class="eyebrow">Delivery assurance</p><h2>Destination health</h2></div><span class="badge">{{len .AdminDestinationHealth}} destination{{if ne (len .AdminDestinationHealth) 1}}s{{end}}</span></div>
   {{if .AdminDestinationHealth}}<div class="table-scroll"><table><thead><tr><th>Account</th><th>Destination</th><th>Health</th><th>Queue</th><th>Last error</th><th>Updated</th></tr></thead><tbody>
-    {{range .AdminDestinationHealth}}<tr><td><strong>{{.UserEmail}}</strong></td><td><strong>{{.DestinationName}}</strong><small>{{.Service}}</small></td><td><span class="badge {{destinationHealthClass .Status}}">{{destinationHealthLabel .Status}}</span>{{if .ConsecutiveFailures}}<small>{{.ConsecutiveFailures}} consecutive failures</small>{{end}}</td><td><small>{{.PendingCount}} pending</small><small>{{.FailedCount}} failed</small></td><td>{{if .LastError}}<small class="health-error">{{.LastError}}</small>{{else}}<small>—</small>{{end}}</td><td>{{if .UpdatedAt}}{{formatTime .UpdatedAt}}{{end}}</td></tr>{{end}}
+    {{range .AdminDestinationHealth}}<tr><td><strong>{{.UserEmail}}</strong></td><td><strong>{{.DestinationName}}</strong><small>{{.Service}}</small></td><td><span class="badge {{destinationHealthClass .Status}}">{{destinationHealthLabel .Status}}</span>{{if .ConsecutiveFailures}}<small>{{.ConsecutiveFailures}} consecutive failures</small>{{end}}</td><td><small>{{.PendingCount}} pending</small><small>{{.BlockedCount}} blocked</small><small>{{.FailedCount}} failed</small></td><td>{{if eq .Status "unsupported"}}<small class="health-error">Transport is unsupported; replace the destination.</small>{{else if .LastError}}<small class="health-error">{{.LastError}}</small>{{else}}<small>—</small>{{end}}</td><td>{{if .UpdatedAt}}{{formatTime .UpdatedAt}}{{end}}</td></tr>{{end}}
   </tbody></table></div>{{else}}<div class="empty">No notification destinations configured.</div>{{end}}
 </section>
 <section class="panel admin-ops">

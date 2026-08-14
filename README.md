@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.41.0`; release images display the injected
+footer. The current release is `v0.42.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -57,7 +57,7 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.41.0 persistence-hardening release routes production SQLite writes
+The v0.42.0 reliability-guardrails release routes production SQLite writes
 through a bounded busy/locked retry path, rejects malformed operational
 timestamps instead of silently showing zero values, and preflights database
 paths and MusicBrainz contact input before startup. The v0.40.0 operations
@@ -212,7 +212,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.41.0` publishes `0.41.0`, `0.41`, and `latest`.
+- Pushing a tag such as `v0.42.0` publishes `0.42.0`, `0.42`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -222,7 +222,7 @@ not confused with a release.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.41.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.42.0 docker compose up -d
 ```
 
 ## Configuration
@@ -348,10 +348,22 @@ filters. Genres come from MusicBrainz tags and are normalized locally.
 
 ## Notification destinations
 
-Users can add guided Email, Discord, Telegram, ntfy, Gotify, and generic
-webhook destinations. Any service supported by Shoutrrr can be added with its
-raw service URL. Credentials are encrypted in SQLite and redacted from the UI
-and logs. Use the **Send test** action after adding a destination.
+Users can add Discord, Telegram, ntfy, and generic HTTP(S) webhook
+destinations. Advanced Shoutrrr URLs are limited to those same audited
+transports; SMTP, Gotify, and unknown schemes are rejected because the
+application cannot apply its connection-time SSRF policy to them. Existing
+legacy destinations remain visible as **Unsupported**, are never contacted,
+and must be replaced explicitly. Credentials are encrypted in SQLite and
+redacted from the UI and logs. Use the **Send test** action after adding a
+destination.
+
+Delivery is at-least-once. A process crash after an external provider accepts a
+message can result in a duplicate, but durable claims and recovery avoid
+silently losing queued work. Paused or unsupported destinations receive a
+blocked queue row instead of disappearing from an event; an administrator or
+owner can retry after replacing/recovering the destination. A newly added
+destination receives future events only and is not backfilled with historical
+notifications.
 
 Users can choose whether albums, EPs, singles, announcements, and release-day
 reminders should be delivered. Followed artists show their last and next
@@ -397,6 +409,11 @@ persistent data directory and is accompanied by a restrictive-permission
 ./scripts/backup.sh artist-trackarr-backup.tgz
 ```
 
+Successful backups write a non-sensitive timestamp marker into the persistent
+volume so administrator diagnostics can show an approximate backup age. The
+marker is archived with the next backup and is not a substitute for an
+off-host backup inventory.
+
 Restore into an empty Compose volume while the app is stopped, keep the
 original `APP_ENCRYPTION_KEY` available, and run the temporary restore
 rehearsal before replacing production data. The key is required to decrypt
@@ -404,11 +421,16 @@ existing notification destinations. Embedded migrations run automatically
 during upgrades; the rehearsal must pass SQLite foreign-key checks and
 `/readyz` before the restored instance is considered usable.
 
-The rehearsal verifies the checksum sidecar when present, fingerprints the
-durable database state, and compares that fingerprint after a clean restart. A
-mismatch fails the rehearsal rather than declaring the restore usable. Legacy
-archives without a sidecar are accepted with a warning; new backups should
-always retain both files.
+The rehearsal requires an immutable image digest (`@sha256:`), verifies the
+checksum sidecar, runs SQLite `integrity_check` and `foreign_key_check`,
+validates that encrypted destinations can be opened with the original key,
+fingerprints the durable logical database state, and compares that fingerprint
+after a clean restart. A mismatch fails the rehearsal rather than declaring the
+restore usable. Legacy archives without a sidecar or mutable images are
+accepted only when explicitly opted in with `RESTORE_ALLOW_LEGACY_ARCHIVE=true`
+or `RESTORE_ALLOW_MUTABLE_IMAGE=true`; new backups should always use the
+immutable path. Backup archives and encryption keys are confidential operator
+artifacts.
 
 The rehearsal uses an isolated Docker volume, starts the selected image,
 stops it with the configured grace period, and starts it again to verify that
@@ -416,9 +438,12 @@ the restored data remains usable:
 
 ```console
 APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
-  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.41.0 \
+  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr@sha256:<release-digest> \
   ./scripts/restore-smoke.sh artist-trackarr-backup.tgz
 ```
+
+The rehearsal records a non-sensitive restore result marker in its temporary
+volume; that volume is removed when the rehearsal exits.
 
 ## Development
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,7 +40,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{DB: db}
+	s := &Store{DB: db, dataDir: filepath.Dir(path)}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err

@@ -221,7 +221,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			switch strings.ToLower(status) {
 			case "healthy":
 				return "sent"
-			case "paused":
+			case "paused", "unsupported":
 				return "failed"
 			default:
 				return "ambiguous"
@@ -235,6 +235,8 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "Paused"
 			case "degraded":
 				return "Degraded"
+			case "unsupported":
+				return "Unsupported"
 			default:
 				return "Unknown"
 			}
@@ -464,14 +466,16 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		cfg: cfg, store: s, mb: mb, spotify: spotify, sender: sender,
 		itunes: itunesProvider,
 		cipher: cipher, artwork: art, jobs: runner, logger: logger, templates: tmpl,
-		setupLimiter:     newFixedWindowLimiter(10, 15*time.Minute),
-		loginLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
-		tokenLimiter:     newFixedWindowLimiter(20, 5*time.Minute),
-		discoveryLimiter: newFixedWindowLimiter(30, 5*time.Minute),
-		importLimiter:    newFixedWindowLimiter(5, time.Hour),
-		importSlots:      make(chan struct{}, maxConcurrentImports),
-		providerLimiter:  newFixedWindowLimiter(30, 10*time.Minute),
-		loginSlots:       make(chan struct{}, 8),
+		setupLimiter:            newFixedWindowLimiter(10, 15*time.Minute),
+		loginLimiter:            newFixedWindowLimiter(20, 5*time.Minute),
+		tokenLimiter:            newFixedWindowLimiter(20, 5*time.Minute),
+		discoveryLimiter:        newFixedWindowLimiter(30, 5*time.Minute),
+		importLimiter:           newFixedWindowLimiter(5, time.Hour),
+		importSlots:             make(chan struct{}, maxConcurrentImports),
+		providerLimiter:         newFixedWindowLimiter(30, 10*time.Minute),
+		destinationTestLimiter:  newFixedWindowLimiter(5, 15*time.Minute),
+		destinationRetryLimiter: newFixedWindowLimiter(10, 15*time.Minute),
+		loginSlots:              make(chan struct{}, 8),
 	}, nil
 }
 
@@ -892,5 +896,15 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
+	w.Header().Set("X-ArtistTrackarr-Database", "healthy")
+	runnerState := "unknown"
+	if a.jobs != nil {
+		if a.jobs.Status().Running {
+			runnerState = "running"
+		} else {
+			runnerState = "stopped"
+		}
+	}
+	w.Header().Set("X-ArtistTrackarr-Runner", runnerState)
 	w.WriteHeader(http.StatusNoContent)
 }
