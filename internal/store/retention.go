@@ -20,6 +20,9 @@ type RetentionReport struct {
 	OldestDelivery            *time.Time
 	OldestDeliveryAttempt     *time.Time
 	OldestApplicationLog      *time.Time
+	OldestHistory             *time.Time
+	HistoryAgeDays            int
+	HistoryReviewDue          bool
 	PrunableApplicationLogs   int64
 	PrunableTransientSessions int64
 	PrunableAuthTokens        int64
@@ -90,7 +93,30 @@ func (s *Store) RetentionReport(ctx context.Context, now time.Time) (RetentionRe
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs WHERE created_at < ?`, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
 		return RetentionReport{}, err
 	}
+	report.OldestHistory = oldestTime(report.OldestNotificationEvent, report.OldestDelivery, report.OldestDeliveryAttempt)
+	if report.OldestHistory != nil {
+		age := report.CheckedAt.Sub(report.OldestHistory.UTC())
+		if age > 0 {
+			report.HistoryAgeDays = int(age / (24 * time.Hour))
+		}
+		report.HistoryReviewDue = report.HistoryAgeDays >= policy.HistoryReviewDays
+	}
 	return report, nil
+}
+
+func oldestTime(values ...*time.Time) *time.Time {
+	var oldest *time.Time
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		candidate := value.UTC()
+		if oldest == nil || candidate.Before(oldest.UTC()) {
+			copy := candidate
+			oldest = &copy
+		}
+	}
+	return oldest
 }
 
 // CleanupRetention performs the same bounded cleanup as scheduled

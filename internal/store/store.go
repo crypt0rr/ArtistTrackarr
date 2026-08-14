@@ -45,13 +45,17 @@ type Store struct {
 type RetentionPolicy struct {
 	ApplicationLogsDays int
 	TransientStateDays  int
+	// HistoryReviewDays is a non-destructive review threshold for notification
+	// and delivery history. Those records are never removed automatically; the
+	// threshold only tells administrators when a retention decision is due.
+	HistoryReviewDays int
 }
 
 // DefaultRetentionPolicy is conservative and matches the existing automatic
 // maintenance windows. It is exposed so the administrator report and tests
 // can describe exactly what an explicit cleanup would remove.
 func DefaultRetentionPolicy() RetentionPolicy {
-	return RetentionPolicy{ApplicationLogsDays: 7, TransientStateDays: 30}
+	return RetentionPolicy{ApplicationLogsDays: 7, TransientStateDays: 30, HistoryReviewDays: 365}
 }
 
 func normalizeRetentionPolicy(policy RetentionPolicy) RetentionPolicy {
@@ -61,6 +65,9 @@ func normalizeRetentionPolicy(policy RetentionPolicy) RetentionPolicy {
 	}
 	if policy.TransientStateDays <= 0 {
 		policy.TransientStateDays = defaults.TransientStateDays
+	}
+	if policy.HistoryReviewDays <= 0 {
+		policy.HistoryReviewDays = defaults.HistoryReviewDays
 	}
 	return policy
 }
@@ -621,6 +628,34 @@ type DiagnosticsSnapshot struct {
 	LastRestoreAt      *time.Time
 	LastRestoreResult  string
 	Providers          []DiagnosticsProvider
+}
+
+// OperationalSnapshot is a bounded, redacted history of the administrator
+// diagnostics. It contains counters and timestamps only; provider payloads,
+// credentials, notification bodies, and destination URLs are never stored.
+type OperationalSnapshot struct {
+	ID                 int64
+	CapturedAt         time.Time
+	Status             string
+	RunnerStatus       string
+	DatabaseHealthy    bool
+	SchemaVersion      int
+	FollowedArtists    int
+	Releases           int
+	QueuedSyncs        int
+	RunningSyncs       int
+	PendingDeliveries  int
+	FailedDeliveries   int
+	RecentLogEntries   int
+	OldestQueueAt      *time.Time
+	StaleClaims        int
+	PausedDestinations int
+	ProviderFailures   int
+	DigestBacklog      int
+	DatabaseBytes      int64
+	LastBackupAt       *time.Time
+	LastRestoreAt      *time.Time
+	LastRestoreResult  string
 }
 
 // DiagnosticsProvider is the redacted provider projection used by support

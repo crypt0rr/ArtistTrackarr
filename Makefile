@@ -1,6 +1,6 @@
 COVERAGE_MIN ?= 80.0
 
-.PHONY: test build run fmt-check tooling-check lint vuln coverage quality
+.PHONY: test build run fmt-check tooling-check version-check lint vuln coverage quality
 
 test:
 	docker build --target test .
@@ -14,6 +14,9 @@ run:
 
 fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
+
+version-check:
+	@scripts/check-version-docs.sh "$(VERSION)"
 
 tooling-check:
 	@marker=$$(printf '@%s' latest); if git grep -n -F "$$marker" -- .github Dockerfile scripts; then \
@@ -49,7 +52,7 @@ coverage:
 	printf 'total coverage: %s%% (minimum: %s%%)\n' "$$coverage" "$(COVERAGE_MIN)"; \
 	awk -v coverage="$$coverage" -v minimum="$(COVERAGE_MIN)" 'BEGIN { exit !(coverage >= minimum) }'
 
-quality: fmt-check tooling-check
+quality: fmt-check tooling-check version-check
 	go vet ./...
 	go test ./... -count=1
 	go test -race ./... -count=1
