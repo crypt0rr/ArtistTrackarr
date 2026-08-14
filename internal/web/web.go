@@ -119,6 +119,9 @@ type PageData struct {
 	AssuranceSummary         store.AssuranceSummary
 	Diagnostics              store.DiagnosticsSnapshot
 	Retention                store.RetentionReport
+	OperationalStatus        string
+	OperationalReasons       []string
+	OperationalSnapshots     []store.OperationalSnapshot
 	RunnerStatus             jobs.RunnerStatus
 	DiagnosticReport         string
 	EvidenceIssues           []store.EvidenceIssue

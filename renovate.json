@@ -2,5 +2,32 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Keep the Go toolchain aligned across module, Docker, and CI",
+      "groupName": "Go toolchain",
+      "matchManagers": [
+        "gomod",
+        "dockerfile",
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "go",
+        "golang",
+        "actions/setup-go"
+      ]
+    },
+    {
+      "description": "Group pinned Go quality tooling updates",
+      "groupName": "Go quality tooling",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/golangci/golangci-lint/v2",
+        "golang.org/x/vuln"
+      ]
+    }
   ]
 }

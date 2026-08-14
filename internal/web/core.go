@@ -47,6 +47,24 @@ func providerHealthClass(p store.ProviderHealth) string {
 	}
 }
 
+func formatBytes(value int64) string {
+	if value < 0 {
+		value = 0
+	}
+	const unit = int64(1024)
+	if value < unit {
+		return strconv.FormatInt(value, 10) + " B"
+	}
+	amount := float64(value)
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	index := 0
+	for amount >= float64(unit) && index < len(units)-1 {
+		amount /= float64(unit)
+		index++
+	}
+	return strconv.FormatFloat(math.Round(amount*10)/10, 'f', -1, 64) + " " + units[index]
+}
+
 func providerHealthTime(value any) string {
 	t, ok := providerTimeValue(value)
 	if !ok || t.IsZero() {
@@ -199,8 +217,20 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "pending"
 			}
 		},
-		"formatProviderTime":   providerHealthTime,
-		"providerTimeAttr":     providerHealthTimeAttr,
+		"formatProviderTime":     providerHealthTime,
+		"providerTimeAttr":       providerHealthTimeAttr,
+		"formatBytes":            formatBytes,
+		"operationalStatusLabel": store.DiagnosticStatusLabel,
+		"operationalStatusClass": func(status string) string {
+			switch strings.ToLower(strings.TrimSpace(status)) {
+			case "healthy":
+				return "sent"
+			case "unavailable":
+				return "failed"
+			default:
+				return "ambiguous"
+			}
+		},
 		"timelineKindLabel":    timelineKindLabel,
 		"timelineStatusClass":  timelineStatusClass,
 		"providerHealthStatus": func(p store.ProviderHealth) string { return providerHealthStatusFor(p, cfg) },
@@ -905,6 +935,18 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 		} else {
 			runnerState = "stopped"
 		}
+	}
+	// Keep readiness usable for Docker while distinguishing a healthy database
+	// from degraded background work. Providers, queues, and backups can need
+	// attention without making the process restart in a loop.
+	if snapshot, err := a.store.Diagnostics(r.Context()); err == nil {
+		status, reasons := store.OperationalStatus(snapshot, runnerState, time.Now().UTC())
+		w.Header().Set("X-ArtistTrackarr-Operational", status)
+		if len(reasons) > 0 {
+			w.Header().Set("X-ArtistTrackarr-Operational-Reason", reasons[0])
+		}
+	} else {
+		w.Header().Set("X-ArtistTrackarr-Operational", "unknown")
 	}
 	w.Header().Set("X-ArtistTrackarr-Runner", runnerState)
 	w.WriteHeader(http.StatusNoContent)

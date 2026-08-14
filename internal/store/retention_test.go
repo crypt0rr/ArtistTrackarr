@@ -97,6 +97,9 @@ func TestRetentionCleanupNeverDeletesDeliveryHistory(t *testing.T) {
 	if report.NotificationEvents != 1 {
 		t.Fatalf("notification events=%d, want 1", report.NotificationEvents)
 	}
+	if !report.HistoryReviewDue || report.HistoryAgeDays < report.Policy.HistoryReviewDays {
+		t.Fatalf("history review=%v age=%d policy=%d", report.HistoryReviewDue, report.HistoryAgeDays, report.Policy.HistoryReviewDays)
+	}
 	if _, err := s.CleanupRetention(ctx, now); err != nil {
 		t.Fatal(err)
 	}

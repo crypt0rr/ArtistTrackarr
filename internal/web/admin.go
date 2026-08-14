@@ -128,6 +128,16 @@ func (a *App) adminData(r *http.Request) PageData {
 	if a.jobs != nil {
 		d.RunnerStatus = a.jobs.Status()
 	}
+	runnerState := "unknown"
+	if a.jobs != nil {
+		runnerState = "stopped"
+		if d.RunnerStatus.Running {
+			runnerState = "running"
+		}
+	}
+	d.OperationalStatus, d.OperationalReasons = store.OperationalStatus(d.Diagnostics, runnerState, time.Now().UTC())
+	d.OperationalSnapshots, err = a.store.OperationalSnapshots(r.Context(), 24)
+	failed = a.pageStoreError(r, &d, "Household administration", "operational snapshot history", err) || failed
 	d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus)
 	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
@@ -169,8 +179,17 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 
 func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus) string {
 	var report strings.Builder
+	runnerState := "stopped"
+	if runner.Running {
+		runnerState = "running"
+	}
+	status, reasons := store.OperationalStatus(snapshot, runnerState, snapshot.CheckedAt)
 	report.WriteString("ArtistTrackarr release assurance report\n")
 	fmt.Fprintf(&report, "Generated: %s\n", snapshot.CheckedAt.Format(time.RFC3339))
+	fmt.Fprintf(&report, "Operational status: %s\n", store.DiagnosticStatusLabel(status))
+	if len(reasons) > 0 {
+		fmt.Fprintf(&report, "Operational reasons: %s\n", strings.Join(reasons, ", "))
+	}
 	fmt.Fprintf(&report, "Database: %s (schema %d)\n", diagnosticHealthLabel(snapshot.DatabaseHealthy), snapshot.SchemaVersion)
 	fmt.Fprintf(&report, "Followed artists: %d\n", snapshot.FollowedArtists)
 	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)

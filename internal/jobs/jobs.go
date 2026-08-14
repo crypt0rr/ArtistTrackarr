@@ -561,21 +561,22 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 
 func (r *Runner) runMaintenance(ctx context.Context) {
 	r.metrics.RecordMaintenance()
-	if recovered, err := r.store.RecoverExpiredWork(ctx, time.Now().UTC()); err != nil {
+	now := time.Now().UTC()
+	if recovered, err := r.store.RecoverExpiredWork(ctx, now); err != nil {
 		r.logger.Warn("durable work recovery failed", "error", err)
 	} else if recovered > 0 {
 		r.logger.Info("durable work recovered", "rows", recovered)
 	}
-	if reconciled, err := r.store.ReconcileStaleDeliveryAttempts(ctx, time.Now().UTC(), 10*time.Minute); err != nil {
+	if reconciled, err := r.store.ReconcileStaleDeliveryAttempts(ctx, now, 10*time.Minute); err != nil {
 		r.logger.Warn("stale delivery attempt reconciliation failed", "error", err)
 	} else if reconciled > 0 {
 		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
 	}
 	policy := r.store.RetentionPolicy()
-	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-time.Duration(policy.ApplicationLogsDays)*24*time.Hour)); err != nil {
+	if err := r.store.PruneApplicationLogs(ctx, now.Add(-time.Duration(policy.ApplicationLogsDays)*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
-	if maintenance, err := r.store.PruneExpiredState(ctx, time.Now().UTC()); err != nil {
+	if maintenance, err := r.store.PruneExpiredState(ctx, now); err != nil {
 		r.logger.Warn("state maintenance failed", "error", err)
 	} else if maintenance.Sessions+maintenance.AuthTokens+maintenance.LoginAttempts+maintenance.ManualSyncs+maintenance.ImportJobs > 0 {
 		r.logger.Info("state maintenance completed",
@@ -591,6 +592,17 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 			r.logger.Info("artwork cache pruning completed",
 				"removed_files", stats.RemovedFiles, "removed_bytes", stats.RemovedBytes,
 				"stale_files", stats.StaleFiles)
+		}
+	}
+	// Persist a redacted hourly point after maintenance has recovered stale
+	// work. This gives operators a short historical view even after a restart,
+	// while the bounded store method prevents unbounded database growth.
+	if snapshot, err := r.store.Diagnostics(ctx); err != nil {
+		r.logger.Warn("operational snapshot capture failed", "error", err)
+	} else {
+		status, _ := store.OperationalStatus(snapshot, "running", now)
+		if err := r.store.RecordOperationalSnapshot(ctx, snapshot, status, "running"); err != nil {
+			r.logger.Warn("operational snapshot persistence failed", "error", err)
 		}
 	}
 }

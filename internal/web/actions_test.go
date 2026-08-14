@@ -104,6 +104,9 @@ func TestArtistActionsReadyAndLogout(t *testing.T) {
 	if ready.StatusCode != http.StatusNoContent {
 		t.Fatalf("ready status=%d", ready.StatusCode)
 	}
+	if ready.Header.Get("X-ArtistTrackarr-Database") != "healthy" || ready.Header.Get("X-ArtistTrackarr-Operational") == "" {
+		t.Fatalf("readiness headers database=%q operational=%q", ready.Header.Get("X-ArtistTrackarr-Database"), ready.Header.Get("X-ArtistTrackarr-Operational"))
+	}
 
 	csrf := getCSRF(t, client, server.URL+"/artists")
 	response := postForm(t, client, server.URL+"/artists/follow", url.Values{
