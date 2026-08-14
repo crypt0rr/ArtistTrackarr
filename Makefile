@@ -24,6 +24,14 @@ tooling-check:
 		echo "unpinned container helper reference found" >&2; \
 		exit 1; \
 	fi
+	@docker_go=$$(sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/\1/p' Dockerfile | head -1); \
+	ci_go=$$(sed -n "s/.*go-version: '\([^']*\)'.*/\1/p" .github/workflows/docker.yml | head -1); \
+	module_go=$$(sed -n 's/^go //p' go.mod | cut -d. -f1-2); \
+	docker_line=$$(printf '%s' "$$docker_go" | cut -d. -f1-2); \
+	if [ -z "$$docker_go" ] || [ -z "$$ci_go" ] || [ -z "$$module_go" ] || [ "$$docker_go" != "$$ci_go" ] || [ "$$docker_line" != "$$module_go" ]; then \
+		echo "Go toolchain drift: module=$$module_go Docker=$$docker_go CI=$$ci_go" >&2; \
+		exit 1; \
+	fi
 
 lint:
 	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...

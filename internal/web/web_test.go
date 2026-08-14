@@ -1154,7 +1154,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	_ = response.Body.Close()
 	for _, expected := range []string{
 		"member@example.com", "Audited Album", "Kitchen display", "ntfy", "failed", "5 attempts",
-		"View details", "Household accounts", "delete-me@example.com",
+		"View details", "Household accounts", "delete-me@example.com", "Retention governance",
 		"/admin/users/" + strconv.FormatInt(targetID, 10) + "/delete", "Current account",
 	} {
 		if !strings.Contains(string(body), expected) {

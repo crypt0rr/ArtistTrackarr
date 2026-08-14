@@ -30,10 +30,60 @@ type Store struct {
 	dataDir             string
 	readerMu            sync.RWMutex
 	healthMu            sync.RWMutex
+	retentionMu         sync.RWMutex
 	pollInterval        time.Duration
 	spotifyPollInterval time.Duration
+	retentionPolicy     RetentionPolicy
 	closeOnce           sync.Once
 	closeErr            error
+}
+
+// RetentionPolicy describes the bounded operational state that may be
+// removed by maintenance. Notification events, delivery queue rows, inbox
+// state, blocked work, and delivery-attempt audit records are intentionally
+// not part of this policy and are retained indefinitely.
+type RetentionPolicy struct {
+	ApplicationLogsDays int
+	TransientStateDays  int
+}
+
+// DefaultRetentionPolicy is conservative and matches the existing automatic
+// maintenance windows. It is exposed so the administrator report and tests
+// can describe exactly what an explicit cleanup would remove.
+func DefaultRetentionPolicy() RetentionPolicy {
+	return RetentionPolicy{ApplicationLogsDays: 7, TransientStateDays: 30}
+}
+
+func normalizeRetentionPolicy(policy RetentionPolicy) RetentionPolicy {
+	defaults := DefaultRetentionPolicy()
+	if policy.ApplicationLogsDays <= 0 {
+		policy.ApplicationLogsDays = defaults.ApplicationLogsDays
+	}
+	if policy.TransientStateDays <= 0 {
+		policy.TransientStateDays = defaults.TransientStateDays
+	}
+	return policy
+}
+
+// SetRetentionPolicy updates the maintenance windows used by reports and
+// explicit administrator cleanup. A zero value restores the safe defaults.
+func (s *Store) SetRetentionPolicy(policy RetentionPolicy) {
+	s.retentionMu.Lock()
+	s.retentionPolicy = normalizeRetentionPolicy(policy)
+	s.retentionMu.Unlock()
+}
+
+func (s *Store) retention() RetentionPolicy {
+	s.retentionMu.RLock()
+	policy := s.retentionPolicy
+	s.retentionMu.RUnlock()
+	return normalizeRetentionPolicy(policy)
+}
+
+// RetentionPolicy returns the effective windows used by scheduled and
+// explicit maintenance.
+func (s *Store) RetentionPolicy() RetentionPolicy {
+	return s.retention()
 }
 
 // SetProviderHealthCadences supplies the configured polling intervals used by

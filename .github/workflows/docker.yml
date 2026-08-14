@@ -59,11 +59,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # Keep CI on the patched toolchain used by the Docker build. The
-          # go.mod language version remains 1.25 for source compatibility;
+          # Keep CI on the patched Go 1.25 toolchain used by the Docker build.
+          # The go.mod language version remains 1.25 for source compatibility;
           # pin the patch version so a newly published standard-library
           # vulnerability cannot silently select an older toolchain.
-          go-version: '1.26.6'
+          go-version: '1.25.13'
           cache: true
 
       - name: Run race detector

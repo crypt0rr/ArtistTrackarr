@@ -1,0 +1,138 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"time"
+)
+
+// RetentionReport is a safe, read-only dry run for the administrator. The
+// history counters are informational; only the two operational candidate
+// counts can be affected by CleanupRetention.
+type RetentionReport struct {
+	CheckedAt                 time.Time
+	Policy                    RetentionPolicy
+	NotificationEvents        int64
+	Deliveries                int64
+	DeliveryAttempts          int64
+	ApplicationLogs           int64
+	OldestNotificationEvent   *time.Time
+	OldestDelivery            *time.Time
+	OldestDeliveryAttempt     *time.Time
+	OldestApplicationLog      *time.Time
+	PrunableApplicationLogs   int64
+	PrunableTransientSessions int64
+	PrunableAuthTokens        int64
+	PrunableLoginAttempts     int64
+	PrunableManualSyncs       int64
+	PrunableImportJobs        int64
+}
+
+// RetentionCleanupStats contains only rows removed from transient state. It
+// deliberately has no notification or delivery fields so callers cannot
+// accidentally imply that user-facing history was purged.
+type RetentionCleanupStats struct {
+	ApplicationLogs int64
+	Sessions        int64
+	AuthTokens      int64
+	LoginAttempts   int64
+	ManualSyncs     int64
+	ImportJobs      int64
+}
+
+func (s *Store) RetentionReport(ctx context.Context, now time.Time) (RetentionReport, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	policy := s.retention()
+	report := RetentionReport{CheckedAt: now.UTC(), Policy: policy}
+
+	queries := []struct {
+		query  string
+		count  *int64
+		oldest **time.Time
+		name   string
+	}{
+		{`SELECT COUNT(*), MIN(created_at) FROM notification_events`, &report.NotificationEvents, &report.OldestNotificationEvent, "notification event"},
+		{`SELECT COUNT(*), MIN(COALESCE(sent_at,next_attempt_at)) FROM deliveries`, &report.Deliveries, &report.OldestDelivery, "delivery"},
+		{`SELECT COUNT(*), MIN(started_at) FROM delivery_attempts`, &report.DeliveryAttempts, &report.OldestDeliveryAttempt, "delivery attempt"},
+		{`SELECT COUNT(*), MIN(created_at) FROM application_logs`, &report.ApplicationLogs, &report.OldestApplicationLog, "application log"},
+	}
+	for _, item := range queries {
+		var oldest sql.NullString
+		if err := s.readerDB().QueryRowContext(ctx, item.query).Scan(item.count, &oldest); err != nil {
+			return RetentionReport{}, err
+		}
+		parsed, err := parseStoredNullableTime(oldest, item.name+" oldest timestamp")
+		if err != nil {
+			return RetentionReport{}, err
+		}
+		*item.oldest = parsed
+	}
+
+	logCutoff := timeText(report.CheckedAt.Add(-time.Duration(policy.ApplicationLogsDays) * 24 * time.Hour))
+	transientCutoff := timeText(report.CheckedAt.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM application_logs WHERE created_at < ?`, logCutoff).Scan(&report.PrunableApplicationLogs); err != nil {
+		return RetentionReport{}, err
+	}
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions WHERE expires_at < ?`, timeText(report.CheckedAt)).Scan(&report.PrunableTransientSessions); err != nil {
+		return RetentionReport{}, err
+	}
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, timeText(report.CheckedAt)).Scan(&report.PrunableAuthTokens); err != nil {
+		return RetentionReport{}, err
+	}
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM login_attempts WHERE first_at < ?`, timeText(report.CheckedAt.Add(-24*time.Hour))).Scan(&report.PrunableLoginAttempts); err != nil {
+		return RetentionReport{}, err
+	}
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, transientCutoff).Scan(&report.PrunableManualSyncs); err != nil {
+		return RetentionReport{}, err
+	}
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs WHERE created_at < ?`, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
+		return RetentionReport{}, err
+	}
+	return report, nil
+}
+
+// CleanupRetention performs the same bounded cleanup as scheduled
+// maintenance, but only when an administrator explicitly requests it. It
+// never deletes notification events, deliveries, inbox state, blocked rows,
+// or delivery-attempt audit records.
+func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionCleanupStats, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	policy := s.retention()
+	stats := RetentionCleanupStats{}
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return stats, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statements := []struct {
+		query string
+		args  []any
+		out   *int64
+	}{
+		{`DELETE FROM application_logs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.ApplicationLogsDays) * 24 * time.Hour))}, &stats.ApplicationLogs},
+		{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}, &stats.Sessions},
+		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &stats.AuthTokens},
+		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(now.Add(-24 * time.Hour))}, &stats.LoginAttempts},
+		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &stats.ManualSyncs},
+		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &stats.ImportJobs},
+	}
+	for _, statement := range statements {
+		result, err := tx.ExecContext(ctx, statement.query, statement.args...)
+		if err != nil {
+			return RetentionCleanupStats{}, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return RetentionCleanupStats{}, err
+		}
+		*statement.out = count
+	}
+	if err := tx.Commit(); err != nil {
+		return RetentionCleanupStats{}, err
+	}
+	return stats, nil
+}

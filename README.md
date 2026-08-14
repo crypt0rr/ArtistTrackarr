@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.42.0`; release images display the injected
+footer. The current release is `v0.43.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -57,10 +57,15 @@ error when a data lookup fails, while the detailed cause remains in structured
 logs. Static assets use immutable, version-stamped URLs and continue to serve
 their unversioned paths for compatibility.
 
-The v0.42.0 reliability-guardrails release routes production SQLite writes
-through a bounded busy/locked retry path, rejects malformed operational
-timestamps instead of silently showing zero values, and preflights database
-paths and MusicBrainz contact input before startup. The v0.40.0 operations
+The v0.43.0 retention-governance release adds an administrator dry-run and
+explicit cleanup action for bounded operational state. Notification events,
+delivery rows, inbox state, blocked work, and delivery-attempt audit records
+are retained indefinitely; only expired sessions/tokens, old login-attempt
+records, completed transient work, and application logs inside the documented
+windows are eligible for cleanup. The v0.42.0 reliability release routes
+production SQLite writes through a bounded busy/locked retry path, rejects
+malformed operational timestamps instead of silently showing zero values, and
+preflights database paths and MusicBrainz contact input before startup. The v0.40.0 operations
 release adds strict boolean configuration validation,
 polling-cadence-aware provider freshness, and bounded scheduler, provider, and
 delivery metrics in the administrator diagnostics report. The v0.39.0
@@ -212,17 +217,21 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.42.0` publishes `0.42.0`, `0.42`, and `latest`.
+- Pushing a tag such as `v0.43.0` publishes `0.43.0`, `0.43`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
 branch and local builds use `dev` or `dev-<short-sha>` so development images are
 not confused with a release.
 
+The module targets Go 1.25 for source compatibility; CI and the Docker build
+use the pinned patched Go 1.25.13 toolchain so local builds and release images
+share the same supported language/runtime line.
+
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.42.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.43.0 docker compose up -d
 ```
 
 ## Configuration
@@ -364,6 +373,20 @@ blocked queue row instead of disappearing from an event; an administrator or
 owner can retry after replacing/recovering the destination. A newly added
 destination receives future events only and is not backfilled with historical
 notifications.
+
+### Retention and cleanup
+
+The administrator page includes a retention dry-run with the effective policy
+before any cleanup is possible. Application logs are kept for seven days;
+expired sessions and tokens, old login-attempt records, completed manual-sync
+requests, and import jobs are transient operational state and use a 30-day
+window (login attempts use a 24-hour safety window). Cleanup is never run from
+the web request automatically: an administrator must explicitly confirm it.
+Notification events, deliveries, inbox state, blocked deliveries, and
+delivery-attempt audit records have no automatic expiry and are not removed by
+this action while the account exists (account deletion still removes that
+account's private data). Backups should therefore be treated as confidential and retained
+according to the household's own recovery policy.
 
 Users can choose whether albums, EPs, singles, announcements, and release-day
 reminders should be delivered. Followed artists show their last and next
