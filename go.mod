@@ -1,6 +1,6 @@
 module github.com/crypt0rr/artist-tracker
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/containrrr/shoutrrr v0.8.0

@@ -224,9 +224,9 @@ argument. Tag builds inject the semantic tag (without the leading `v`), while
 branch and local builds use `dev` or `dev-<short-sha>` so development images are
 not confused with a release.
 
-The module targets Go 1.25 for source compatibility; CI and the Docker build
-use the pinned patched Go 1.25.13 toolchain so local builds and release images
-share the same supported language/runtime line.
+The module targets Go 1.26; CI and the Docker build use the pinned patched Go
+1.26.6 toolchain so local builds and release images share the same supported
+language/runtime line.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
