@@ -69,4 +69,9 @@ docker run --rm --volumes-from "$container_id" -v "$output_dir:/backup" "$HELPER
 	sha256sum "$(basename -- "$output_file")" > "$(basename -- "$checksum_file")"
 )
 chmod 600 "$output_file" "$checksum_file"
+# Write the marker only after both the archive and checksum are complete. It is
+# deliberately not part of the just-created archive; the next backup will
+# include it, while the live application immediately sees the latest result.
+docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec \
+	'printf "%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/.artist-trackarr-last-backup && chmod 600 /data/.artist-trackarr-last-backup'
 echo "backup: wrote $output_file and $checksum_file from volume $mount_name"

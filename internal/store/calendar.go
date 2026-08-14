@@ -172,11 +172,11 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			_ = tx.Rollback()
 			return queued, err
 		}
-		deliveryResult, err := tx.ExecContext(ctx, `INSERT INTO release_digest_deliveries
+		deliveryResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_deliveries
 			(run_id,destination_id,status,next_attempt_at)
-			SELECT ?,d.id,'pending',? FROM destinations d
+			SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
 			LEFT JOIN destination_health dh ON dh.destination_id=d.id
-			WHERE d.user_id=? AND d.enabled=1 AND `+destinationAdmissionPredicate, runID, timeText(now), user.ID)
+			WHERE d.user_id=? AND d.enabled=1`, runID, timeText(now), user.ID)
 		if err != nil {
 			_ = tx.Rollback()
 			return queued, err
@@ -187,7 +187,9 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			return queued, err
 		}
 		if deliveryCount == 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='sent' WHERE id=?`, runID); err != nil {
+			// No admitted destination is not a successful send. Keep the run
+			// pending so it remains visible for an explicit replay/recovery action.
+			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='pending' WHERE id=?`, runID); err != nil {
 				_ = tx.Rollback()
 				return queued, err
 			}

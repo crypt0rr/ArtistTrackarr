@@ -120,6 +120,48 @@ func TestBuildURLRejectsIncompleteInput(t *testing.T) {
 	}
 }
 
+func TestValidateTransportPolicyMatrix(t *testing.T) {
+	for _, serviceURL := range []string{
+		"discord://token@123456",
+		"telegram://token@telegram?chats=-100123",
+		"ntfy://ntfy.sh/releases",
+		"generic+http://hooks.example/releases",
+		"generic+https://hooks.example/releases",
+	} {
+		if err := ValidateTransportPolicy(serviceURL); err != nil {
+			t.Errorf("supported transport %q rejected: %v", serviceURL, err)
+		}
+	}
+	for _, serviceURL := range []string{
+		"gotify://push.example/token",
+		"smtp://mail.example:587/",
+		"matrix://room.example/room",
+		"http://hooks.example/releases",
+		"generic+ftp://hooks.example/releases",
+	} {
+		if err := ValidateTransportPolicy(serviceURL); !errors.Is(err, ErrUnsupportedTransport) {
+			t.Errorf("unsupported transport %q error=%v, want ErrUnsupportedTransport", serviceURL, err)
+		}
+	}
+}
+
+func TestCanonicalTransportService(t *testing.T) {
+	tests := map[string]string{
+		"generic+http://hooks.example/releases":  "generic",
+		"generic+https://hooks.example/releases": "generic",
+		"DISCORD://token@123456":                 "discord",
+		"telegram://token@telegram?chats=-100":   "telegram",
+		"ntfy://ntfy.sh/releases":                "ntfy",
+		"smtp://mail.example:587/":               "smtp",
+		"not a URL":                              "unknown",
+	}
+	for serviceURL, want := range tests {
+		if got := CanonicalTransportService(serviceURL); got != want {
+			t.Errorf("CanonicalTransportService(%q)=%q, want %q", serviceURL, got, want)
+		}
+	}
+}
+
 func TestRedactErrorRemovesDestinationCredentials(t *testing.T) {
 	message := RedactError(errors.New(`send failed to ntfy://user:pass@example.test/topic?token=abc: password=secret`))
 	if strings.Contains(message, "example.test") || strings.Contains(message, "pass@") || strings.Contains(message, "?token=abc") || strings.Contains(message, "=secret") {

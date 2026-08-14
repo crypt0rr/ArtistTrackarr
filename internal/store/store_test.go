@@ -222,7 +222,10 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=24`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("assurance indexes migration marker=%d err=%v", migrationsApplied, err)
 	}
-	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination"} {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=25`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("recovery leases migration marker=%d err=%v", migrationsApplied, err)
+	}
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
 			t.Fatalf("migration index %q missing: %v", indexName, err)

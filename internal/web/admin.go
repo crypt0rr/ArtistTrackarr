@@ -156,7 +156,25 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)
 	fmt.Fprintf(&report, "Running syncs: %d\n", snapshot.RunningSyncs)
 	fmt.Fprintf(&report, "Pending deliveries: %d\n", snapshot.PendingDeliveries)
+	fmt.Fprintf(&report, "Digest backlog: %d\n", snapshot.DigestBacklog)
 	fmt.Fprintf(&report, "Failed deliveries: %d\n", snapshot.FailedDeliveries)
+	fmt.Fprintf(&report, "Stale work claims: %d\n", snapshot.StaleClaims)
+	fmt.Fprintf(&report, "Paused destinations: %d\n", snapshot.PausedDestinations)
+	fmt.Fprintf(&report, "Provider failures: %d\n", snapshot.ProviderFailures)
+	fmt.Fprintf(&report, "Database size: %d bytes\n", snapshot.DatabaseBytes)
+	if snapshot.OldestQueueAt != nil {
+		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", snapshot.OldestQueueAt.Format(time.RFC3339))
+	}
+	if snapshot.LastBackupAt != nil {
+		fmt.Fprintf(&report, "Last backup: %s\n", snapshot.LastBackupAt.Format(time.RFC3339))
+	} else {
+		fmt.Fprintln(&report, "Last backup: not recorded")
+	}
+	if snapshot.LastRestoreAt != nil {
+		fmt.Fprintf(&report, "Last restore rehearsal: %s (%s)\n", snapshot.LastRestoreAt.Format(time.RFC3339), snapshot.LastRestoreResult)
+	} else {
+		fmt.Fprintln(&report, "Last restore rehearsal: not recorded")
+	}
 	fmt.Fprintf(&report, "Application events (24h): %d\n", snapshot.RecentLogEntries)
 	fmt.Fprintf(&report, "Scheduler: %s\n", diagnosticHealthLabel(runner.Running))
 	if runner.LastActivityAt != nil {

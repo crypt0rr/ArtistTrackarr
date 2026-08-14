@@ -43,12 +43,13 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = a.sender.Validate(serviceURL)
 	}
+	storedService := notify.CanonicalTransportService(serviceURL)
 	var encrypted []byte
 	if err == nil {
 		encrypted, err = a.cipher.Encrypt(serviceURL)
 	}
 	if err == nil {
-		err = a.store.AddDestination(r.Context(), session.User.ID, r.FormValue("name"), input.Service, encrypted)
+		err = a.store.AddDestination(r.Context(), session.User.ID, r.FormValue("name"), storedService, encrypted)
 	}
 	if err != nil {
 		d := a.data(r, "Settings")
@@ -67,6 +68,10 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 	id, parseErr := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if parseErr != nil || id < 1 {
 		http.NotFound(w, r)
+		return
+	}
+	if a.destinationTestLimiter != nil && !a.destinationTestLimiter.Allow(fmt.Sprintf("%d|%d", session.User.ID, id)) {
+		rateLimited(w, 900, "destination tests are temporarily rate limited; try again later")
 		return
 	}
 	destination, err := a.store.Destination(r.Context(), session.User.ID, id)
@@ -93,6 +98,10 @@ func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id < 1 {
 		http.NotFound(w, r)
+		return
+	}
+	if a.destinationRetryLimiter != nil && !a.destinationRetryLimiter.Allow(fmt.Sprintf("%d|%d", session.User.ID, id)) {
+		rateLimited(w, 900, "destination retries are temporarily rate limited; try again later")
 		return
 	}
 	count, err := a.store.RetryFailedDeliveries(r.Context(), session.User.ID, id, time.Now().UTC())

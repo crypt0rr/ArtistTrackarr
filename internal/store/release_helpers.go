@@ -750,9 +750,9 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 	// repeated release-day queue run should never turn an already queued event
 	// into a duplicate-delivery error (or duplicate rows).
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(event_id,destination_id,status,next_attempt_at)
-		SELECT ?,d.id,'pending',? FROM destinations d
+		SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
 		LEFT JOIN destination_health dh ON dh.destination_id=d.id
-		WHERE d.user_id=? AND d.enabled=1 AND `+destinationAdmissionPredicate, eventID, timeText(now), userID)
+		WHERE d.user_id=? AND d.enabled=1`, eventID, timeText(now), userID)
 	return err
 }
 

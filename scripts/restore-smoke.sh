@@ -18,7 +18,21 @@ if [ -z "${APP_ENCRYPTION_KEY:-}" ] || [ "${#APP_ENCRYPTION_KEY}" -lt 32 ]; then
 	exit 1
 fi
 
-image=${ARTIST_TRACKARR_IMAGE:-ghcr.io/crypt0rr/artist-trackarr:latest}
+image=${ARTIST_TRACKARR_IMAGE:-}
+if [ -z "$image" ]; then
+	echo "restore: set ARTIST_TRACKARR_IMAGE to an immutable image digest (for example ghcr.io/crypt0rr/artist-trackarr@sha256:...)" >&2
+	exit 1
+fi
+case "$image" in
+	*@sha256:*) ;;
+	*)
+		if [ "${RESTORE_ALLOW_MUTABLE_IMAGE:-false}" != "true" ]; then
+			echo "restore: image must use an immutable @sha256 digest (set RESTORE_ALLOW_MUTABLE_IMAGE=true only for local rehearsal)" >&2
+			exit 1
+		fi
+		echo "restore: warning: mutable image explicitly allowed" >&2
+		;;
+esac
 port=${RESTORE_SMOKE_PORT:-18080}
 volume="artist-trackarr-restore-$$"
 container="artist-trackarr-restore-$$"
@@ -38,18 +52,39 @@ if [ -s "$checksum_path" ]; then
 		sha256sum -c "$(basename -- "$checksum_path")"
 	)
 else
-	echo "restore: checksum sidecar is absent; accepting a legacy archive" >&2
+	if [ "${RESTORE_ALLOW_LEGACY_ARCHIVE:-false}" != "true" ]; then
+		echo "restore: checksum sidecar is required (set RESTORE_ALLOW_LEGACY_ARCHIVE=true only for a legacy archive)" >&2
+		exit 1
+	fi
+	echo "restore: warning: checksum sidecar is absent; accepting an explicitly allowed legacy archive" >&2
 fi
 docker run --rm -v "$volume:/data" -v "$archive_path:/backup/restore.tgz:ro" "$HELPER_IMAGE" \
-	sh -ec 'tar xzf /backup/restore.tgz -C /data; test -s /data/artist-tracker.db; apk add --no-cache sqlite >/dev/null; test -z "$(sqlite3 /data/artist-tracker.db "PRAGMA foreign_key_check;")"'
+	sh -ec 'tar xzf /backup/restore.tgz -C /data; test -s /data/artist-tracker.db; apk add --no-cache sqlite >/dev/null; test "$(sqlite3 /data/artist-tracker.db "PRAGMA integrity_check;")" = ok; test -z "$(sqlite3 /data/artist-tracker.db "PRAGMA foreign_key_check;")"'
 
 state_fingerprint() {
-	docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec '
-		apk add --no-cache sqlite >/dev/null
-		sqlite3 -noheader -separator "|" /data/artist-tracker.db \
-			"SELECT (SELECT count(*) FROM schema_migrations),(SELECT count(*) FROM users),(SELECT count(*) FROM artists),(SELECT count(*) FROM follows),(SELECT count(*) FROM release_groups),(SELECT count(*) FROM destinations);" \
-			| sha256sum | cut -d" " -f1
-	'
+	docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec "
+set -eu
+apk add --no-cache sqlite >/dev/null
+fingerprint_file=\$(mktemp)
+sqlite3 -noheader -separator '|' /data/artist-tracker.db >\"\$fingerprint_file\" <<'SQL'
+-- Fingerprint durable logical state, not runner-owned timestamps, claims,
+-- observations, sessions, or queue status that may legitimately change
+-- while the restored process starts and performs maintenance.
+SELECT 'schema',version FROM schema_migrations ORDER BY version;
+SELECT 'users',id,email,username,password_hash,role,timezone,reminder_time FROM users ORDER BY id;
+SELECT 'artists',id,mbid,name,sort_name,artist_type,country,disambiguation,spotify_id,spotify_url,spotify_image_url FROM artists ORDER BY id;
+SELECT 'follows',user_id,artist_id FROM follows ORDER BY user_id,artist_id;
+SELECT 'releases',id,mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,spotify_url,itunes_url,spotify_id,itunes_id,source,artist_credit_role,itunes_artwork_url FROM release_groups ORDER BY id;
+SELECT 'destinations',id,user_id,name,service,hex(encrypted_url),enabled,transport_status,transport_message FROM destinations ORDER BY id;
+SELECT 'events',id,user_id,release_group_id,event_type,title,body FROM notification_events ORDER BY id;
+SELECT 'prefs',user_id,albums,eps,singles,announcements,release_day,release_digest_enabled,release_digest_frequency,hold_conflicting_notifications FROM notification_preferences ORDER BY user_id;
+SELECT 'genres',artist_id,genre,source FROM artist_genres ORDER BY artist_id,genre,source;
+SELECT 'credits',release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,provider_url,confidence FROM release_credits ORDER BY release_group_id,artist_id,provider,provider_id,role,track_title;
+SQL
+sha256sum \"\$fingerprint_file\" > \"\$fingerprint_file.sha256\"
+fingerprint_hash=\$(cut -d' ' -f1 \"\$fingerprint_file.sha256\")
+printf '%s\\n' "\$fingerprint_hash"
+"
 }
 
 docker run -d --name "$container" --network host -v "$volume:/data" \
@@ -95,4 +130,6 @@ if [ "$before_fingerprint" != "$after_fingerprint" ]; then
 	echo "restore: database state changed across restart" >&2
 	exit 1
 fi
+docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec \
+	'printf "%s\\n%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok" > /data/.artist-trackarr-last-restore && chmod 600 /data/.artist-trackarr-last-restore'
 echo "restore: readiness, foreign-key check, key-preserving startup, and restart persistence passed (state $after_fingerprint)"

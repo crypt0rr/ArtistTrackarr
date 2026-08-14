@@ -9,7 +9,8 @@ build:
 	docker build -t artist-trackarr:local .
 
 run:
-	docker compose up --build
+	$(MAKE) build
+	ARTIST_TRACKARR_IMAGE=artist-trackarr:local docker compose up
 
 fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"

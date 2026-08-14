@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -35,16 +36,6 @@ func (a *App) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	count, err := a.store.UserCount(r.Context())
-	if err != nil {
-		a.logger.Error("setup user count failed", "page", "Create administrator", "path", r.URL.Path, "error", err)
-		http.Error(w, "could not load setup", http.StatusInternalServerError)
-		return
-	}
-	if count > 0 {
-		http.Error(w, "setup has already completed", http.StatusConflict)
-		return
-	}
 	if a.cfg.SetupToken == "" || subtle.ConstantTimeCompare([]byte(r.FormValue("setup_token")), []byte(a.cfg.SetupToken)) != 1 {
 		d := a.data(r, "Create administrator")
 		d.Error = "The setup token is incorrect."
@@ -57,10 +48,14 @@ func (a *App) setup(w http.ResponseWriter, r *http.Request) {
 		if _, supplied := r.Form["username"]; supplied && username == "" {
 			err = store.ErrInvalidUsername
 		} else {
-			_, err = a.store.CreateUser(r.Context(), r.FormValue("email"), hash, "admin", r.FormValue("timezone"), username)
+			_, err = a.store.CreateInitialAdmin(r.Context(), r.FormValue("email"), hash, r.FormValue("timezone"), username)
 		}
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrSetupCompleted) {
+			http.Error(w, "setup has already completed", http.StatusConflict)
+			return
+		}
 		d := a.data(r, "Create administrator")
 		d.Error = err.Error()
 		a.render(w, "setup", d, http.StatusBadRequest)
@@ -190,7 +185,9 @@ func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			a.logger.Warn("password reset failed", "page", "Reset password", "path", r.URL.Path, "error", err)
+			digest := security.Digest(chi.URLParam(r, "token"))
+			a.logger.Warn("password reset failed", "page", "Reset password", "route", "/reset/{token}",
+				"token_fingerprint", fmt.Sprintf("%x", digest[:6]), "error", err)
 		}
 		d := a.data(r, "Reset password")
 		d.Error, d.Token, d.TokenKind = "Reset link is invalid, expired, or already used. Please request a new link.", chi.URLParam(r, "token"), "reset"
