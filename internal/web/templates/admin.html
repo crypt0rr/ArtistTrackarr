@@ -47,6 +47,32 @@
     <button type="button" class="secondary" data-copy data-copy-target="#diagnostic-report">Copy report</button>
   </details>
 </section>
+<section class="panel retention-panel">
+  <div class="section-head"><div><p class="eyebrow">Retention governance</p><h2>Operational history</h2><p>This is a read-only dry run until you explicitly confirm cleanup. Notification events, deliveries, inbox state, blocked work, and delivery-attempt audit records are retained indefinitely for existing accounts; deleting an account still removes its private data.</p></div><span class="badge">Checked {{formatProviderTime .Retention.CheckedAt}}</span></div>
+  <div class="diagnostics-grid">
+    <div><strong>{{.Retention.PrunableApplicationLogs}}</strong><span>application logs eligible ({{.Retention.Policy.ApplicationLogsDays}} days)</span></div>
+    <div><strong>{{.Retention.PrunableTransientSessions}}</strong><span>expired sessions eligible</span></div>
+    <div><strong>{{.Retention.PrunableAuthTokens}}</strong><span>used/expired tokens eligible</span></div>
+    <div><strong>{{.Retention.PrunableLoginAttempts}}</strong><span>old login attempts eligible</span></div>
+    <div><strong>{{.Retention.PrunableManualSyncs}}</strong><span>completed sync requests eligible ({{.Retention.Policy.TransientStateDays}} days)</span></div>
+    <div><strong>{{.Retention.PrunableImportJobs}}</strong><span>old import jobs eligible ({{.Retention.Policy.TransientStateDays}} days)</span></div>
+    <div><strong>{{.Retention.NotificationEvents}}</strong><span>notification events retained</span></div>
+    <div><strong>{{.Retention.Deliveries}}</strong><span>delivery rows retained</span></div>
+    <div><strong>{{.Retention.DeliveryAttempts}}</strong><span>delivery attempts retained</span></div>
+  </div>
+  <details class="diagnostic-details"><summary>Retention policy and history ages</summary>
+    <p>Application logs are kept for {{.Retention.Policy.ApplicationLogsDays}} days. Expired sessions, used tokens, old login attempts, and completed transient work are eligible after {{.Retention.Policy.TransientStateDays}} days (login attempts use a 24-hour safety window). Notification and delivery history has no automatic expiry for existing accounts.</p>
+    {{if .Retention.OldestNotificationEvent}}<small>Oldest notification event: {{formatProviderTime .Retention.OldestNotificationEvent}}</small>{{end}}
+    {{if .Retention.OldestDelivery}}<small>Oldest delivery row: {{formatProviderTime .Retention.OldestDelivery}}</small>{{end}}
+    {{if .Retention.OldestDeliveryAttempt}}<small>Oldest delivery attempt: {{formatProviderTime .Retention.OldestDeliveryAttempt}}</small>{{end}}
+    {{if .Retention.OldestApplicationLog}}<small>Oldest application log: {{formatProviderTime .Retention.OldestApplicationLog}}</small>{{end}}
+  </details>
+  <form method="post" action="/admin/retention/cleanup" class="stack compact retention-cleanup-form">
+    {{template "csrf" .}}
+    <label class="check"><input type="checkbox" name="confirm" value="cleanup" required> I understand this removes only expired/transient operational records and application logs; notification and delivery history will remain.</label>
+    <button class="danger">Run confirmed cleanup</button>
+  </form>
+</section>
 <section class="panel user-admin">
   <div class="section-head"><div><p class="eyebrow">Users</p><h2>Household accounts</h2></div><span class="badge">{{len .AdminUsers}} user{{if ne (len .AdminUsers) 1}}s{{end}}</span></div>
   <p>Deleting an account permanently removes its follows, notification destinations, pending artist identifications, sessions, and delivery history.</p>

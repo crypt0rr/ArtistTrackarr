@@ -571,7 +571,8 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 	} else if reconciled > 0 {
 		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
 	}
-	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-7*24*time.Hour)); err != nil {
+	policy := r.store.RetentionPolicy()
+	if err := r.store.PruneApplicationLogs(ctx, time.Now().UTC().Add(-time.Duration(policy.ApplicationLogsDays)*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
 	}
 	if maintenance, err := r.store.PruneExpiredState(ctx, time.Now().UTC()); err != nil {

@@ -192,8 +192,9 @@ type MaintenanceStats struct {
 }
 
 func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (MaintenanceStats, error) {
+	policy := s.retention()
 	cutoff := now.Add(-24 * time.Hour)
-	manualCutoff := now.Add(-30 * 24 * time.Hour)
+	manualCutoff := now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour)
 	var stats MaintenanceStats
 	statements := []struct {
 		query string

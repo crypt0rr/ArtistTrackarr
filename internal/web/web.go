@@ -118,6 +118,7 @@ type PageData struct {
 	CoveragePageEnd          int
 	AssuranceSummary         store.AssuranceSummary
 	Diagnostics              store.DiagnosticsSnapshot
+	Retention                store.RetentionReport
 	RunnerStatus             jobs.RunnerStatus
 	DiagnosticReport         string
 	EvidenceIssues           []store.EvidenceIssue

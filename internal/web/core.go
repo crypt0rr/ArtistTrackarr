@@ -608,6 +608,7 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/sync/artists/{id}", a.queueArtistSync)
 			admin.Get("/admin/provider-health", a.providerHealth)
 			admin.Get("/admin/diagnostics", a.diagnostics)
+			admin.Post("/admin/retention/cleanup", a.cleanupRetention)
 		})
 	})
 	return r

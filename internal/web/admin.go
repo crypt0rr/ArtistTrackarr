@@ -123,6 +123,8 @@ func (a *App) adminData(r *http.Request) PageData {
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
 	d.Diagnostics, err = a.store.Diagnostics(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "system diagnostics", err) || failed
+	d.Retention, err = a.store.RetentionReport(r.Context(), time.Now().UTC())
+	failed = a.pageStoreError(r, &d, "Household administration", "retention report", err) || failed
 	if a.jobs != nil {
 		d.RunnerStatus = a.jobs.Status()
 	}
@@ -144,6 +146,25 @@ func (a *App) adminData(r *http.Request) PageData {
 		d.AdminNextPage = page + 1
 	}
 	return d
+}
+
+func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(r.FormValue("confirm")) != "cleanup" {
+		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Cleanup was not confirmed; no records were removed."), http.StatusSeeOther)
+		return
+	}
+	stats, err := a.store.CleanupRetention(r.Context(), time.Now().UTC())
+	if err != nil {
+		a.logger.Error("retention cleanup failed", "path", r.URL.Path, "error", err)
+		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Retention cleanup could not be completed."), http.StatusSeeOther)
+		return
+	}
+	removed := stats.ApplicationLogs + stats.Sessions + stats.AuthTokens + stats.LoginAttempts + stats.ManualSyncs + stats.ImportJobs
+	a.logger.Info("retention cleanup completed", "removed", removed,
+		"application_logs", stats.ApplicationLogs, "sessions", stats.Sessions,
+		"auth_tokens", stats.AuthTokens, "login_attempts", stats.LoginAttempts,
+		"manual_syncs", stats.ManualSyncs, "import_jobs", stats.ImportJobs)
+	http.Redirect(w, r, "/admin?message="+url.QueryEscape(fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)), http.StatusSeeOther)
 }
 
 func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus) string {

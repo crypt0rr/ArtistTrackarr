@@ -380,6 +380,12 @@ func TestAdminInvitationAndResetRoutes(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("admin retry queue status=%d", response.StatusCode)
 	}
+	response = postForm(t, client, server.URL+"/admin/retention/cleanup", url.Values{"_csrf": {csrf}})
+	cleanupBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(cleanupBody), "Cleanup was not confirmed") {
+		t.Fatalf("unconfirmed retention cleanup status/body=%d %q", response.StatusCode, cleanupBody)
+	}
 	csrf = getCSRF(t, client, server.URL+"/admin")
 	response = postForm(t, client, server.URL+"/admin/sync/artists/"+strconv.FormatInt(artist.ID, 10), url.Values{"_csrf": {csrf}})
 	_ = response.Body.Close()
