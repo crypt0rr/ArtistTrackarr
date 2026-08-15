@@ -2,6 +2,7 @@ package web
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
 	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +92,253 @@ func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner)); err != nil {
 		a.logger.Debug("system diagnostics response interrupted", "error", err)
 	}
+}
+
+// diagnosticsJSON exposes the same redacted operational view as the support
+// report, but in a stable machine-readable shape for household monitoring.
+// It is deliberately admin-only and contains no provider error text,
+// destination URLs, credentials, or notification bodies.
+func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	snapshot, err := a.store.Diagnostics(r.Context())
+	if err != nil {
+		a.logger.Error("system diagnostics JSON failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
+		return
+	}
+	retention, err := a.store.RetentionReport(r.Context(), now)
+	if err != nil {
+		a.logger.Error("retention diagnostics JSON failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
+		return
+	}
+	var runner jobs.RunnerStatus
+	if a.jobs != nil {
+		runner = a.jobs.Status()
+	}
+	runnerState := "unknown"
+	if a.jobs != nil {
+		runnerState = "stopped"
+		if runner.Running {
+			runnerState = "running"
+		}
+	}
+	status, reasons := store.OperationalStatus(snapshot, runnerState, now)
+	payload := diagnosticsJSONPayload{
+		Version:            version.Current,
+		GeneratedAt:        now,
+		CheckedAt:          snapshot.CheckedAt,
+		OperationalStatus:  status,
+		OperationalReasons: reasons,
+		Database: diagnosticsJSONDatabase{
+			Healthy:       snapshot.DatabaseHealthy,
+			Schema:        snapshot.SchemaVersion,
+			SizeBytes:     snapshot.DatabaseBytes,
+			LastBackupAt:  snapshot.LastBackupAt,
+			LastRestoreAt: snapshot.LastRestoreAt,
+			RestoreResult: snapshot.LastRestoreResult,
+		},
+		Inventory: diagnosticsJSONInventory{
+			FollowedArtists:  snapshot.FollowedArtists,
+			Releases:         snapshot.Releases,
+			RecentLogEntries: snapshot.RecentLogEntries,
+			ProviderFailures: snapshot.ProviderFailures,
+		},
+		Queue: diagnosticsJSONQueue{
+			QueuedSyncs:       snapshot.QueuedSyncs,
+			RunningSyncs:      snapshot.RunningSyncs,
+			PendingDeliveries: snapshot.PendingDeliveries,
+			FailedDeliveries:  snapshot.FailedDeliveries,
+			DigestBacklog:     snapshot.DigestBacklog,
+			OldestQueueAt:     snapshot.OldestQueueAt,
+			StaleClaims:       snapshot.StaleClaims,
+		},
+		Destinations: diagnosticsJSONDestinations{
+			Paused: snapshot.PausedDestinations,
+		},
+		Providers: make([]diagnosticsJSONProvider, 0, len(snapshot.Providers)),
+		Retention: diagnosticsJSONRetention{
+			CheckedAt:               retention.CheckedAt,
+			HistoryReviewDue:        retention.HistoryReviewDue,
+			HistoryAgeDays:          retention.HistoryAgeDays,
+			HistoryReviewDays:       retention.Policy.HistoryReviewDays,
+			NotificationEvents:      retention.NotificationEvents,
+			Deliveries:              retention.Deliveries,
+			DeliveryAttempts:        retention.DeliveryAttempts,
+			PrunableApplicationLogs: retention.PrunableApplicationLogs,
+			PrunableTransientRows:   retention.PrunableTransientSessions + retention.PrunableAuthTokens + retention.PrunableLoginAttempts + retention.PrunableManualSyncs + retention.PrunableImportJobs,
+		},
+		Runner: diagnosticsJSONRunner{
+			State:                    runnerState,
+			LastActivityAt:           runner.LastActivityAt,
+			WakeSignals:              runner.Metrics.WakeSignals,
+			TaskOverlaps:             runner.Metrics.TaskOverlaps,
+			TaskPanics:               runner.Metrics.TaskPanics,
+			SyncRuns:                 runner.Metrics.SyncRuns,
+			SyncDue:                  runner.Metrics.SyncDue,
+			SyncSucceeded:            runner.Metrics.SyncSucceeded,
+			SyncFailed:               runner.Metrics.SyncFailed,
+			ResolutionRuns:           runner.Metrics.ResolutionRuns,
+			ResolutionItems:          runner.Metrics.ResolutionItems,
+			ReleaseDayRuns:           runner.Metrics.ReleaseDayRuns,
+			MaintenanceRuns:          runner.Metrics.MaintenanceRuns,
+			DeliveryBatches:          runner.Metrics.DeliveryBatches,
+			DeliveryAttempted:        runner.Metrics.DeliveryAttempted,
+			DeliverySent:             runner.Metrics.DeliverySent,
+			DeliveryFailed:           runner.Metrics.DeliveryFailed,
+			SpotifyCooldownSkips:     runner.Metrics.SpotifyCooldownSkips,
+			ITunesCooldownSkips:      runner.Metrics.ITunesCooldownSkips,
+			MusicBrainzCooldownSkips: runner.Metrics.MusicBrainzCooldownSkips,
+		},
+	}
+	for _, provider := range snapshot.Providers {
+		payload.Providers = append(payload.Providers, diagnosticsJSONProvider{
+			Name:        provider.Provider,
+			Status:      provider.Status,
+			NextCheckAt: provider.NextCheckAt,
+		})
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		a.logger.Debug("system diagnostics JSON response interrupted", "error", err)
+	}
+}
+
+type diagnosticsJSONPayload struct {
+	Version            string                      `json:"version"`
+	GeneratedAt        time.Time                   `json:"generated_at"`
+	CheckedAt          time.Time                   `json:"checked_at"`
+	OperationalStatus  string                      `json:"operational_status"`
+	OperationalReasons []string                    `json:"operational_reasons,omitempty"`
+	Database           diagnosticsJSONDatabase     `json:"database"`
+	Inventory          diagnosticsJSONInventory    `json:"inventory"`
+	Queue              diagnosticsJSONQueue        `json:"queue"`
+	Destinations       diagnosticsJSONDestinations `json:"destinations"`
+	Providers          []diagnosticsJSONProvider   `json:"providers"`
+	Retention          diagnosticsJSONRetention    `json:"retention"`
+	Runner             diagnosticsJSONRunner       `json:"runner"`
+}
+
+type diagnosticsJSONDatabase struct {
+	Healthy       bool       `json:"healthy"`
+	Schema        int        `json:"schema"`
+	SizeBytes     int64      `json:"size_bytes"`
+	LastBackupAt  *time.Time `json:"last_backup_at,omitempty"`
+	LastRestoreAt *time.Time `json:"last_restore_at,omitempty"`
+	RestoreResult string     `json:"restore_result,omitempty"`
+}
+
+type diagnosticsJSONQueue struct {
+	QueuedSyncs       int        `json:"queued_syncs"`
+	RunningSyncs      int        `json:"running_syncs"`
+	PendingDeliveries int        `json:"pending_deliveries"`
+	FailedDeliveries  int        `json:"failed_deliveries"`
+	DigestBacklog     int        `json:"digest_backlog"`
+	OldestQueueAt     *time.Time `json:"oldest_queue_at,omitempty"`
+	StaleClaims       int        `json:"stale_claims"`
+}
+
+type diagnosticsJSONInventory struct {
+	FollowedArtists  int `json:"followed_artists"`
+	Releases         int `json:"releases"`
+	RecentLogEntries int `json:"recent_log_entries"`
+	ProviderFailures int `json:"provider_failures"`
+}
+
+type diagnosticsJSONDestinations struct {
+	Paused int `json:"paused"`
+}
+
+type diagnosticsJSONProvider struct {
+	Name        string     `json:"name"`
+	Status      string     `json:"status"`
+	NextCheckAt *time.Time `json:"next_check_at,omitempty"`
+}
+
+type diagnosticsJSONRetention struct {
+	CheckedAt               time.Time `json:"checked_at"`
+	HistoryReviewDue        bool      `json:"history_review_due"`
+	HistoryAgeDays          int       `json:"history_age_days"`
+	HistoryReviewDays       int       `json:"history_review_days"`
+	NotificationEvents      int64     `json:"notification_events"`
+	Deliveries              int64     `json:"deliveries"`
+	DeliveryAttempts        int64     `json:"delivery_attempts"`
+	PrunableApplicationLogs int64     `json:"prunable_application_logs"`
+	PrunableTransientRows   int64     `json:"prunable_transient_rows"`
+}
+
+type diagnosticsJSONRunner struct {
+	State                    string     `json:"state"`
+	LastActivityAt           *time.Time `json:"last_activity_at,omitempty"`
+	WakeSignals              uint64     `json:"wake_signals"`
+	TaskOverlaps             uint64     `json:"task_overlaps"`
+	TaskPanics               uint64     `json:"task_panics"`
+	SyncRuns                 uint64     `json:"sync_runs"`
+	SyncDue                  uint64     `json:"sync_due"`
+	SyncSucceeded            uint64     `json:"sync_succeeded"`
+	SyncFailed               uint64     `json:"sync_failed"`
+	ResolutionRuns           uint64     `json:"resolution_runs"`
+	ResolutionItems          uint64     `json:"resolution_items"`
+	ReleaseDayRuns           uint64     `json:"release_day_runs"`
+	MaintenanceRuns          uint64     `json:"maintenance_runs"`
+	DeliveryBatches          uint64     `json:"delivery_batches"`
+	DeliveryAttempted        uint64     `json:"delivery_attempted"`
+	DeliverySent             uint64     `json:"delivery_sent"`
+	DeliveryFailed           uint64     `json:"delivery_failed"`
+	SpotifyCooldownSkips     uint64     `json:"spotify_cooldown_skips"`
+	ITunesCooldownSkips      uint64     `json:"itunes_cooldown_skips"`
+	MusicBrainzCooldownSkips uint64     `json:"musicbrainz_cooldown_skips"`
+}
+
+func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request) {
+	const pageSize = 500
+	if _, err := a.store.AdminDeliveryHistoryCount(r.Context()); err != nil {
+		a.logger.Error("delivery audit export preflight failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-delivery-audit.csv"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at"}); err != nil {
+		a.logger.Debug("write delivery audit header failed", "error", err)
+		return
+	}
+	for offset := 0; ; offset += pageSize {
+		rows, err := a.store.AdminDeliveryHistory(r.Context(), pageSize, offset)
+		if err != nil {
+			a.logger.Error("delivery audit export lookup failed", "path", r.URL.Path, "offset", offset, "error", err)
+			return
+		}
+		for _, item := range rows {
+			row := []string{
+				strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
+				item.EventType, item.Destination, item.Service, item.Status,
+				strconv.Itoa(item.Attempts), item.LastError,
+				item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt),
+			}
+			if err := writer.Write(neutralizeCSVRow(row)); err != nil {
+				a.logger.Debug("write delivery audit row failed", "error", err)
+				return
+			}
+		}
+		if len(rows) < pageSize {
+			break
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		a.logger.Warn("write delivery audit export failed", "error", err)
+	}
+}
+
+func formatNullableTime(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 func (a *App) adminData(r *http.Request) PageData {
 	const pageSize = 50

@@ -19,7 +19,7 @@
 <form method="post" action="/admin/reset" class="stack">{{template "csrf" .}}<label>Member email<input name="email" type="email" required></label><button>Create reset link</button></form></section>
 </div>
 <section class="panel diagnostics-panel">
-  <div class="section-head"><div><p class="eyebrow">Release assurance</p><h2>System diagnostics</h2><p>Safe counters and scheduler state help troubleshoot a missed sync without exposing credentials or notification content.</p></div><div class="section-actions"><span class="badge {{operationalStatusClass .OperationalStatus}}">{{operationalStatusLabel .OperationalStatus}}</span><a class="button secondary" href="/admin/diagnostics">Open report</a></div></div>
+  <div class="section-head"><div><p class="eyebrow">Release assurance</p><h2>System diagnostics</h2><p>Safe counters and scheduler state help troubleshoot a missed sync without exposing credentials or notification content.</p></div><div class="section-actions"><span class="badge {{operationalStatusClass .OperationalStatus}}">{{operationalStatusLabel .OperationalStatus}}</span><a class="button secondary" href="/admin/diagnostics">Open report</a><a class="button secondary" href="/admin/diagnostics.json">JSON</a></div></div>
   {{if .OperationalReasons}}<p class="diagnostic-warning"><strong>Needs attention:</strong> {{join .OperationalReasons ", "}}. The database remains available; resolve these conditions before treating the household as fully healthy.</p>{{end}}
   <div class="diagnostics-grid">
     <div><strong>{{if .Diagnostics.DatabaseHealthy}}Healthy{{else}}Unavailable{{end}}</strong><span>database · schema {{.Diagnostics.SchemaVersion}}</span></div>
@@ -73,6 +73,8 @@
     {{if .Retention.OldestDeliveryAttempt}}<small>Oldest delivery attempt: {{formatProviderTime .Retention.OldestDeliveryAttempt}}</small>{{end}}
     {{if .Retention.OldestApplicationLog}}<small>Oldest application log: {{formatProviderTime .Retention.OldestApplicationLog}}</small>{{end}}
   </details>
+  <p class="retention-export-note">Before changing any future history policy, download the delivery-audit export or use the complete encrypted database backup. The CSV includes notification text, but never destination credentials or encrypted URLs.</p>
+  <p><a class="button secondary" href="/admin/retention/export">Download delivery audit CSV</a></p>
   <form method="post" action="/admin/retention/cleanup" class="stack compact retention-cleanup-form">
     {{template "csrf" .}}
     <label class="check"><input type="checkbox" name="confirm" value="cleanup" required> I understand this removes only expired/transient operational records and application logs; notification and delivery history will remain.</label>

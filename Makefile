@@ -1,4 +1,5 @@
 COVERAGE_MIN ?= 80.0
+GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
 .PHONY: test build run fmt-check tooling-check version-check lint vuln coverage quality
 
@@ -37,10 +38,10 @@ tooling-check:
 	fi
 
 lint:
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 
 vuln:
-	go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 coverage:
 	go test ./internal/... -p 1 -count=1 -coverprofile=coverage.out
