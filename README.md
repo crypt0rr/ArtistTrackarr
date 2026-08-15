@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.44.0`; release images display the injected
+footer. The current release is `v0.45.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -145,6 +145,15 @@ readiness while exposing `X-ArtistTrackarr-Operational` and
 `X-ArtistTrackarr-Operational-Reason` headers when background work is degraded;
 a provider cooldown or overdue backup does not cause a restart loop.
 
+The v0.45.0 operations release adds an administrator-only machine-readable
+diagnostics document at `/admin/diagnostics.json`. It contains bounded queue,
+provider, runner, database, and retention counters without credentials,
+destination URLs, provider error text, or notification bodies. The admin page
+also offers a paginated, CSV-safe delivery-audit export before any future
+history policy is considered. The export contains notification text and should
+be handled as confidential household data; a complete encrypted database
+backup remains the authoritative recovery archive.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -226,7 +235,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.44.0` publishes `0.44.0`, `0.44`, and `latest`.
+- Pushing a tag such as `v0.45.0` publishes `0.45.0`, `0.45`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -240,7 +249,7 @@ language/runtime line.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.44.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.45.0 docker compose up -d
 ```
 
 ## Configuration
@@ -401,6 +410,9 @@ The administrator page marks a retention review when the oldest notification or
 delivery history reaches 365 days. This is a review recommendation only: no
 user-facing history is deleted automatically, and any future cleanup policy
 must be approved against the household's recovery and audit requirements first.
+Administrators can download the delivery-audit CSV from the same page to support
+an export-before-delete workflow. The export neutralizes formula-leading cells
+and never includes encrypted destination URLs.
 
 Users can choose whether albums, EPs, singles, announcements, and release-day
 reminders should be delivered. Followed artists show their last and next
