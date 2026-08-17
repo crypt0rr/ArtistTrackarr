@@ -107,6 +107,101 @@ func drainNotificationHoldsTx(ctx context.Context, tx *sql.Tx, userID, releaseID
 	return nil
 }
 
+// ensureApprovedReleaseNotificationTx makes an explicit review actionable
+// even when the provider conflict was discovered after the original event
+// would have been queued. Existing events and explicit discard decisions win;
+// otherwise the event is rebuilt through the normal preference and follow-rule
+// admission path, bypassing only the conflict hold itself.
+func ensureApprovedReleaseNotificationTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, now time.Time, bypassBlocking bool) error {
+	var exists int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_events
+		WHERE user_id=? AND release_group_id=? LIMIT 1`, userID, releaseID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// A member who explicitly discarded a held notification must not receive a
+	// later approval-created copy of that same release.
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM notification_holds
+		WHERE user_id=? AND release_group_id=? AND status='discarded' LIMIT 1`, userID, releaseID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM release_groups rg
+		WHERE rg.id=? AND `+followedReleasePredicate("?")+` LIMIT 1`, releaseID, userID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if !bypassBlocking {
+		var blocking int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_evidence_issues
+			WHERE release_group_id=? AND status='open' AND severity IN ('warning','critical')`, releaseID).Scan(&blocking); err != nil {
+			return err
+		}
+		if blocking > 0 {
+			return nil
+		}
+	}
+
+	release, err := releaseByIDTx(ctx, tx, releaseID)
+	if err != nil {
+		return err
+	}
+	var timezone string
+	if err := tx.QueryRowContext(ctx, `SELECT timezone FROM users WHERE id=?`, userID).Scan(&timezone); err != nil {
+		return err
+	}
+	location, err := time.LoadLocation(strings.TrimSpace(timezone))
+	if err != nil {
+		location = time.UTC
+	}
+	localNow := now.In(location)
+	eventType := "announcement"
+	releaseDateValue := strings.TrimSpace(release.FirstReleaseDate)
+	precision := release.DatePrecision
+	if precision < 1 || precision > 3 {
+		switch len(releaseDateValue) {
+		case 4:
+			precision = 1
+		case 7:
+			precision = 2
+		case 10:
+			precision = 3
+		default:
+			return nil
+		}
+	}
+	switch precision {
+	case 1:
+		if _, valid := comparableReleaseDate(releaseDateValue); !valid || len(releaseDateValue) != 4 {
+			return nil
+		}
+	case 2:
+		if _, valid := comparableReleaseDate(releaseDateValue); !valid || len(releaseDateValue) != 7 {
+			return nil
+		}
+	case 3:
+		date, valid := releaseDate(releaseDateValue)
+		if !valid {
+			return nil
+		}
+		if date.Format("2006-01-02") == localNow.Format("2006-01-02") {
+			eventType = "release_day"
+		}
+	default:
+		return nil
+	}
+	title, body := initialReleaseMessage(Artist{ID: release.ArtistID, Name: release.ArtistName}, release, eventType, now.UTC())
+	return enqueueApprovedEventTx(ctx, tx, userID, releaseID, eventType, title, body, now.UTC())
+}
+
 // NotificationHolds returns pending holds for one household member.
 func (s *Store) NotificationHolds(ctx context.Context, userID int64, limit int) ([]NotificationHold, error) {
 	if limit < 1 {

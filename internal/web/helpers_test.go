@@ -138,6 +138,9 @@ func TestPageFilterAndURLHelpers(t *testing.T) {
 	if got := inboxPageURL("", "", "", 2); got != "/inbox?page=2" {
 		t.Fatalf("paged inbox URL=%q", got)
 	}
+	if got := inboxReadRedirect("/inbox?state=unread&source=spotify&type=album&page=4"); got != "/inbox?source=spotify&state=unread&type=album" {
+		t.Fatalf("inbox read redirect=%q", got)
+	}
 	if got := evidenceIssuePageURL("confirmed", "read", "date", "high", 2); !strings.Contains(got, "status=confirmed") || !strings.Contains(got, "page=2") {
 		t.Fatalf("evidence URL=%q", got)
 	}

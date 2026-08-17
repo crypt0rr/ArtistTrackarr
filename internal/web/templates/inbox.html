@@ -10,7 +10,7 @@
     <label>Type<select name="type"><option value=""{{if eq .InboxType ""}} selected{{end}}>All types</option><option value="album"{{if eq .InboxType "album"}} selected{{end}}>Albums</option><option value="ep"{{if eq .InboxType "ep"}} selected{{end}}>EPs</option><option value="single"{{if eq .InboxType "single"}} selected{{end}}>Singles</option></select></label>
     <button class="secondary">Apply filters</button>
   </form>
-  <div class="section-head inbox-list-head"><div><p class="eyebrow">Activity</p><h2>{{if .InboxCount}}{{.InboxPageStart}}–{{.InboxPageEnd}} of {{.InboxCount}}{{else}}No releases{{end}}</h2></div><a href="/" class="button-link">Back to dashboard</a></div>
+  <div class="section-head inbox-list-head"><div><p class="eyebrow">Activity</p><h2>{{if .InboxCount}}{{.InboxPageStart}}–{{.InboxPageEnd}} of {{.InboxCount}}{{else}}No releases{{end}}</h2><p class="muted">In the default view, unread releases appear first. Marking one read returns you to the next unread item.</p></div><a href="/" class="button-link">Back to dashboard</a></div>
   {{if .InboxItems}}<div class="inbox-list">
     {{range .InboxItems}}<article class="inbox-item inbox-{{.State}}">
       <div class="inbox-item-main">

@@ -128,3 +128,55 @@ func TestReleaseInboxSnoozeExpires(t *testing.T) {
 		t.Fatalf("expired snooze count=%d err=%v", count, err)
 	}
 }
+
+func TestReleaseInboxOrdersUnreadAndExpiredSnoozesFirst(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "inbox-order@example.com", "hash", "member", "UTC", "inbox-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "inbox-order-artist", Name: "Inbox Order Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	insertRelease := func(mbid, title string, created time.Time) int64 {
+		t.Helper()
+		result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at,source)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, mbid, artist.ID, title, "Album", "[]", "2026-08-01", 3,
+			"https://musicbrainz.org/release-group/"+mbid, timeText(created), timeText(created), "spotify")
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at)
+			VALUES(?,?,?,?,?,?)`, userID, releaseID, "announcement", title, "body", timeText(created)); err != nil {
+			t.Fatal(err)
+		}
+		return releaseID
+	}
+	readID := insertRelease("inbox-order-read", "Newest read", now)
+	unreadID := insertRelease("inbox-order-unread", "Older unread", now.Add(-time.Hour))
+	if err := s.SetReleaseInboxState(ctx, userID, readID, "read", nil); err != nil {
+		t.Fatal(err)
+	}
+	expiredID := insertRelease("inbox-order-expired", "Expired snooze", now.Add(-2*time.Hour))
+	if err := s.SetReleaseInboxState(ctx, userID, expiredID, "snoozed", ptrTime(now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.ReleaseInbox(ctx, userID, "", "", "", 20, 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 || items[0].ID != unreadID || items[0].State != "unread" || items[1].ID != expiredID || items[1].State != "unread" || items[2].ID != readID || items[2].State != "read" {
+		t.Fatalf("inbox order=%+v", items)
+	}
+}

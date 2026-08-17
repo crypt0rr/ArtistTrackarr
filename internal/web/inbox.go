@@ -148,10 +148,31 @@ func (a *App) inboxStateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redirect := localReturnPath(r.FormValue("return"), "/inbox", "/inbox")
+	if state == "read" {
+		redirect = inboxReadRedirect(redirect)
+	}
 	separator := "?"
 	if strings.Contains(redirect, "?") {
 		separator = "&"
 	}
 	message := url.QueryEscape("Release inbox updated")
 	http.Redirect(w, r, redirect+separator+"message="+message, http.StatusSeeOther)
+}
+
+// inboxReadRedirect returns the first page while preserving any explicit
+// source/type/state filters. This keeps the next unread item at the top after
+// a member marks the current item read.
+func inboxReadRedirect(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Path != "/inbox" {
+		return "/inbox"
+	}
+	query := parsed.Query()
+	query.Del("page")
+	parsed.RawQuery = query.Encode()
+	parsed.Fragment = ""
+	if parsed.RawQuery == "" {
+		return parsed.Path
+	}
+	return parsed.Path + "?" + parsed.RawQuery
 }
