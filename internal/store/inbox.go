@@ -66,10 +66,12 @@ func (s *Store) ReleaseInbox(ctx context.Context, userID int64, state, source, p
 	}
 	where, filterArgs := releaseInboxFilters(state, source, primaryType, now.UTC())
 	query := `SELECT ` + releaseSelectColumns + `,e.event_type,e.title,e.created_at,COALESCE(s.state,'unread'),s.snoozed_until` +
-		releaseInboxFrom + where + ` ORDER BY e.created_at DESC,e.id DESC LIMIT ? OFFSET ?`
+		releaseInboxFrom + where + ` ORDER BY CASE WHEN s.state IS NULL OR s.state='unread' OR
+		(s.state='snoozed' AND (s.snoozed_until IS NULL OR s.snoozed_until<=?)) THEN 0 ELSE 1 END,
+		e.created_at DESC,e.id DESC LIMIT ? OFFSET ?`
 	args := []any{userID, userID}
 	args = append(args, filterArgs...)
-	args = append(args, limit, offset)
+	args = append(args, timeText(now.UTC()), limit, offset)
 	rows, err := s.readerDB().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -92,6 +94,9 @@ func (s *Store) ReleaseInbox(ctx context.Context, userID int64, state, source, p
 		item.SnoozedUntil, err = parseStoredNullableTime(snoozed, "inbox snoozed_until")
 		if err != nil {
 			return nil, err
+		}
+		if item.State == "snoozed" && item.SnoozedUntil != nil && !item.SnoozedUntil.After(now.UTC()) {
+			item.State = "unread"
 		}
 		result = append(result, item)
 	}

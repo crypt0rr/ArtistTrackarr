@@ -56,6 +56,23 @@ func TestReleaseTruthDecisionIsOwnerScopedAndReversible(t *testing.T) {
 	if err := s.SetReleaseTruthDecision(ctx, userID, releaseID, "itunes", "Apple listing has the clearest date"); err != nil {
 		t.Fatal(err)
 	}
+	var eventType string
+	if err := s.DB.QueryRowContext(ctx, `SELECT event_type FROM notification_events WHERE user_id=? AND release_group_id=?`, userID, releaseID).Scan(&eventType); err != nil {
+		t.Fatal(err)
+	}
+	if eventType != "announcement" {
+		t.Fatalf("approval catch-up event type=%q, want announcement", eventType)
+	}
+	if err := s.SetReleaseTruthDecision(ctx, userID, releaseID, "itunes", "approval repeated"); err != nil {
+		t.Fatal(err)
+	}
+	var eventCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events WHERE user_id=? AND release_group_id=?`, userID, releaseID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("repeated approval created %d events, want one", eventCount)
+	}
 	detail, err = s.ReleaseDetail(ctx, userID, releaseID)
 	if err != nil {
 		t.Fatal(err)

@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.45.0`; release images display the injected
+footer. The current release is `v0.46.0`; release images display the injected
 semantic version while local builds identify themselves as `dev`. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -145,7 +145,13 @@ readiness while exposing `X-ArtistTrackarr-Operational` and
 `X-ArtistTrackarr-Operational-Reason` headers when background work is degraded;
 a provider cooldown or overdue backup does not cause a restart loop.
 
-The v0.45.0 operations release adds an administrator-only machine-readable
+The v0.46.0 approval catch-up release ensures an explicit provider or evidence
+approval creates one owner-scoped inbox event and delivery when no earlier
+notification hold existed. It preserves discarded holds, waits for all blocking
+evidence issues to resolve, and orders the default inbox with unread releases
+first; marking an item read returns to the first page so the next unread item
+is immediately visible. The v0.45.0 operations release adds an
+administrator-only machine-readable
 diagnostics document at `/admin/diagnostics.json`. It contains bounded queue,
 provider, runner, database, and retention counters without credentials,
 destination URLs, provider error text, or notification bodies. The admin page
@@ -235,7 +241,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.45.0` publishes `0.45.0`, `0.45`, and `latest`.
+- Pushing a tag such as `v0.46.0` publishes `0.46.0`, `0.46`, and `latest`.
 
 Release images receive their version through the Docker build's `APP_VERSION`
 argument. Tag builds inject the semantic tag (without the leading `v`), while
@@ -249,7 +255,7 @@ language/runtime line.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.45.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.0 docker compose up -d
 ```
 
 ## Configuration

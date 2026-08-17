@@ -657,6 +657,18 @@ func comparableReleaseDate(value string) (time.Time, bool) {
 	return parsed, err == nil
 }
 func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
+	return enqueueEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, false)
+}
+
+// enqueueApprovedEventTx queues an event after an explicit evidence/truth
+// approval. It follows the same owner, preference, follow-rule, and delivery
+// admission checks as normal events, but bypasses only the conflict-hold gate
+// that the approval is intended to resolve.
+func enqueueApprovedEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
+	return enqueueEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true)
+}
+
+func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
 	var p NotificationPreferences
 	var albums, eps, singles, announcements, releaseDay, holdConflicts int
 	var primary, role, mode string
@@ -701,7 +713,7 @@ func enqueueEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, ev
 	if err != nil {
 		return err
 	}
-	if p.HoldConflictingNotifications && rule.queuesImmediate(now) {
+	if p.HoldConflictingNotifications && rule.queuesImmediate(now) && !bypassConflictHold {
 		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
 			return err
 		}

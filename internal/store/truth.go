@@ -19,7 +19,9 @@ var (
 // SetReleaseTruthDecision records a household-scoped, reversible source choice
 // after verifying that the caller follows the release's artist.
 // The decision is deliberately separate from release_groups and provider
-// observations so it cannot rewrite canonical data or affect notifications.
+// observations so it cannot rewrite canonical data. An explicit confirmation
+// may release or create this member's notification after normal admission
+// rules are applied.
 func (s *Store) SetReleaseTruthDecision(ctx context.Context, userID, releaseID int64, provider, reason string) error {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider != "spotify" && provider != "itunes" && provider != "musicbrainz" {
@@ -65,7 +67,11 @@ func (s *Store) SetReleaseTruthDecision(ctx context.Context, userID, releaseID i
 	// Confirming a provider is an explicit review decision, so release any
 	// notification that was held for this member even if another observation
 	// remains present for audit purposes.
-	if err := drainNotificationHoldsTx(ctx, tx, userID, releaseID, time.Now().UTC()); err != nil {
+	nowTime := time.Now().UTC()
+	if err := drainNotificationHoldsTx(ctx, tx, userID, releaseID, nowTime); err != nil {
+		return err
+	}
+	if err := ensureApprovedReleaseNotificationTx(ctx, tx, userID, releaseID, nowTime, true); err != nil {
 		return err
 	}
 	return tx.Commit()
