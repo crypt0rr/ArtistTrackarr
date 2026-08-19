@@ -584,6 +584,9 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
 			"import_jobs", maintenance.ImportJobs)
 	}
+	if err := r.store.Optimize(ctx); err != nil {
+		r.logger.Debug("SQLite query optimization failed", "error", err)
+	}
 	if r.artwork != nil {
 		stats, err := r.artwork.Prune(ctx, artwork.DefaultMaxCacheBytes, artwork.DefaultMaxCacheFiles)
 		if err != nil {

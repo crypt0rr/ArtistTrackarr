@@ -39,6 +39,35 @@ func TestStoreUsesWriterAndReadOnlyPool(t *testing.T) {
 	}
 }
 
+func TestHotPathIndexesAreUsedByDateAndAuditQueries(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	assertPlanUses := func(query, index string) {
+		t.Helper()
+		rows, err := s.DB.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id, parent, notUsed int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(detail, index) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("query plan did not use %s for %s", index, query)
+	}
+	assertPlanUses(`SELECT id FROM release_groups WHERE date_precision=3 AND first_release_date BETWEEN '2026-01-01' AND '2026-12-31'`, "release_groups_precision_date")
+	assertPlanUses(`SELECT id FROM notification_events ORDER BY created_at DESC,id DESC LIMIT 50`, "notification_events_created_id")
+}
+
 func TestStoreConcurrentReadsDuringWrites(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -322,7 +351,10 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=28`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("iTunes artist identity migration marker=%d err=%v", migrationsApplied, err)
 	}
-	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id"} {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=29`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("hot path indexes migration marker=%d err=%v", migrationsApplied, err)
+	}
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
 			t.Fatalf("migration index %q missing: %v", indexName, err)

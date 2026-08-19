@@ -107,6 +107,14 @@ func (s *Store) PruneApplicationLogs(ctx context.Context, before time.Time) erro
 	_, err := s.execWriteContext(ctx, `DELETE FROM application_logs WHERE created_at < ?`, timeText(before))
 	return err
 }
+
+// Optimize refreshes SQLite's lightweight query-planner statistics. It is
+// deliberately run by hourly maintenance on the serialized writer so it
+// cannot contend with read-only dashboard connections or race a schema write.
+func (s *Store) Optimize(ctx context.Context) error {
+	_, err := s.DB.ExecContext(ctx, `PRAGMA optimize`)
+	return err
+}
 func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope string, artistID *int64) (ManualSyncRequest, error) {
 	if scope != "artist" && scope != "retry" {
 		return ManualSyncRequest{}, errors.New("invalid sync scope")
