@@ -439,6 +439,58 @@ func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 	}
 }
 
+func TestSaveImportRowPreservesSharedArtistIdentityOnConflict(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	ownerID, err := s.CreateUser(ctx, "identity-owner@example.com", "hash", "member", "UTC", "identity-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := s.CreateUser(ctx, "identity-other@example.com", "hash", "member", "UTC", "identity-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerJob, err := s.CreateImportJob(ctx, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJob, err := s.CreateImportJob(ctx, otherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "22222222-2222-4222-8222-222222222222"
+	original := ImportInput{
+		SourceValue: "https://musicbrainz.org/artist/" + mbid,
+		DisplayName: "Canonical Artist",
+		MBID:        mbid,
+		MBURL:       "https://musicbrainz.org/artist/" + mbid,
+		SpotifyID:   "0OdUWJ0sBjDrqHygGUXeCF",
+		SpotifyURL:  "https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF",
+	}
+	if _, err := s.SaveImportRow(ctx, ownerID, ownerJob.ID, original); err != nil {
+		t.Fatal(err)
+	}
+	changed := original
+	changed.DisplayName = "Attacker-Supplied Name"
+	changed.SpotifyID = "1OdUWJ0sBjDrqHygGUXeCF"
+	changed.SpotifyURL = "https://open.spotify.com/artist/1OdUWJ0sBjDrqHygGUXeCF"
+	row, err := s.SaveImportRow(ctx, otherID, otherJob.ID, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "added" {
+		t.Fatalf("cross-user import status=%q, want added", row.Status)
+	}
+	artist, err := s.ArtistByMBID(ctx, mbid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artist.Name != original.DisplayName || artist.SortName != original.DisplayName ||
+		artist.SpotifyID != original.SpotifyID || artist.SpotifyURL != original.SpotifyURL {
+		t.Fatalf("shared artist identity changed by import: %#v", artist)
+	}
+}
+
 func TestReleaseSyncUsesDefaultsForMissingLegacyRule(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

@@ -92,9 +92,7 @@ func (s *Store) SaveImportRow(ctx context.Context, userID, jobID int64, input Im
 	_, err = tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
 		spotify_id,spotify_url,spotify_image_url,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
-		spotify_id=COALESCE(excluded.spotify_id,artists.spotify_id),
-		spotify_url=COALESCE(excluded.spotify_url,artists.spotify_url),updated_at=excluded.updated_at`,
+		ON CONFLICT(mbid) DO NOTHING`,
 		input.MBID, input.DisplayName, input.DisplayName, "", "", "",
 		nullString(input.SpotifyID), nullString(input.SpotifyURL), nil, now, now)
 	if err != nil {
