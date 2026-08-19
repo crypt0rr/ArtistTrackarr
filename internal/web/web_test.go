@@ -203,6 +203,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
 		!strings.Contains(string(loginBody), "/static/theme.js") ||
 		!strings.Contains(string(loginBody), "v"+version.Current) ||
+		!strings.Contains(string(loginBody), "v="+version.Current+"-") ||
 		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/ArtistTrackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-toggle`) ||
 		strings.Contains(string(loginBody), `data-theme-select`) ||

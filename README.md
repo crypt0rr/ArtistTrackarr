@@ -54,8 +54,9 @@ normalized automatically during the v0.20.0 migration.
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
 error when a data lookup fails, while the detailed cause remains in structured
-logs. Static assets use immutable, version-stamped URLs and continue to serve
-their unversioned paths for compatibility.
+logs. Static assets use immutable, semantic-version and content-hash stamped
+URLs, so an asset change invalidates browser caches even before the next
+release version bump; unversioned paths remain available for compatibility.
 
 The v0.43.0 retention-governance release adds an administrator dry-run and
 explicit cleanup action for bounded operational state. Notification events,

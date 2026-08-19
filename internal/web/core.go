@@ -214,7 +214,9 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"lower": strings.ToLower,
 		"query": url.QueryEscape,
 		"staticURL": func(path string) string {
-			return "/static/" + strings.TrimLeft(path, "/") + "?v=" + url.QueryEscape(version.Current)
+			asset := strings.TrimLeft(path, "/")
+			cacheKey := version.Current + "-" + staticAssetVersion(asset)
+			return "/static/" + asset + "?v=" + url.QueryEscape(cacheKey)
 		},
 		"shortDate": func(v string) string {
 			if v == "" {
