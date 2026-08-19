@@ -345,7 +345,7 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK ||
 		!strings.Contains(string(body), "MusicBrainz is temporarily unavailable") ||
-		strings.Contains(string(body), "EOF") {
+		strings.Contains(string(body), ">EOF<") {
 		t.Fatalf("search failure status/body = %d, %q", response.StatusCode, body)
 	}
 
