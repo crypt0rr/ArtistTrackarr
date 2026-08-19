@@ -669,6 +669,18 @@ func enqueueApprovedEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID i
 }
 
 func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
+	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, true)
+}
+
+// enqueueHeldEventTxMode re-evaluates a previously held event against the
+// owner's current notification rules. Hold bodies already contain the
+// association decoration that was rendered when the hold was created, so the
+// normal message decoration must not be applied a second time.
+func enqueueHeldEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
+	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, false)
+}
+
+func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold, decorateBody bool) error {
 	var p NotificationPreferences
 	var albums, eps, singles, announcements, releaseDay, holdConflicts int
 	var primary, secondary, role, mode string
@@ -714,9 +726,11 @@ func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64
 		!rule.allowsAccountNotificationMoment(p, eventType) {
 		return nil
 	}
-	title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
-	if err != nil {
-		return err
+	if decorateBody {
+		title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
+		if err != nil {
+			return err
+		}
 	}
 	if p.HoldConflictingNotifications && rule.queuesImmediate(now) && !bypassConflictHold {
 		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {

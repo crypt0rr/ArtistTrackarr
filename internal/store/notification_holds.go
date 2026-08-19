@@ -73,12 +73,22 @@ func drainResolvedNotificationHoldsForUserTx(ctx context.Context, tx *sql.Tx, us
 	if blocking > 0 {
 		return nil
 	}
-	return drainNotificationHoldsTx(ctx, tx, userID, releaseID, now)
+	return drainNotificationHoldsTxMode(ctx, tx, userID, releaseID, now, false)
 }
 
 // drainNotificationHoldsTx creates the normal event/delivery rows and marks
 // matching holds released. userID=0 means all owners of the release.
 func drainNotificationHoldsTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, now time.Time) error {
+	return drainNotificationHoldsTxMode(ctx, tx, userID, releaseID, now, true)
+}
+
+// drainNotificationHoldsTxMode re-admits held events through the current
+// notification rules before releasing their review rows. A hold created under
+// an immediate rule may later be paused, switched to digest-only, or disabled;
+// those changes must be honored when the hold is resolved. Explicit provider
+// confirmation and a user choosing "Notify anyway" bypass only the conflict
+// gate, not the owner's current content, timing, or delivery-mode rules.
+func drainNotificationHoldsTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, now time.Time, bypassConflictHold bool) error {
 	query := `SELECT h.id,h.user_id,h.event_type,h.title,h.body
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
 		WHERE h.release_group_id=? AND ` + followedReleasePredicate("h.user_id") + ` AND h.status='held'`
@@ -111,10 +121,20 @@ func drainNotificationHoldsTx(ctx context.Context, tx *sql.Tx, userID, releaseID
 	}
 	_ = rows.Close()
 	for _, item := range holds {
-		// A hold was created only after the normal rule and preference checks
-		// passed. Releasing it is an explicit review action (or a resolved
-		// conflict), so bypass the hold check and queue the retained event.
-		if err := insertNotificationEventTx(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now); err != nil {
+		if err := enqueueHeldEventTxMode(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now, bypassConflictHold); err != nil {
+			return err
+		}
+		var eventID int64
+		err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
+			WHERE user_id=? AND release_group_id=? AND event_type=?`, item.ownerID, releaseID, item.eventType).Scan(&eventID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Current rules intentionally suppressed this event (for example,
+			// the owner disabled the follow or account-level moment). Keep the
+			// hold available so a later rule change or explicit restore can
+			// re-admit it instead of silently losing the alert.
+			continue
+		}
+		if err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE notification_holds SET status='released',released_at=? WHERE id=? AND status='held'`, timeText(now), item.id); err != nil {
@@ -336,7 +356,18 @@ func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int6
 	}
 	status = "discarded"
 	if action == "notify" {
-		if err := insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
+		if err := enqueueHeldEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true); err != nil {
+			return err
+		}
+		var eventID int64
+		err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
+			WHERE user_id=? AND release_group_id=? AND event_type=?`, userID, releaseID, eventType).Scan(&eventID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// The current rule intentionally blocks admission. Keep the hold
+			// pending so the owner can change the rule and retry it later.
+			return tx.Commit()
+		}
+		if err != nil {
 			return err
 		}
 		status = "released"
