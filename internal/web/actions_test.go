@@ -104,8 +104,13 @@ func TestArtistActionsReadyAndLogout(t *testing.T) {
 	if ready.StatusCode != http.StatusNoContent {
 		t.Fatalf("ready status=%d", ready.StatusCode)
 	}
-	if ready.Header.Get("X-ArtistTrackarr-Database") != "healthy" || ready.Header.Get("X-ArtistTrackarr-Operational") == "" {
-		t.Fatalf("readiness headers database=%q operational=%q", ready.Header.Get("X-ArtistTrackarr-Database"), ready.Header.Get("X-ArtistTrackarr-Operational"))
+	if ready.Header.Get("X-ArtistTrackarr-Database") != "healthy" ||
+		ready.Header.Get("X-ArtistTrackarr-Operational") != "" ||
+		ready.Header.Get("X-ArtistTrackarr-Operational-Reason") != "" ||
+		ready.Header.Get("X-ArtistTrackarr-Runner") != "" {
+		t.Fatalf("readiness exposed operational headers: database=%q operational=%q reason=%q runner=%q",
+			ready.Header.Get("X-ArtistTrackarr-Database"), ready.Header.Get("X-ArtistTrackarr-Operational"),
+			ready.Header.Get("X-ArtistTrackarr-Operational-Reason"), ready.Header.Get("X-ArtistTrackarr-Runner"))
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/artists")

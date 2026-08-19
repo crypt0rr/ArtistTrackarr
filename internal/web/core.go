@@ -954,27 +954,10 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
+	// Readiness is intentionally a cheap unauthenticated orchestration probe.
+	// Detailed queue, provider, backup, and runner state belongs behind the
+	// authenticated diagnostics/admin pages and must not be exposed through
+	// probe headers.
 	w.Header().Set("X-ArtistTrackarr-Database", "healthy")
-	runnerState := "unknown"
-	if a.jobs != nil {
-		if a.jobs.Status().Running {
-			runnerState = "running"
-		} else {
-			runnerState = "stopped"
-		}
-	}
-	// Keep readiness usable for Docker while distinguishing a healthy database
-	// from degraded background work. Providers, queues, and backups can need
-	// attention without making the process restart in a loop.
-	if snapshot, err := a.store.Diagnostics(r.Context()); err == nil {
-		status, reasons := store.OperationalStatus(snapshot, runnerState, time.Now().UTC())
-		w.Header().Set("X-ArtistTrackarr-Operational", status)
-		if len(reasons) > 0 {
-			w.Header().Set("X-ArtistTrackarr-Operational-Reason", reasons[0])
-		}
-	} else {
-		w.Header().Set("X-ArtistTrackarr-Operational", "unknown")
-	}
-	w.Header().Set("X-ArtistTrackarr-Runner", runnerState)
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -396,7 +396,10 @@ func (s *Store) Close() error {
 }
 func (s *Store) Healthy(ctx context.Context) error {
 	var one int
-	return s.readerDB().QueryRowContext(ctx, `SELECT 1`).Scan(&one)
+	// Keep readiness bounded while still proving that migrations completed. A
+	// bare SELECT 1 would report an arbitrary SQLite file as ready even when the
+	// application schema is absent or corrupt.
+	return s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM schema_migrations LIMIT 1`).Scan(&one)
 }
 func changedOrNotFound(result sql.Result, err error) error {
 	if err != nil {

@@ -531,3 +531,17 @@ func TestStoreFilterAndClassificationHelpers(t *testing.T) {
 		t.Fatalf("empty first non-empty=%q", got)
 	}
 }
+
+func TestHealthyRequiresMigratedSchema(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	if err := s.Healthy(ctx); err != nil {
+		t.Fatalf("healthy migrated store=%v", err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DROP TABLE schema_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Healthy(ctx); err == nil {
+		t.Fatal("healthy reported a database without the application schema")
+	}
+}

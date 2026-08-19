@@ -142,10 +142,11 @@ The v0.44.0 operations release also persists a redacted hourly health snapshot
 for up to 30 days. Snapshots contain only scheduler state, queue/provider
 counters, database size, and backup/restore timestamps, so administrators can
 see whether a problem is recurring after a restart without retaining provider
-payloads or notification content. `/readyz` continues to report database
-readiness while exposing `X-ArtistTrackarr-Operational` and
-`X-ArtistTrackarr-Operational-Reason` headers when background work is degraded;
-a provider cooldown or overdue backup does not cause a restart loop.
+payloads or notification content. `/readyz` is deliberately a cheap,
+unauthenticated database/schema readiness probe; detailed queue, provider,
+runner, and backup state remains available only through authenticated admin
+diagnostics. A provider cooldown or overdue backup does not cause a restart
+loop.
 
 The v0.46.0 approval catch-up release ensures an explicit provider or evidence
 approval creates one owner-scoped inbox event and delivery when no earlier
