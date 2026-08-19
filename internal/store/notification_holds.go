@@ -19,6 +19,15 @@ func holdConflictingNotificationTx(ctx context.Context, tx *sql.Tx, userID, rele
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	// A member's explicit discard is terminal until they restore the hold.
+	// Without this guard, each release-day queue pass would recreate the same
+	// discarded review row while the evidence issue remained open.
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_holds
+		WHERE user_id=? AND release_group_id=? AND event_type=? AND status='discarded' LIMIT 1`, userID, releaseID, eventType).Scan(&exists); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	var reason, fingerprint string
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(group_concat(summary,'; '),''),
 		COALESCE(group_concat(fingerprint,','),'')
@@ -48,6 +57,14 @@ func holdConflictingNotificationTx(ctx context.Context, tx *sql.Tx, userID, rele
 // drainResolvedNotificationHoldsTx releases holds for a release once its
 // warning/critical evidence issues have disappeared during synchronization.
 func drainResolvedNotificationHoldsTx(ctx context.Context, tx *sql.Tx, releaseID int64, now time.Time) error {
+	return drainResolvedNotificationHoldsForUserTx(ctx, tx, 0, releaseID, now)
+}
+
+// drainResolvedNotificationHoldsForUserTx is the owner-scoped variant used by
+// private evidence review actions. Synchronization-driven resolution calls the
+// household-wide helper above, but one member confirming an issue must never
+// release another member's held notification.
+func drainResolvedNotificationHoldsForUserTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, now time.Time) error {
 	var blocking int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_evidence_issues
 		WHERE release_group_id=? AND status='open' AND severity IN ('warning','critical')`, releaseID).Scan(&blocking); err != nil {
@@ -56,7 +73,7 @@ func drainResolvedNotificationHoldsTx(ctx context.Context, tx *sql.Tx, releaseID
 	if blocking > 0 {
 		return nil
 	}
-	return drainNotificationHoldsTx(ctx, tx, 0, releaseID, now)
+	return drainNotificationHoldsTx(ctx, tx, userID, releaseID, now)
 }
 
 // drainNotificationHoldsTx creates the normal event/delivery rows and marks
@@ -254,11 +271,40 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
 	return result, rows.Err()
 }
 
+// NotificationHoldsForReleaseIncludingDiscarded returns pending and explicitly
+// discarded holds for a release. The broader projection is used only on the
+// release details page so a member can intentionally restore a discarded hold;
+// dashboard hold counts continue to represent pending work only.
+func (s *Store) NotificationHoldsForReleaseIncludingDiscarded(ctx context.Context, userID, releaseID int64) ([]NotificationHold, error) {
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT h.id,h.user_id,h.release_group_id,a.name,rg.title,
+		h.event_type,h.title,h.body,h.reason,h.issue_fingerprint,h.planned_at,h.status,h.created_at,h.released_at
+		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
+		JOIN artists a ON a.id=rg.artist_id
+		WHERE h.user_id=? AND h.release_group_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status IN ('held','discarded')
+		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []NotificationHold
+	for rows.Next() {
+		item, err := scanNotificationHold(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
 // ResolveNotificationHold either sends the held event through the normal
-// delivery queue or discards it. Both actions are owner-scoped and atomic.
+// delivery queue, discards it, or restores a discarded hold. All actions are
+// owner-scoped and atomic. Restoring re-enters the normal admission flow: a
+// still-blocking evidence issue leaves the hold pending, while a resolved
+// issue releases it immediately.
 func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int64, action string) error {
 	action = strings.ToLower(strings.TrimSpace(action))
-	if action != "notify" && action != "discard" {
+	if action != "notify" && action != "discard" && action != "restore" {
 		return ErrInvalidNotificationHoldAction
 	}
 	tx, err := s.beginWriteTx(ctx)
@@ -268,13 +314,27 @@ func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int6
 	defer func() { _ = tx.Rollback() }()
 	var releaseID int64
 	var eventType, title, body string
+	status := "held"
+	if action == "restore" {
+		status = "discarded"
+	}
 	if err := tx.QueryRowContext(ctx, `SELECT h.release_group_id,h.event_type,h.title,h.body
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
-		WHERE h.id=? AND h.user_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'`, holdID, userID, userID).Scan(&releaseID, &eventType, &title, &body); err != nil {
+		WHERE h.id=? AND h.user_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status=?`, holdID, userID, status).Scan(&releaseID, &eventType, &title, &body); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	status := "discarded"
+	if action == "restore" {
+		if _, err := tx.ExecContext(ctx, `UPDATE notification_holds
+			SET status='held',released_at=NULL WHERE id=? AND user_id=? AND status='discarded'`, holdID, userID); err != nil {
+			return err
+		}
+		if err := drainResolvedNotificationHoldsForUserTx(ctx, tx, userID, releaseID, now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	status = "discarded"
 	if action == "notify" {
 		if err := insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
 			return err

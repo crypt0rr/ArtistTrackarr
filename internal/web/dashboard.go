@@ -83,7 +83,7 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "release", d, http.StatusInternalServerError)
 		return
 	}
-	d.ReleaseNotificationHolds, err = a.store.NotificationHoldsForRelease(r.Context(), session.User.ID, id)
+	d.ReleaseNotificationHolds, err = a.store.NotificationHoldsForReleaseIncludingDiscarded(r.Context(), session.User.ID, id)
 	if a.pageStoreError(r, &d, "Release details", "release notification holds", err) {
 		a.render(w, "release", d, http.StatusInternalServerError)
 		return

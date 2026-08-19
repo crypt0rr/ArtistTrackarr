@@ -693,7 +693,11 @@ func (a *App) csrf(next http.Handler) http.Handler {
 		const name = "artist_csrf"
 		var raw string
 		if cookie, err := r.Cookie(name); err == nil {
-			raw, _ = security.VerifySignedToken(a.cfg.SessionSecret, cookie.Value)
+			var valid bool
+			raw, valid = security.VerifySignedToken(a.cfg.SessionSecret, cookie.Value)
+			if !valid {
+				raw = ""
+			}
 		}
 		if raw == "" {
 			raw, _ = security.Token(24)

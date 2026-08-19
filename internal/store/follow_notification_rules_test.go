@@ -176,3 +176,188 @@ func TestFollowNotificationRulesFilterEventsAndQueueModes(t *testing.T) {
 	}
 	assertEventCount(t, s, userID, "announcement", 4)
 }
+
+func TestAccountNotificationMomentPreferencesGateInheritedRules(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "account-preferences@example.com", "hash", "member", "UTC", "account-preferences")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "account-preferences-artist", Name: "Account Preferences"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true,
+		Announcements: false, ReleaseDay: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	baseline := Release{MBID: "account-old", Title: "Account Old", PrimaryType: "Album", FirstReleaseDate: "2020-01-01", DatePrecision: 3}
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{baseline}, now); err != nil {
+		t.Fatal(err)
+	}
+	announcement := baseline
+	announcement.MBID = "account-announcement"
+	announcement.Title = "Account Announcement"
+	announcement.FirstReleaseDate = "2026-08-20"
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{baseline, announcement}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+
+	// An explicit per-follow mode is an override of the account-wide moment
+	// preference. Its content filters still apply normally.
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.DeliveryMode = FollowDeliveryImmediate
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	override := announcement
+	override.MBID = "account-override"
+	override.Title = "Account Override"
+	override.FirstReleaseDate = "2026-08-21"
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{baseline, announcement, override}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+
+	// Release-day queueing uses the same admission path, so the inherited
+	// account preference also suppresses reminders until the explicit rule is
+	// selected.
+	today := baseline
+	today.MBID = "account-today"
+	today.Title = "Account Today"
+	today.FirstReleaseDate = now.Format("2006-01-02")
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{baseline, announcement, override, today}, now.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, FollowNotificationRule{
+		DeliveryMode: FollowDeliveryInherit, IncludePrimary: true, IncludeFeatured: true,
+		Albums: true, EPs: true, Singles: true, Compilations: true, Announcements: true, ReleaseDay: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueDueReleaseDays(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 0)
+	rule, err = s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.DeliveryMode = FollowDeliveryImmediate
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueDueReleaseDays(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 1)
+}
+
+func TestCompilationFilterUsesSecondaryTypeAndPreservesAlbumFilter(t *testing.T) {
+	now := time.Now().UTC()
+	rule := defaultFollowNotificationRule(1, 1, now)
+	rule.Albums = false
+	rule.Compilations = false
+	if rule.AllowsRelease("Album", []string{"Compilation"}, "primary", "announcement", now) {
+		t.Fatal("compilation was admitted while Compilations is disabled")
+	}
+	rule.Compilations = true
+	if !rule.AllowsRelease("Album", []string{"Compilation"}, "primary", "announcement", now) {
+		t.Fatal("compilation was not admitted while Compilations is enabled")
+	}
+	if rule.AllowsRelease("Album", nil, "primary", "announcement", now) {
+		t.Fatal("ordinary album was admitted while Albums is disabled")
+	}
+	rule.Albums = true
+	if !rule.AllowsRelease("Album", []string{"Live"}, "primary", "announcement", now) {
+		t.Fatal("live album was not controlled by Albums")
+	}
+}
+
+func TestCompilationFilterAppliesAcrossReleaseProviders(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "compilation-providers@example.com", "hash", "member", "UTC", "compilation-providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "compilation-providers-artist", Name: "Compilation Providers"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.Compilations = false
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 12, 12, 0, 0, 0, time.UTC)
+	providers := []string{"musicbrainz", "spotify", "itunes"}
+	for index, provider := range providers {
+		old := compilationProviderRelease(provider, "old", "2020-01-01")
+		if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: provider, Releases: []Release{old}}}, now.Add(time.Duration(index)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		newRelease := compilationProviderRelease(provider, "filtered", "2026-09-01")
+		if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: provider, Releases: []Release{old, newRelease}}}, now.Add(time.Duration(index+3)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		assertEventCount(t, s, userID, "announcement", index)
+
+		rule, err = s.FollowNotificationRule(ctx, userID, artist.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule.Compilations = true
+		if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+			t.Fatal(err)
+		}
+		admitted := compilationProviderRelease(provider, "admitted", "2026-09-02")
+		if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: provider, Releases: []Release{old, newRelease, admitted}}}, now.Add(time.Duration(index+6)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		assertEventCount(t, s, userID, "announcement", index+1)
+
+		rule.Compilations = false
+		if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func compilationProviderRelease(provider, suffix, date string) Release {
+	release := Release{
+		Title: "Compilation " + provider + " " + suffix, PrimaryType: "Album",
+		SecondaryTypes: []string{"Compilation"}, FirstReleaseDate: date, DatePrecision: 3,
+		Source: provider,
+	}
+	switch provider {
+	case "musicbrainz":
+		release.MBID = "compilation:" + provider + ":" + suffix
+	case "spotify":
+		release.MBID = "spotify:compilation:" + suffix
+		release.SpotifyID = "compilation-spotify-" + suffix
+		release.SpotifyURL = "https://open.spotify.com/album/compilation-spotify-" + suffix
+	case "itunes":
+		release.MBID = "itunes:compilation:" + suffix
+		release.ITunesID = "compilation-itunes-" + suffix
+		release.ITunesURL = "https://music.apple.com/us/album/compilation-itunes-" + suffix
+	}
+	return release
+}

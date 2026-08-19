@@ -1791,6 +1791,25 @@ func TestCompactCount(t *testing.T) {
 	}
 }
 
+func TestCSRFRejectsInvalidCookieSignature(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, ok := client.Jar.(*cookiejar.Jar)
+	if !ok {
+		t.Fatal("authenticated test client does not use a cookie jar")
+	}
+	jar.SetCookies(serverURL, []*http.Cookie{{Name: "artist_csrf", Value: "forged.invalid-signature", Path: "/"}})
+
+	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {"forged"}})
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("forged CSRF cookie status=%d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+}
+
 func authenticatedTestServer(
 	t *testing.T,
 	mb catalog.CatalogProvider,

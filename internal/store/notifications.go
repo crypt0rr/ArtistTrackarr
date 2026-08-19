@@ -672,6 +672,9 @@ func (s *Store) MarkDeliverySentOwned(ctx context.Context, id int64, owner strin
 	if err != nil {
 		return err
 	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
+	}
 	if changed == 0 {
 		return nil
 	}
@@ -709,6 +712,9 @@ func (s *Store) MarkDeliveryFailedOwned(ctx context.Context, id int64, attempts 
 	if err != nil {
 		return err
 	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
+	}
 	if changed == 0 {
 		return nil
 	}
@@ -743,6 +749,9 @@ func (s *Store) MarkDigestDeliverySentOwned(ctx context.Context, id int64, owner
 	changed, err := result.RowsAffected()
 	if err != nil {
 		return err
+	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
 	}
 	if changed == 0 {
 		return nil
@@ -794,6 +803,9 @@ func (s *Store) MarkDigestDeliveryFailedOwned(ctx context.Context, id int64, att
 	changed, err := result.RowsAffected()
 	if err != nil {
 		return err
+	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
 	}
 	if changed == 0 {
 		return nil

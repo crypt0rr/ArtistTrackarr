@@ -133,4 +133,70 @@ func TestReleaseEvidenceMatchingProvidersStayClean(t *testing.T) {
 	}
 }
 
+func TestEvidenceConfirmationOnlyDrainsConfirmingMembersHold(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	alice, err := s.CreateUser(ctx, "evidence-alice@example.com", "hash", "member", "UTC", "evidence-alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "evidence-bob@example.com", "hash", "member", "UTC", "evidence-bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "evidence-shared-artist", Name: "Evidence Shared Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, alice, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, bob, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "evidence-shared-release", artist.ID, "Evidence Shared Release", "Album", "[]", "2099-01-01", 3,
+		"https://musicbrainz.org/release-group/evidence-shared-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,evidence_json,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, releaseID, "date_conflict", "warning", "evidence-shared-fingerprint", "resolved conflict", "[]", "resolved", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	issueID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{alice, bob} {
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO notification_holds
+			(user_id,release_group_id,event_type,title,body,reason,issue_fingerprint,planned_at,status,created_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`, userID, releaseID, "announcement", "Shared release", "Body", "review", "evidence-shared-fingerprint", nowText(), "held", nowText()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetEvidenceIssueState(ctx, alice, issueID, "confirmed", nil); err != nil {
+		t.Fatal(err)
+	}
+	var aliceStatus, bobStatus string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE user_id=? AND release_group_id=?`, alice, releaseID).Scan(&aliceStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE user_id=? AND release_group_id=?`, bob, releaseID).Scan(&bobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if aliceStatus != "released" || bobStatus != "held" {
+		t.Fatalf("hold statuses alice=%q bob=%q", aliceStatus, bobStatus)
+	}
+	assertEventCount(t, s, alice, "announcement", 1)
+	assertEventCount(t, s, bob, "announcement", 0)
+}
+
 func ptrTime(value time.Time) *time.Time { return &value }

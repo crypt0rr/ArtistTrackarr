@@ -1085,4 +1085,18 @@ func TestNotificationHoldActionsAreOwnerScoped(t *testing.T) {
 	if status != "discarded" {
 		t.Fatalf("discarded hold status=%q", status)
 	}
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, client, server.URL+"/notifications/holds/"+strconv.FormatInt(discardID, 10)+"/restore", url.Values{
+		"_csrf": {csrf}, "return": {"/inbox?state=held"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("restore hold status=%d", response.StatusCode)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE id=?`, discardID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "held" {
+		t.Fatalf("restored hold status=%q, want held while evidence remains open", status)
+	}
 }

@@ -495,4 +495,18 @@ func TestDurableDeliveryClaimsRecoverExpiredWork(t *testing.T) {
 	if owner.Valid {
 		t.Fatalf("digest delivery claim owner=%q after recovery", owner.String)
 	}
+	claimedNormal, err := s.ClaimDueDeliveries(ctx, now, 10, "worker-one", time.Minute)
+	if err != nil || len(claimedNormal) != 1 {
+		t.Fatalf("reclaimed normal delivery=%#v err=%v", claimedNormal, err)
+	}
+	claimedDigest, err := s.ClaimDueDigestDeliveries(ctx, now, 10, "worker-one", time.Minute)
+	if err != nil || len(claimedDigest) != 1 {
+		t.Fatalf("reclaimed digest delivery=%#v err=%v", claimedDigest, err)
+	}
+	if err := s.MarkDeliverySentOwned(ctx, claimedNormal[0].ID, "worker-two", now); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lost normal delivery claim error=%v, want sql.ErrNoRows", err)
+	}
+	if err := s.MarkDigestDeliveryFailedOwned(ctx, claimedDigest[0].ID, 1, "temporary", "worker-two", now); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lost digest delivery claim error=%v, want sql.ErrNoRows", err)
+	}
 }

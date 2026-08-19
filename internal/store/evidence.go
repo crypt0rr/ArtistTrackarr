@@ -530,7 +530,7 @@ func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64
 	}
 	if state == "confirmed" {
 		now := time.Now().UTC()
-		if err := drainResolvedNotificationHoldsTx(ctx, tx, releaseID, now); err != nil {
+		if err := drainResolvedNotificationHoldsForUserTx(ctx, tx, userID, releaseID, now); err != nil {
 			return err
 		}
 		if err := ensureApprovedReleaseNotificationTx(ctx, tx, userID, releaseID, now, false); err != nil {

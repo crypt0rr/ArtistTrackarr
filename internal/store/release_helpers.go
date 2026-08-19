@@ -671,13 +671,13 @@ func enqueueApprovedEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID i
 func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
 	var p NotificationPreferences
 	var albums, eps, singles, announcements, releaseDay, holdConflicts int
-	var primary, role, mode string
+	var primary, secondary, role, mode string
 	var includePrimary, includeFeatured int
 	var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
 	var paused, updated sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT COALESCE(p.albums,1),COALESCE(p.eps,1),COALESCE(p.singles,1),
 		COALESCE(p.announcements,1),COALESCE(p.release_day,1),COALESCE(p.hold_conflicting_notifications,0),
-		rg.primary_type,COALESCE(rg.artist_credit_role,'primary'),
+		rg.primary_type,COALESCE(rg.secondary_types,'[]'),COALESCE(rg.artist_credit_role,'primary'),
 		COALESCE(nr.delivery_mode,'inherit'),COALESCE(nr.include_primary,1),COALESCE(nr.include_featured,1),
 		COALESCE(nr.albums,1),COALESCE(nr.eps,1),COALESCE(nr.singles,1),COALESCE(nr.compilations,1),
 		COALESCE(nr.announcements,1),COALESCE(nr.release_day,1),nr.paused_until,COALESCE(nr.updated_at,'')
@@ -690,7 +690,7 @@ func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64
 		LEFT JOIN follow_notification_rules nr ON nr.user_id=? AND nr.artist_id=f.artist_id
 		WHERE rg.id=?
 		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END LIMIT 1`, userID, userID, userID, releaseID).Scan(&albums, &eps, &singles, &announcements, &releaseDay,
-		&holdConflicts, &primary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
+		&holdConflicts, &primary, &secondary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
 		&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -706,7 +706,12 @@ func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64
 	if err != nil {
 		return err
 	}
-	if !releaseTypeEnabled(p, primary) || !rule.AllowsContent(primary, role, eventType, now) {
+	var secondaryTypes []string
+	if err := json.Unmarshal([]byte(secondary), &secondaryTypes); err != nil {
+		return fmt.Errorf("parse release secondary types: %w", err)
+	}
+	if !releaseTypeEnabled(p, primary) || !rule.AllowsRelease(primary, secondaryTypes, role, eventType, now) ||
+		!rule.allowsAccountNotificationMoment(p, eventType) {
 		return nil
 	}
 	title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)

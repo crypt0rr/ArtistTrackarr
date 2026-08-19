@@ -157,7 +157,7 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 				rule = defaultFollowNotificationRule(user.ID, item.ArtistID, now.UTC())
 			}
 			if !releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType) ||
-				!rule.AllowsContent(item.PrimaryType, item.ArtistCreditRole, "", now) || !rule.belongsInDigest(now) {
+				!rule.AllowsRelease(item.PrimaryType, item.SecondaryTypes, item.ArtistCreditRole, "", now) || !rule.belongsInDigest(now) {
 				continue
 			}
 			releases = append(releases, item)

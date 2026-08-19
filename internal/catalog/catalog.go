@@ -639,6 +639,26 @@ type spotifyReleaseCache struct {
 	releases   []store.Release
 }
 
+type spotifyAlbumPage struct {
+	Total int                `json:"total"`
+	Items []spotifyAlbumItem `json:"items"`
+}
+
+type spotifyAlbumItem struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	AlbumType     string            `json:"album_type"`
+	AlbumGroup    string            `json:"album_group"`
+	TotalTracks   int               `json:"total_tracks"`
+	ReleaseDate   string            `json:"release_date"`
+	DatePrecision string            `json:"release_date_precision"`
+	ExternalURLs  map[string]string `json:"external_urls"`
+	Images        []struct {
+		URL   string `json:"url"`
+		Width int    `json:"width"`
+	} `json:"images"`
+}
+
 type spotifySearchCache struct {
 	observedAt time.Time
 	expiresAt  time.Time
@@ -1148,92 +1168,99 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	if cached, ok := s.cachedReleases(artistID, since); ok {
 		return cached, nil
 	}
-	// Spotify currently permits at most 10 items per artist-albums page. Keep
-	// pagination aligned with the provider's limit so a sync is not rejected
-	// with a 400 Invalid limit response.
-	const pageSize = 10
-	const maxPages = 100
 	var result []store.Release
 	seen := make(map[string]int)
-	complete := false
-	for page := 0; page < maxPages; page++ {
-		offset := page * pageSize
-		endpoint := fmt.Sprintf(
-			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation%%2Cappears_on&market=%s&limit=%d&offset=%d",
-			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
-		)
-		var page struct {
-			Total int `json:"total"`
-			Items []struct {
-				ID            string            `json:"id"`
-				Name          string            `json:"name"`
-				AlbumType     string            `json:"album_type"`
-				AlbumGroup    string            `json:"album_group"`
-				TotalTracks   int               `json:"total_tracks"`
-				ReleaseDate   string            `json:"release_date"`
-				DatePrecision string            `json:"release_date_precision"`
-				ExternalURLs  map[string]string `json:"external_urls"`
-				Images        []struct {
-					URL   string `json:"url"`
-					Width int    `json:"width"`
-				} `json:"images"`
-			} `json:"items"`
-		}
-		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+	// A full mixed catalog is safe to page until Spotify's reported total. For
+	// incremental polling, Spotify may place appears_on entries after the
+	// primary catalog, so fetch that group independently instead of letting the
+	// primary watermark hide guest releases.
+	if since == "" {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation,appears_on", since, false, false, &result, seen); err != nil {
 			return nil, err
+		}
+	} else {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", since, true, false, &result, seen); err != nil {
+			return nil, err
+		}
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", since, true, true, &result, seen); err != nil {
+			return nil, err
+		}
+	}
+	s.cacheReleases(artistID, result)
+	return result, nil
+}
+
+// fetchSpotifyReleasePages retrieves one Spotify artist-albums stream. The
+// provider currently permits at most ten items per page; callers must not
+// apply a partial catalog when the generous page safety cap is reached.
+func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includeGroups, since string, stopAtWatermark, featuredOnly bool, result *[]store.Release, seen map[string]int) error {
+	const pageSize = 10
+	const maxPages = 100
+	complete := false
+	for pageNumber := 0; pageNumber < maxPages; pageNumber++ {
+		offset := pageNumber * pageSize
+		endpoint := fmt.Sprintf(
+			"%s/v1/artists/%s/albums?include_groups=%s&market=%s&limit=%d&offset=%d",
+			s.apiURL, url.PathEscape(artistID), url.QueryEscape(includeGroups), url.QueryEscape(s.market), pageSize, offset,
+		)
+		var page spotifyAlbumPage
+		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+			return err
 		}
 		oldest := ""
 		for _, item := range page.Items {
 			if item.ReleaseDate != "" && (oldest == "" || item.ReleaseDate < oldest) {
 				oldest = item.ReleaseDate
 			}
-			if item.ID == "" {
-				continue
-			}
-			primaryType, secondaryTypes, eligible := spotifyReleaseType(
-				item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
-			)
-			if !eligible {
-				continue
-			}
-			role := "primary"
-			if strings.EqualFold(strings.TrimSpace(item.AlbumGroup), "appears_on") {
-				role = "featured"
-			}
-			candidate := store.Release{
-				MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
-				SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
-				DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
-				SpotifyID:     item.ID, SpotifyURL: item.ExternalURLs["spotify"],
-				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
-				Credits: []store.ReleaseCredit{{Provider: "spotify", ProviderID: item.ID, Role: role,
-					ProviderURL: item.ExternalURLs["spotify"], Confidence: "confirmed"}},
-			}
-			if existing, ok := seen[item.ID]; ok {
-				// Spotify can expose one release in both the artist's primary
-				// catalogue and appears_on. Keep one record and prefer the
-				// direct release-level credit when both are present, while
-				// retaining the provider evidence for the graph.
-				result[existing].Credits = mergeReleaseCredits(result[existing].Credits, candidate.Credits)
-				if result[existing].ArtistCreditRole == "featured" && role == "primary" {
-					candidate.Credits = append([]store.ReleaseCredit(nil), result[existing].Credits...)
-					result[existing] = candidate
-				}
-				continue
-			}
-			seen[item.ID] = len(result)
-			result = append(result, candidate)
+			s.appendSpotifyRelease(result, seen, item, featuredOnly)
 		}
-		if since == "" || oldest == "" || oldest <= since || len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
+		if len(page.Items) == 0 || offset+len(page.Items) >= page.Total ||
+			(stopAtWatermark && since != "" && oldest != "" && oldest <= since) {
 			complete = true
 			break
 		}
 	}
 	if !complete {
-		return nil, &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
+		return &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
 	}
-	s.cacheReleases(artistID, result)
-	return result, nil
+	return nil
+}
+
+func (s *Spotify) appendSpotifyRelease(result *[]store.Release, seen map[string]int, item spotifyAlbumItem, featuredOnly bool) {
+	if item.ID == "" {
+		return
+	}
+	primaryType, secondaryTypes, eligible := spotifyReleaseType(item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks)
+	if !eligible {
+		return
+	}
+	role := "primary"
+	if featuredOnly || strings.EqualFold(strings.TrimSpace(item.AlbumGroup), "appears_on") {
+		role = "featured"
+	}
+	providerURL := item.ExternalURLs["spotify"]
+	candidate := store.Release{
+		MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
+		SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
+		DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
+		SpotifyID:     item.ID, SpotifyURL: providerURL,
+		SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
+		Credits: []store.ReleaseCredit{{Provider: "spotify", ProviderID: item.ID, Role: role,
+			ProviderURL: providerURL, Confidence: "confirmed"}},
+	}
+	if existing, ok := seen[item.ID]; ok {
+		// Spotify can expose one release in both the primary catalogue and
+		// appears_on. Keep one record and prefer the direct release-level credit
+		// when both are present, while retaining provider evidence for the graph.
+		(*result)[existing].Credits = mergeReleaseCredits((*result)[existing].Credits, candidate.Credits)
+		if (*result)[existing].ArtistCreditRole == "featured" && role == "primary" {
+			candidate.Credits = append([]store.ReleaseCredit(nil), (*result)[existing].Credits...)
+			(*result)[existing] = candidate
+		}
+		return
+	}
+	seen[item.ID] = len(*result)
+	*result = append(*result, candidate)
 }
 
 // InvalidateArtistReleases drops the cached release pages for one artist.

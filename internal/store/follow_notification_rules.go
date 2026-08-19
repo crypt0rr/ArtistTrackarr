@@ -43,10 +43,20 @@ func (r FollowNotificationRule) effectiveDeliveryMode(now time.Time) string {
 }
 
 // AllowsContent determines whether an event for this follow should exist in
-// the member's notification/inbox history. DeliveryMode is intentionally not
-// considered here: digest and paused rules retain the event for visibility,
-// while deciding whether a destination receives it is handled separately.
+// the member's notification/inbox history. It is retained as a compatibility
+// helper for callers that do not have secondary release metadata. New release
+// paths should use AllowsRelease so compilations can be distinguished from
+// ordinary albums.
 func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType string, now time.Time) bool {
+	return r.AllowsRelease(primaryType, nil, creditRole, eventType, now)
+}
+
+// AllowsRelease determines whether an event for this follow should exist in
+// the member's notification/inbox history. Spotify, iTunes, and MusicBrainz
+// normalize compilations as primary type Album with Compilation in the
+// secondary types, so compilations have their own filter and must not be
+// accidentally controlled by the Albums checkbox.
+func (r FollowNotificationRule) AllowsRelease(primaryType string, secondaryTypes []string, creditRole, eventType string, now time.Time) bool {
 	if strings.EqualFold(strings.TrimSpace(creditRole), "featured") {
 		if !r.IncludeFeatured {
 			return false
@@ -54,22 +64,33 @@ func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType
 	} else if !r.IncludePrimary {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(primaryType)) {
-	case "album":
-		if !r.Albums {
-			return false
+	compilation := strings.EqualFold(strings.TrimSpace(primaryType), "compilation")
+	if !compilation {
+		for _, secondary := range secondaryTypes {
+			if strings.EqualFold(strings.TrimSpace(secondary), "compilation") {
+				compilation = true
+				break
+			}
 		}
-	case "ep":
-		if !r.EPs {
-			return false
-		}
-	case "single":
-		if !r.Singles {
-			return false
-		}
-	case "compilation":
+	}
+	if compilation {
 		if !r.Compilations {
 			return false
+		}
+	} else {
+		switch strings.ToLower(strings.TrimSpace(primaryType)) {
+		case "album":
+			if !r.Albums {
+				return false
+			}
+		case "ep":
+			if !r.EPs {
+				return false
+			}
+		case "single":
+			if !r.Singles {
+				return false
+			}
 		}
 	}
 	switch eventType {
@@ -91,6 +112,27 @@ func (r FollowNotificationRule) queuesImmediate(now time.Time) bool {
 func (r FollowNotificationRule) belongsInDigest(now time.Time) bool {
 	mode := r.effectiveDeliveryMode(now)
 	return mode == FollowDeliveryInherit || mode == FollowDeliveryDigest
+}
+
+// allowsAccountNotificationMoment applies the account-wide event-moment
+// preferences to follows that still inherit account defaults. A follow with
+// an explicit delivery mode is intentionally treated as an override: its
+// content filters continue to decide whether the event is eligible, while the
+// mode controls whether it is delivered immediately, in a digest, or retained
+// only in history. This keeps the account settings useful without making an
+// explicit per-follow rule impossible to use.
+func (r FollowNotificationRule) allowsAccountNotificationMoment(p NotificationPreferences, eventType string) bool {
+	if normalizeFollowDeliveryMode(r.DeliveryMode) != FollowDeliveryInherit {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "announcement":
+		return p.Announcements
+	case "release_day":
+		return p.ReleaseDay
+	default:
+		return true
+	}
 }
 
 func scanFollowNotificationRule(row interface{ Scan(...any) error }) (FollowNotificationRule, error) {

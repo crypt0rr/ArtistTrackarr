@@ -146,6 +146,24 @@ func TestTransientFailureServesStaleArtwork(t *testing.T) {
 	}
 }
 
+func TestWriteAtomicRejectsEmptyDataWithoutReplacingExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cover.img")
+	original := []byte("complete artwork")
+	if err := writeAtomic(path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, nil); err == nil {
+		t.Fatal("empty artwork write unexpectedly succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing artwork changed after failed write: %q", got)
+	}
+}
+
 func TestAllowedImageTypes(t *testing.T) {
 	for _, value := range []string{"image/jpeg", "image/png", "image/webp; charset=binary", "image/gif"} {
 		if !allowedImageType(value) {

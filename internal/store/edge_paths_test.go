@@ -340,6 +340,84 @@ func TestResolveNotificationHoldDiscardsOwnerScopedHold(t *testing.T) {
 	}
 }
 
+func TestDiscardedNotificationHoldIsTerminalUntilRestored(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	userID, err := s.CreateUser(ctx, "hold-terminal@example.com", "hash", "member", "UTC", "hold-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences, err := s.NotificationPreferences(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences.HoldConflictingNotifications = true
+	if err := s.UpdateNotificationPreferences(ctx, preferences); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "hold-terminal-artist", Name: "Hold Terminal Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "hold-terminal-release", artist.ID, "Hold Terminal Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/hold-terminal-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,evidence_json,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, releaseID, "title_conflict", "warning", "hold-terminal-fingerprint", "title conflict", "[]", "open", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.QueueDueReleaseDays(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := s.NotificationHoldsForRelease(ctx, userID, releaseID)
+	if err != nil || len(holds) != 1 {
+		t.Fatalf("initial holds=%#v err=%v", holds, err)
+	}
+	if err := s.ResolveNotificationHold(ctx, userID, holds[0].ID, "discard"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueDueReleaseDays(ctx, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if holds, err := s.NotificationHolds(ctx, userID, 20); err != nil || len(holds) != 0 {
+		t.Fatalf("discarded hold was recreated: holds=%#v err=%v", holds, err)
+	}
+	allHolds, err := s.NotificationHoldsForReleaseIncludingDiscarded(ctx, userID, releaseID)
+	if err != nil || len(allHolds) != 1 || allHolds[0].Status != "discarded" {
+		t.Fatalf("discarded hold projection=%#v err=%v", allHolds, err)
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `UPDATE release_evidence_issues SET status='resolved',resolved_at=? WHERE release_group_id=?`, nowText(), releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolveNotificationHold(ctx, userID, allHolds[0].ID, "restore"); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 1)
+	var status string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE id=?`, allHolds[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "released" {
+		t.Fatalf("restored hold status=%q, want released", status)
+	}
+}
+
 func TestWriteTransactionCancellationAndClosedDatabase(t *testing.T) {
 	s := testStore(t)
 	ctx, cancel := context.WithCancel(context.Background())

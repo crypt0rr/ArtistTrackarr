@@ -182,7 +182,9 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	if response.StatusCode == http.StatusNotFound {
 		c.resetCircuit()
 		_ = os.Remove(imagePath)
-		_ = c.writeCacheFile(missingPath, nil)
+		// Keep a non-empty marker so the atomic artwork writer can reject empty
+		// image payloads without disabling the 24-hour negative cache.
+		_ = c.writeCacheFile(missingPath, []byte("missing\n"))
 		return placeholderAsset("missing")
 	}
 	if response.StatusCode != http.StatusOK {
@@ -380,14 +382,22 @@ func (c *Cache) writeCacheFile(path string, data []byte) error {
 }
 
 func writeAtomic(path string, data []byte) error {
+	if len(data) == 0 {
+		return errors.New("artwork cache data is empty")
+	}
 	file, err := os.CreateTemp(filepath.Dir(path), ".artwork-*")
 	if err != nil {
 		return err
 	}
 	tempName := file.Name()
 	defer func() { _ = os.Remove(tempName) }()
-	if err := file.Chmod(0o640); err == nil {
-		_, err = file.Write(data)
+	if err := file.Chmod(0o640); err != nil {
+		_ = file.Close()
+		return err
+	}
+	written, err := file.Write(data)
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
 	}
 	if closeErr := file.Close(); err == nil {
 		err = closeErr

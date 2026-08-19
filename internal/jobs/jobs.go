@@ -1279,6 +1279,11 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 			if attemptID > 0 {
 				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
+			if errors.Is(markErr, sql.ErrNoRows) {
+				r.logger.Warn("notification delivery claim lost after send",
+					"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+				return deliveryResult{failed: true}
+			}
 			return deliveryResult{failed: true, err: markErr}
 		}
 		if attemptID > 0 {
@@ -1295,7 +1300,12 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	r.logger.Warn("release digest delivery attempt failed",
 		"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
 	if markErr := r.store.MarkDigestDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		result.err = markErr
+		if errors.Is(markErr, sql.ErrNoRows) {
+			r.logger.Warn("notification delivery claim lost after failure",
+				"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+		} else {
+			result.err = markErr
+		}
 	}
 	if attemptID > 0 {
 		var nextRetry *time.Time
@@ -1334,6 +1344,11 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 			if attemptID > 0 {
 				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
+			if errors.Is(markErr, sql.ErrNoRows) {
+				r.logger.Warn("notification delivery claim lost after send",
+					"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+				return deliveryResult{failed: true}
+			}
 			return deliveryResult{failed: true, err: markErr}
 		}
 		if attemptID > 0 {
@@ -1350,7 +1365,12 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	r.logger.Warn("notification attempt failed",
 		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
 	if markErr := r.store.MarkDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		result.err = markErr
+		if errors.Is(markErr, sql.ErrNoRows) {
+			r.logger.Warn("notification delivery claim lost after failure",
+				"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+		} else {
+			result.err = markErr
+		}
 	}
 	if attemptID > 0 {
 		var nextRetry *time.Time

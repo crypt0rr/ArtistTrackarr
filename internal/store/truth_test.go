@@ -129,6 +129,56 @@ func TestReleaseTruthDecisionRejectsUnobservedProvider(t *testing.T) {
 	}
 }
 
+func TestAccountAnnouncementPreferenceAppliesToTruthApproval(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "truth-account-preferences@example.com", "hash", "member", "UTC", "truth-account-preferences")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "truth-account-preferences-artist", Name: "Truth Account Preferences"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true,
+		Announcements: false, ReleaseDay: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release := Release{
+		SpotifyID: "truth-account-preferences-release", SpotifyURL: "https://open.spotify.com/album/truth-account-preferences-release",
+		Title: "Truth Account Preferences Release", PrimaryType: "Album", FirstReleaseDate: "2099-01-01", DatePrecision: 3,
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE spotify_id=?`, release.SpotifyID).Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReleaseTruthDecision(ctx, userID, releaseID, "spotify", "reviewed while account announcements are disabled"); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.DeliveryMode = FollowDeliveryImmediate
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReleaseTruthDecision(ctx, userID, releaseID, "spotify", "explicit follow override"); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
 func TestReleaseTruthState(t *testing.T) {
 	cases := []struct {
 		name, want, explicit, source string

@@ -115,6 +115,11 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 		f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
 		followers = append(followers, f)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		_ = tx.Rollback()
+		return err
+	}
 	_ = rows.Close()
 	for _, follower := range followers {
 		if !follower.baseline {
@@ -293,6 +298,10 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 			return err
 		}
 		candidates = append(candidates, d)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
 	}
 	_ = rows.Close()
 	for _, d := range candidates {

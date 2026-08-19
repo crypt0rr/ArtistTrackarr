@@ -45,7 +45,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.46.5`; local and published images use the
+footer. The current release is `v0.46.6`; local and published images use the
 same source-controlled semantic version. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
@@ -241,7 +241,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.46.5` publishes `0.46.5`, `0.46`, and `latest`.
+- Pushing a tag such as `v0.46.6` publishes `0.46.6`, `0.46`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -255,7 +255,7 @@ language/runtime line.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.5 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.6 docker compose up -d
 ```
 
 ## Configuration
@@ -467,7 +467,10 @@ persistent data directory and is accompanied by a restrictive-permission
 Successful backups write a non-sensitive timestamp marker into the persistent
 volume so administrator diagnostics can show an approximate backup age. The
 marker is archived with the next backup and is not a substitute for an
-off-host backup inventory.
+off-host backup inventory. The helper preserves the invoking operator's UID/GID
+on the archive and checksum, and makes the marker readable by the application
+user (UID 10001); the operator therefore only needs Docker access and write
+permission to the output directory.
 
 Restore into an empty Compose volume while the app is stopped, keep the
 original `APP_ENCRYPTION_KEY` available, and run the temporary restore
