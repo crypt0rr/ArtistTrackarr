@@ -169,7 +169,10 @@ func TestReleaseInboxOrdersUnreadAndExpiredSnoozesFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	expiredID := insertRelease("inbox-order-expired", "Expired snooze", now.Add(-2*time.Hour))
-	if err := s.SetReleaseInboxState(ctx, userID, expiredID, "snoozed", ptrTime(now.Add(-time.Minute))); err != nil {
+	// Seed an expired snooze directly because SetReleaseInboxState intentionally
+	// rejects user-created snoozes that are not in the future relative to wall time.
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO user_release_states(user_id,release_group_id,state,snoozed_until,updated_at)
+		VALUES(?,?,?,?,?)`, userID, expiredID, "snoozed", timeText(now.Add(-time.Minute)), timeText(now)); err != nil {
 		t.Fatal(err)
 	}
 	items, err := s.ReleaseInbox(ctx, userID, "", "", "", 20, 0, now)
