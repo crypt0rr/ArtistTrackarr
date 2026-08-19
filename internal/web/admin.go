@@ -65,8 +65,12 @@ func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := make([]providerHealthPayload, 0, len(health))
+	timezone := ""
+	if session, ok := currentSession(r); ok {
+		timezone = session.User.Timezone
+	}
 	for _, provider := range health {
-		response = append(response, providerHealthPayloadForConfig(provider, a.cfg))
+		response = append(response, providerHealthPayloadForConfig(provider, a.cfg, timezone))
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -6,7 +6,7 @@
   <article><strong>{{.AlreadyFollowed}}</strong><span>already followed</span></article>
   <article><strong>{{.Invalid}}</strong><span>invalid</span></article>
 </section>
-<section class="panel"><div class="section-head"><div><p class="eyebrow">CSV import</p><h2>Row details</h2></div><span class="badge">{{len .Rows}} rows · {{formatTime .CreatedAt}}</span></div>
+<section class="panel"><div class="section-head"><div><p class="eyebrow">CSV import</p><h2>Row details</h2></div><span class="badge">{{len .Rows}} rows · {{formatTime .CreatedAt $.User.Timezone}}</span></div>
   {{if .Rows}}<div class="table-scroll"><table><thead><tr><th>Source</th><th>Display name</th><th>Status</th><th>Reason</th></tr></thead><tbody>{{range .Rows}}<tr><td>{{.SourceValue}}</td><td>{{.DisplayName}}</td><td><span class="badge {{.Status}}">{{.Status}}</span></td><td>{{.Reason}}</td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No rows were recorded.</div>{{end}}
 </section>
 {{end}}

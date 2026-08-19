@@ -87,7 +87,7 @@
   <p class="eyebrow">Delivery log</p><h2>Recent notifications</h2>
   {{if .History}}<div class="list delivery-scroll" data-delivery-scroll tabindex="0" aria-label="Recent notification deliveries">{{range .History}}<article class="list-row delivery-row">
     <div><strong>{{.Title}}</strong><span>{{.EventType}} · {{.Destination}}</span></div>
-    <div class="delivery-state"><span class="badge {{.Status}}">{{.Status}}</span><small>{{formatTime .CreatedAt}}</small></div>
+    <div class="delivery-state"><span class="badge {{.Status}}">{{.Status}}</span><small>{{formatTime .CreatedAt $.User.Timezone}}</small></div>
   </article>{{end}}</div>{{else}}<div class="empty">No notification events yet.</div>{{end}}
 </section>
 {{template "foot" .}}

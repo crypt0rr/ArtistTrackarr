@@ -65,12 +65,33 @@ func formatBytes(value int64) string {
 	return strconv.FormatFloat(math.Round(amount*10)/10, 'f', -1, 64) + " " + units[index]
 }
 
-func providerHealthTime(value any) string {
+func displayLocation(timezones ...string) *time.Location {
+	if len(timezones) == 0 || strings.TrimSpace(timezones[0]) == "" {
+		return time.Local
+	}
+	location, err := time.LoadLocation(strings.TrimSpace(timezones[0]))
+	if err != nil {
+		// Timezone validation happens when profiles are written, but legacy
+		// databases can contain invalid values. UTC keeps their display
+		// deterministic without affecting stored timestamps or scheduling.
+		return time.UTC
+	}
+	return location
+}
+
+func formatTime(value time.Time, timezones ...string) string {
+	if len(timezones) == 0 {
+		return value.Format("2006-01-02 15:04")
+	}
+	return value.In(displayLocation(timezones...)).Format("2006-01-02 15:04")
+}
+
+func providerHealthTime(value any, timezones ...string) string {
 	t, ok := providerTimeValue(value)
 	if !ok || t.IsZero() {
 		return ""
 	}
-	return t.In(time.Local).Format("2006-01-02 15:04:05 MST")
+	return t.In(displayLocation(timezones...)).Format("2006-01-02 15:04:05 MST")
 }
 
 func providerHealthTimeAttr(value any) string {
@@ -132,20 +153,20 @@ func assuranceStatusClass(status string) string {
 	}
 }
 
-func providerHealthPayloadFor(p store.ProviderHealth) providerHealthPayload {
+func providerHealthPayloadFor(p store.ProviderHealth, timezones ...string) providerHealthPayload {
 	return providerHealthPayload{
 		Provider: p.Provider, Status: providerHealthStatus(p), StatusClass: providerHealthClass(p),
-		LastSuccessAt: p.LastSuccessAt, LastSuccessDisplay: providerHealthTime(p.LastSuccessAt),
-		LastFailureAt: p.LastFailureAt, LastFailureDisplay: providerHealthTime(p.LastFailureAt),
+		LastSuccessAt: p.LastSuccessAt, LastSuccessDisplay: providerHealthTime(p.LastSuccessAt, timezones...),
+		LastFailureAt: p.LastFailureAt, LastFailureDisplay: providerHealthTime(p.LastFailureAt, timezones...),
 		LastError: providerHealthError(p), NextCheckAt: p.NextCheckAt,
-		NextCheckDisplay: providerHealthTime(p.NextCheckAt), UpdatedAt: p.UpdatedAt,
-		UpdatedDisplay: providerHealthTime(&p.UpdatedAt), RateLimited: p.RateLimited,
+		NextCheckDisplay: providerHealthTime(p.NextCheckAt, timezones...), UpdatedAt: p.UpdatedAt,
+		UpdatedDisplay: providerHealthTime(&p.UpdatedAt, timezones...), RateLimited: p.RateLimited,
 		QuotaExceeded: p.QuotaExceeded,
 	}
 }
 
-func providerHealthPayloadForConfig(p store.ProviderHealth, cfg config.Config) providerHealthPayload {
-	payload := providerHealthPayloadFor(p)
+func providerHealthPayloadForConfig(p store.ProviderHealth, cfg config.Config, timezones ...string) providerHealthPayload {
+	payload := providerHealthPayloadFor(p, timezones...)
 	payload.Status = providerHealthStatusFor(p, cfg)
 	switch payload.Status {
 	case "healthy":
@@ -201,7 +222,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 			}
 			return v
 		},
-		"formatTime":          func(v time.Time) string { return v.Format("2006-01-02 15:04") },
+		"formatTime":          formatTime,
 		"compactCount":        compactCount,
 		"followDeliveryLabel": followDeliveryLabel,
 		"followRuleSummary":   followRuleSummary,

@@ -14,7 +14,7 @@
   </form>
   {{if .EvidenceIssues}}<div class="evidence-list">
     {{range .EvidenceIssues}}<article class="evidence-issue evidence-{{.Severity}}">
-      <div class="evidence-issue-head"><div><span class="badge {{evidenceIssueSeverityClass .Severity}}">{{.Severity}}</span><span class="badge">{{evidenceIssueTypeLabel .IssueType}}</span><span class="badge">{{.ReviewState}}</span></div><small>Last seen {{formatTime .LastSeenAt}}</small></div>
+      <div class="evidence-issue-head"><div><span class="badge {{evidenceIssueSeverityClass .Severity}}">{{.Severity}}</span><span class="badge">{{evidenceIssueTypeLabel .IssueType}}</span><span class="badge">{{.ReviewState}}</span></div><small>Last seen {{formatTime .LastSeenAt $.User.Timezone}}</small></div>
       <a class="evidence-release-link" href="/releases/{{.ReleaseGroupID}}"><h3>{{.ReleaseTitle}}</h3><p>{{.ArtistName}}</p></a>
       <p class="evidence-summary">{{.Summary}}</p>
       {{if .Evidence}}<div class="evidence-snapshots" aria-label="Provider snapshots">{{range .Evidence}}<div class="evidence-snapshot"><div><strong>{{providerLabel .Provider}}</strong>{{if .ProviderURL}}<a href="{{.ProviderURL}}" target="_blank" rel="noopener noreferrer">Open source</a>{{end}}</div><span>{{.Title}} · {{.PrimaryType}} · {{if .FirstReleaseDate}}{{.FirstReleaseDate}}{{else}}date unknown{{end}}</span></div>{{end}}</div>{{end}}
