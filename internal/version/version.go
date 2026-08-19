@@ -1,7 +1,8 @@
 package version
 
-// Current is overridden for release images with -ldflags. Local builds are
-// intentionally identified as dev so they cannot be mistaken for a release.
-var Current = "dev"
+// Current is the source-controlled application version shown in the UI and
+// sent in provider User-Agent headers. It is bumped with every release so
+// local and published images share the same version identity.
+const Current = "0.46.1"
 
-var UserAgent = "ArtistTrackarr/" + Current
+const UserAgent = "ArtistTrackarr/" + Current
