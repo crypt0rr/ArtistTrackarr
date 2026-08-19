@@ -110,6 +110,10 @@ func scanFollowNotificationRule(row interface{ Scan(...any) error }) (FollowNoti
 	if rule.PausedUntil, parseErr = parseStoredNullableTime(paused, "follow notification rule paused_until"); parseErr != nil {
 		return rule, parseErr
 	}
+	if !updated.Valid || strings.TrimSpace(updated.String) == "" {
+		rule.UpdatedAt = time.Now().UTC()
+		return rule, nil
+	}
 	rule.UpdatedAt, parseErr = parseStoredTime(updated.String, "follow notification rule updated_at")
 	return rule, parseErr
 }
@@ -350,6 +354,9 @@ func followRuleFromColumns(mode string, primary, featured, albums, eps, singles,
 		if err != nil {
 			return rule, err
 		}
+	}
+	if strings.TrimSpace(updated) == "" {
+		return rule, nil
 	}
 	rule.UpdatedAt, err = parseStoredTime(updated, "follow notification rule updated_at")
 	return rule, err

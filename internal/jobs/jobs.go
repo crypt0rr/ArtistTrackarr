@@ -987,7 +987,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	outcome.SpotifyUnchanged = strategy.spotifyUnchanged
 	if strategy.spotifyDeferred {
 		if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
-			return outcome, err
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 		return outcome, nil
 	}
@@ -1003,7 +1003,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		// outage.
 		if len(strategy.providerErrors) == 0 && (strategy.spotifyHealthy || strategy.itunesHealthy) {
 			if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
-				return outcome, err
+				return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 			}
 			if spotifyWasDue && strategy.spotifyAttempted {
 				// Empty Spotify results are a healthy request but not an
@@ -1014,7 +1014,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 					retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
 				}
 				if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
-					return outcome, err
+					return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 				}
 			}
 			return outcome, nil
@@ -1024,24 +1024,34 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
 				"quota_exceeded", strategy.spotifyRateLimit.QuotaExceeded)
-			strategy.providerErrors = append(strategy.providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID,
-				now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))))
+			if scheduleErr := r.store.ScheduleSpotifyCheck(ctx, artist.ID,
+				now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))); scheduleErr != nil {
+				strategy.providerErrors = append(strategy.providerErrors,
+					r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, scheduleErr))
+			}
 		} else if strategy.spotifySuppressed {
-			strategy.providerErrors = append(strategy.providerErrors, r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown))
+			if scheduleErr := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); scheduleErr != nil {
+				strategy.providerErrors = append(strategy.providerErrors,
+					r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, scheduleErr))
+			}
 		}
 		r.logger.Debug("artist sync retry scheduled", "artist_id", artist.ID,
 			"retry_after", providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval).String())
-		return outcome, errors.Join(errors.Join(strategy.providerErrors...), r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt))
+		retryErr := r.store.ScheduleArtistCheck(ctx, artist.ID, retryAt)
+		if retryErr != nil {
+			retryErr = r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, retryErr)
+		}
+		return outcome, errors.Join(errors.Join(strategy.providerErrors...), retryErr)
 	}
 	if err := r.store.ApplyReleaseBatches(ctx, artist, strategy.batches, now); err != nil {
-		return outcome, err
+		return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 	}
 	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
-		return outcome, err
+		return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 	}
 	if strategy.spotifySuppressed {
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); err != nil {
-			return outcome, err
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 		return outcome, nil
 	}
@@ -1050,7 +1060,10 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
 				"quota_exceeded", strategy.spotifyRateLimit.QuotaExceeded)
-			return outcome, r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval)))
+			if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))); err != nil {
+				return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
+			}
+			return outcome, nil
 		}
 		upcoming := false
 		for _, batch := range strategy.batches {
@@ -1065,7 +1078,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			}
 		}
 		if err := r.store.MarkSpotifyCheckedAdaptive(ctx, artist.ID, now, r.spotifyInterval, outcome.SpotifyChanged, upcoming); err != nil {
-			return outcome, err
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 		outcome.SpotifyBackoff = outcome.SpotifyUnchanged && !upcoming
 	} else if spotifyWasDue && strategy.spotifyAttempted && !strategy.spotifySucceeded {
@@ -1078,10 +1091,27 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
 		}
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
-			return outcome, err
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 	}
 	return outcome, nil
+}
+
+// scheduleSyncPersistenceFailure keeps a malformed or otherwise failed
+// persistence step from pinning an artist at the front of the due queue. The
+// original error remains the caller's primary signal; retry scheduling is a
+// best-effort recovery action with the same bounded delay used for provider
+// failures.
+func (r *Runner) scheduleSyncPersistenceFailure(ctx context.Context, artistID int64, now time.Time, cause error) error {
+	retryAfter := providerFailureRetryDelay(nil, r.interval)
+	retryAt := now.Add(retryAfter)
+	if err := r.store.ScheduleArtistRetry(ctx, artistID, now, retryAt); err != nil {
+		r.logger.Warn("artist sync retry scheduling failed", "artist_id", artistID, "error", err)
+		return errors.Join(cause, err)
+	}
+	r.logger.Debug("artist sync persistence retry scheduled", "artist_id", artistID,
+		"retry_after", retryAfter.String())
+	return cause
 }
 
 func isFutureRelease(value string, now time.Time) bool {

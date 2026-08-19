@@ -703,6 +703,29 @@ func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next ti
 	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
 	return err
 }
+
+// ScheduleArtistRetry advances the normal schedule after a persistence
+// failure. Any due Spotify/provider schedule is advanced with it so the
+// artist cannot remain pinned by ArtistsDue's OR predicate, while a provider
+// cooldown already in the future is preserved.
+func (s *Store) ScheduleArtistRetry(ctx context.Context, artistID int64, now, next time.Time) error {
+	tx, err := s.beginWriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+		CASE WHEN spotify_next_check_at IS NULL OR spotify_next_check_at<=? THEN ? ELSE spotify_next_check_at END
+		WHERE id=?`, timeText(next), timeText(now), timeText(next), artistID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=?
+		WHERE artist_id=? AND (next_check_at IS NULL OR next_check_at<=?)`, timeText(next), artistID, timeText(now)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
 	return s.MarkSpotifyCheckedAdaptive(ctx, artistID, now, interval, true, false)
 

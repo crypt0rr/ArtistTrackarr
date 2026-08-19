@@ -62,7 +62,7 @@ func TestAdminDiagnosticsJSONAndRetentionExport(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["version"] != "0.46.1" || payload["operational_status"] == nil || payload["database"] == nil || payload["retention"] == nil || payload["runner"] == nil {
+	if payload["version"] != "0.46.2" || payload["operational_status"] == nil || payload["database"] == nil || payload["retention"] == nil || payload["runner"] == nil {
 		t.Fatalf("unexpected diagnostics payload=%#v", payload)
 	}
 	jsonBody, _ := json.Marshal(payload)

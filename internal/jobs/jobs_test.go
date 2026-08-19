@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -905,6 +906,157 @@ func TestSyncArtistsSummarizesMixedOutcomes(t *testing.T) {
 	}
 	if releases != 1 {
 		t.Fatalf("successful artist release count=%d", releases)
+	}
+}
+
+func TestImportedFollowSyncCreatesRuleReleaseAndOnboardingEvent(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "import-sync@example.com", "unused", "member", "UTC", "import-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "import-sync-artist"
+	if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{
+		SourceValue: mbid, DisplayName: "Imported Sync Artist", MBID: mbid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.ArtistByMBID(ctx, mbid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artist.ID).Scan(&rules); err != nil {
+		t.Fatal(err)
+	}
+	if rules != 1 {
+		t.Fatalf("imported follow rules=%d, want 1", rules)
+	}
+	provider := &perArtistCatalog{releases: map[string][]store.Release{
+		mbid: {{MBID: "import-sync-release", Title: "Imported Sync Release", PrimaryType: "Album", FirstReleaseDate: "2026-08-18", DatePrecision: 3}},
+	}}
+	if err := testRunner(database, provider).SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	var releases, events int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if releases != 1 || events != 1 {
+		t.Fatalf("import sync releases=%d events=%d, want one of each", releases, events)
+	}
+}
+
+func TestImportedArtistsDoNotPinDueQueue(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "import-queue@example.com", "unused", "member", "UTC", "import-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &perArtistCatalog{releases: make(map[string][]store.Release)}
+	for i := 0; i < 30; i++ {
+		mbid := fmt.Sprintf("import-queue-artist-%02d", i)
+		if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: mbid, MBID: mbid}); err != nil {
+			t.Fatal(err)
+		}
+		provider.releases[mbid] = []store.Release{{
+			MBID: fmt.Sprintf("import-queue-release-%02d", i), Title: "Imported Queue Release", PrimaryType: "Album",
+			FirstReleaseDate: "2026-08-18", DatePrecision: 3,
+		}}
+	}
+	normal, err := database.UpsertArtist(ctx, store.Artist{MBID: "import-queue-normal", Name: "Normal Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, normal.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider.releases[normal.MBID] = []store.Release{{
+		MBID: "import-queue-normal-release", Title: "Normal Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-18", DatePrecision: 3,
+	}}
+	runner := testRunner(database, provider)
+	now := time.Now().UTC().Add(time.Minute)
+	first, err := runner.syncArtists(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.syncArtists(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Due != 25 || second.Due != 6 {
+		t.Fatalf("queue summaries first=%#v second=%#v, want 25 then 6", first, second)
+	}
+	var normalReleases int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, normal.ID).Scan(&normalReleases); err != nil {
+		t.Fatal(err)
+	}
+	if normalReleases != 1 {
+		t.Fatalf("normal artist release count=%d, want 1", normalReleases)
+	}
+}
+
+func TestSyncPersistenceFailureSchedulesBoundedRetry(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "sync-retry@example.com", "unused", "member", "UTC", "sync-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "sync-retry-artist", Name: "Sync Retry Artist", SpotifyID: "sync-retry-spotify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `UPDATE follow_notification_rules SET updated_at='not-a-time' WHERE user_id=? AND artist_id=?`, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider := &perArtistCatalog{releases: map[string][]store.Release{
+		artist.MBID: {{MBID: "sync-retry-release", Title: "Retry Release", PrimaryType: "Album", FirstReleaseDate: "2026-08-18", DatePrecision: 3}},
+	}}
+	now := time.Now().UTC()
+	runner := testRunner(database, provider)
+	if _, err := runner.syncOne(ctx, artist, now); err == nil {
+		t.Fatal("sync succeeded despite corrupt persisted notification rule")
+	}
+	var next sql.NullString
+	if err := database.DB.QueryRowContext(ctx, `SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	if !next.Valid {
+		t.Fatal("persistence failure did not schedule a retry")
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, next.String)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retryAt.After(now) || retryAt.After(now.Add(15*time.Minute+time.Second)) {
+		t.Fatalf("retry scheduled at %s, want within 15 minutes after %s", retryAt, now)
+	}
+	due, err := database.ArtistsDue(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			t.Fatal("persistence failure left the artist due through its Spotify schedule")
+		}
 	}
 }
 
