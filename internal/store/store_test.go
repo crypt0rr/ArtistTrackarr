@@ -968,6 +968,78 @@ func TestInitialMultiSourceSyncCanChooseSpotifyRelease(t *testing.T) {
 	}
 }
 
+func TestInitialReleaseUsesFollowerTimezoneForTodayClassification(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	nearMidnight := time.Date(2026, 8, 19, 23, 30, 0, 0, time.UTC)
+	localTodayUser, err := s.CreateUser(ctx, "initial-local-today@example.com", "unused", "member", "Pacific/Kiritimati", "initial-local-today")
+	if err != nil {
+		t.Fatal(err)
+	}
+	futureUser, err := s.CreateUser(ctx, "initial-local-future@example.com", "unused", "member", "Etc/GMT+12", "initial-local-future")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "initial-timezone-artist", Name: "Timezone Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{localTodayUser, futureUser} {
+		if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := Release{
+		MBID: "initial-timezone-release", Title: "Tomorrow Somewhere", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-20", DatePrecision: 3,
+		MusicBrainzURL: "https://musicbrainz.org/release-group/initial-timezone-release",
+	}
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{release}, nearMidnight); err != nil {
+		t.Fatal(err)
+	}
+	var localEvent, futureEvent string
+	if err := s.DB.QueryRowContext(ctx, `SELECT event_type FROM notification_events WHERE user_id=?`, localTodayUser).Scan(&localEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT event_type FROM notification_events WHERE user_id=?`, futureUser).Scan(&futureEvent); err != nil {
+		t.Fatal(err)
+	}
+	if localEvent != "release_day" || futureEvent != "announcement" {
+		t.Fatalf("local event=%q future event=%q, want release_day/announcement", localEvent, futureEvent)
+	}
+}
+
+func TestInitialReleaseLocalDateHandlesDSTAndPartialDates(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dayRelease := syncedRelease{release: Release{
+		MBID: "dst-day", Title: "DST Day", PrimaryType: "Album",
+		FirstReleaseDate: "2026-03-08", DatePrecision: 3,
+	}}
+	selected, eventType, ok := selectInitialReleaseInLocation(
+		[]syncedRelease{dayRelease},
+		time.Date(2026, 3, 9, 0, 30, 0, 0, time.UTC),
+		location,
+	)
+	if !ok || selected.release.MBID != "dst-day" || eventType != "release_day" {
+		t.Fatalf("DST day selection=%q event=%q ok=%v, want dst-day/release_day/true", selected.release.MBID, eventType, ok)
+	}
+	partialRelease := syncedRelease{release: Release{
+		MBID: "partial-month", Title: "March Collection", PrimaryType: "Album",
+		FirstReleaseDate: "2026-03", DatePrecision: 2,
+	}}
+	selected, eventType, ok = selectInitialReleaseInLocation(
+		[]syncedRelease{partialRelease},
+		time.Date(2026, 3, 31, 23, 30, 0, 0, time.UTC),
+		location,
+	)
+	if !ok || selected.release.MBID != "partial-month" || eventType != "announcement" {
+		t.Fatalf("partial-date selection=%q event=%q ok=%v, want partial-month/announcement/true", selected.release.MBID, eventType, ok)
+	}
+}
+
 func TestSpotifyUpgradeBaselineSuppressesBackCatalogueAndAlertsNewRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

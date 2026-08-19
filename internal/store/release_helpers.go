@@ -506,8 +506,12 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 		`SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE rg.id=?`, releaseID))
 }
 func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
+	return selectInitialReleaseInLocation(items, observed, time.UTC)
+}
+
+func selectInitialReleaseInLocation(items []syncedRelease, observed time.Time, location *time.Location) (syncedRelease, string, bool) {
 	var zero syncedRelease
-	today := dayUTC(observed)
+	today := dayInLocation(observed, location)
 	var upcoming syncedRelease
 	var upcomingStart time.Time
 	var latest syncedRelease
@@ -544,7 +548,11 @@ func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRele
 	return latest, "announcement", true
 }
 func initialReleaseMessage(artist Artist, release Release, eventType string, observed time.Time) (string, string) {
-	today := dayUTC(observed)
+	return initialReleaseMessageInLocation(artist, release, eventType, observed, time.UTC)
+}
+
+func initialReleaseMessageInLocation(artist Artist, release Release, eventType string, observed time.Time, location *time.Location) (string, string) {
+	today := dayInLocation(observed, location)
 	start, _ := comparableReleaseDate(release.FirstReleaseDate)
 	link := releaseExternalURL(release)
 	creditRole, trackTitle := releaseMessageCredit(release)
@@ -941,4 +949,22 @@ func releaseDate(value string) (time.Time, bool) {
 func dayUTC(t time.Time) time.Time {
 	y, m, d := t.UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func dayInLocation(t time.Time, location *time.Location) time.Time {
+	if location == nil {
+		location = time.UTC
+	}
+	y, m, d := t.In(location).Date()
+	// Keep the returned value in UTC so it can be compared with the parsed
+	// ISO release dates without mixing location offsets into date ordering.
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func userLocation(value string) *time.Location {
+	location, err := time.LoadLocation(strings.TrimSpace(value))
+	if err != nil {
+		return time.UTC
+	}
+	return location
 }

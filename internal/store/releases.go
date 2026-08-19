@@ -89,14 +89,15 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			return fmt.Errorf("drain release notification holds: %w", err)
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT user_id,baseline_synced_at,spotify_baseline_synced_at,spotify_appears_on_baseline_synced_at
-		FROM follows WHERE artist_id=?`, artist.ID)
+	rows, err := tx.QueryContext(ctx, `SELECT f.user_id,u.timezone,f.baseline_synced_at,f.spotify_baseline_synced_at,f.spotify_appears_on_baseline_synced_at
+		FROM follows f JOIN users u ON u.id=f.user_id WHERE f.artist_id=?`, artist.ID)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	type follower struct {
 		id                        int64
+		timezone                  string
 		baseline                  bool
 		spotifyBaseline           bool
 		spotifyAppearanceBaseline bool
@@ -105,7 +106,7 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 	for rows.Next() {
 		var f follower
 		var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
-		if err := rows.Scan(&f.id, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
+		if err := rows.Scan(&f.id, &f.timezone, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
 			_ = rows.Close()
 			_ = tx.Rollback()
 			return err
@@ -122,9 +123,10 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 	}
 	_ = rows.Close()
 	for _, follower := range followers {
+		location := userLocation(follower.timezone)
 		if !follower.baseline {
-			if selected, eventType, ok := selectInitialRelease(savedReleases, observed); ok {
-				title, body := initialReleaseMessage(artist, selected.release, eventType, observed)
+			if selected, eventType, ok := selectInitialReleaseInLocation(savedReleases, observed, location); ok {
+				title, body := initialReleaseMessageInLocation(artist, selected.release, eventType, observed, location)
 				if err := enqueueEventTx(ctx, tx, follower.id, selected.release.ID, eventType, title, body, observed); err != nil {
 					_ = tx.Rollback()
 					return fmt.Errorf("enqueue initial release event: %w", err)

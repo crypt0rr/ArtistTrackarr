@@ -195,10 +195,7 @@ func ensureApprovedReleaseNotificationTx(ctx context.Context, tx *sql.Tx, userID
 	if err := tx.QueryRowContext(ctx, `SELECT timezone FROM users WHERE id=?`, userID).Scan(&timezone); err != nil {
 		return err
 	}
-	location, err := time.LoadLocation(strings.TrimSpace(timezone))
-	if err != nil {
-		location = time.UTC
-	}
+	location := userLocation(timezone)
 	localNow := now.In(location)
 	eventType := "announcement"
 	releaseDateValue := strings.TrimSpace(release.FirstReleaseDate)
@@ -235,7 +232,7 @@ func ensureApprovedReleaseNotificationTx(ctx context.Context, tx *sql.Tx, userID
 	default:
 		return nil
 	}
-	title, body := initialReleaseMessage(Artist{ID: release.ArtistID, Name: release.ArtistName}, release, eventType, now.UTC())
+	title, body := initialReleaseMessageInLocation(Artist{ID: release.ArtistID, Name: release.ArtistName}, release, eventType, now.UTC(), location)
 	return enqueueApprovedEventTx(ctx, tx, userID, releaseID, eventType, title, body, now.UTC())
 }
 
