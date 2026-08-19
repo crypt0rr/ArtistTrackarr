@@ -643,29 +643,46 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	artists, err := a.store.FollowedArtists(r.Context(), session.User.ID)
+	filename := "artist-trackarr-watched-artists-" + time.Now().UTC().Format("2006-01-02") + ".csv"
+	payload, err := buildBufferedCSV(func(writer *csv.Writer) error {
+		if err := writer.Write([]string{
+			"artist", "display_name", "musicbrainz_id", "musicbrainz_url", "spotify_id", "spotify_url",
+		}); err != nil {
+			return err
+		}
+		const pageSize = 500
+		var cursor *store.ArtistExportCursor
+		for {
+			artists, next, err := a.store.FollowedArtistsExportPage(r.Context(), session.User.ID, pageSize, cursor)
+			if err != nil {
+				return fmt.Errorf("artist export page lookup: %w", err)
+			}
+			for _, artist := range artists {
+				musicBrainzURL := "https://musicbrainz.org/artist/" + artist.MBID
+				if err := writer.Write(neutralizeCSVRow([]string{
+					musicBrainzURL, artist.Name, artist.MBID, musicBrainzURL, artist.SpotifyID, artist.SpotifyURL,
+				})); err != nil {
+					return err
+				}
+			}
+			if len(artists) < pageSize || next == nil {
+				break
+			}
+			cursor = next
+		}
+		return nil
+	})
 	if err != nil {
-		a.logger.Error("artist export lookup failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "error", err)
+		a.logger.Error("artist export failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "error", err)
 		http.Error(w, "could not export followed artists", http.StatusInternalServerError)
 		return
 	}
-	filename := "artist-trackarr-watched-artists-" + time.Now().UTC().Format("2006-01-02") + ".csv"
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	w.Header().Set("Cache-Control", "private, no-store")
-	writer := csv.NewWriter(w)
-	_ = writer.Write([]string{
-		"artist", "display_name", "musicbrainz_id", "musicbrainz_url", "spotify_id", "spotify_url",
-	})
-	for _, artist := range artists {
-		musicBrainzURL := "https://musicbrainz.org/artist/" + artist.MBID
-		_ = writer.Write(neutralizeCSVRow([]string{
-			musicBrainzURL, artist.Name, artist.MBID, musicBrainzURL, artist.SpotifyID, artist.SpotifyURL,
-		}))
-	}
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		a.logger.Warn("write artist export failed", "user_id", session.User.ID, "error", err)
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	if _, err := w.Write(payload); err != nil {
+		a.logger.Debug("artist export response interrupted", "user_id", session.User.ID, "error", err)
 	}
 }
 

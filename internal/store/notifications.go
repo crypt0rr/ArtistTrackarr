@@ -888,7 +888,7 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 		JOIN users u ON u.id=e.user_id
 		LEFT JOIN deliveries d ON d.event_id=e.id
 		LEFT JOIN destinations dst ON dst.id=d.destination_id
-		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+		ORDER BY e.created_at DESC,e.id DESC,COALESCE(d.id,0) DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -931,6 +931,80 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	return result, rows.Err()
 }
 
+// AdminDeliveryHistoryExportPage returns a stable keyset-paginated page for
+// the full delivery audit export. Unlike OFFSET pagination, the cursor keeps
+// a deterministic position when new events are inserted while an export is
+// being generated. The page includes events without an admitted delivery so
+// the export retains the same household audit semantics as the admin view.
+func (s *Store) AdminDeliveryHistoryExportPage(ctx context.Context, limit int, after *AdminDeliveryExportCursor) ([]AdminDeliveryHistory, *AdminDeliveryExportCursor, error) {
+	if limit < 1 {
+		limit = 500
+	}
+	query := `SELECT d.id,u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at,
+		e.id,COALESCE(d.id,0)
+		FROM notification_events e
+		JOIN users u ON u.id=e.user_id
+		LEFT JOIN deliveries d ON d.event_id=e.id
+		LEFT JOIN destinations dst ON dst.id=d.destination_id`
+	args := make([]any, 0, 7)
+	if after != nil {
+		query += ` WHERE e.created_at < ?
+			OR (e.created_at = ? AND e.id < ?)
+			OR (e.created_at = ? AND e.id = ? AND COALESCE(d.id,0) < ?)`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.EventID, after.CreatedAt, after.EventID, after.DeliveryID)
+	}
+	query += ` ORDER BY e.created_at DESC,e.id DESC,COALESCE(d.id,0) DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.readerDB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]AdminDeliveryHistory, 0, limit)
+	var last *AdminDeliveryExportCursor
+	for rows.Next() {
+		var h AdminDeliveryHistory
+		var destination, service, status, lastError sql.NullString
+		var attempts sql.NullInt64
+		var deliveryID sql.NullInt64
+		var created string
+		var nextAttempt, sent sql.NullString
+		var eventID, sortDeliveryID int64
+		if err := rows.Scan(
+			&deliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+			&destination, &service, &status, &attempts, &lastError,
+			&created, &nextAttempt, &sent, &eventID, &sortDeliveryID,
+		); err != nil {
+			return nil, nil, err
+		}
+		if deliveryID.Valid {
+			h.DeliveryID = deliveryID.Int64
+		}
+		h.Destination, h.Service = destination.String, service.String
+		h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
+		if h.Destination == "" {
+			h.Destination, h.Status = "No destination configured", "not sent"
+		}
+		h.CreatedAt, err = parseStoredTime(created, "admin delivery export created_at")
+		if err != nil {
+			return nil, nil, err
+		}
+		if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "admin delivery export next_attempt_at"); err != nil {
+			return nil, nil, err
+		}
+		if h.SentAt, err = parseStoredNullableTime(sent, "admin delivery export sent_at"); err != nil {
+			return nil, nil, err
+		}
+		result = append(result, h)
+		last = &AdminDeliveryExportCursor{CreatedAt: created, EventID: eventID, DeliveryID: sortDeliveryID}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return result, last, nil
+}
+
 // AdminDeliveryHistorySummary deliberately omits notification bodies and
 // provider error strings from the normal admin page. An administrator can
 // request one specific record through AdminDeliveryDetail when investigation
@@ -948,7 +1022,7 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 		JOIN users u ON u.id=e.user_id
 		LEFT JOIN deliveries d ON d.event_id=e.id
 		LEFT JOIN destinations dst ON dst.id=d.destination_id
-		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+		ORDER BY e.created_at DESC,e.id DESC,COALESCE(d.id,0) DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}

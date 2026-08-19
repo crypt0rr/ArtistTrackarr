@@ -302,39 +302,45 @@ func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
 		return
 	}
+	payload, err := buildBufferedCSV(func(writer *csv.Writer) error {
+		if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at"}); err != nil {
+			return err
+		}
+		var cursor *store.AdminDeliveryExportCursor
+		for {
+			rows, next, err := a.store.AdminDeliveryHistoryExportPage(r.Context(), pageSize, cursor)
+			if err != nil {
+				return fmt.Errorf("delivery audit page lookup: %w", err)
+			}
+			for _, item := range rows {
+				row := []string{
+					strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
+					item.EventType, item.Destination, item.Service, item.Status,
+					strconv.Itoa(item.Attempts), item.LastError,
+					item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt),
+				}
+				if err := writer.Write(neutralizeCSVRow(row)); err != nil {
+					return err
+				}
+			}
+			if len(rows) < pageSize || next == nil {
+				break
+			}
+			cursor = next
+		}
+		return nil
+	})
+	if err != nil {
+		a.logger.Error("delivery audit export failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-delivery-audit.csv"`)
-	writer := csv.NewWriter(w)
-	if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at"}); err != nil {
-		a.logger.Debug("write delivery audit header failed", "error", err)
-		return
-	}
-	for offset := 0; ; offset += pageSize {
-		rows, err := a.store.AdminDeliveryHistory(r.Context(), pageSize, offset)
-		if err != nil {
-			a.logger.Error("delivery audit export lookup failed", "path", r.URL.Path, "offset", offset, "error", err)
-			return
-		}
-		for _, item := range rows {
-			row := []string{
-				strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
-				item.EventType, item.Destination, item.Service, item.Status,
-				strconv.Itoa(item.Attempts), item.LastError,
-				item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt),
-			}
-			if err := writer.Write(neutralizeCSVRow(row)); err != nil {
-				a.logger.Debug("write delivery audit row failed", "error", err)
-				return
-			}
-		}
-		if len(rows) < pageSize {
-			break
-		}
-	}
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		a.logger.Warn("write delivery audit export failed", "error", err)
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	if _, err := w.Write(payload); err != nil {
+		a.logger.Debug("delivery audit export response interrupted", "error", err)
 	}
 }
 

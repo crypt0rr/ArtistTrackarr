@@ -819,6 +819,25 @@ type AdminDeliveryHistory struct {
 	SentAt      *time.Time
 }
 
+// AdminDeliveryExportCursor identifies the last row emitted by the stable
+// delivery-audit export ordering. Cursors are intentionally opaque to the web
+// layer apart from their fields; they are never persisted or exposed to users.
+type AdminDeliveryExportCursor struct {
+	CreatedAt  string
+	EventID    int64
+	DeliveryID int64
+}
+
+// ArtistExportCursor identifies the last row emitted by the stable followed
+// artist export ordering. The normalized name keys mirror the SQL ORDER BY
+// expression so concurrent inserts cannot make OFFSET pages skip or repeat
+// existing artists.
+type ArtistExportCursor struct {
+	Name     string
+	SortName string
+	ID       int64
+}
+
 type ManualSyncRequest struct {
 	ID             int64
 	RequestedBy    int64

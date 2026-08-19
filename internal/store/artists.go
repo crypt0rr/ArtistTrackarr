@@ -298,6 +298,63 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, error) {
 	return s.FollowedArtistsFiltered(ctx, userID, "", "", "")
 }
+
+// FollowedArtistsExportPage returns a stable keyset-paginated page for CSV
+// exports. It mirrors the alphabetical ordering used by the Artists page but
+// uses the normalized name/sort-name/id tuple as its cursor, avoiding OFFSET
+// skips and duplicates when the watchlist changes during a long export.
+func (s *Store) FollowedArtistsExportPage(ctx context.Context, userID int64, limit int, after *ArtistExportCursor) ([]Artist, *ArtistExportCursor, error) {
+	if limit < 1 {
+		limit = 500
+	}
+	query := `SELECT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
+		a.spotify_id,a.spotify_url,a.spotify_image_url,a.last_checked_at,a.spotify_next_check_at,f.baseline_synced_at
+		FROM follows f JOIN artists a ON a.id=f.artist_id WHERE f.user_id=?`
+	args := []any{userID}
+	if after != nil {
+		query += ` AND (lower(trim(a.name)) > ?
+			OR (lower(trim(a.name)) = ? AND lower(trim(a.sort_name)) > ?)
+			OR (lower(trim(a.name)) = ? AND lower(trim(a.sort_name)) = ? AND a.id > ?))`
+		args = append(args, after.Name, after.Name, after.SortName, after.Name, after.SortName, after.ID)
+	}
+	query += ` ORDER BY lower(trim(a.name)),lower(trim(a.sort_name)),a.id LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.readerDB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]Artist, 0, limit)
+	var last *ArtistExportCursor
+	for rows.Next() {
+		var a Artist
+		var sid, surl, image, checked, spotifyNext, baseline sql.NullString
+		if err := rows.Scan(&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
+			&sid, &surl, &image, &checked, &spotifyNext, &baseline); err != nil {
+			return nil, nil, err
+		}
+		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = sid.String, surl.String, image.String
+		var parseErr error
+		if a.LastCheckedAt, parseErr = parseStoredNullableTime(checked, "artist export last_checked_at"); parseErr != nil {
+			return nil, nil, parseErr
+		}
+		if a.SpotifyNextCheckAt, parseErr = parseStoredNullableTime(spotifyNext, "artist export spotify_next_check_at"); parseErr != nil {
+			return nil, nil, parseErr
+		}
+		a.BaselineSynced = baseline.Valid
+		result = append(result, a)
+		last = &ArtistExportCursor{
+			Name:     strings.ToLower(strings.TrimSpace(a.Name)),
+			SortName: strings.ToLower(strings.TrimSpace(a.SortName)),
+			ID:       a.ID,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return result, last, nil
+}
+
 func (s *Store) FollowedArtistsFiltered(ctx context.Context, userID int64, genre, country, artistType string) ([]Artist, error) {
 	where, args := followedArtistFilters(userID, genre, country, artistType)
 	return s.followedArtistsQuery(ctx, where, args, 0, 0)

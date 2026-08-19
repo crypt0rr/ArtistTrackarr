@@ -359,7 +359,9 @@ and 500 data rows, validate canonical MusicBrainz and optional Spotify
 identities locally, and process rows independently. Added rows are followed
 and scheduled for the normal baseline sync; invalid rows remain visible in the
 owner-only import results page and do not prevent valid rows from being
-applied. At most two uploads are processed concurrently and manual sync work
+applied. Exports use stable keyset pages and are fully assembled before the
+download begins so watchlist changes or lookup failures cannot produce a
+misleading truncated file. At most two uploads are processed concurrently and manual sync work
 is admitted through a bounded queue, so large imports cannot starve scheduled
 work or the SQLite writer. Provider calls are never made during the upload
 request.
@@ -419,8 +421,10 @@ delivery history reaches 365 days. This is a review recommendation only: no
 user-facing history is deleted automatically, and any future cleanup policy
 must be approved against the household's recovery and audit requirements first.
 Administrators can download the delivery-audit CSV from the same page to support
-an export-before-delete workflow. The export neutralizes formula-leading cells
-and never includes encrypted destination URLs.
+an export-before-delete workflow. The export neutralizes formula-leading cells,
+uses stable keyset pages while it is generated, and is assembled before the
+response starts so a lookup failure cannot masquerade as a truncated 200 file.
+It never includes encrypted destination URLs.
 
 Users can choose whether albums, EPs, singles, announcements, and release-day
 reminders should be delivered. Followed artists show their last and next
