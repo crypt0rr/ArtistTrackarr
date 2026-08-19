@@ -462,3 +462,20 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 	}
 	return d, credits.Err()
 }
+
+// ReleaseGroupVisibleByMBID reports whether a release group identified by a
+// canonical MusicBrainz ID is visible to the member. Artwork requests use
+// this owner-scoped check before contacting the Cover Art Archive so a member
+// cannot turn the route into an arbitrary UUID fetch oracle.
+func (s *Store) ReleaseGroupVisibleByMBID(ctx context.Context, userID int64, mbid string) (bool, error) {
+	var exists int
+	err := s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM release_groups rg
+		WHERE rg.mbid=? AND `+followedReleasePredicate("?")+` LIMIT 1`, mbid, userID).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
+}

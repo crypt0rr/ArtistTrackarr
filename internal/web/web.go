@@ -42,6 +42,7 @@ type App struct {
 	importLimiter           *fixedWindowLimiter
 	importSlots             chan struct{}
 	providerLimiter         *fixedWindowLimiter
+	artworkLimiter          *fixedWindowLimiter
 	destinationTestLimiter  *fixedWindowLimiter
 	destinationRetryLimiter *fixedWindowLimiter
 	loginSlots              chan struct{}

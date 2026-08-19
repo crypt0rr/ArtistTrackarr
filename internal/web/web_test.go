@@ -375,8 +375,24 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if err != nil || destination.Name != "My phone" {
 		t.Fatalf("renamed destination = %#v, %v", destination, err)
 	}
+	art, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "artwork-test-artist", Name: "Artwork Test Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, art.ID); err != nil {
+		t.Fatal(err)
+	}
+	const artworkMBID = "6e335887-60ba-38f0-95af-fae7774336bf"
+	if _, err := database.DB.ExecContext(context.Background(), `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, artworkMBID, art.ID, "Artwork Test Release", "Album", "[]", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+artworkMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 
-	response, err = client.Get(server.URL + "/art/release-group/6e335887-60ba-38f0-95af-fae7774336bf")
+	response, err = client.Get(server.URL + "/art/release-group/" + artworkMBID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,6 +422,93 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 	}
 	if spotify.searchCalls != 1 || mb.calls != 0 {
 		t.Fatalf("Spotify calls=%d MusicBrainz calls=%d", spotify.searchCalls, mb.calls)
+	}
+}
+
+func TestReleaseGroupArtworkIsOwnerScopedAndRateLimited(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	member, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "artwork-owner-artist", Name: "Artwork Owner Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, member.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	const ownedMBID = "11111111-1111-4111-8111-111111111111"
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, ownedMBID, artist.ID, "Owned artwork", "Album", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+ownedMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/art/release-group/" + ownedMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("owned artwork status=%d", response.StatusCode)
+	}
+
+	response, err = client.Get(server.URL + "/art/release-group/not-a-mbid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid artwork status=%d, want 404", response.StatusCode)
+	}
+
+	otherID, err := database.CreateUser(ctx, "other@example.com", "other-user", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherArtist, err := database.UpsertArtist(ctx, store.Artist{MBID: "artwork-foreign-artist", Name: "Artwork Foreign Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, otherID, otherArtist.ID); err != nil {
+		t.Fatal(err)
+	}
+	const foreignMBID = "22222222-2222-4222-8222-222222222222"
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, foreignMBID, otherArtist.ID, "Foreign artwork", "Album", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+foreignMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Get(server.URL + "/art/release-group/" + foreignMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign artwork status=%d, want 404", response.StatusCode)
+	}
+
+	for request := 0; request < 119; request++ {
+		response, err = client.Get(server.URL + "/art/release-group/" + ownedMBID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("artwork request %d status=%d", request+1, response.StatusCode)
+		}
+	}
+	response, err = client.Get(server.URL + "/art/release-group/" + ownedMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited artwork status=%d, want 429", response.StatusCode)
 	}
 }
 

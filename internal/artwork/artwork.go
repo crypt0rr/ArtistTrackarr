@@ -425,3 +425,10 @@ func validMBID(value string) bool {
 	}
 	return true
 }
+
+// ValidMBID reports whether value has the canonical MusicBrainz UUID shape.
+// Callers that gate access to the Cover Art Archive can use this check before
+// performing any persistent lookup or upstream request.
+func ValidMBID(value string) bool {
+	return validMBID(value)
+}

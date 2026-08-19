@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -24,7 +25,33 @@ func (a *App) destinations(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, location, http.StatusSeeOther)
 }
 func (a *App) releaseGroupArt(w http.ResponseWriter, r *http.Request) {
-	asset := a.artwork.Get(r.Context(), chi.URLParam(r, "mbid"))
+	session, ok := currentSession(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	mbid := chi.URLParam(r, "mbid")
+	if !artwork.ValidMBID(mbid) {
+		http.NotFound(w, r)
+		return
+	}
+	visible, err := a.store.ReleaseGroupVisibleByMBID(r.Context(), session.User.ID, mbid)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Error("release artwork visibility lookup failed", "user_id", session.User.ID, "error", err)
+		}
+		http.Error(w, "artwork is temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	if !visible {
+		http.NotFound(w, r)
+		return
+	}
+	if a.artworkLimiter != nil && !a.artworkLimiter.Allow(fmt.Sprintf("%d", session.User.ID)) {
+		rateLimited(w, 60, "artwork requests are temporarily rate limited; try again later")
+		return
+	}
+	asset := a.artwork.Get(r.Context(), mbid)
 	w.Header().Set("Content-Type", asset.ContentType)
 	w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", int(asset.MaxAge.Seconds())))
 	w.Header().Set("X-Artwork-Status", asset.Status)
