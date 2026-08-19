@@ -15,6 +15,7 @@ import (
 
 	"github.com/containrrr/shoutrrr"
 	"github.com/containrrr/shoutrrr/pkg/types"
+	"github.com/containrrr/shoutrrr/pkg/util/jsonclient"
 )
 
 type NotificationSender interface {
@@ -102,23 +103,10 @@ func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
 	}
 	notificationHTTPClientMu.Lock()
 	defer notificationHTTPClientMu.Unlock()
-	transport := http.DefaultTransport
-	if base, ok := transport.(*http.Transport); ok {
-		transport = base.Clone()
-	}
-	http.DefaultClient = &http.Client{
-		Transport: safeTransport(transport, allowPrivateTargets, net.DefaultResolver.LookupIP, (&net.Dialer{Timeout: timeout}).DialContext),
-		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("notification redirect limit exceeded")
-			}
-			if err := validateOutboundTargetWithLookup(req.Context(), req.URL.String(), allowPrivateTargets, true, net.DefaultResolver.LookupIP); err != nil {
-				return err
-			}
-			return nil
-		},
-	}
+	client := newHTTPClient(timeout, allowPrivateTargets, net.DefaultResolver.LookupIP,
+		(&net.Dialer{Timeout: timeout}).DialContext)
+	http.DefaultClient = client
+	jsonclient.DefaultClient = jsonclient.NewWithHTTPClient(client)
 }
 
 func newHTTPClient(timeout time.Duration, allowPrivateTargets bool,
@@ -158,6 +146,68 @@ func (s ShoutrrrSender) httpClient() *http.Client {
 		return s.client
 	}
 	return newHTTPClient(s.sendTimeout(), s.AllowPrivateTargets, s.lookupIP, s.dial)
+}
+
+// observedHTTPClient returns a shallow client copy whose transport records
+// connection errors. Shoutrrr's Telegram adapter can turn transport errors
+// into a nil error when the response body is empty; retaining the underlying
+// error lets Send report a timeout instead of incorrectly marking the delivery
+// successful.
+func observedHTTPClient(base *http.Client, requestCtx context.Context) (*http.Client, *observedRoundTripper) {
+	if base == nil {
+		base = newHTTPClient(DefaultSendTimeout, false, nil, nil)
+	}
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	observer := &observedRoundTripper{base: transport, requestCtx: requestCtx}
+	client := *base
+	client.Transport = observer
+	return &client, observer
+}
+
+type observedRoundTripper struct {
+	base       http.RoundTripper
+	requestCtx context.Context
+	mu         sync.Mutex
+	err        error
+	inFlight   int
+}
+
+func (t *observedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.requestCtx != nil {
+		req = req.WithContext(t.requestCtx)
+	}
+	t.mu.Lock()
+	t.inFlight++
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.inFlight--
+		t.mu.Unlock()
+	}()
+	response, err := t.base.RoundTrip(req)
+	if err != nil {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return response, err
+}
+
+func (t *observedRoundTripper) error() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
+func (t *observedRoundTripper) hasInFlightRequest() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.inFlight > 0
 }
 
 func safeTransport(base http.RoundTripper, allowPrivate bool,
@@ -264,27 +314,58 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	notificationHTTPClientMu.Lock()
 	queueWait := time.Since(queueStarted)
 	previousClient := http.DefaultClient
-	http.DefaultClient = s.httpClient()
+	previousJSONClient := jsonclient.DefaultClient
+	// Shoutrrr's Telegram transport uses jsonclient.DefaultClient, which is
+	// initialized at package load and does not follow a later http.DefaultClient
+	// swap. Install both compatibility clients around the send so Telegram and
+	// the other supported transports share the same bounded, policy-enforcing
+	// sender-owned client.
+	scopedClient, transportObserver := observedHTTPClient(s.httpClient(), sendCtx)
+	http.DefaultClient = scopedClient
+	jsonclient.DefaultClient = jsonclient.NewWithHTTPClient(scopedClient)
 	holdStarted := time.Now()
 	defer func() {
 		holdTime := time.Since(holdStarted)
+		jsonclient.DefaultClient = previousJSONClient
 		http.DefaultClient = previousClient
 		notificationHTTPClientMu.Unlock()
 		if observer != nil {
 			observer(queueWait, holdTime)
 		}
 	}()
-	sender, err := shoutrrr.CreateSender(serviceURL)
+	router, err := shoutrrr.CreateSender(serviceURL)
+	if err != nil {
+		return err
+	}
+	// Locate the single service and invoke it directly instead of using the
+	// router's asynchronous wrapper. The wrapper has its own watchdog and can
+	// return while a service goroutine is still using the process-wide client;
+	// direct invocation keeps the compatibility globals scoped until the
+	// transport has completed or the sender-owned client timeout fires.
+	service, err := router.Locate(serviceURL)
 	if err != nil {
 		return err
 	}
 	params := types.Params{}
 	params.SetTitle(title)
-	errs := sender.Send(body, &params)
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	sendStarted := time.Now()
+	if err := service.Send(body, &params); err != nil {
+		return err
 	}
 	if err := sendCtx.Err(); err != nil {
+		return err
+	}
+	if transportObserver.hasInFlightRequest() {
+		return context.DeadlineExceeded
+	}
+	// A few Shoutrrr adapters can return just as the HTTP client's timeout
+	// fires, before the shared send context observes its own deadline. Treat
+	// that boundary as a failure rather than acknowledging an unconfirmed
+	// notification.
+	if time.Since(sendStarted) >= s.sendTimeout() {
+		return context.DeadlineExceeded
+	}
+	if err := transportObserver.error(); err != nil {
 		return err
 	}
 	return nil

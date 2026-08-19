@@ -12,7 +12,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/containrrr/shoutrrr/pkg/util/jsonclient"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestBuildURL(t *testing.T) {
 	tests := []struct {
@@ -104,6 +112,107 @@ func TestShoutrrrSenderSendsGenericWebhookAndReportsUpstreamErrors(t *testing.T)
 	}
 	if err := sender.Send(context.Background(), "generic+"+server.URL+"/fail", "Release title", "Release body"); err == nil {
 		t.Fatal("upstream webhook failure was ignored")
+	}
+}
+
+func TestTelegramUsesScopedClientAndRestoresGlobals(t *testing.T) {
+	previousHTTPClient := http.DefaultClient
+	previousJSONClient := jsonclient.DefaultClient
+	t.Cleanup(func() {
+		http.DefaultClient = previousHTTPClient
+		jsonclient.DefaultClient = previousJSONClient
+	})
+
+	var sentinelCalls atomic.Int32
+	sentinelClient := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		sentinelCalls.Add(1)
+		return nil, errors.New("sentinel client should not receive Telegram requests")
+	})}
+	sentinelJSONClient := jsonclient.NewWithHTTPClient(sentinelClient)
+	http.DefaultClient = sentinelClient
+	jsonclient.DefaultClient = sentinelJSONClient
+
+	var scopedCalls atomic.Int32
+	scopedClient := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		scopedCalls.Add(1)
+		if req.URL.Host != "api.telegram.org" || req.URL.Path != "/bot12345:mock-token/sendMessage" {
+			t.Errorf("unexpected Telegram request URL %s", req.URL)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+			Request:    req,
+		}, nil
+	})}
+	sender := ShoutrrrSender{client: scopedClient, SendTimeout: time.Second}
+	if err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123", "title", "body"); err != nil {
+		t.Fatalf("Telegram send failed: %v", err)
+	}
+	if got := scopedCalls.Load(); got != 1 {
+		t.Fatalf("scoped Telegram client calls=%d, want 1", got)
+	}
+	if got := sentinelCalls.Load(); got != 0 {
+		t.Fatalf("sentinel client calls=%d, want 0", got)
+	}
+	if http.DefaultClient != sentinelClient {
+		t.Fatal("Telegram send leaked its scoped HTTP client")
+	}
+	if jsonclient.DefaultClient != sentinelJSONClient {
+		t.Fatal("Telegram send leaked its scoped JSON client")
+	}
+
+	var timeoutCalls atomic.Int32
+	timeoutClient := &http.Client{
+		Timeout: 5 * time.Millisecond,
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			timeoutCalls.Add(1)
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(5 * time.Millisecond):
+				return nil, context.DeadlineExceeded
+			}
+		}),
+	}
+	// Use a fresh sender so a Telegram call that exceeds the sender-owned
+	// client timeout still restores both compatibility globals.
+	timeoutSender := ShoutrrrSender{client: timeoutClient, SendTimeout: time.Second}
+	started := time.Now()
+	err := timeoutSender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123", "title", "body")
+	if err == nil {
+		t.Fatal("Telegram timeout was not reported")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Telegram timeout took %s", elapsed)
+	}
+	if got := timeoutCalls.Load(); got != 1 {
+		t.Fatalf("timeout Telegram client calls=%d, want 1", got)
+	}
+	if http.DefaultClient != sentinelClient {
+		t.Fatal("timed-out Telegram send leaked its scoped HTTP client")
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	var cancelCalls atomic.Int32
+	cancelClient := &http.Client{
+		Timeout: time.Second,
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			cancelCalls.Add(1)
+			cancel()
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}),
+	}
+	cancelSender := ShoutrrrSender{client: cancelClient, SendTimeout: time.Second}
+	if err := cancelSender.Send(cancelCtx, "telegram://12345:mock-token@telegram?chats=-100123", "title", "body"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Telegram send error=%v, want context.Canceled", err)
+	}
+	if got := cancelCalls.Load(); got != 1 {
+		t.Fatalf("canceled Telegram client calls=%d, want 1", got)
+	}
+	if http.DefaultClient != sentinelClient {
+		t.Fatal("canceled Telegram send leaked its scoped HTTP client")
 	}
 }
 
