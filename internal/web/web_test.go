@@ -435,7 +435,7 @@ func TestLoginRejectsInvalidAndUnknownCredentials(t *testing.T) {
 }
 
 func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
-	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	csrf := getCSRF(t, client, server.URL+"/")
 	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {csrf}})
 	_ = response.Body.Close()
@@ -458,6 +458,13 @@ func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(body), "Too many attempts") {
 		t.Fatalf("throttled login status/body=%d %q", response.StatusCode, body)
+	}
+	var keys int
+	if err := database.DB.QueryRow(`SELECT COUNT(*) FROM login_attempts`).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if keys != 2 {
+		t.Fatalf("login failures created %d throttle keys, want peer and account keys", keys)
 	}
 }
 

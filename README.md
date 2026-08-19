@@ -92,9 +92,10 @@ aggregate values when a response omits an artist; Cover Art Archive failures
 retain stale artwork or the local placeholder without negative-caching
 transient outages.
 
-The v0.23.0 hardening defaults keep setup and login attempts bounded, accept
-forwarded client addresses only from explicitly trusted proxy networks, and
-redact notification destination credentials from delivery errors. Notification
+The v0.23.0 hardening defaults keep setup and login attempts bounded, use both
+the trusted peer and normalized account identity for durable login throttling,
+accept forwarded client addresses only from explicitly trusted proxy networks,
+and redact notification destination credentials from delivery errors. Notification
 targets that resolve to loopback, private, link-local, metadata, shared, or
 reserved networks are blocked by default; enable
 `ALLOW_PRIVATE_NOTIFICATION_TARGETS` only for a trusted household that needs a
