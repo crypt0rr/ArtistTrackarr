@@ -112,6 +112,15 @@ func (s *Store) SaveImportRow(ctx context.Context, userID, jobID int64, input Im
 	if err != nil {
 		return ImportRow{}, err
 	}
+	// Keep imported follows equivalent to follows created through the normal
+	// and resolution paths. INSERT OR IGNORE repairs a legacy follow without
+	// resetting an existing customized policy, and remains part of this
+	// transaction so the first release sync can enqueue notifications.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
+		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
+		return ImportRow{}, err
+	}
 	row.ArtistID = &artistID
 	if added > 0 {
 		row.Status = "added"

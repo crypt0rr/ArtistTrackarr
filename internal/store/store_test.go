@@ -228,6 +228,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=26`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("operational snapshots migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=27`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("follow notification rule backfill migration marker=%d err=%v", migrationsApplied, err)
+	}
 	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
@@ -309,6 +312,70 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	}
 }
 
+func TestFollowNotificationRuleBackfillIsIdempotentAndPreservesCustomRules(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "rule-backfill@example.com", "hash", "member", "UTC", "rule-backfill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.UpsertArtist(ctx, Artist{MBID: "rule-backfill-first", Name: "First"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.UpsertArtist(ctx, Artist{MBID: "rule-backfill-second", Name: "Second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, artist := range []Artist{first, second} {
+		if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	custom := defaultFollowNotificationRule(userID, first.ID, time.Now().UTC())
+	custom.DeliveryMode = FollowDeliveryOff
+	if err := s.UpdateFollowNotificationRule(ctx, userID, first.ID, custom); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version=27`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follow_notification_rules WHERE user_id=?`, userID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("backfilled rule count=%d, want 2", count)
+	}
+	var mode string
+	if err := s.DB.QueryRowContext(ctx, `SELECT delivery_mode FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, first.ID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != FollowDeliveryOff {
+		t.Fatalf("custom rule mode=%q, want %q", mode, FollowDeliveryOff)
+	}
+	var defaults int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM follow_notification_rules WHERE user_id=? AND artist_id=? AND delivery_mode='inherit' AND include_primary=1 AND include_featured=1`, userID, second.ID).Scan(&defaults); err != nil {
+		t.Fatal(err)
+	}
+	if defaults != 1 {
+		t.Fatalf("backfilled default rows=%d, want 1", defaults)
+	}
+	var foreignKey string
+	if err := s.DB.QueryRowContext(ctx, `PRAGMA foreign_key_check`).Scan(&foreignKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("foreign key check returned %q err=%v", foreignKey, err)
+	}
+}
+
 func TestReleaseRecordsMatchRequiresCompatiblePrecision(t *testing.T) {
 	base := Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024", DatePrecision: 1}
 	if !releaseRecordsMatch(base, Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024", DatePrecision: 1}) {
@@ -369,6 +436,57 @@ func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 	var next sql.NullString
 	if err := s.DB.QueryRow(`SELECT next_check_at FROM artists WHERE mbid=?`, mbid).Scan(&next); err != nil || !next.Valid {
 		t.Fatalf("imported artist was not scheduled: %q err=%v", next.String, err)
+	}
+}
+
+func TestReleaseSyncUsesDefaultsForMissingLegacyRule(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "missing-rule@example.com", "hash", "member", "UTC", "missing-rule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "missing-rule-artist", Name: "Missing Rule Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "missing-rule-release", Title: "Missing Rule Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-18", DatePrecision: 3,
+	}}, time.Now().UTC()); err != nil {
+		t.Fatalf("sync with missing legacy rule failed: %v", err)
+	}
+	var releases, events int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&releases); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if releases != 1 || events != 1 {
+		t.Fatalf("missing-rule sync releases=%d events=%d, want one of each", releases, events)
+	}
+	second, err := s.UpsertArtist(ctx, Artist{MBID: "empty-rule-timestamp-artist", Name: "Empty Rule Timestamp Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE follow_notification_rules SET updated_at='' WHERE user_id=? AND artist_id=?`, userID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyReleaseSync(ctx, second, []Release{{
+		MBID: "empty-rule-timestamp-release", Title: "Empty Rule Timestamp Release", PrimaryType: "EP",
+		FirstReleaseDate: "2026-08-18", DatePrecision: 3,
+	}}, time.Now().UTC()); err != nil {
+		t.Fatalf("sync with empty legacy rule timestamp failed: %v", err)
 	}
 }
 
