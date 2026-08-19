@@ -45,8 +45,8 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.46.0`; release images display the injected
-semantic version while local builds identify themselves as `dev`. Operational
+footer. The current release is `v0.46.1`; local and published images use the
+same source-controlled semantic version. Operational
 timestamps are stored
 in UTC and rendered in the configured system timezone; existing databases are
 normalized automatically during the v0.20.0 migration.
@@ -241,12 +241,12 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.46.0` publishes `0.46.0`, `0.46`, and `latest`.
+- Pushing a tag such as `v0.46.1` publishes `0.46.1`, `0.46`, and `latest`.
 
-Release images receive their version through the Docker build's `APP_VERSION`
-argument. Tag builds inject the semantic tag (without the leading `v`), while
-branch and local builds use `dev` or `dev-<short-sha>` so development images are
-not confused with a release.
+The application version is kept in `internal/version/version.go` and is bumped
+with each release. Local, branch, and release images show that same semantic
+version in the interface and User-Agent. Build provenance remains available
+through image labels and immutable SHA tags.
 
 The module targets Go 1.26; CI and the Docker build use the pinned patched Go
 1.26.6 toolchain so local builds and release images share the same supported
@@ -255,7 +255,7 @@ language/runtime line.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.1 docker compose up -d
 ```
 
 ## Configuration

@@ -17,7 +17,11 @@ fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
 
 version-check:
-	@scripts/check-version-docs.sh "$(VERSION)"
+	@if [ -n "$(VERSION)" ]; then \
+		scripts/check-version-docs.sh "$(VERSION)"; \
+	else \
+		scripts/check-version-docs.sh; \
+	fi
 
 tooling-check:
 	@marker=$$(printf '@%s' latest); if git grep -n -F "$$marker" -- .github Dockerfile scripts; then \

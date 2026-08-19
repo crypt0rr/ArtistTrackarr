@@ -8,6 +8,7 @@ umask 077
 HELPER_IMAGE="${SMOKE_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
 IMAGE="${1:-artist-trackarr:ci}"
 PORT="${SMOKE_PORT:-18080}"
+EXPECTED_VERSION="${SMOKE_EXPECTED_VERSION:-}"
 suffix="${CI_RUN_ID:-$$}"
 volume="artist-trackarr-smoke-${suffix}"
 container="artist-trackarr-smoke-${suffix}"
@@ -66,6 +67,13 @@ curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
 	--data-urlencode 'timezone=UTC' >/dev/null
 
 login_page=$(curl --fail --silent --cookie-jar "$jar" "$base/login")
+if [[ -n "$EXPECTED_VERSION" ]]; then
+	grep -q "v${EXPECTED_VERSION}" <<<"$login_page"
+	if grep -qE 'vdev(-|</|<)' <<<"$login_page"; then
+		echo "container smoke: development version leaked into the UI" >&2
+		exit 1
+	fi
+fi
 login_csrf=$(printf '%s' "$login_page" | csrf_from)
 test -n "$login_csrf"
 curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
