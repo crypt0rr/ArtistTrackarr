@@ -161,24 +161,11 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			if item.provider == "spotify" && !follower.spotifyBaseline {
 				continue
 			}
-			skipHistoricalCredit := false
 			for _, role := range releaseCreditRoles(item.release, item.provider) {
-				created, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed)
-				if err != nil {
+				if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
 					_ = tx.Rollback()
 					return err
 				}
-				skipHistoricalCredit = skipHistoricalCredit || created
-			}
-			// A release can legitimately be both a primary catalogue entry and
-			// a featured/guest result. A newly created primary release must still
-			// notify, while a newly discovered credit on an existing primary
-			// release remains suppressed by the one-time credit baseline.
-			if skipHistoricalCredit && item.release.ArtistCreditRole != "primary" {
-				continue
-			}
-			if skipHistoricalCredit && item.creditNew && !item.isNew {
-				continue
 			}
 			date, full := releaseDate(item.release.FirstReleaseDate)
 			if (!item.isNew && !item.creditNew) || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {

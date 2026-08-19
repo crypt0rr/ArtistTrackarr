@@ -1062,6 +1062,99 @@ func TestSpotifyAppearanceBaselineSuppressesHistoricalFeaturedReleases(t *testin
 	}
 }
 
+func TestNewReleaseCreditNotifiesTheSecondFollowedArtist(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "second-credit@example.com", "unused", "member", "UTC", "second-credit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.UpsertArtist(ctx, Artist{MBID: "second-credit-primary", Name: "Primary Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	featured, err := s.UpsertArtist(ctx, Artist{MBID: "second-credit-featured", Name: "Featured Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, featured.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	// Establish the followed artist's primary and Spotify baselines before the
+	// shared release is observed. This is the upgrade/back-catalog guard, not a
+	// reason to suppress a genuinely new future appearance.
+	if err := s.ApplyReleaseBatches(ctx, featured, []ReleaseBatch{{Provider: "spotify"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	release := Release{
+		SpotifyID: "second-credit-release", SpotifyURL: "https://open.spotify.com/album/second-credit-release",
+		Title: "A New Shared Release", PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3,
+		ArtistCreditRole: "primary", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, primary, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	featuredRelease := release
+	featuredRelease.ArtistCreditRole = "featured"
+	if err := s.ApplyReleaseBatches(ctx, featured, []ReleaseBatch{{Provider: "spotify", Releases: []Release{featuredRelease}}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+	var title string
+	if err := s.DB.QueryRowContext(ctx, `SELECT title FROM notification_events WHERE user_id=?`, userID).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "New featured appearance from Featured Artist" {
+		t.Fatalf("notification title=%q", title)
+	}
+}
+
+func TestFeaturedFollowRuleUsesTheFollowedCreditRole(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "featured-rule@example.com", "unused", "member", "UTC", "featured-rule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.UpsertArtist(ctx, Artist{MBID: "featured-rule-primary", Name: "Primary Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	featured, err := s.UpsertArtist(ctx, Artist{MBID: "featured-rule-featured", Name: "Featured Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, featured.ID); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, featured.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.IncludeFeatured = false
+	if err := s.UpdateFollowNotificationRule(ctx, userID, featured.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseBatches(ctx, featured, []ReleaseBatch{{Provider: "spotify"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	release := Release{
+		SpotifyID: "featured-rule-release", SpotifyURL: "https://open.spotify.com/album/featured-rule-release",
+		Title: "Featured Rule Release", PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3,
+		ArtistCreditRole: "primary", Source: "spotify",
+	}
+	if err := s.ApplyReleaseBatches(ctx, primary, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	release.ArtistCreditRole = "featured"
+	if err := s.ApplyReleaseBatches(ctx, featured, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 0)
+}
+
 func TestGuestCreditBaselineAndReleaseDetail(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
