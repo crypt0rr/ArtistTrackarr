@@ -447,6 +447,57 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 	}
 }
 
+func TestITunesRejectsAmbiguousExactArtistNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" {
+			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"results":[
+			{"wrapperType":"artist","artistId":101,"artistName":"Example"},
+			{"wrapperType":"artist","artistId":202,"artistName":"Example"}
+		]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	_, err := itunes.ArtistReleases(context.Background(), "Example")
+	var ambiguous *ITunesAmbiguousArtistError
+	if !errors.As(err, &ambiguous) || len(ambiguous.IDs) != 2 {
+		t.Fatalf("ambiguous error=%v (%T), want two exact matches", err, err)
+	}
+}
+
+func TestITunesCanonicalReleaseCacheIncludesCanonicalAndProviderIDs(t *testing.T) {
+	var searches, lookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/search":
+			searches.Add(1)
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/artist/example"}]}`)
+		case "/lookup":
+			lookups.Add(1)
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"Example Album","collectionArtistName":"Example","trackCount":10,"releaseDate":"2026-01-02T00:00:00Z"}]}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	if _, id, _, err := itunes.ArtistReleasesForCanonical(context.Background(), "mbid-one", "Example", ""); err != nil || id != "123" {
+		t.Fatalf("first canonical lookup id=%q err=%v", id, err)
+	}
+	if _, id, _, err := itunes.ArtistReleasesForCanonical(context.Background(), "mbid-two", "Example", ""); err != nil || id != "123" {
+		t.Fatalf("second canonical lookup id=%q err=%v", id, err)
+	}
+	if searches.Load() != 1 {
+		t.Fatalf("searches=%d, want cached name lookup", searches.Load())
+	}
+	if lookups.Load() != 2 {
+		t.Fatalf("album lookups=%d, want one per canonical cache key", lookups.Load())
+	}
+}
+
 func TestNormalizeITunesArtworkURLRejectsUntrustedHosts(t *testing.T) {
 	valid := normalizeITunesArtworkURL("http://is2.mzstatic.com/image/100x100bb.jpg")
 	if valid != "https://is2.mzstatic.com/image/250x250bb.jpg" {

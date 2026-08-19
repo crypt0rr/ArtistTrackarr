@@ -724,6 +724,7 @@ type DiagnosticsProvider struct {
 // on existing rows and never create releases or notification events.
 type ITunesArtworkArtist struct {
 	ID       int64
+	MBID     string
 	Name     string
 	Attempts int
 }

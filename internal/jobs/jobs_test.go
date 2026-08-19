@@ -118,6 +118,27 @@ type itunesReleaseCatalog struct {
 	calls    atomic.Int32
 }
 
+type canonicalITunesReleaseCatalog struct {
+	releases     []store.Release
+	resolvedID   string
+	resolvedURL  string
+	err          error
+	calls        atomic.Int32
+	canonicalIDs []string
+	providerIDs  []string
+}
+
+func (f *canonicalITunesReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	f.calls.Add(1)
+	return f.releases, f.err
+}
+
+func (f *canonicalITunesReleaseCatalog) ArtistReleasesForCanonical(_ context.Context, canonicalID, _ string, providerID string) ([]store.Release, string, string, error) {
+	f.canonicalIDs = append(f.canonicalIDs, canonicalID)
+	f.providerIDs = append(f.providerIDs, providerID)
+	return f.releases, f.resolvedID, f.resolvedURL, f.err
+}
+
 type listenBrainzStatsProvider struct {
 	values map[string]catalog.ListenBrainzArtistStats
 	err    error
@@ -1211,6 +1232,44 @@ func TestITunesFailureFallsBackToMusicBrainz(t *testing.T) {
 	}
 }
 
+func TestITunesObservationPersistsCanonicalProviderIdentity(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "itunes-canonical@example.com", "unused", "member", "UTC", "itunes-canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "canonical-mbid", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider := &canonicalITunesReleaseCatalog{
+		resolvedID: "123", resolvedURL: "https://music.apple.com/artist/example/123",
+		releases: []store.Release{{ITunesID: "album-123", ITunesURL: "https://music.apple.com/album/123", Title: "Example Album", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3, Source: "itunes"}},
+	}
+	runner := New(database, &resolutionCatalog{}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := database.ArtistProviderIdentity(ctx, artist.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "123" {
+		t.Fatalf("identity=%#v found=%v err=%v", identity, found, err)
+	}
+	if len(provider.providerIDs) != 1 || provider.providerIDs[0] != "" {
+		t.Fatalf("first canonical provider IDs=%#v", provider.providerIDs)
+	}
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.providerIDs) != 2 || provider.providerIDs[1] != "123" {
+		t.Fatalf("second canonical provider IDs=%#v", provider.providerIDs)
+	}
+}
+
 func TestSyncAppliesMusicBrainzWhenSpotifyIsRateLimited(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
@@ -1615,6 +1674,14 @@ func TestManualSyncRequestsAndQueuedResolution(t *testing.T) {
 	followed, err := database.FollowedArtists(ctx, userID)
 	if err != nil || len(followed) != 2 {
 		t.Fatalf("followed after resolution=%#v err=%v", followed, err)
+	}
+	selected, err := database.ArtistByMBID(ctx, "selected-mbid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := database.ArtistProviderIdentity(ctx, selected.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "12345" {
+		t.Fatalf("reviewed iTunes identity=%#v found=%v err=%v", identity, found, err)
 	}
 }
 

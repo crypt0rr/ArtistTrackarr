@@ -272,7 +272,92 @@ func (i *ITunes) ArtistReleases(ctx context.Context, artistName string) ([]store
 	if artistName == "" {
 		return nil, errors.New("artist name is required")
 	}
-	key := normalizeITunesQuery(artistName)
+	artist, err := i.resolveExactArtist(ctx, artistName)
+	if err != nil {
+		return nil, err
+	}
+	return i.artistReleasesCached(ctx, "name:"+artist.ID, artistName, artist.ID)
+}
+
+// ArtistReleasesForCanonical resolves or uses the persisted iTunes identity
+// for one canonical MusicBrainz artist. A canonical key is deliberately part
+// of the release cache key so two same-name canonical artists can never share
+// an otherwise valid provider response.
+func (i *ITunes) ArtistReleasesForCanonical(ctx context.Context, canonicalID, artistName, providerID string) ([]store.Release, string, string, error) {
+	if i == nil {
+		return nil, "", "", errors.New("iTunes is not configured")
+	}
+	canonicalID, artistName, providerID = strings.TrimSpace(canonicalID), strings.TrimSpace(artistName), strings.TrimSpace(providerID)
+	if canonicalID == "" {
+		return nil, "", "", errors.New("canonical artist ID is required")
+	}
+	if artistName == "" {
+		return nil, "", "", errors.New("artist name is required")
+	}
+	var artist ITunesArtist
+	var err error
+	if providerID != "" {
+		if !validITunesID(providerID) {
+			return nil, "", "", errors.New("invalid iTunes artist ID")
+		}
+		artist = ITunesArtist{ID: providerID, URL: "https://itunes.apple.com/artist/id" + providerID}
+	} else {
+		artist, err = i.resolveExactArtist(ctx, artistName)
+		if err != nil {
+			return nil, "", "", err
+		}
+	}
+	key := "canonical:" + canonicalID + "\x00" + artist.ID
+	releases, err := i.artistReleasesCached(ctx, key, artistName, artist.ID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return releases, artist.ID, artist.URL, nil
+}
+
+func (i *ITunes) resolveExactArtist(ctx context.Context, artistName string) (ITunesArtist, error) {
+	artists, err := i.SearchArtists(ctx, artistName)
+	if err != nil {
+		return ITunesArtist{}, err
+	}
+	matches := make([]ITunesArtist, 0, len(artists))
+	seen := make(map[string]struct{})
+	for _, artist := range artists {
+		if !strings.EqualFold(strings.TrimSpace(artist.Name), artistName) || !validITunesID(strings.TrimSpace(artist.ID)) {
+			continue
+		}
+		if _, ok := seen[artist.ID]; ok {
+			continue
+		}
+		seen[artist.ID] = struct{}{}
+		matches = append(matches, artist)
+	}
+	if len(matches) == 0 {
+		return ITunesArtist{}, fmt.Errorf("iTunes artist %q was not found", artistName)
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, match := range matches {
+			ids = append(ids, match.ID)
+		}
+		return ITunesArtist{}, &ITunesAmbiguousArtistError{Name: artistName, IDs: ids}
+	}
+	return matches[0], nil
+}
+
+// ITunesAmbiguousArtistError is returned when a name-only lookup has more
+// than one exact provider identity. Callers should fall back or ask for an
+// explicit reviewed mapping instead of picking the first result.
+type ITunesAmbiguousArtistError struct {
+	Name string
+	IDs  []string
+}
+
+func (e *ITunesAmbiguousArtistError) Error() string {
+	return fmt.Sprintf("iTunes artist %q has %d exact matches", e.Name, len(e.IDs))
+}
+
+func (i *ITunes) artistReleasesCached(ctx context.Context, key, artistName, artistID string) ([]store.Release, error) {
 	if cached, ok := i.cachedReleases(key); ok {
 		return cached, nil
 	}
@@ -291,7 +376,7 @@ func (i *ITunes) ArtistReleases(ctx context.Context, artistName string) ([]store
 	i.releaseCalls[key] = call
 	i.cacheMu.Unlock()
 
-	result, err := i.artistReleases(ctx, artistName)
+	result, err := i.artistReleasesByID(ctx, artistName, artistID)
 	i.cacheMu.Lock()
 	delete(i.releaseCalls, key)
 	call.results = cloneITunesReleases(result)
@@ -304,21 +389,7 @@ func (i *ITunes) ArtistReleases(ctx context.Context, artistName string) ([]store
 	return result, err
 }
 
-func (i *ITunes) artistReleases(ctx context.Context, artistName string) ([]store.Release, error) {
-	artists, err := i.SearchArtists(ctx, artistName)
-	if err != nil {
-		return nil, err
-	}
-	var artistID string
-	for _, artist := range artists {
-		if strings.EqualFold(strings.TrimSpace(artist.Name), artistName) {
-			artistID = artist.ID
-			break
-		}
-	}
-	if artistID == "" {
-		return nil, fmt.Errorf("iTunes artist %q was not found", artistName)
-	}
+func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID string) ([]store.Release, error) {
 	const pageSize = 200
 	const maxPages = 100
 	result := make([]store.Release, 0)

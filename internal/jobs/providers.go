@@ -243,7 +243,7 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	}
 
 	observation.attempted = true
-	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
+	releases, err := r.itunesReleasesForArtist(ctx, artist)
 	if err == nil {
 		r.clearITunesProviderCooldown()
 		if creditProvider, ok := r.itunes.(catalog.ReleaseCreditProvider); ok {

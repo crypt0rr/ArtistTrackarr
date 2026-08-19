@@ -654,7 +654,7 @@ func (r *Runner) backfillITunesArtwork(ctx context.Context, now time.Time) (*art
 			"artist_id", artist.ID, "retry_after", cooldown.Sub(now).String())
 		return nil, nil
 	}
-	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
+	releases, err := r.itunesReleasesForArtist(ctx, store.Artist{ID: artist.ID, MBID: artist.MBID, Name: artist.Name})
 	if err != nil {
 		var rateLimit *catalog.ITunesRateLimitError
 		if errors.As(err, &rateLimit) {
@@ -930,6 +930,40 @@ func (r *Runner) invalidateSpotifyReleaseCache(artist store.Artist) {
 	if invalidator, ok := r.spotify.(spotifyReleaseCacheInvalidator); ok {
 		invalidator.InvalidateArtistReleases(artist.SpotifyID)
 	}
+}
+
+// itunesReleasesForArtist keeps the fallback provider tied to the canonical
+// MusicBrainz artist. Real iTunes clients use the optional canonical-aware
+// interface; small test providers and legacy implementations retain the
+// existing name-based interface for compatibility.
+func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artist) ([]store.Release, error) {
+	if r.itunes == nil {
+		return nil, errors.New("iTunes is not configured")
+	}
+	identity, found, err := r.store.ArtistProviderIdentity(ctx, artist.ID, "itunes")
+	if err != nil {
+		return nil, err
+	}
+	canonical, ok := r.itunes.(catalog.CanonicalITunesReleaseProvider)
+	if !ok {
+		return r.itunes.ArtistReleases(ctx, artist.Name)
+	}
+	providerID := ""
+	if found {
+		providerID = identity.ProviderID
+	}
+	releases, resolvedID, resolvedURL, err := canonical.ArtistReleasesForCanonical(
+		ctx, artist.MBID, artist.Name, providerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(resolvedID) != "" && (!found || identity.ProviderID != resolvedID) {
+		if err := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); err != nil {
+			return nil, fmt.Errorf("persist iTunes artist identity: %w", err)
+		}
+	}
+	return releases, nil
 }
 
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {

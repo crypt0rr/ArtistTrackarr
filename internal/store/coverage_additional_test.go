@@ -333,6 +333,32 @@ func TestCreateArtistResolutionValidatesProviderIdentity(t *testing.T) {
 	}
 }
 
+func TestArtistProviderIdentityPersistsAndPreventsCrossCanonicalReuse(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	first, err := s.UpsertArtist(ctx, Artist{MBID: "itunes-canonical-one", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.UpsertArtist(ctx, Artist{MBID: "itunes-canonical-two", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveArtistProviderIdentity(ctx, first.ID, "itunes", "101", "https://music.apple.com/artist/example/101"); err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := s.ArtistProviderIdentity(ctx, first.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "101" || identity.ProviderURL == "" {
+		t.Fatalf("identity=%#v found=%v err=%v", identity, found, err)
+	}
+	if err := s.SaveArtistProviderIdentity(ctx, second.ID, "itunes", "101", "https://music.apple.com/artist/example/101"); err == nil {
+		t.Fatal("same iTunes artist was assigned to two canonical artists")
+	}
+	if _, found, err := s.ArtistProviderIdentity(ctx, second.ID, "itunes"); err != nil || found {
+		t.Fatalf("second identity found=%v err=%v after rejected mapping", found, err)
+	}
+}
+
 func TestCompleteArtistResolutionPersistsGenresWithoutProviderLeakage(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

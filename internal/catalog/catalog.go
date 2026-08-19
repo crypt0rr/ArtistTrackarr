@@ -70,6 +70,15 @@ type ITunesReleaseProvider interface {
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
+// CanonicalITunesReleaseProvider resolves an iTunes artist in the context of
+// one canonical MusicBrainz artist. The resolved provider identity is
+// returned so callers can persist it and avoid repeating ambiguous name
+// lookups. Implementations must keep release caches keyed by both canonicalID
+// and providerID; a display name is not a stable artist identity.
+type CanonicalITunesReleaseProvider interface {
+	ArtistReleasesForCanonical(context.Context, string, string, string) ([]store.Release, string, string, error)
+}
+
 // ListenBrainzProvider exposes public, aggregate artist popularity statistics.
 // It is intentionally separate from release providers so it can never create
 // release observations or notification events.
