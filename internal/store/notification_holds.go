@@ -324,55 +324,47 @@ func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int6
 	if action != "notify" && action != "discard" && action != "restore" {
 		return ErrInvalidNotificationHoldAction
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var releaseID int64
-	var eventType, title, body string
-	status := "held"
-	if action == "restore" {
-		status = "discarded"
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT h.release_group_id,h.event_type,h.title,h.body
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var releaseID int64
+		var eventType, title, body string
+		status := "held"
+		if action == "restore" {
+			status = "discarded"
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT h.release_group_id,h.event_type,h.title,h.body
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
 		WHERE h.id=? AND h.user_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status=?`, holdID, userID, status).Scan(&releaseID, &eventType, &title, &body); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	if action == "restore" {
-		if _, err := tx.ExecContext(ctx, `UPDATE notification_holds
+			return err
+		}
+		now := time.Now().UTC()
+		if action == "restore" {
+			if _, err := tx.ExecContext(ctx, `UPDATE notification_holds
 			SET status='held',released_at=NULL WHERE id=? AND user_id=? AND status='discarded'`, holdID, userID); err != nil {
-			return err
+				return err
+			}
+			return drainResolvedNotificationHoldsForUserTx(ctx, tx, userID, releaseID, now)
 		}
-		if err := drainResolvedNotificationHoldsForUserTx(ctx, tx, userID, releaseID, now); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-	status = "discarded"
-	if action == "notify" {
-		if err := enqueueHeldEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true); err != nil {
-			return err
-		}
-		var eventID int64
-		err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
+		status = "discarded"
+		if action == "notify" {
+			if err := enqueueHeldEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true); err != nil {
+				return err
+			}
+			var eventID int64
+			err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
 			WHERE user_id=? AND release_group_id=? AND event_type=?`, userID, releaseID, eventType).Scan(&eventID)
-		if errors.Is(err, sql.ErrNoRows) {
-			// The current rule intentionally blocks admission. Keep the hold
-			// pending so the owner can change the rule and retry it later.
-			return tx.Commit()
+			if errors.Is(err, sql.ErrNoRows) {
+				// The current rule intentionally blocks admission. Keep the hold
+				// pending so the owner can change the rule and retry it later.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			status = "released"
 		}
-		if err != nil {
-			return err
-		}
-		status = "released"
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE notification_holds SET status=?,released_at=? WHERE id=? AND status='held'`, status, timeText(now), holdID); err != nil {
+		_, err := tx.ExecContext(ctx, `UPDATE notification_holds SET status=?,released_at=? WHERE id=? AND status='held'`, status, timeText(now), holdID)
 		return err
-	}
-	return tx.Commit()
+	})
 }
 
 func scanNotificationHold(row interface{ Scan(...any) error }) (NotificationHold, error) {

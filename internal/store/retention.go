@@ -128,37 +128,31 @@ func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionC
 		now = time.Now().UTC()
 	}
 	policy := s.retention()
-	stats := RetentionCleanupStats{}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return stats, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	statements := []struct {
-		query string
-		args  []any
-		out   *int64
-	}{
-		{`DELETE FROM application_logs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.ApplicationLogsDays) * 24 * time.Hour))}, &stats.ApplicationLogs},
-		{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}, &stats.Sessions},
-		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &stats.AuthTokens},
-		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(now.Add(-24 * time.Hour))}, &stats.LoginAttempts},
-		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &stats.ManualSyncs},
-		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &stats.ImportJobs},
-	}
-	for _, statement := range statements {
-		result, err := tx.ExecContext(ctx, statement.query, statement.args...)
-		if err != nil {
-			return RetentionCleanupStats{}, err
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (RetentionCleanupStats, error) {
+		var resultStats RetentionCleanupStats
+		statements := []struct {
+			query string
+			args  []any
+			out   *int64
+		}{
+			{`DELETE FROM application_logs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.ApplicationLogsDays) * 24 * time.Hour))}, &resultStats.ApplicationLogs},
+			{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}, &resultStats.Sessions},
+			{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &resultStats.AuthTokens},
+			{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(now.Add(-24 * time.Hour))}, &resultStats.LoginAttempts},
+			{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ManualSyncs},
+			{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ImportJobs},
 		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return RetentionCleanupStats{}, err
+		for _, statement := range statements {
+			result, err := tx.ExecContext(ctx, statement.query, statement.args...)
+			if err != nil {
+				return RetentionCleanupStats{}, err
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return RetentionCleanupStats{}, err
+			}
+			*statement.out = count
 		}
-		*statement.out = count
-	}
-	if err := tx.Commit(); err != nil {
-		return RetentionCleanupStats{}, err
-	}
-	return stats, nil
+		return resultStats, nil
+	})
 }

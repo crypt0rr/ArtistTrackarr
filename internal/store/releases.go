@@ -17,184 +17,183 @@ func (s *Store) ApplyReleaseSync(ctx context.Context, artist Artist, releases []
 	}}, observed)
 }
 func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches []ReleaseBatch, observed time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	var savedReleases []syncedRelease
-	savedIndexes := make(map[string]int)
-	spotifyObserved := false
-	seenProviders := make(map[string]bool)
-	for _, batch := range batches {
-		provider := strings.ToLower(strings.TrimSpace(batch.Provider))
-		if seenProviders[provider] {
-			_ = tx.Rollback()
-			return fmt.Errorf("duplicate release batch for %s", provider)
-		}
-		seenProviders[provider] = true
-		if provider == "spotify" {
-			spotifyObserved = true
-		}
-		for _, release := range batch.Releases {
-			var saved syncedRelease
-			switch provider {
-			case "musicbrainz":
-				saved, err = saveMusicBrainzReleaseTx(ctx, tx, artist.ID, release, observed)
-			case "spotify":
-				saved, err = saveSpotifyReleaseTx(ctx, tx, artist.ID, release, observed)
-			case "itunes":
-				saved, err = saveITunesReleaseTx(ctx, tx, artist.ID, release, observed)
-			default:
-				err = fmt.Errorf("unsupported release provider %q", provider)
-			}
-			if err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		var savedReleases []syncedRelease
+		savedIndexes := make(map[string]int)
+		spotifyObserved := false
+		seenProviders := make(map[string]bool)
+		for _, batch := range batches {
+			provider := strings.ToLower(strings.TrimSpace(batch.Provider))
+			if seenProviders[provider] {
 				_ = tx.Rollback()
-				return fmt.Errorf("save %s release: %w", provider, err)
+				return fmt.Errorf("duplicate release batch for %s", provider)
 			}
-			if err := evaluateReleaseEvidenceTx(ctx, tx, saved.release.ID, observed); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("evaluate %s release evidence: %w", provider, err)
+			seenProviders[provider] = true
+			if provider == "spotify" {
+				spotifyObserved = true
 			}
-			// One Spotify release can arrive through both the direct catalogue
-			// and appears_on. Keep one notification candidate and let a primary
-			// credit win even if Spotify returned the featured copy first.
-			key := saved.provider + "\x00" + fmt.Sprint(saved.release.ID)
-			if index, exists := savedIndexes[key]; exists {
-				previous := savedReleases[index]
-				saved.release.Credits = mergeReleaseCredits(previous.release.Credits, saved.release.Credits)
-				saved.creditNew = previous.creditNew || saved.creditNew
-				if previous.release.ArtistCreditRole == "primary" && saved.release.ArtistCreditRole == "featured" {
-					previous.isNew = previous.isNew || saved.isNew
-					previous.creditNew = previous.creditNew || saved.creditNew
-					previous.release.Credits = saved.release.Credits
-					savedReleases[index] = previous
-				} else {
-					saved.isNew = saved.isNew || previous.isNew
-					saved.creditNew = saved.creditNew || previous.creditNew
-					savedReleases[index] = saved
+			for _, release := range batch.Releases {
+				var saved syncedRelease
+				switch provider {
+				case "musicbrainz":
+					saved, err = saveMusicBrainzReleaseTx(ctx, tx, artist.ID, release, observed)
+				case "spotify":
+					saved, err = saveSpotifyReleaseTx(ctx, tx, artist.ID, release, observed)
+				case "itunes":
+					saved, err = saveITunesReleaseTx(ctx, tx, artist.ID, release, observed)
+				default:
+					err = fmt.Errorf("unsupported release provider %q", provider)
 				}
-			} else {
-				savedIndexes[key] = len(savedReleases)
-				savedReleases = append(savedReleases, saved)
+				if err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("save %s release: %w", provider, err)
+				}
+				if err := evaluateReleaseEvidenceTx(ctx, tx, saved.release.ID, observed); err != nil {
+					_ = tx.Rollback()
+					return fmt.Errorf("evaluate %s release evidence: %w", provider, err)
+				}
+				// One Spotify release can arrive through both the direct catalogue
+				// and appears_on. Keep one notification candidate and let a primary
+				// credit win even if Spotify returned the featured copy first.
+				key := saved.provider + "\x00" + fmt.Sprint(saved.release.ID)
+				if index, exists := savedIndexes[key]; exists {
+					previous := savedReleases[index]
+					saved.release.Credits = mergeReleaseCredits(previous.release.Credits, saved.release.Credits)
+					saved.creditNew = previous.creditNew || saved.creditNew
+					if previous.release.ArtistCreditRole == "primary" && saved.release.ArtistCreditRole == "featured" {
+						previous.isNew = previous.isNew || saved.isNew
+						previous.creditNew = previous.creditNew || saved.creditNew
+						previous.release.Credits = saved.release.Credits
+						savedReleases[index] = previous
+					} else {
+						saved.isNew = saved.isNew || previous.isNew
+						saved.creditNew = saved.creditNew || previous.creditNew
+						savedReleases[index] = saved
+					}
+				} else {
+					savedIndexes[key] = len(savedReleases)
+					savedReleases = append(savedReleases, saved)
+				}
 			}
 		}
-	}
-	// A later synchronization may have made previously conflicting evidence
-	// agree again. Drain those holds only after every provider batch in this
-	// transaction has been evaluated, so an intermediate provider cannot
-	// release a notification before the rest of the batch is visible.
-	for _, item := range savedReleases {
-		if err := drainResolvedNotificationHoldsTx(ctx, tx, item.release.ID, observed); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("drain release notification holds: %w", err)
+		// A later synchronization may have made previously conflicting evidence
+		// agree again. Drain those holds only after every provider batch in this
+		// transaction has been evaluated, so an intermediate provider cannot
+		// release a notification before the rest of the batch is visible.
+		for _, item := range savedReleases {
+			if err := drainResolvedNotificationHoldsTx(ctx, tx, item.release.ID, observed); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("drain release notification holds: %w", err)
+			}
 		}
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT f.user_id,u.timezone,f.baseline_synced_at,f.spotify_baseline_synced_at,f.spotify_appears_on_baseline_synced_at
+		rows, err := tx.QueryContext(ctx, `SELECT f.user_id,u.timezone,f.baseline_synced_at,f.spotify_baseline_synced_at,f.spotify_appears_on_baseline_synced_at
 		FROM follows f JOIN users u ON u.id=f.user_id WHERE f.artist_id=?`, artist.ID)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	type follower struct {
-		id                        int64
-		timezone                  string
-		baseline                  bool
-		spotifyBaseline           bool
-		spotifyAppearanceBaseline bool
-	}
-	var followers []follower
-	for rows.Next() {
-		var f follower
-		var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
-		if err := rows.Scan(&f.id, &f.timezone, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		type follower struct {
+			id                        int64
+			timezone                  string
+			baseline                  bool
+			spotifyBaseline           bool
+			spotifyAppearanceBaseline bool
+		}
+		var followers []follower
+		for rows.Next() {
+			var f follower
+			var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
+			if err := rows.Scan(&f.id, &f.timezone, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			f.baseline = baseline.Valid
+			f.spotifyBaseline = spotifyBaseline.Valid
+			f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
+			followers = append(followers, f)
+		}
+		if err := rows.Err(); err != nil {
 			_ = rows.Close()
 			_ = tx.Rollback()
 			return err
 		}
-		f.baseline = baseline.Valid
-		f.spotifyBaseline = spotifyBaseline.Valid
-		f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
-		followers = append(followers, f)
-	}
-	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		_ = tx.Rollback()
-		return err
-	}
-	_ = rows.Close()
-	for _, follower := range followers {
-		location := userLocation(follower.timezone)
-		if !follower.baseline {
-			if selected, eventType, ok := selectInitialReleaseInLocation(savedReleases, observed, location); ok {
-				title, body := initialReleaseMessageInLocation(artist, selected.release, eventType, observed, location)
-				if err := enqueueEventTx(ctx, tx, follower.id, selected.release.ID, eventType, title, body, observed); err != nil {
-					_ = tx.Rollback()
-					return fmt.Errorf("enqueue initial release event: %w", err)
+		for _, follower := range followers {
+			location := userLocation(follower.timezone)
+			if !follower.baseline {
+				if selected, eventType, ok := selectInitialReleaseInLocation(savedReleases, observed, location); ok {
+					title, body := initialReleaseMessageInLocation(artist, selected.release, eventType, observed, location)
+					if err := enqueueEventTx(ctx, tx, follower.id, selected.release.ID, eventType, title, body, observed); err != nil {
+						_ = tx.Rollback()
+						return fmt.Errorf("enqueue initial release event: %w", err)
+					}
 				}
+				for _, item := range savedReleases {
+					for _, role := range releaseCreditRoles(item.release, item.provider) {
+						if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
+							_ = tx.Rollback()
+							return err
+						}
+					}
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
+					timeText(observed), follower.id, artist.ID); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
+				if spotifyObserved {
+					if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
+					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+					if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_appears_on_baseline_synced_at=?
+					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+				}
+				continue
 			}
 			for _, item := range savedReleases {
+				if item.provider == "spotify" && !follower.spotifyBaseline {
+					continue
+				}
 				for _, role := range releaseCreditRoles(item.release, item.provider) {
 					if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
 						_ = tx.Rollback()
 						return err
 					}
 				}
+				date, full := releaseDate(item.release.FirstReleaseDate)
+				if (!item.isNew && !item.creditNew) || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
+					continue
+				}
+				title, body := releaseAnnouncementMessage(artist, item.release)
+				if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement", title, body, observed); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
-				timeText(observed), follower.id, artist.ID); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-			if spotifyObserved {
+			if spotifyObserved && !follower.spotifyBaseline {
 				if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
-					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
 					_ = tx.Rollback()
 					return err
 				}
+			}
+			if spotifyObserved && !follower.spotifyAppearanceBaseline {
 				if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_appears_on_baseline_synced_at=?
-					WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
+				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
 					_ = tx.Rollback()
 					return err
 				}
 			}
-			continue
 		}
-		for _, item := range savedReleases {
-			if item.provider == "spotify" && !follower.spotifyBaseline {
-				continue
-			}
-			for _, role := range releaseCreditRoles(item.release, item.provider) {
-				if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
-					_ = tx.Rollback()
-					return err
-				}
-			}
-			date, full := releaseDate(item.release.FirstReleaseDate)
-			if (!item.isNew && !item.creditNew) || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
-				continue
-			}
-			title, body := releaseAnnouncementMessage(artist, item.release)
-			if err := enqueueEventTx(ctx, tx, follower.id, item.release.ID, "announcement", title, body, observed); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-		}
-		if spotifyObserved && !follower.spotifyBaseline {
-			if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_baseline_synced_at=?
-				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-		}
-		if spotifyObserved && !follower.spotifyAppearanceBaseline {
-			if _, err := tx.ExecContext(ctx, `UPDATE follows SET spotify_appears_on_baseline_synced_at=?
-				WHERE user_id=? AND artist_id=?`, timeText(observed), follower.id, artist.ID); err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 func matchingReleaseIDTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, candidate Release, spotifyOnly bool,
@@ -321,15 +320,9 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	return nil
 }
 func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, eventType, title, body string, now time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	if err := enqueueEventTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return enqueueEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
+	})
 }
 func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]Release, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id

@@ -63,81 +63,72 @@ func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, e
 // canonical artist and owner-scoped follow in the same transaction. This makes
 // partial uploads durable without coupling them to provider availability.
 func (s *Store) SaveImportRow(ctx context.Context, userID, jobID int64, input ImportInput) (ImportRow, error) {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return ImportRow{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var owner int64
-	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM import_jobs WHERE id=?`, jobID).Scan(&owner); err != nil {
-		return ImportRow{}, err
-	}
-	if owner != userID {
-		return ImportRow{}, sql.ErrNoRows
-	}
-
-	row := ImportRow{JobID: jobID, SourceValue: strings.TrimSpace(input.SourceValue), DisplayName: strings.TrimSpace(input.DisplayName)}
-	if input.Reason != "" {
-		row.Status, row.Reason = "invalid", input.Reason
-		if err := insertImportRowTx(ctx, tx, row); err != nil {
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ImportRow, error) {
+		var owner int64
+		if err := tx.QueryRowContext(ctx, `SELECT user_id FROM import_jobs WHERE id=?`, jobID).Scan(&owner); err != nil {
 			return ImportRow{}, err
 		}
-		if err := tx.Commit(); err != nil {
-			return ImportRow{}, err
+		if owner != userID {
+			return ImportRow{}, sql.ErrNoRows
 		}
-		return row, nil
-	}
 
-	now := nowText()
-	_, err = tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
+		row := ImportRow{JobID: jobID, SourceValue: strings.TrimSpace(input.SourceValue), DisplayName: strings.TrimSpace(input.DisplayName)}
+		if input.Reason != "" {
+			row.Status, row.Reason = "invalid", input.Reason
+			if err := insertImportRowTx(ctx, tx, row); err != nil {
+				return ImportRow{}, err
+			}
+			return row, nil
+		}
+
+		now := nowText()
+		_, err := tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
 		spotify_id,spotify_url,spotify_image_url,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(mbid) DO NOTHING`,
-		input.MBID, input.DisplayName, input.DisplayName, "", "", "",
-		nullString(input.SpotifyID), nullString(input.SpotifyURL), nil, now, now)
-	if err != nil {
-		return ImportRow{}, err
-	}
-	var artistID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM artists WHERE mbid=?`, input.MBID).Scan(&artistID); err != nil {
-		return ImportRow{}, err
-	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`, userID, artistID, now)
-	if err != nil {
-		return ImportRow{}, err
-	}
-	added, err := result.RowsAffected()
-	if err != nil {
-		return ImportRow{}, err
-	}
-	// Keep imported follows equivalent to follows created through the normal
-	// and resolution paths. INSERT OR IGNORE repairs a legacy follow without
-	// resetting an existing customized policy, and remains part of this
-	// transaction so the first release sync can enqueue notifications.
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
-		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
-		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
-		return ImportRow{}, err
-	}
-	row.ArtistID = &artistID
-	if added > 0 {
-		row.Status = "added"
-		// The next normal runner tick performs the regular baseline sync. It is
-		// intentionally not run inline with the upload and therefore cannot
-		// flood this request with provider calls.
-		if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+			input.MBID, input.DisplayName, input.DisplayName, "", "", "",
+			nullString(input.SpotifyID), nullString(input.SpotifyURL), nil, now, now)
+		if err != nil {
 			return ImportRow{}, err
 		}
-	} else {
-		row.Status = "already_followed"
-	}
-	if err := insertImportRowTx(ctx, tx, row); err != nil {
-		return ImportRow{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return ImportRow{}, err
-	}
-	return row, nil
+		var artistID int64
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM artists WHERE mbid=?`, input.MBID).Scan(&artistID); err != nil {
+			return ImportRow{}, err
+		}
+		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`, userID, artistID, now)
+		if err != nil {
+			return ImportRow{}, err
+		}
+		added, err := result.RowsAffected()
+		if err != nil {
+			return ImportRow{}, err
+		}
+		// Keep imported follows equivalent to follows created through the normal
+		// and resolution paths. INSERT OR IGNORE repairs a legacy follow without
+		// resetting an existing customized policy, and remains part of this
+		// transaction so the first release sync can enqueue notifications.
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
+		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
+			return ImportRow{}, err
+		}
+		row.ArtistID = &artistID
+		if added > 0 {
+			row.Status = "added"
+			// The next normal runner tick performs the regular baseline sync. It is
+			// intentionally not run inline with the upload and therefore cannot
+			// flood this request with provider calls.
+			if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+				return ImportRow{}, err
+			}
+		} else {
+			row.Status = "already_followed"
+		}
+		if err := insertImportRowTx(ctx, tx, row); err != nil {
+			return ImportRow{}, err
+		}
+		return row, nil
+	})
 }
 
 func insertImportRowTx(ctx context.Context, tx *sql.Tx, row ImportRow) error {
@@ -202,36 +193,31 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 	policy := s.retention()
 	cutoff := now.Add(-24 * time.Hour)
 	manualCutoff := now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour)
-	var stats MaintenanceStats
 	statements := []struct {
 		query string
 		args  []any
-		out   *int64
 	}{
-		{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}, &stats.Sessions},
-		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &stats.AuthTokens},
-		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(cutoff)}, &stats.LoginAttempts},
-		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(manualCutoff)}, &stats.ManualSyncs},
-		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(manualCutoff)}, &stats.ImportJobs},
+		{`DELETE FROM sessions WHERE expires_at < ?`, []any{timeText(now)}},
+		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}},
+		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(cutoff)}},
+		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(manualCutoff)}},
+		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(manualCutoff)}},
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return stats, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	for _, statement := range statements {
-		result, err := tx.ExecContext(ctx, statement.query, statement.args...)
-		if err != nil {
-			return stats, err
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (MaintenanceStats, error) {
+		var stats MaintenanceStats
+		counts := []*int64{&stats.Sessions, &stats.AuthTokens, &stats.LoginAttempts, &stats.ManualSyncs, &stats.ImportJobs}
+		for i, statement := range statements {
+			res, err := tx.ExecContext(ctx, statement.query, statement.args...)
+			if err != nil {
+				return stats, err
+			}
+			count, err := res.RowsAffected()
+			if err != nil {
+				return stats, err
+			}
+			*counts[i] = count
 		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return stats, err
-		}
-		*statement.out = count
-	}
-	if err := tx.Commit(); err != nil {
-		return stats, err
-	}
-	return stats, nil
+		return stats, nil
+	})
+	return result, err
 }

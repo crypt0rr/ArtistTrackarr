@@ -111,52 +111,46 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 	if scope != "artist" && scope != "retry" {
 		return ManualSyncRequest{}, errors.New("invalid sync scope")
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var q string
-	var args []any
-	if scope == "artist" {
-		if artistID == nil {
-			return ManualSyncRequest{}, errors.New("artist is required")
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ManualSyncRequest, error) {
+		var q string
+		var args []any
+		if scope == "artist" {
+			if artistID == nil {
+				return ManualSyncRequest{}, errors.New("artist is required")
+			}
+			q = `SELECT id FROM manual_sync_requests WHERE scope='artist' AND artist_id=? AND status IN ('queued','running') LIMIT 1`
+			args = []any{*artistID}
+		} else {
+			q = `SELECT id FROM manual_sync_requests WHERE scope='retry' AND status IN ('queued','running') LIMIT 1`
 		}
-		q = `SELECT id FROM manual_sync_requests WHERE scope='artist' AND artist_id=? AND status IN ('queued','running') LIMIT 1`
-		args = []any{*artistID}
-	} else {
-		q = `SELECT id FROM manual_sync_requests WHERE scope='retry' AND status IN ('queued','running') LIMIT 1`
-	}
-	var existing int64
-	if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
-		return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
-	} else if err != sql.ErrNoRows {
-		return ManualSyncRequest{}, err
-	}
-	var queued int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'`).Scan(&queued); err != nil {
-		return ManualSyncRequest{}, err
-	}
-	if queued >= maxQueuedManualSyncRequests {
-		return ManualSyncRequest{}, ErrManualSyncQueueFull
-	}
-	now := nowText()
-	res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return ManualSyncRequest{}, err
-	}
-	created, err := parseStoredTime(now, "manual sync created_at")
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
+		var existing int64
+		if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
+			return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
+		} else if err != sql.ErrNoRows {
+			return ManualSyncRequest{}, err
+		}
+		var queued int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'`).Scan(&queued); err != nil {
+			return ManualSyncRequest{}, err
+		}
+		if queued >= maxQueuedManualSyncRequests {
+			return ManualSyncRequest{}, ErrManualSyncQueueFull
+		}
+		now := nowText()
+		res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		created, err := parseStoredTime(now, "manual sync created_at")
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
+	})
 }
 func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
 	return s.ClaimManualSyncRequestsWithLease(ctx, limit, "legacy-worker", 5*time.Minute)
@@ -176,65 +170,62 @@ func (s *Store) ClaimManualSyncRequestsWithLease(ctx context.Context, limit int,
 	if lease <= 0 {
 		lease = 5 * time.Minute
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := time.Now().UTC()
-	expires := now.Add(lease)
-	rows, err := tx.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,created_at FROM manual_sync_requests
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) ([]ManualSyncRequest, error) {
+		now := time.Now().UTC()
+		expires := now.Add(lease)
+		rows, err := tx.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,created_at FROM manual_sync_requests
 		WHERE status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
 		ORDER BY id LIMIT ?`, timeText(now), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []int64
-	var out []ManualSyncRequest
-	for rows.Next() {
-		var r ManualSyncRequest
-		var aid sql.NullInt64
-		var ts string
-		if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
+		if err != nil {
 			return nil, err
 		}
-		if aid.Valid {
-			v := aid.Int64
-			r.ArtistID = &v
+		var ids []int64
+		var out []ManualSyncRequest
+		for rows.Next() {
+			var r ManualSyncRequest
+			var aid sql.NullInt64
+			var ts string
+			if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if aid.Valid {
+				v := aid.Int64
+				r.ArtistID = &v
+			}
+			r.Status = "running"
+			created, parseErr := parseStoredTime(ts, "manual sync created_at")
+			if parseErr != nil {
+				_ = rows.Close()
+				return nil, parseErr
+			}
+			r.CreatedAt = created
+			out = append(out, r)
+			ids = append(ids, r.ID)
 		}
-		r.Status = "running"
-		created, parseErr := parseStoredTime(ts, "manual sync created_at")
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		r.CreatedAt = created
-		out = append(out, r)
-		ids = append(ids, r.ID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	nowTextValue := timeText(now)
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE manual_sync_requests SET status='running',started_at=?,lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE id=? AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))`, nowTextValue, owner, timeText(expires), id, nowTextValue); err != nil {
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	started, err := parseStoredTime(nowTextValue, "manual sync started_at")
-	if err != nil {
-		return nil, err
-	}
-	for i := range out {
-		out[i].StartedAt = &started
-		out[i].LeaseOwner = owner
-		expiresCopy := expires
-		out[i].LeaseExpiresAt = &expiresCopy
-	}
-	return out, nil
+		_ = rows.Close()
+		nowTextValue := timeText(now)
+		for _, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE manual_sync_requests SET status='running',started_at=?,lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE id=? AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))`, nowTextValue, owner, timeText(expires), id, nowTextValue); err != nil {
+				return nil, err
+			}
+		}
+		started, err := parseStoredTime(nowTextValue, "manual sync started_at")
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			out[i].StartedAt = &started
+			out[i].LeaseOwner = owner
+			expiresCopy := expires
+			out[i].LeaseExpiresAt = &expiresCopy
+		}
+		return out, nil
+	})
 }
 func (s *Store) CompleteManualSyncRequest(ctx context.Context, id int64, syncErr error) error {
 	return s.CompleteManualSyncRequestOwned(ctx, id, "", syncErr)

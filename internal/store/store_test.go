@@ -88,6 +88,94 @@ func TestSQLiteBusyClassification(t *testing.T) {
 	}
 }
 
+func TestWithWriteTxRetriesWholeClosureAfterBusyError(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	var attempts int
+	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		attempts++
+		if _, err := tx.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`,
+			nowText(), "INFO", fmt.Sprintf("attempt-%d", attempts), "[]"); err != nil {
+			return err
+		}
+		if attempts < 3 {
+			return errors.New("database is locked")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d, want 3", attempts)
+	}
+	var count int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM application_logs WHERE message LIKE 'attempt-%'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("committed rows=%d, want only the successful replay", count)
+	}
+}
+
+func TestWithWriteTxStopsOnNonRetryableError(t *testing.T) {
+	s := testStore(t)
+	want := errors.New("constraint failed")
+	var attempts int
+	err := s.withWriteTx(context.Background(), func(*sql.Tx) error {
+		attempts++
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("error=%v, want %v", err, want)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d, want 1", attempts)
+	}
+}
+
+func TestWithWriteTxHonorsCancellationDuringRetry(t *testing.T) {
+	s := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var attempts int
+	err := s.withWriteTx(ctx, func(*sql.Tx) error {
+		attempts++
+		cancel()
+		return errors.New("database is locked")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d, want one attempt before cancellation", attempts)
+	}
+}
+
+func TestWithWriteTxResultPublishesOnlyAfterCommit(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	attempts := 0
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (string, error) {
+		attempts++
+		if _, err := tx.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`,
+			nowText(), "INFO", fmt.Sprintf("result-attempt-%d", attempts), "[]"); err != nil {
+			return "", err
+		}
+		if attempts < 2 {
+			return "rolled back", errors.New("database table is locked")
+		}
+		return "committed", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "committed" {
+		t.Fatalf("result=%q, want committed", result)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want 2", attempts)
+	}
+}
+
 func TestStoredTimeParsingRejectsCorruptValues(t *testing.T) {
 	if _, err := parseStoredTime("not-a-time", "test timestamp"); err == nil || !strings.Contains(err.Error(), "test timestamp") {
 		t.Fatalf("parseStoredTime accepted corrupt value: %v", err)

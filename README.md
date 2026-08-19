@@ -65,7 +65,9 @@ records, completed transient work, and application logs inside the documented
 windows are eligible for cleanup. The v0.42.0 reliability release routes
 production SQLite writes through a bounded busy/locked retry path, rejects
 malformed operational timestamps instead of silently showing zero values, and
-preflights database paths and MusicBrainz contact input before startup. The v0.40.0 operations
+replays complete multi-statement write transactions after an intermediate or
+commit-time lock, and preflights database paths and MusicBrainz contact input
+before startup. The v0.40.0 operations
 release adds strict boolean configuration validation,
 polling-cadence-aware provider freshness, and bounded scheduler, provider, and
 delivery metrics in the administrator diagnostics report. The v0.39.0

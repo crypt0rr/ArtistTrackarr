@@ -144,6 +144,59 @@ func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
 	return nil, lastErr
 }
 
+// withWriteTx executes one logical write transaction with bounded retry for
+// transient SQLite contention. The closure is replayed in its entirety after
+// rollback, so a busy/locked error at an intermediate statement or during
+// commit cannot leave callers with a partially applied operation. Callers must
+// keep the closure limited to database work; external side effects belong
+// after this helper returns successfully.
+func (s *Store) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			lastErr = err
+		} else {
+			err = fn(tx)
+			if err != nil {
+				_ = tx.Rollback()
+				lastErr = err
+			} else if err = tx.Commit(); err != nil {
+				_ = tx.Rollback()
+				lastErr = err
+			} else {
+				return nil
+			}
+		}
+		if !sqliteBusy(lastErr) || attempt == 4 {
+			return lastErr
+		}
+		if err := waitWriteRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// withWriteTxResult is the result-bearing form used by transactional store
+// operations. The result is only published after a successful commit, so a
+// replay cannot expose values from a rolled-back attempt.
+func withWriteTxResult[T any](s *Store, ctx context.Context, fn func(*sql.Tx) (T, error)) (T, error) {
+	var zero T
+	var result T
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		value, err := fn(tx)
+		if err == nil {
+			result = value
+		}
+		return err
+	})
+	if err != nil {
+		return zero, err
+	}
+	return result, nil
+}
+
 // execWriteContext applies the same bounded busy/locked retry policy to
 // single-statement writes that do not need a multi-statement transaction.
 // Keeping this behind Store prevents individual persistence paths from

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -167,57 +168,52 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		}
 		body := buildDigestBody(releases, user.Frequency)
 		title := fmt.Sprintf("Upcoming releases · %s", localNow.Format("2006-01-02"))
-		tx, err := s.beginWriteTx(ctx)
-		if err != nil {
-			return queued, err
-		}
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_runs
-			(user_id,frequency,period_start,title,body,release_count,status,created_at)
-			VALUES(?,?,?,?,?,?, 'pending',?)`, user.ID, user.Frequency, periodKey, title, body, len(releases), timeText(now))
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		if inserted == 0 {
-			_ = tx.Rollback()
-			continue
-		}
-		runID, err := result.LastInsertId()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		deliveryResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_deliveries
-			(run_id,destination_id,status,next_attempt_at)
-			SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
-			LEFT JOIN destination_health dh ON dh.destination_id=d.id
-			WHERE d.user_id=? AND d.enabled=1`, runID, timeText(now), user.ID)
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		deliveryCount, err := deliveryResult.RowsAffected()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		if deliveryCount == 0 {
-			// No admitted destination is not a successful send. Keep the run
-			// pending so it remains visible for an explicit replay/recovery action.
-			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='pending' WHERE id=?`, runID); err != nil {
-				_ = tx.Rollback()
-				return queued, err
+		insertedRun := false
+		err = s.withWriteTx(ctx, func(tx *sql.Tx) error {
+			result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_runs
+				(user_id,frequency,period_start,title,body,release_count,status,created_at)
+				VALUES(?,?,?,?,?,?, 'pending',?)`, user.ID, user.Frequency, periodKey, title, body, len(releases), timeText(now))
+			if err != nil {
+				return err
 			}
-		}
-		if err := tx.Commit(); err != nil {
+			inserted, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if inserted == 0 {
+				return nil
+			}
+			insertedRun = true
+			runID, err := result.LastInsertId()
+			if err != nil {
+				return err
+			}
+			deliveryResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_deliveries
+				(run_id,destination_id,status,next_attempt_at)
+				SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
+				LEFT JOIN destination_health dh ON dh.destination_id=d.id
+				WHERE d.user_id=? AND d.enabled=1`, runID, timeText(now), user.ID)
+			if err != nil {
+				return err
+			}
+			deliveryCount, err := deliveryResult.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if deliveryCount == 0 {
+				// No admitted destination is not a successful send. Keep the run
+				// pending so it remains visible for an explicit replay/recovery action.
+				_, err = tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='pending' WHERE id=?`, runID)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
 			return queued, err
 		}
-		queued++
+		if insertedRun {
+			queued++
+		}
 	}
 	return queued, nil
 }

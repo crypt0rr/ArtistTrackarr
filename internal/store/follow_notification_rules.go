@@ -270,26 +270,22 @@ func (s *Store) UpdateFollowNotificationRules(ctx context.Context, userID int64,
 	}
 	rule.DeliveryMode = normalizeFollowDeliveryMode(rule.DeliveryMode)
 	now := time.Now().UTC()
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, userID)
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	var followed int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
-		return 0, err
-	}
-	if followed != len(ids) {
-		return 0, sql.ErrNoRows
-	}
-	for _, artistID := range ids {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, userID)
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		var followed int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+			return 0, err
+		}
+		if followed != len(ids) {
+			return 0, sql.ErrNoRows
+		}
+		for _, artistID := range ids {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
 			(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,paused_until,updated_at)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(user_id,artist_id) DO UPDATE SET
@@ -298,16 +294,14 @@ func (s *Store) UpdateFollowNotificationRules(ctx context.Context, userID int64,
 			singles=excluded.singles,compilations=excluded.compilations,
 			announcements=excluded.announcements,release_day=excluded.release_day,
 			paused_until=excluded.paused_until,updated_at=excluded.updated_at`,
-			userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
-			boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
-			boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
-			return 0, err
+				userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
+				boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
+				boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
+				return 0, err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return len(ids), nil
+		return len(ids), nil
+	})
 }
 
 func (s *Store) UpdateFollowNotificationRule(ctx context.Context, userID, artistID int64, rule FollowNotificationRule) error {
@@ -337,41 +331,35 @@ func (s *Store) SetFollowNotificationDeliveryMode(ctx context.Context, userID in
 	if len(ids) == 0 {
 		return 0, errors.New("select at least one followed artist")
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, userID)
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	var followed int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
-		return 0, err
-	}
-	if followed != len(ids) {
-		return 0, sql.ErrNoRows
-	}
-	args = []any{mode, timeText(time.Now().UTC()), userID}
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE follow_notification_rules SET delivery_mode=?,updated_at=?
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, userID)
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		var followed int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+			return 0, err
+		}
+		if followed != len(ids) {
+			return 0, sql.ErrNoRows
+		}
+		args = []any{mode, timeText(time.Now().UTC()), userID}
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE follow_notification_rules SET delivery_mode=?,updated_at=?
 		WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...)
-	if err != nil {
-		return 0, err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return int(changed), nil
+		if err != nil {
+			return 0, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		return int(changed), nil
+	})
 }
 
 func (s *Store) PauseFollowNotificationRule(ctx context.Context, userID, artistID int64, until *time.Time) error {

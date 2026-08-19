@@ -61,56 +61,47 @@ func (s *Store) ArtistByMBID(ctx context.Context, mbid string) (Artist, error) {
 	return a, nil
 }
 func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error) {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := nowText()
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
-		userID, artistID, now)
-	if err != nil {
-		return false, err
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if n > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (bool, error) {
+		now := nowText()
+		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
+			userID, artistID, now)
+		if err != nil {
 			return false, err
 		}
-	}
-	// Keep the policy row present even for a legacy follow that predates the
-	// policy migration. INSERT OR IGNORE also avoids resetting an existing
-	// policy.
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
-		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
-		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return n > 0, nil
+		n, err := result.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if n > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+				return false, err
+			}
+		}
+		// Keep the policy row present even for a legacy follow that predates the
+		// policy migration. INSERT OR IGNORE also avoids resetting an existing
+		// policy.
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+			(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
+			VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
+			return false, err
+		}
+		return n > 0, nil
+	})
 }
 func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
-	if err != nil {
-		return err
-	}
-	if err := changedOrNotFound(result, nil); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artistID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
+		if err != nil {
+			return err
+		}
+		if err := changedOrNotFound(result, nil); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artistID); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provider, providerID, name, providerURL, imageURL string) (ArtistResolution, bool, error) {
@@ -233,21 +224,19 @@ func (s *Store) CancelArtistResolution(ctx context.Context, userID, resolutionID
 	return changedOrNotFound(result, err)
 }
 func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistResolution, artist Artist) (Artist, bool, error) {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return Artist{}, false, err
-	}
-	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM artist_resolutions WHERE id=? AND user_id=?`,
-		resolution.ID, resolution.UserID).Scan(&exists); err != nil || exists == 0 {
-		_ = tx.Rollback()
-		if err != nil {
-			return Artist{}, false, err
+	var stored Artist
+	var added bool
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM artist_resolutions WHERE id=? AND user_id=?`,
+			resolution.ID, resolution.UserID).Scan(&exists); err != nil || exists == 0 {
+			if err != nil {
+				return err
+			}
+			return sql.ErrNoRows
 		}
-		return Artist{}, false, sql.ErrNoRows
-	}
-	now := nowText()
-	_, err = tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
+		now := nowText()
+		_, err := tx.ExecContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
 		spotify_id,spotify_url,spotify_image_url,created_at,updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
@@ -255,54 +244,51 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		spotify_id=COALESCE(excluded.spotify_id,artists.spotify_id),
 		spotify_url=COALESCE(excluded.spotify_url,artists.spotify_url),
 		spotify_image_url=COALESCE(excluded.spotify_image_url,artists.spotify_image_url),updated_at=excluded.updated_at`,
-		artist.MBID, artist.Name, artist.SortName, artist.Type, artist.Country, artist.Disambiguation,
-		nullString(artist.SpotifyID), nullString(artist.SpotifyURL), nullString(artist.SpotifyImageURL), now, now)
-	if err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	var sid, surl, image, checked sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,
-		spotify_id,spotify_url,spotify_image_url,last_checked_at FROM artists WHERE mbid=?`, artist.MBID).Scan(
-		&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type, &artist.Country,
-		&artist.Disambiguation, &sid, &surl, &image, &checked)
-	if err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
-	if artist.LastCheckedAt, err = parseStoredNullableTime(checked, "artist last_checked_at"); err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	if len(artist.Genres) > 0 {
-		if err := replaceArtistGenresExec(ctx, tx, artist.ID, artist.Genres, "musicbrainz"); err != nil {
-			_ = tx.Rollback()
-			return Artist{}, false, err
+			artist.MBID, artist.Name, artist.SortName, artist.Type, artist.Country, artist.Disambiguation,
+			nullString(artist.SpotifyID), nullString(artist.SpotifyURL), nullString(artist.SpotifyImageURL), now, now)
+		if err != nil {
+			return err
 		}
-	}
-	follow, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
-		resolution.UserID, artist.ID, now)
-	if err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	added, _ := follow.RowsAffected()
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
+		var sid, surl, image, checked sql.NullString
+		err = tx.QueryRowContext(ctx, `SELECT id,mbid,name,sort_name,artist_type,country,disambiguation,
+		spotify_id,spotify_url,spotify_image_url,last_checked_at FROM artists WHERE mbid=?`, artist.MBID).Scan(
+			&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type, &artist.Country,
+			&artist.Disambiguation, &sid, &surl, &image, &checked)
+		if err != nil {
+			return err
+		}
+		artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
+		if artist.LastCheckedAt, err = parseStoredNullableTime(checked, "artist last_checked_at"); err != nil {
+			return err
+		}
+		if len(artist.Genres) > 0 {
+			if err := replaceArtistGenresExec(ctx, tx, artist.ID, artist.Genres, "musicbrainz"); err != nil {
+				return err
+			}
+		}
+		follow, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`,
+			resolution.UserID, artist.ID, now)
+		if err != nil {
+			return err
+		}
+		followAdded, err := follow.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_notification_rules
 		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,updated_at)
 		VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, resolution.UserID, artist.ID, now); err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`,
-		resolution.ID, resolution.UserID); err != nil {
-		_ = tx.Rollback()
-		return Artist{}, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Artist{}, false, err
-	}
-	return artist, added > 0, nil
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM artist_resolutions WHERE id=? AND user_id=?`,
+			resolution.ID, resolution.UserID); err != nil {
+			return err
+		}
+		stored = artist
+		added = followAdded > 0
+		return nil
+	})
+	return stored, added, err
 }
 func (s *Store) FollowedArtists(ctx context.Context, userID int64) ([]Artist, error) {
 	return s.FollowedArtistsFiltered(ctx, userID, "", "", "")
@@ -414,15 +400,9 @@ func (s *Store) FollowedArtistCount(ctx context.Context, userID int64) (int, err
 	return count, err
 }
 func (s *Store) replaceArtistGenres(ctx context.Context, artistID int64, genres []string, source string) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := replaceArtistGenresExec(ctx, tx, artistID, genres, source); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return replaceArtistGenresExec(ctx, tx, artistID, genres, source)
+	})
 }
 func (s *Store) ArtistGenres(ctx context.Context, artistID int64) ([]string, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT genre FROM artist_genres WHERE artist_id=? ORDER BY weight DESC,genre`, artistID)
@@ -542,17 +522,14 @@ func (s *Store) DueListenBrainzArtists(ctx context.Context, now time.Time, limit
 	return result, rows.Err()
 }
 func (s *Store) SaveListenBrainzStats(ctx context.Context, stats map[int64]ListenBrainzStats, now, next time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	for artistID, value := range stats {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,?,?,'',0,?) ON CONFLICT(artist_id) DO UPDATE SET total_listen_count=excluded.total_listen_count,total_user_count=excluded.total_user_count,checked_at=excluded.checked_at,next_check_at=excluded.next_check_at,last_error='',attempts=0,updated_at=excluded.updated_at`, artistID, value.TotalListenCount, value.TotalUserCount, timeText(now), timeText(next), timeText(now)); err != nil {
-			return err
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		for artistID, value := range stats {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,?,?,'',0,?) ON CONFLICT(artist_id) DO UPDATE SET total_listen_count=excluded.total_listen_count,total_user_count=excluded.total_user_count,checked_at=excluded.checked_at,next_check_at=excluded.next_check_at,last_error='',attempts=0,updated_at=excluded.updated_at`, artistID, value.TotalListenCount, value.TotalUserCount, timeText(now), timeText(next), timeText(now)); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // ScheduleListenBrainzRefresh advances refresh timestamps for artists that
@@ -562,36 +539,30 @@ func (s *Store) ScheduleListenBrainzRefresh(ctx context.Context, artistIDs []int
 	if len(artistIDs) == 0 {
 		return nil
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	for _, artistID := range artistIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at)
-			VALUES(?,?, '',0,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,updated_at=excluded.updated_at`,
-			artistID, timeText(next), timeText(next)); err != nil {
-			return err
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, artistID := range artistIDs {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at)
+				VALUES(?,?, '',0,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,updated_at=excluded.updated_at`,
+				artistID, timeText(next), timeText(next)); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func (s *Store) ScheduleListenBrainzRetry(ctx context.Context, artistIDs []int64, next time.Time, message string) error {
 	if len(artistIDs) == 0 {
 		return nil
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	for _, artistID := range artistIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,last_error=excluded.last_error,attempts=artist_listenbrainz_stats.attempts+1,updated_at=excluded.updated_at`, artistID, timeText(next), message, nowText()); err != nil {
-			return err
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		for _, artistID := range artistIDs {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO artist_listenbrainz_stats(artist_id,next_check_at,last_error,attempts,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(artist_id) DO UPDATE SET next_check_at=excluded.next_check_at,last_error=excluded.last_error,attempts=artist_listenbrainz_stats.attempts+1,updated_at=excluded.updated_at`, artistID, timeText(next), message, nowText()); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit int) ([]Artist, error) {
 	if limit < 1 || limit > 20 {
@@ -683,21 +654,15 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 }
 func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
 	next := now.Add(interval)
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE artists SET last_checked_at=?,next_check_at=? WHERE id=?`,
+			timeText(now), timeText(next), artistID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider IN ('itunes','musicbrainz')`,
+			timeText(next), artistID)
 		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artists SET last_checked_at=?,next_check_at=? WHERE id=?`,
-		timeText(now), timeText(next), artistID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider IN ('itunes','musicbrainz')`,
-		timeText(next), artistID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next time.Time) error {
 	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(next), artistID)
@@ -709,21 +674,16 @@ func (s *Store) ScheduleArtistCheck(ctx context.Context, artistID int64, next ti
 // artist cannot remain pinned by ArtistsDue's OR predicate, while a provider
 // cooldown already in the future is preserved.
 func (s *Store) ScheduleArtistRetry(ctx context.Context, artistID int64, now, next time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+			CASE WHEN spotify_next_check_at IS NULL OR spotify_next_check_at<=? THEN ? ELSE spotify_next_check_at END
+			WHERE id=?`, timeText(next), timeText(now), timeText(next), artistID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=?
+			WHERE artist_id=? AND (next_check_at IS NULL OR next_check_at<=?)`, timeText(next), artistID, timeText(now))
 		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
-		CASE WHEN spotify_next_check_at IS NULL OR spotify_next_check_at<=? THEN ? ELSE spotify_next_check_at END
-		WHERE id=?`, timeText(next), timeText(now), timeText(next), artistID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=?
-		WHERE artist_id=? AND (next_check_at IS NULL OR next_check_at<=?)`, timeText(next), artistID, timeText(now)); err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 
 func (s *Store) MarkSpotifyChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
@@ -741,74 +701,60 @@ func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (Spotif
 	return state, err
 }
 func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, now time.Time, interval time.Duration, changed, upcoming bool) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	var streak int
-	var last sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).Scan(&streak, &last); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	var lastChange *time.Time
-	if last.Valid {
-		parsed, parseErr := parseStoredNullableTime(last, "artist spotify_last_change_at")
-		if parseErr != nil {
-			_ = tx.Rollback()
-			return parseErr
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var streak int
+		var last sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).Scan(&streak, &last); err != nil {
+			return err
 		}
-		lastChange = parsed
-	}
-	if changed {
-		streak = 0
-		t := now
-		lastChange = &t
-	} else {
-		streak++
-	}
-	delay := spotifyPollDelay(artistID, interval)
-	if !changed && !upcoming {
-		backoff := interval
-		for i := 0; i < min(streak, 3); i++ {
-			backoff *= 2
+		var lastChange *time.Time
+		if last.Valid {
+			parsed, parseErr := parseStoredNullableTime(last, "artist spotify_last_change_at")
+			if parseErr != nil {
+				return parseErr
+			}
+			lastChange = parsed
 		}
-		if backoff > 7*24*time.Hour {
-			backoff = 7 * 24 * time.Hour
+		if changed {
+			streak = 0
+			t := now
+			lastChange = &t
+		} else {
+			streak++
 		}
-		delay = spotifyPollDelay(artistID, backoff)
-		if delay > backoff {
-			delay = backoff
+		delay := spotifyPollDelay(artistID, interval)
+		if !changed && !upcoming {
+			backoff := interval
+			for i := 0; i < min(streak, 3); i++ {
+				backoff *= 2
+			}
+			if backoff > 7*24*time.Hour {
+				backoff = 7 * 24 * time.Hour
+			}
+			delay = spotifyPollDelay(artistID, backoff)
+			if delay > backoff {
+				delay = backoff
+			}
 		}
-	}
-	next := now.Add(delay)
-	if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
-		timeText(next), streak, nullableTime(lastChange), artistID); err != nil {
-		_ = tx.Rollback()
+		next := now.Add(delay)
+		if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=?,spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`,
+			timeText(next), streak, nullableTime(lastChange), artistID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
+			timeText(next), artistID)
 		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
-		timeText(next), artistID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) ScheduleSpotifyCheck(ctx context.Context, artistID int64, next time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, timeText(next), artistID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
+			timeText(next), artistID)
 		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, timeText(next), artistID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE artist_provider_status SET next_check_at=? WHERE artist_id=? AND provider='spotify'`,
-		timeText(next), artistID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (string, error) {
 	var date sql.NullString
@@ -849,65 +795,57 @@ func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, 
 			byID[id] = artworkURL
 		}
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-	rows, err := tx.QueryContext(ctx, `SELECT id,itunes_id FROM release_groups
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (struct{ checked, updated int }, error) {
+		var counts struct{ checked, updated int }
+		rows, err := tx.QueryContext(ctx, `SELECT id,itunes_id FROM release_groups
 		WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`, artistID)
-	if err != nil {
-		return 0, 0, err
-	}
-	type candidate struct {
-		id       int64
-		itunesID string
-	}
-	var candidates []candidate
-	for rows.Next() {
-		var item candidate
-		if err := rows.Scan(&item.id, &item.itunesID); err != nil {
-			_ = rows.Close()
-			return 0, 0, err
+		if err != nil {
+			return counts, err
 		}
-		candidates = append(candidates, item)
-	}
-	if err := rows.Err(); err != nil {
+		type candidate struct {
+			id       int64
+			itunesID string
+		}
+		var candidates []candidate
+		for rows.Next() {
+			var item candidate
+			if err := rows.Scan(&item.id, &item.itunesID); err != nil {
+				_ = rows.Close()
+				return counts, err
+			}
+			candidates = append(candidates, item)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return counts, err
+		}
 		_ = rows.Close()
-		return 0, 0, err
-	}
-	_ = rows.Close()
-	checkedAt := timeText(observed)
-	negativeNext := timeText(observed.Add(30 * 24 * time.Hour))
-	for _, item := range candidates {
-		checked++
-		artworkURL := byID[item.itunesID]
-		if artworkURL != "" {
-			result, execErr := tx.ExecContext(ctx, `UPDATE release_groups SET
+		checkedAt := timeText(observed)
+		negativeNext := timeText(observed.Add(30 * 24 * time.Hour))
+		for _, item := range candidates {
+			counts.checked++
+			artworkURL := byID[item.itunesID]
+			if artworkURL != "" {
+				result, execErr := tx.ExecContext(ctx, `UPDATE release_groups SET
 				itunes_artwork_url=?,itunes_artwork_checked_at=?,itunes_artwork_next_check_at=NULL,
 				itunes_artwork_attempts=0,updated_at=? WHERE id=?`, artworkURL, checkedAt, checkedAt, item.id)
-			if execErr != nil {
-				return 0, 0, execErr
+				if execErr != nil {
+					return counts, execErr
+				}
+				n, _ := result.RowsAffected()
+				counts.updated += int(n)
+				continue
 			}
-			n, _ := result.RowsAffected()
-			updated += int(n)
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE release_groups SET
+			if _, err := tx.ExecContext(ctx, `UPDATE release_groups SET
 			itunes_artwork_checked_at=?,itunes_artwork_next_check_at=?,
 			itunes_artwork_attempts=itunes_artwork_attempts+1,updated_at=? WHERE id=?`,
-			checkedAt, negativeNext, checkedAt, item.id); err != nil {
-			return 0, 0, err
+				checkedAt, negativeNext, checkedAt, item.id); err != nil {
+				return counts, err
+			}
 		}
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, 0, err
-	}
-	return checked, updated, nil
+		return counts, nil
+	})
+	return result.checked, result.updated, err
 }
 
 // ScheduleITunesArtworkRetry applies a bounded durable retry time to all

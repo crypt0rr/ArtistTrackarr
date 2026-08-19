@@ -71,35 +71,32 @@ func (s *Store) RecordOperationalSnapshot(ctx context.Context, snapshot Diagnost
 	if captured.IsZero() {
 		captured = time.Now().UTC()
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	_, err = tx.ExecContext(ctx, `INSERT INTO operational_snapshots
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO operational_snapshots
 		(captured_at,status,runner_status,database_healthy,schema_version,followed_artists,releases,
 		 queued_syncs,running_syncs,pending_deliveries,failed_deliveries,recent_log_entries,
 		 oldest_queue_at,stale_claims,paused_destinations,provider_failures,digest_backlog,database_bytes,
 		 last_backup_at,last_restore_at,last_restore_result)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		timeText(captured), status, runnerStatus, boolInt(snapshot.DatabaseHealthy), snapshot.SchemaVersion,
-		snapshot.FollowedArtists, snapshot.Releases, snapshot.QueuedSyncs, snapshot.RunningSyncs,
-		snapshot.PendingDeliveries, snapshot.FailedDeliveries, snapshot.RecentLogEntries,
-		nullableTime(snapshot.OldestQueueAt), snapshot.StaleClaims, snapshot.PausedDestinations,
-		snapshot.ProviderFailures, snapshot.DigestBacklog, snapshot.DatabaseBytes,
-		nullableTime(snapshot.LastBackupAt), nullableTime(snapshot.LastRestoreAt), snapshot.LastRestoreResult)
-	if err != nil {
-		return err
-	}
-	cutoff := captured.Add(-operationalSnapshotRetention)
-	if _, err = tx.ExecContext(ctx, `DELETE FROM operational_snapshots WHERE captured_at < ?`, timeText(cutoff)); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM operational_snapshots WHERE id NOT IN
+			timeText(captured), status, runnerStatus, boolInt(snapshot.DatabaseHealthy), snapshot.SchemaVersion,
+			snapshot.FollowedArtists, snapshot.Releases, snapshot.QueuedSyncs, snapshot.RunningSyncs,
+			snapshot.PendingDeliveries, snapshot.FailedDeliveries, snapshot.RecentLogEntries,
+			nullableTime(snapshot.OldestQueueAt), snapshot.StaleClaims, snapshot.PausedDestinations,
+			snapshot.ProviderFailures, snapshot.DigestBacklog, snapshot.DatabaseBytes,
+			nullableTime(snapshot.LastBackupAt), nullableTime(snapshot.LastRestoreAt), snapshot.LastRestoreResult)
+		if err != nil {
+			return err
+		}
+		cutoff := captured.Add(-operationalSnapshotRetention)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM operational_snapshots WHERE captured_at < ?`, timeText(cutoff)); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM operational_snapshots WHERE id NOT IN
 		(SELECT id FROM operational_snapshots ORDER BY captured_at DESC,id DESC LIMIT ?)`, operationalSnapshotLimit); err != nil {
-		return err
-	}
-	return tx.Commit()
+			return err
+		}
+		return nil
+	})
 }
 
 // OperationalSnapshots returns the most recent persisted diagnostics points
