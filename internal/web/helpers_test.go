@@ -250,7 +250,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 	providerTime := now.Add(-time.Hour)
 	resolution := &store.ArtistResolution{ID: 1, UserID: user.ID, Provider: "spotify", ProviderID: "spotify-template", DisplayName: artist.Name, ProviderURL: "https://open.spotify.com/artist/template", Status: "review", Candidates: []store.ResolutionCandidate{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}}}
 	data := PageData{
-		Title: "Template smoke", Version: "0.46.3", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true, Query: "template",
+		Title: "Template smoke", Version: "0.46.4", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true, Query: "template",
 		Artists: []store.Artist{artist}, Results: []catalog.ArtistResult{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}},
 		SpotifyResults: []catalog.SpotifyArtist{{ID: "spotify-template", Name: artist.Name, URL: "https://open.spotify.com/artist/template"}},
 		ITunesResults:  []catalog.ITunesArtist{{ID: "123", Name: artist.Name, URL: "https://music.apple.com/us/artist/template/123"}}, UpcomingReleases: []store.Release{release}, RecentReleases: []store.Release{release},

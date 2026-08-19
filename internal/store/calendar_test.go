@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +59,104 @@ func TestCalendarReleasesAreOwnerScopedAndExposeHoldState(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("cross-user calendar items=%#v", items)
+	}
+}
+
+func TestCalendarReleasesDoesNotNestReaderQueries(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	s.Reader.SetMaxIdleConns(1)
+	userID, err := s.CreateUser(ctx, "calendar-reader@example.com", "hash", "member", "UTC", "calendar-reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "calendar-reader-artist", Name: "Calendar Reader Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	releaseDate := time.Now().UTC().AddDate(0, 0, 3).Format("2006-01-02")
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "calendar-reader-release", artist.ID, "Calendar Reader Release", "Album", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/calendar-reader-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Now().UTC().Format("2006-01-02")
+	to := time.Now().UTC().AddDate(0, 0, 7).Format("2006-01-02")
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	items, err := s.CalendarReleases(queryCtx, userID, from, to, 20)
+	if err != nil {
+		t.Fatalf("calendar query exhausted the reader pool: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != releaseID {
+		t.Fatalf("calendar items=%#v, want release %d", items, releaseID)
+	}
+	if len(items[0].FollowedArtists) != 1 || items[0].FollowedArtists[0] != "Calendar Reader Artist (primary)" {
+		t.Fatalf("followed associations=%v", items[0].FollowedArtists)
+	}
+}
+
+func TestCalendarReleasesBatchesLargeAssociationSets(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	s.Reader.SetMaxIdleConns(1)
+	userID, err := s.CreateUser(ctx, "calendar-batch@example.com", "hash", "member", "UTC", "calendar-batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "calendar-batch-artist", Name: "Calendar Batch Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	releaseDate := time.Now().UTC().AddDate(0, 0, 3).Format("2006-01-02")
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 501; i++ {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+			 musicbrainz_url,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, fmt.Sprintf("calendar-batch-release-%03d", i), artist.ID,
+			fmt.Sprintf("Calendar Batch Release %03d", i), "Album", "[]", releaseDate, 3,
+			fmt.Sprintf("https://musicbrainz.org/release-group/calendar-batch-release-%03d", i), "musicbrainz", nowText(), nowText()); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	from := time.Now().UTC().Format("2006-01-02")
+	to := time.Now().UTC().AddDate(0, 0, 7).Format("2006-01-02")
+	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	items, err := s.CalendarReleases(queryCtx, userID, from, to, 600)
+	if err != nil {
+		t.Fatalf("large calendar query failed: %v", err)
+	}
+	if len(items) != 501 {
+		t.Fatalf("calendar items=%d, want 501", len(items))
+	}
+	for _, item := range items {
+		if len(item.FollowedArtists) != 1 || item.FollowedArtists[0] != "Calendar Batch Artist (primary)" {
+			t.Fatalf("release %d followed associations=%v", item.ID, item.FollowedArtists)
+		}
 	}
 }
 
