@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,7 +55,10 @@ type Provider interface {
 type Option func(*Cache)
 
 func WithBaseURL(value string) Option {
-	return func(c *Cache) { c.baseURL = strings.TrimRight(value, "/") }
+	return func(c *Cache) {
+		c.baseURL = strings.TrimRight(value, "/")
+		c.allowLoopback = artworkBaseURLIsLoopback(value)
+	}
 }
 
 func WithHTTPClient(client *http.Client) Option {
@@ -63,6 +67,16 @@ func WithHTTPClient(client *http.Client) Option {
 
 func WithClock(clock func() time.Time) Option {
 	return func(c *Cache) { c.now = clock }
+}
+
+// WithResolver and WithDialer are narrow seams for deterministic transport
+// tests. Production uses the system resolver and a bounded net.Dialer.
+func WithResolver(lookup func(context.Context, string, string) ([]net.IP, error)) Option {
+	return func(c *Cache) { c.lookupIP = lookup }
+}
+
+func WithDialer(dial func(context.Context, string, string) (net.Conn, error)) Option {
+	return func(c *Cache) { c.dial = dial }
 }
 
 type call struct {
@@ -74,7 +88,11 @@ type Cache struct {
 	root                 string
 	baseURL              string
 	client               *http.Client
+	requestClient        *http.Client
 	now                  func() time.Time
+	lookupIP             func(context.Context, string, string) ([]net.IP, error)
+	dial                 func(context.Context, string, string) (net.Conn, error)
+	allowLoopback        bool
 	semaphore            chan struct{}
 	mu                   sync.Mutex
 	inflight             map[string]*call
@@ -89,6 +107,8 @@ func NewCache(root string, options ...Option) (*Cache, error) {
 		baseURL:   "https://coverartarchive.org",
 		client:    &http.Client{Timeout: 20 * time.Second},
 		now:       time.Now,
+		lookupIP:  net.DefaultResolver.LookupIP,
+		dial:      (&net.Dialer{Timeout: 20 * time.Second}).DialContext,
 		semaphore: make(chan struct{}, 4),
 		inflight:  make(map[string]*call),
 	}
@@ -98,6 +118,13 @@ func NewCache(root string, options ...Option) (*Cache, error) {
 	if cache.client == nil || cache.now == nil {
 		return nil, errors.New("artwork cache requires an HTTP client and clock")
 	}
+	if cache.lookupIP == nil {
+		cache.lookupIP = net.DefaultResolver.LookupIP
+	}
+	if cache.dial == nil {
+		cache.dial = (&net.Dialer{Timeout: 20 * time.Second}).DialContext
+	}
+	cache.requestClient = cache.secureClient()
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create artwork cache: %w", err)
 	}
@@ -167,12 +194,16 @@ func (c *Cache) refresh(ctx context.Context, mbid string) Asset {
 	}
 
 	endpoint := c.baseURL + "/release-group/" + url.PathEscape(mbid) + "/front-250"
+	parsedEndpoint, parseErr := url.Parse(endpoint)
+	if parseErr != nil || validateArtworkTarget(parsedEndpoint, c.allowLoopback) != nil {
+		return fallback(stale, "blocked")
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fallback(stale, "error")
 	}
 	request.Header.Set("User-Agent", version.UserAgent)
-	response, err := c.client.Do(request)
+	response, err := c.requestClient.Do(request)
 	if err != nil {
 		c.recordTransientFailure()
 		return fallback(stale, "upstream-error")
@@ -424,6 +455,132 @@ func validMBID(value string) bool {
 		}
 	}
 	return true
+}
+
+func (c *Cache) secureClient() *http.Client {
+	client := *c.client
+	if client.Timeout <= 0 {
+		client.Timeout = 20 * time.Second
+	}
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	client.Transport = safeTransport(base, c.allowLoopback, c.lookupIP, c.dial)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("artwork redirect limit exceeded")
+		}
+		if err := validateArtworkTarget(req.URL, c.allowLoopback); err != nil {
+			return err
+		}
+		return nil
+	}
+	return &client
+}
+
+func safeTransport(base http.RoundTripper, allowLoopback bool,
+	lookup func(context.Context, string, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) http.RoundTripper {
+	transport, ok := base.(*http.Transport)
+	if !ok {
+		return base
+	}
+	transport = transport.Clone()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, errors.New("artwork upstream address is invalid")
+		}
+		if isBlockedArtworkHost(host, allowLoopback) {
+			return nil, errors.New("artwork upstream resolved to a local or private network")
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		ips, err := lookup(lookupCtx, "ip", host)
+		if err != nil || len(ips) == 0 {
+			return nil, errors.New("artwork upstream host could not be resolved")
+		}
+		var lastErr error
+		for _, ip := range ips {
+			if isBlockedArtworkIP(ip, allowLoopback) {
+				lastErr = errors.New("artwork upstream resolved to a local or private network")
+				continue
+			}
+			conn, dialErr := dial(ctx, network, net.JoinHostPort(ip.String(), port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		if lastErr == nil {
+			lastErr = errors.New("artwork upstream could not be reached")
+		}
+		return nil, lastErr
+	}
+	return transport
+}
+
+func validateArtworkTarget(target *url.URL, allowLoopback bool) error {
+	if target == nil || target.Hostname() == "" {
+		return errors.New("artwork upstream URL is invalid")
+	}
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(target.Hostname()), "."))
+	if target.Scheme != "https" && !(allowLoopback && target.Scheme == "http" && isLoopbackHost(host)) {
+		return errors.New("artwork upstream must use HTTPS")
+	}
+	if !allowedArtworkHost(host, allowLoopback) {
+		return errors.New("artwork upstream host is not approved")
+	}
+	if port := target.Port(); port != "" && !(allowLoopback && isLoopbackHost(host) && port != "443") && port != "443" {
+		return errors.New("artwork upstream port is not approved")
+	}
+	return nil
+}
+
+func allowedArtworkHost(host string, allowLoopback bool) bool {
+	if allowLoopback && isLoopbackHost(host) {
+		return true
+	}
+	for _, domain := range []string{"coverartarchive.org", "archive.org"} {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLoopbackHost(host string) bool {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func isBlockedArtworkHost(host string, allowLoopback bool) bool {
+	host = strings.Trim(host, "[]")
+	if allowLoopback && isLoopbackHost(host) {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return isBlockedArtworkIP(ip, allowLoopback)
+	}
+	return false
+}
+
+func isBlockedArtworkIP(ip net.IP, allowLoopback bool) bool {
+	if ip == nil {
+		return true
+	}
+	if allowLoopback && ip.IsLoopback() {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+func artworkBaseURLIsLoopback(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && parsed != nil && isLoopbackHost(parsed.Hostname())
 }
 
 // ValidMBID reports whether value has the canonical MusicBrainz UUID shape.

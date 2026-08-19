@@ -133,6 +133,8 @@ func TestMusicBrainzSearchValidationAndResponseErrors(t *testing.T) {
 
 func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 	const mbid = "11111111-1111-4111-8111-111111111111"
+	const firstRelease = "22222222-2222-4222-8222-222222222222"
+	const secondRelease = "33333333-3333-4333-8333-333333333333"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
@@ -142,7 +144,7 @@ func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 			if request.URL.Query().Get("artist") != mbid || request.URL.Query().Get("type") != "album|ep|single" {
 				t.Fatalf("unexpected release-group query: %s", request.URL.RawQuery)
 			}
-			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"release-one","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"release-two","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
+			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"`+firstRelease+`","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"`+secondRelease+`","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
 		default:
 			http.NotFound(w, request)
 		}
@@ -193,6 +195,24 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 	credit := credits[0].Credits[0]
 	if credit.Role != "guest" || credit.ProviderID != recordingID || credit.TrackTitle != "Collab track" {
 		t.Fatalf("credit=%#v", credit)
+	}
+}
+
+func TestMusicBrainzRejectsMalformedReleaseGroupID(t *testing.T) {
+	const artistID = "11111111-1111-4111-8111-111111111111"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws/2/release-group" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"release-group-count":1,"release-groups":[{"id":"not-a-uuid","title":"Unsafe","primary-type":"Album"}]}`)
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	if releases, err := mb.ArtistReleases(context.Background(), artistID); err == nil || releases != nil {
+		t.Fatalf("malformed release group accepted: releases=%#v err=%v", releases, err)
 	}
 }
 

@@ -314,6 +314,9 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 	if err := m.getJSON(ctx, endpoint, &item); err != nil {
 		return ArtistResult{}, err
 	}
+	if !validMBID(item.ID) {
+		return ArtistResult{}, errors.New("MusicBrainz returned an invalid artist ID")
+	}
 	result := ArtistResult{
 		MBID: item.ID, Name: item.Name, SortName: item.SortName, Type: item.Type,
 		Country: item.Country, Disambiguation: item.Disambiguation,
@@ -369,6 +372,9 @@ func (m *MusicBrainz) ResolveExternalArtist(ctx context.Context, externalURL str
 }
 
 func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.Release, error) {
+	if !validMBID(mbid) {
+		return nil, errors.New("invalid MusicBrainz artist ID")
+	}
 	var all []store.Release
 	offset := 0
 	const pageSize = 100
@@ -395,6 +401,9 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 			return nil, err
 		}
 		for _, item := range response.ReleaseGroups {
+			if !validMBID(item.ID) {
+				return nil, errors.New("MusicBrainz returned an invalid release-group ID")
+			}
 			precision := 0
 			switch len(item.FirstReleaseDate) {
 			case 4:

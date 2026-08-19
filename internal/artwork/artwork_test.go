@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,6 +65,51 @@ func TestCacheFollowsRedirectAndRefreshes(t *testing.T) {
 	refreshed := cache.Get(context.Background(), testMBID)
 	if refreshed.Status != "fetched" || requests.Load() != 4 {
 		t.Fatalf("stale cache did not refresh: status=%s requests=%d", refreshed.Status, requests.Load())
+	}
+}
+
+func TestCacheRejectsUnapprovedAndDowngradedRedirects(t *testing.T) {
+	for name, location := range map[string]string{
+		"unapproved host": "https://example.invalid/art.jpg",
+		"https downgrade": "http://coverartarchive.org/art.jpg",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				http.Redirect(w, r, location, http.StatusTemporaryRedirect)
+			}))
+			defer server.Close()
+			cache, err := NewCache(t.TempDir(), WithBaseURL(server.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			asset := cache.Get(context.Background(), testMBID)
+			if asset.Status != "upstream-error" || requests.Load() != 1 {
+				t.Fatalf("redirect was not rejected: status=%q requests=%d", asset.Status, requests.Load())
+			}
+		})
+	}
+}
+
+func TestCacheRejectsPrivateResolvedArtworkAddressBeforeDial(t *testing.T) {
+	var dialCalled atomic.Bool
+	cache, err := NewCache(t.TempDir(),
+		WithHTTPClient(&http.Client{Transport: &http.Transport{}}),
+		WithResolver(func(context.Context, string, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}),
+		WithDialer(func(context.Context, string, string) (net.Conn, error) {
+			dialCalled.Store(true)
+			return nil, errors.New("dial should not be called")
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset := cache.Get(context.Background(), testMBID)
+	if asset.Status != "upstream-error" || dialCalled.Load() {
+		t.Fatalf("private artwork address was dialed or not rejected: status=%q dialed=%v", asset.Status, dialCalled.Load())
 	}
 }
 
