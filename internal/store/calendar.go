@@ -48,13 +48,33 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 		}
 		item.CalendarDate = item.FirstReleaseDate
 		item.Held = held != 0
-		item.FollowedArtists, err = s.followedReleaseArtists(ctx, userID, item.ID)
-		if err != nil {
-			return nil, err
-		}
 		result = append(result, item)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	// Materialize and close the release projection before resolving followed
+	// associations. The reader pool is finite; querying associations while the
+	// cursor is open can otherwise deadlock when all readers are occupied.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return result, nil
+	}
+	releaseIDs := make([]int64, len(result))
+	for i := range result {
+		releaseIDs[i] = result[i].ID
+	}
+	followedArtists, err := s.followedReleaseArtistsBatch(ctx, userID, releaseIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range result {
+		result[i].FollowedArtists = followedArtists[result[i].ID]
+	}
+	return result, nil
 }
 
 type digestUser struct {

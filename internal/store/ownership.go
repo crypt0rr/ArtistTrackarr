@@ -1,6 +1,9 @@
 package store
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // followedReleasePredicate returns an owner-scoped predicate for a release
 // group aliased as rg. A release is visible when the member follows either
@@ -79,4 +82,52 @@ func (s *Store) followedReleaseArtists(ctx context.Context, userID, releaseID in
 		names = append(names, name)
 	}
 	return names, rows.Err()
+}
+
+// followedReleaseArtistsBatch loads the followed associations for a materialized
+// set of releases. Callers should close any release projection cursor before
+// invoking this helper: each bounded query may acquire a reader connection.
+// Keeping the association lookup batched avoids one nested reader query per
+// release and prevents calendar callers from exhausting the reader pool.
+func (s *Store) followedReleaseArtistsBatch(ctx context.Context, userID int64, releaseIDs []int64) (map[int64][]string, error) {
+	associations := make(map[int64][]string, len(releaseIDs))
+	for start := 0; start < len(releaseIDs); start += 500 {
+		end := min(start+500, len(releaseIDs))
+		ids := releaseIDs[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		for _, releaseID := range ids {
+			args = append(args, releaseID)
+		}
+		args = append(args, userID)
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT rg.id, `+followedReleaseAssociationLabel+`
+			FROM follows f
+			JOIN artists a ON a.id=f.artist_id
+			JOIN release_groups rg ON rg.id IN (`+placeholders+`)
+			WHERE f.user_id=? AND (f.artist_id=rg.artist_id OR EXISTS (
+				SELECT 1 FROM release_credits rc
+				WHERE rc.release_group_id=rg.id AND rc.artist_id=f.artist_id
+			))
+			ORDER BY rg.id,lower(a.name),f.artist_id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var releaseID int64
+			var name string
+			if err := rows.Scan(&releaseID, &name); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			associations[releaseID] = append(associations[releaseID], name)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return associations, nil
 }
