@@ -300,7 +300,11 @@ language/runtime line.
 `make lint` runs the pinned `golangci-lint` v2.12.2 configuration. The focused
 quality gate covers unchecked errors, Go vet, static analysis, ineffective
 assignments, unused code, row and SQL resource handling, HTTP body closure,
-wrapped errors, and nil-error paths.
+wrapped errors, and nil-error paths. `make test` builds the fast Docker test
+stage; `make docker-quality` builds the full Docker quality stage, which runs
+serialized race tests plus the pinned lint and vulnerability checks. Race tests
+use one package at a time so constrained Docker/CI filesystems do not report
+spurious SQLite disk-full failures.
 
 Pin a deployment to a release by setting the Compose image before starting:
 

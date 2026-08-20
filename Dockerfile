@@ -11,6 +11,21 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go vet ./... && go test ./...
 
+# The test stage is intentionally fast and is used by the regular image
+# smoke-build. The quality stage is the reproducible, resource-bounded gate
+# for local release validation: it serializes race tests and runs the same
+# pinned lint and vulnerability tools as CI.
+FROM dependencies AS quality
+COPY . .
+RUN apk add --no-cache build-base
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go vet ./... && \
+    go test -p 1 ./... -count=1 && \
+    go test -race -p 1 ./... -count=1 && \
+    go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./... && \
+    go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
 FROM dependencies AS build
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \

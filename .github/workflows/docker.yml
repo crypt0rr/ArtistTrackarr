@@ -65,7 +65,7 @@ jobs:
           cache: true
 
       - name: Run race detector
-        run: go test -race ./...
+        run: go test -race -p 1 ./...
 
       - name: Report test coverage
         run: make coverage

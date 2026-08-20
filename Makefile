@@ -1,10 +1,13 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
-.PHONY: test build run fmt-check tooling-check version-check lint vuln coverage quality
+.PHONY: test docker-quality build run fmt-check tooling-check version-check lint vuln coverage quality
 
 test:
 	docker build --target test .
+
+docker-quality:
+	docker build --target quality .
 
 build:
 	docker build -t artist-trackarr:local .
@@ -60,5 +63,5 @@ coverage:
 quality: fmt-check tooling-check version-check
 	go vet ./...
 	go test ./... -count=1
-	go test -race ./... -count=1
+	go test -race -p 1 ./... -count=1
 	$(MAKE) lint vuln
