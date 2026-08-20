@@ -18,8 +18,11 @@ import (
 
 // maxQueuedManualSyncRequests prevents repeated manual-sync actions from
 // starving normal scheduled work. Requests for the same artist are still
-// coalesced by CreateManualSyncRequest before this global cap is checked.
-const maxQueuedManualSyncRequests = 100
+// coalesced by CreateManualSyncRequest before these caps are checked.
+const (
+	maxQueuedManualSyncRequests        = 100
+	maxQueuedManualSyncRequestsPerUser = 25
+)
 
 func (s *Store) InsertApplicationLog(ctx context.Context, entry logging.Entry) error {
 	attrs, err := json.Marshal(entry.Attributes)
@@ -107,56 +110,66 @@ func (s *Store) PruneApplicationLogs(ctx context.Context, before time.Time) erro
 	_, err := s.execWriteContext(ctx, `DELETE FROM application_logs WHERE created_at < ?`, timeText(before))
 	return err
 }
+
+// Optimize refreshes SQLite's lightweight query-planner statistics. It is
+// deliberately run by hourly maintenance on the serialized writer so it
+// cannot contend with read-only dashboard connections or race a schema write.
+func (s *Store) Optimize(ctx context.Context) error {
+	_, err := s.DB.ExecContext(ctx, `PRAGMA optimize`)
+	return err
+}
 func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope string, artistID *int64) (ManualSyncRequest, error) {
 	if scope != "artist" && scope != "retry" {
 		return ManualSyncRequest{}, errors.New("invalid sync scope")
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var q string
-	var args []any
-	if scope == "artist" {
-		if artistID == nil {
-			return ManualSyncRequest{}, errors.New("artist is required")
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ManualSyncRequest, error) {
+		var q string
+		var args []any
+		if scope == "artist" {
+			if artistID == nil {
+				return ManualSyncRequest{}, errors.New("artist is required")
+			}
+			q = `SELECT id FROM manual_sync_requests WHERE scope='artist' AND artist_id=? AND status IN ('queued','running') LIMIT 1`
+			args = []any{*artistID}
+		} else {
+			q = `SELECT id FROM manual_sync_requests WHERE scope='retry' AND status IN ('queued','running') LIMIT 1`
 		}
-		q = `SELECT id FROM manual_sync_requests WHERE scope='artist' AND artist_id=? AND status IN ('queued','running') LIMIT 1`
-		args = []any{*artistID}
-	} else {
-		q = `SELECT id FROM manual_sync_requests WHERE scope='retry' AND status IN ('queued','running') LIMIT 1`
-	}
-	var existing int64
-	if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
-		return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
-	} else if err != sql.ErrNoRows {
-		return ManualSyncRequest{}, err
-	}
-	var queued int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'`).Scan(&queued); err != nil {
-		return ManualSyncRequest{}, err
-	}
-	if queued >= maxQueuedManualSyncRequests {
-		return ManualSyncRequest{}, ErrManualSyncQueueFull
-	}
-	now := nowText()
-	res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return ManualSyncRequest{}, err
-	}
-	created, err := parseStoredTime(now, "manual sync created_at")
-	if err != nil {
-		return ManualSyncRequest{}, err
-	}
-	return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
+		var existing int64
+		if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
+			return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return ManualSyncRequest{}, err
+		}
+		var queued int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status='queued'`).Scan(&queued); err != nil {
+			return ManualSyncRequest{}, err
+		}
+		if queued >= maxQueuedManualSyncRequests {
+			return ManualSyncRequest{}, ErrManualSyncQueueFull
+		}
+		var ownerQueued int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests
+			WHERE status='queued' AND requested_by=?`, userID).Scan(&ownerQueued); err != nil {
+			return ManualSyncRequest{}, err
+		}
+		if ownerQueued >= maxQueuedManualSyncRequestsPerUser {
+			return ManualSyncRequest{}, ErrManualSyncQueueFull
+		}
+		now := nowText()
+		res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		created, err := parseStoredTime(now, "manual sync created_at")
+		if err != nil {
+			return ManualSyncRequest{}, err
+		}
+		return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
+	})
 }
 func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
 	return s.ClaimManualSyncRequestsWithLease(ctx, limit, "legacy-worker", 5*time.Minute)
@@ -176,65 +189,66 @@ func (s *Store) ClaimManualSyncRequestsWithLease(ctx context.Context, limit int,
 	if lease <= 0 {
 		lease = 5 * time.Minute
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := time.Now().UTC()
-	expires := now.Add(lease)
-	rows, err := tx.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,created_at FROM manual_sync_requests
-		WHERE status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
-		ORDER BY id LIMIT ?`, timeText(now), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var ids []int64
-	var out []ManualSyncRequest
-	for rows.Next() {
-		var r ManualSyncRequest
-		var aid sql.NullInt64
-		var ts string
-		if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) ([]ManualSyncRequest, error) {
+		now := time.Now().UTC()
+		expires := now.Add(lease)
+		rows, err := tx.QueryContext(ctx, `WITH eligible AS (
+			SELECT id,requested_by,scope,artist_id,created_at,
+				ROW_NUMBER() OVER (PARTITION BY requested_by ORDER BY id) AS owner_rank
+			FROM manual_sync_requests
+			WHERE status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
+		)
+		SELECT id,requested_by,scope,artist_id,created_at FROM eligible
+		ORDER BY owner_rank,id LIMIT ?`, timeText(now), limit)
+		if err != nil {
 			return nil, err
 		}
-		if aid.Valid {
-			v := aid.Int64
-			r.ArtistID = &v
-		}
-		r.Status = "running"
-		created, parseErr := parseStoredTime(ts, "manual sync created_at")
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		r.CreatedAt = created
-		out = append(out, r)
-		ids = append(ids, r.ID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	nowTextValue := timeText(now)
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE manual_sync_requests SET status='running',started_at=?,lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE id=? AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))`, nowTextValue, owner, timeText(expires), id, nowTextValue); err != nil {
+		var ids []int64
+		var out []ManualSyncRequest
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var r ManualSyncRequest
+				var aid sql.NullInt64
+				var ts string
+				if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
+					return err
+				}
+				if aid.Valid {
+					v := aid.Int64
+					r.ArtistID = &v
+				}
+				r.Status = "running"
+				created, parseErr := parseStoredTime(ts, "manual sync created_at")
+				if parseErr != nil {
+					return parseErr
+				}
+				r.CreatedAt = created
+				out = append(out, r)
+				ids = append(ids, r.ID)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	started, err := parseStoredTime(nowTextValue, "manual sync started_at")
-	if err != nil {
-		return nil, err
-	}
-	for i := range out {
-		out[i].StartedAt = &started
-		out[i].LeaseOwner = owner
-		expiresCopy := expires
-		out[i].LeaseExpiresAt = &expiresCopy
-	}
-	return out, nil
+		nowTextValue := timeText(now)
+		for _, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE manual_sync_requests SET status='running',started_at=?,lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE id=? AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))`, nowTextValue, owner, timeText(expires), id, nowTextValue); err != nil {
+				return nil, err
+			}
+		}
+		started, err := parseStoredTime(nowTextValue, "manual sync started_at")
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			out[i].StartedAt = &started
+			out[i].LeaseOwner = owner
+			expiresCopy := expires
+			out[i].LeaseExpiresAt = &expiresCopy
+		}
+		return out, nil
+	})
 }
 func (s *Store) CompleteManualSyncRequest(ctx context.Context, id int64, syncErr error) error {
 	return s.CompleteManualSyncRequestOwned(ctx, id, "", syncErr)
@@ -392,6 +406,23 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	var snapshot DiagnosticsSnapshot
 	snapshot.CheckedAt = time.Now().UTC()
+	snapshot.DatabaseHealthState = DatabaseHealthy
+	if healthErr := s.Healthy(ctx); healthErr != nil {
+		var classified *DatabaseHealthError
+		if errors.As(healthErr, &classified) && classified != nil && classified.State != "" {
+			snapshot.DatabaseHealthState = classified.State
+		} else {
+			snapshot.DatabaseHealthState = DatabaseUnavailable
+		}
+	} else if healthErr := s.Writable(ctx); healthErr != nil {
+		var classified *DatabaseHealthError
+		if errors.As(healthErr, &classified) && classified != nil && classified.State != "" {
+			snapshot.DatabaseHealthState = classified.State
+		} else {
+			snapshot.DatabaseHealthState = DatabaseWriteFailed
+		}
+	}
+	snapshot.DatabaseHealthy = snapshot.DatabaseHealthState == DatabaseHealthy
 	err := s.readerDB().QueryRowContext(ctx, `SELECT
 		COALESCE((SELECT MAX(version) FROM schema_migrations),0),
 		(SELECT COUNT(*) FROM follows),
@@ -408,7 +439,12 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	if err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	snapshot.DatabaseHealthy = true
+	backlog, err := s.DueArtistSyncBacklog(ctx, snapshot.CheckedAt)
+	if err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	snapshot.DueSyncArtists = backlog.Count
+	snapshot.OldestDueSyncAt = backlog.OldestDueAt
 	var oldest sql.NullString
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT MIN(value) FROM (
 		SELECT next_attempt_at AS value FROM deliveries WHERE status IN ('pending','blocked')
@@ -416,6 +452,20 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		return DiagnosticsSnapshot{}, err
 	}
 	if snapshot.OldestQueueAt, err = parseStoredNullableTime(oldest, "oldest queued delivery"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	var earliestFuture sql.NullString
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(value) FROM (
+		SELECT next_attempt_at AS value FROM deliveries
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?
+		UNION ALL
+		SELECT next_attempt_at FROM release_digest_deliveries
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?)`,
+		timeText(snapshot.CheckedAt.Add(24*time.Hour)), timeText(snapshot.CheckedAt.Add(24*time.Hour))).
+		Scan(&snapshot.FutureDeliveries, &earliestFuture); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.EarliestFutureDelivery, err = parseStoredNullableTime(earliestFuture, "earliest future delivery"); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT
@@ -428,14 +478,33 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		Scan(&snapshot.StaleClaims, &snapshot.PausedDestinations, &snapshot.ProviderFailures, &snapshot.DigestBacklog); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	var pageCount, pageSize int64
+	var oldestProviderFailure, oldestDigestBacklog sql.NullString
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT
+		(SELECT MIN(last_failure_at) FROM provider_health
+		 WHERE last_failure_at IS NOT NULL AND (last_success_at IS NULL OR last_failure_at>last_success_at)),
+		(SELECT MIN(r.created_at) FROM release_digest_deliveries dd
+		 JOIN release_digest_runs r ON r.id=dd.run_id
+		 WHERE dd.status IN ('pending','blocked'))`).Scan(&oldestProviderFailure, &oldestDigestBacklog); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.OldestProviderFailureAt, err = parseStoredNullableTime(oldestProviderFailure, "oldest provider failure"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.OldestDigestBacklogAt, err = parseStoredNullableTime(oldestDigestBacklog, "oldest digest backlog"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	var pageCount, pageSize, freePages int64
 	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
 	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
+	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
 	snapshot.DatabaseBytes = pageCount * pageSize
+	snapshot.DatabaseFreeBytes = freePages * pageSize
 	snapshot.LastBackupAt, _ = s.operationalMarker(backupMarkerFile)
 	snapshot.LastRestoreAt, snapshot.LastRestoreResult = s.operationalMarker(restoreMarkerFile)
 	health, err := s.ProviderHealth(ctx)
@@ -453,7 +522,10 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	return snapshot, nil
 }
 func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
-	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())
+	now := nowText()
+	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+		CASE WHEN spotify_id IS NOT NULL THEN ? ELSE spotify_next_check_at END
+		WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, now, now)
 	return err
 }
 func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {

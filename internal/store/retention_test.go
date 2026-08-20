@@ -46,6 +46,9 @@ func TestRetentionReportAndCleanupPreserveNotificationHistory(t *testing.T) {
 	if stats.ApplicationLogs != 1 || stats.Sessions != 1 || stats.LoginAttempts != 1 {
 		t.Fatalf("unexpected cleanup stats: %#v", stats)
 	}
+	if !stats.WALCheckpointed && !stats.WALCheckpointError {
+		t.Fatalf("cleanup did not report a WAL checkpoint outcome: %#v", stats)
+	}
 	var logs int
 	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM application_logs`).Scan(&logs); err != nil {
 		t.Fatal(err)

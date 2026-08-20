@@ -42,16 +42,24 @@ func (f *musicBrainzCreditCatalog) ArtistReleaseCredits(context.Context, string,
 }
 
 type perArtistCatalog struct {
-	releases map[string][]store.Release
-	errors   map[string]error
+	releases      map[string][]store.Release
+	errors        map[string]error
+	resolveErrors map[string]error
+	resolved      map[string]catalog.ArtistResult
 }
 
 func (f *perArtistCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
 	return nil, nil
 }
 
-func (f *perArtistCatalog) ResolveArtist(context.Context, string) (catalog.ArtistResult, error) {
-	return catalog.ArtistResult{}, nil
+func (f *perArtistCatalog) ResolveArtist(_ context.Context, mbid string) (catalog.ArtistResult, error) {
+	if err := f.resolveErrors[mbid]; err != nil {
+		return catalog.ArtistResult{}, err
+	}
+	if result, ok := f.resolved[mbid]; ok {
+		return result, nil
+	}
+	return catalog.ArtistResult{MBID: mbid, Name: mbid}, nil
 }
 
 func (f *perArtistCatalog) ResolveExternalArtist(context.Context, string) ([]catalog.ArtistResult, error) {
@@ -83,9 +91,10 @@ func (f *resolutionCatalog) ArtistReleases(context.Context, string) ([]store.Rel
 }
 
 type spotifyReleaseCatalog struct {
-	releases []store.Release
-	err      error
-	calls    atomic.Int32
+	releases      []store.Release
+	err           error
+	calls         atomic.Int32
+	invalidations atomic.Int32
 }
 
 func (f *spotifyReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
@@ -93,12 +102,17 @@ func (f *spotifyReleaseCatalog) ArtistReleases(context.Context, string) ([]store
 	return f.releases, f.err
 }
 
+func (f *spotifyReleaseCatalog) InvalidateArtistReleases(string) {
+	f.invalidations.Add(1)
+}
+
 type incrementalSpotifyReleaseCatalog struct {
-	releases   []store.Release
-	err        error
-	sinceDate  string
-	calls      atomic.Int32
-	sinceCalls atomic.Int32
+	releases      []store.Release
+	err           error
+	sinceDate     string
+	calls         atomic.Int32
+	sinceCalls    atomic.Int32
+	invalidations atomic.Int32
 }
 
 func (f *incrementalSpotifyReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
@@ -112,10 +126,35 @@ func (f *incrementalSpotifyReleaseCatalog) ArtistReleasesSince(_ context.Context
 	return f.releases, f.err
 }
 
+func (f *incrementalSpotifyReleaseCatalog) InvalidateArtistReleases(string) {
+	f.invalidations.Add(1)
+}
+
 type itunesReleaseCatalog struct {
 	releases []store.Release
 	err      error
 	calls    atomic.Int32
+}
+
+type canonicalITunesReleaseCatalog struct {
+	releases     []store.Release
+	resolvedID   string
+	resolvedURL  string
+	err          error
+	calls        atomic.Int32
+	canonicalIDs []string
+	providerIDs  []string
+}
+
+func (f *canonicalITunesReleaseCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	f.calls.Add(1)
+	return f.releases, f.err
+}
+
+func (f *canonicalITunesReleaseCatalog) ArtistReleasesForCanonical(_ context.Context, canonicalID, _ string, providerID string) ([]store.Release, string, string, error) {
+	f.canonicalIDs = append(f.canonicalIDs, canonicalID)
+	f.providerIDs = append(f.providerIDs, providerID)
+	return f.releases, f.resolvedID, f.resolvedURL, f.err
 }
 
 type listenBrainzStatsProvider struct {
@@ -140,6 +179,23 @@ type parallelTestSender struct {
 
 type failingSender struct {
 	err error
+}
+
+type blockingSender struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSender) Validate(string) error { return nil }
+
+func (s *blockingSender) Send(context.Context, string, string, string) error {
+	select {
+	case <-s.started:
+	default:
+		close(s.started)
+	}
+	<-s.release
+	return nil
 }
 
 func (s failingSender) Validate(string) error { return nil }
@@ -365,6 +421,27 @@ func TestDeliveryHandlesUnavailableCipherSenderAndCanceledContext(t *testing.T) 
 	}
 }
 
+func TestNotificationSendReturnsWhenSenderIgnoresCancellation(t *testing.T) {
+	database := resolutionTestStore(t)
+	sender := &blockingSender{started: make(chan struct{}), release: make(chan struct{})}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runner.sendNotification(ctx, "test://blocked", "title", "body") }()
+	<-sender.started
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("send error=%v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("non-cooperative sender blocked cancellation")
+	}
+	close(sender.release)
+}
+
 func TestBackgroundTaskGuardPreventsOverlap(t *testing.T) {
 	runner := &Runner{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	var guard sync.Mutex
@@ -556,7 +633,9 @@ func TestDigestDeliveryUsesNotificationWorker(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
+	// Keep the logical digest creation time after the destination's persisted
+	// created_at even when the fixture truncates to minute precision.
+	now := time.Now().UTC().Add(time.Minute)
 	if now.Hour() < 10 {
 		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
 	} else {
@@ -587,6 +666,87 @@ func TestDigestDeliveryUsesNotificationWorker(t *testing.T) {
 	}
 	if status != "sent" {
 		t.Fatalf("digest delivery status=%q", status)
+	}
+}
+
+func TestDeliveryClaimLossAfterSendFinalizesRow(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "claim-loss@example.com", "unused", "member", "UTC", "claim-loss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "claim-loss-artist", Name: "Claim Loss Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("claim loss test secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test://claim-loss-destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Claim loss", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	releaseResult, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "claim-loss-release", artist.ID, "Claim Loss Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "", "musicbrainz", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := releaseResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventResult, err := database.DB.ExecContext(ctx, `INSERT INTO notification_events
+		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Claim Loss Release", "body", now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := eventResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO deliveries
+		(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[0].ID, "pending", 0, now.Add(-time.Minute).Format(time.RFC3339Nano), ""); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimDueDeliveries(ctx, now, 1, "worker-one", time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claimed=%#v err=%v", claimed, err)
+	}
+	// Simulate lease recovery after the external send has happened but before
+	// the owner-scoped state transition executes.
+	if _, err := database.DB.ExecContext(ctx, `UPDATE deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE id=?`, claimed[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, &parallelTestSender{}, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result := runner.deliverOne(ctx, now, claimed[0])
+	if !result.sent || result.failed || result.err != nil {
+		t.Fatalf("delivery result=%#v, want sent after claim loss", result)
+	}
+	var status string
+	var attempts int
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,attempts FROM deliveries WHERE id=?`, claimed[0].ID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "sent" || attempts != 1 {
+		t.Fatalf("finalized delivery status=%q attempts=%d, want sent/1", status, attempts)
 	}
 }
 
@@ -955,6 +1115,111 @@ func TestImportedFollowSyncCreatesRuleReleaseAndOnboardingEvent(t *testing.T) {
 	}
 }
 
+func TestImportedIdentityVerificationPersistsCanonicalMetadata(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "import-identity@example.com", "unused", "member", "UTC", "import-identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "import-identity-artist"
+	if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: "Stale Import Name", MBID: mbid}); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.ArtistByMBID(ctx, mbid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &perArtistCatalog{
+		resolved: map[string]catalog.ArtistResult{mbid: {MBID: mbid, Name: "Canonical Import Name", SortName: "Canonical Import Name", Type: "Person", Country: "NL"}},
+		releases: map[string][]store.Release{mbid: {{MBID: "import-identity-release", Title: "Identity Release", PrimaryType: "Album", FirstReleaseDate: "2026-08-18", DatePrecision: 3}}},
+	}
+	if err := testRunner(database, provider).SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.ArtistByMBID(ctx, mbid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "Canonical Import Name" || stored.Country != "NL" {
+		t.Fatalf("stored artist=%#v, want canonical metadata", stored)
+	}
+	identity, found, err := database.ArtistIdentityStatus(ctx, stored.ID)
+	if err != nil || !found || identity.Status != "verified" || identity.Attempts != 0 {
+		t.Fatalf("identity=%#v found=%v err=%v, want verified", identity, found, err)
+	}
+}
+
+func TestImportedIdentityFailuresBecomeTerminalAndLeaveDueQueue(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "import-terminal@example.com", "unused", "member", "UTC", "import-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "import-terminal-artist"
+	if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: mbid, MBID: mbid}); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.ArtistByMBID(ctx, mbid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &perArtistCatalog{
+		resolveErrors: map[string]error{mbid: errors.New("MusicBrainz unavailable")},
+		releases:      map[string][]store.Release{},
+	}
+	runner := testRunner(database, provider)
+	now := time.Now().UTC()
+	for attempt := 0; attempt < artistIdentityMaxAttempts; attempt++ {
+		if _, err := runner.syncOne(ctx, artist, now.Add(time.Duration(attempt)*time.Hour)); err == nil {
+			t.Fatalf("attempt %d unexpectedly succeeded", attempt+1)
+		}
+	}
+	identity, found, err := database.ArtistIdentityStatus(ctx, artist.ID)
+	if err != nil || !found || identity.Status != "unresolvable" || identity.Attempts != artistIdentityMaxAttempts {
+		t.Fatalf("identity=%#v found=%v err=%v, want terminal after %d attempts", identity, found, err, artistIdentityMaxAttempts)
+	}
+	due, err := database.ArtistsDue(ctx, now.Add(48*time.Hour), 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			t.Fatal("terminal imported artist remained in automatic due queue")
+		}
+	}
+}
+
+func TestManualSyncResetsTerminalImportedIdentity(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, _ := database.CreateUser(ctx, "import-reset@example.com", "unused", "member", "UTC", "import-reset")
+	job, _ := database.CreateImportJob(ctx, userID)
+	mbid := "import-reset-artist"
+	_, _ = database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: mbid, MBID: mbid})
+	artist, _ := database.ArtistByMBID(ctx, mbid)
+	if err := database.ScheduleArtistIdentityFailure(ctx, artist.ID, artistIdentityMaxAttempts, time.Now().UTC().Add(24*time.Hour), "terminal", true); err != nil {
+		t.Fatal(err)
+	}
+	provider := &perArtistCatalog{resolveErrors: map[string]error{mbid: errors.New("still unavailable")}}
+	if err := testRunner(database, provider).SyncArtistNow(ctx, artist); err == nil {
+		t.Fatal("manual sync unexpectedly succeeded")
+	}
+	identity, found, err := database.ArtistIdentityStatus(ctx, artist.ID)
+	if err != nil || !found || identity.Status != "pending" || identity.Attempts != 1 {
+		t.Fatalf("identity=%#v found=%v err=%v, want one retry after manual reset", identity, found, err)
+	}
+}
+
 func TestImportedArtistsDoNotPinDueQueue(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
@@ -1208,6 +1473,164 @@ func TestITunesFailureFallsBackToMusicBrainz(t *testing.T) {
 	releases, err := database.RecentReleases(ctx, userID, 10)
 	if err != nil || len(releases) != 1 || releases[0].Source != "musicbrainz" {
 		t.Fatalf("MusicBrainz fallback releases=%#v err=%v", releases, err)
+	}
+}
+
+func TestITunesNotFoundIsHealthyNegativeAndFallsBackToMusicBrainz(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "itunes-negative@example.com", "unused", "member", "UTC", "itunes-negative")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "itunes-negative-artist", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	itunes := &itunesReleaseCatalog{err: &catalog.ITunesArtistNotFoundError{Name: artist.Name}}
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "itunes-negative-mb-release", Title: "MusicBrainz fallback", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-18", DatePrecision: 3, Source: "musicbrainz",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(itunes))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	var itunesStatus, itunesError, musicBrainzStatus string
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,last_error FROM artist_provider_status
+		WHERE artist_id=? AND provider='itunes'`, artist.ID).Scan(&itunesStatus, &itunesError); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM artist_provider_status
+		WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).Scan(&musicBrainzStatus); err != nil {
+		t.Fatal(err)
+	}
+	if itunesStatus != "not_found" || itunesError == "" || musicBrainzStatus != "healthy" {
+		t.Fatalf("negative/fallback statuses iTunes=%q error=%q MusicBrainz=%q", itunesStatus, itunesError, musicBrainzStatus)
+	}
+	health, err := database.ProviderHealthByName(ctx, "itunes")
+	if err != nil || health.LastSuccessAt == nil || health.LastFailureAt != nil || health.LastError != "" {
+		t.Fatalf("negative lookup was recorded as outage: health=%#v err=%v", health, err)
+	}
+	if releases, err := database.RecentReleases(ctx, userID, 10); err != nil || len(releases) != 1 || releases[0].Source != "musicbrainz" {
+		t.Fatalf("fallback releases=%#v err=%v", releases, err)
+	}
+}
+
+func TestSkippedProviderStatusIsStandbyAndRecoveryClearsStaleFailure(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "provider-standby@example.com", "unused", "member", "UTC", "provider-standby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "provider-standby-artist", Name: "Example", SpotifyID: "spotify-standby",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	failureAt := time.Now().UTC().Add(-time.Hour)
+	if err := database.RecordArtistProviderStatus(ctx, store.ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "failed", LastAttemptAt: &failureAt,
+		LastFailureAt: &failureAt, LastError: "previous outage", UpdatedAt: failureAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertProviderHealth(ctx, "musicbrainz", false, nil, false, false, "previous outage"); err != nil {
+		t.Fatal(err)
+	}
+	spotify := &spotifyReleaseCatalog{releases: []store.Release{{
+		MBID: "provider-standby-release", SpotifyID: "provider-standby-release", Title: "Spotify release",
+		PrimaryType: "Album", FirstReleaseDate: "2026-08-18", DatePrecision: 3, Source: "spotify",
+	}}}
+	runner := New(database, &resolutionCatalog{}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify), WithITunes(&itunesReleaseCatalog{}))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	var musicBrainzStatus, musicBrainzError, itunesStatus string
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,last_error FROM artist_provider_status
+		WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).Scan(&musicBrainzStatus, &musicBrainzError); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM artist_provider_status
+		WHERE artist_id=? AND provider='itunes'`, artist.ID).Scan(&itunesStatus); err != nil {
+		t.Fatal(err)
+	}
+	if musicBrainzStatus != "standby" || musicBrainzError != "previous outage" || itunesStatus != "standby" {
+		t.Fatalf("skipped provider statuses MusicBrainz=%q error=%q iTunes=%q", musicBrainzStatus, musicBrainzError, itunesStatus)
+	}
+	globalHealth, err := database.ProviderHealthByName(ctx, "musicbrainz")
+	if err != nil || globalHealth.LastError != "previous outage" || globalHealth.LastFailureAt == nil {
+		t.Fatalf("skipped provider erased global failure history: %#v err=%v", globalHealth, err)
+	}
+	coverage, err := database.FollowedArtistCoveragePage(ctx, userID, 10, 0)
+	if err != nil || len(coverage) != 1 || coverage[0].AssuranceStatus == "degraded" || coverage[0].OverallStatus == "attention" {
+		t.Fatalf("standby provider incorrectly degraded coverage=%#v err=%v", coverage, err)
+	}
+
+	// A later real MusicBrainz attempt replaces standby with healthy state and
+	// therefore clears the stale per-artist failure from Trust Center status.
+	recovery := New(database, &resolutionCatalog{releases: []store.Release{{
+		MBID: "provider-recovery-release", Title: "Recovered release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-17", DatePrecision: 3, Source: "musicbrainz",
+	}}}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := recovery.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM artist_provider_status
+		WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).Scan(&musicBrainzStatus); err != nil {
+		t.Fatal(err)
+	}
+	if musicBrainzStatus != "healthy" {
+		t.Fatalf("MusicBrainz recovery status=%q", musicBrainzStatus)
+	}
+}
+
+func TestITunesObservationPersistsCanonicalProviderIdentity(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "itunes-canonical@example.com", "unused", "member", "UTC", "itunes-canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "canonical-mbid", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider := &canonicalITunesReleaseCatalog{
+		resolvedID: "123", resolvedURL: "https://music.apple.com/artist/example/123",
+		releases: []store.Release{{ITunesID: "album-123", ITunesURL: "https://music.apple.com/album/123", Title: "Example Album", PrimaryType: "Album", FirstReleaseDate: "2026-08-01", DatePrecision: 3, Source: "itunes"}},
+	}
+	runner := New(database, &resolutionCatalog{}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := database.ArtistProviderIdentity(ctx, artist.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "123" {
+		t.Fatalf("identity=%#v found=%v err=%v", identity, found, err)
+	}
+	if len(provider.providerIDs) != 1 || provider.providerIDs[0] != "" {
+		t.Fatalf("first canonical provider IDs=%#v", provider.providerIDs)
+	}
+	if err := runner.SyncArtistNow(ctx, artist); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.providerIDs) != 2 || provider.providerIDs[1] != "123" {
+		t.Fatalf("second canonical provider IDs=%#v", provider.providerIDs)
 	}
 }
 
@@ -1512,6 +1935,9 @@ func TestObserveSpotifyUsesIncrementalProviderAndDefersFutureChecks(t *testing.T
 	if provider.sinceDate != "2026-07-01" {
 		t.Fatalf("incremental since date=%q", provider.sinceDate)
 	}
+	if provider.invalidations.Load() != 1 {
+		t.Fatalf("scheduled observation invalidations=%d, want 1", provider.invalidations.Load())
+	}
 
 	artist.SpotifyNextCheckAt = timePtr(now.Add(time.Hour))
 	observation, err = runner.observeSpotify(ctx, artist, now, "2026-08-01", false, true)
@@ -1557,18 +1983,24 @@ func TestManualSyncRequestsAndQueuedResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "manual-sync-artist", Name: "Manual Sync Artist"})
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "manual-sync-artist", Name: "Manual Sync Artist", SpotifyID: "spotify-manual-sync"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
+	future := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := database.DB.ExecContext(ctx, `UPDATE artists SET spotify_next_check_at=? WHERE id=?`, future.UTC().Format(time.RFC3339Nano), artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	provider := &resolutionCatalog{releases: []store.Release{{
-		MBID: "manual-release", Title: "Manual Release", PrimaryType: "Album",
+		MBID: "spotify:manual-release", SpotifyID: "manual-release", Title: "Manual Release", PrimaryType: "Album",
 		FirstReleaseDate: "2026-08-06", DatePrecision: 3,
 	}}}
-	runner := testRunner(database, provider)
+	spotify := &spotifyReleaseCatalog{releases: provider.releases}
+	runner := New(database, provider, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify))
 	artistRequest, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -1580,8 +2012,8 @@ func TestManualSyncRequestsAndQueuedResolution(t *testing.T) {
 	if err != nil || len(requests) != 1 || requests[0].ID != artistRequest.ID || requests[0].Status != "completed" {
 		t.Fatalf("completed manual request=%#v err=%v", requests, err)
 	}
-	if provider.releaseCalls.Load() != 1 {
-		t.Fatalf("manual provider calls=%d", provider.releaseCalls.Load())
+	if spotify.calls.Load() != 1 {
+		t.Fatalf("manual Spotify provider calls=%d", spotify.calls.Load())
 	}
 
 	retryRequest, err := database.CreateManualSyncRequest(ctx, userID, "retry", nil)
@@ -1615,6 +2047,14 @@ func TestManualSyncRequestsAndQueuedResolution(t *testing.T) {
 	followed, err := database.FollowedArtists(ctx, userID)
 	if err != nil || len(followed) != 2 {
 		t.Fatalf("followed after resolution=%#v err=%v", followed, err)
+	}
+	selected, err := database.ArtistByMBID(ctx, "selected-mbid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := database.ArtistProviderIdentity(ctx, selected.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "12345" {
+		t.Fatalf("reviewed iTunes identity=%#v found=%v err=%v", identity, found, err)
 	}
 }
 

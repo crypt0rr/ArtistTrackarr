@@ -23,6 +23,34 @@ func TestICSEscapeEscapesCalendarControlCharacters(t *testing.T) {
 	}
 }
 
+func TestICSLineFoldingAndURIEscaping(t *testing.T) {
+	var builder strings.Builder
+	writeICSLine(&builder, "SUMMARY:"+strings.Repeat("é", 80))
+	lines := strings.Split(strings.TrimSuffix(builder.String(), "\r\n"), "\r\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[1], " ") {
+		t.Fatalf("folded lines=%q", lines)
+	}
+	for _, line := range lines {
+		if len([]byte(line)) > 75 {
+			t.Fatalf("line length=%d exceeds 75 octets: %q", len([]byte(line)), line)
+		}
+	}
+	builder.Reset()
+	writeICSLine(&builder, "DESCRIPTION:"+strings.Repeat("x", 160))
+	for _, line := range strings.Split(strings.TrimSuffix(builder.String(), "\r\n"), "\r\n") {
+		if len([]byte(line)) > 75 {
+			t.Fatalf("ASCII folded line length=%d exceeds 75 octets", len([]byte(line)))
+		}
+	}
+	uri := icsEscapeURI("https://example.test/a b?x=hello world&name=é#frag ment\nINJECT")
+	if uri != "https://example.test/a%20b?x=hello%20world&name=%C3%A9#frag%20mentINJECT" {
+		t.Fatalf("URI escape=%q", uri)
+	}
+	if malformed := icsEscapeURI("https://example.test/a?x=bad%zz"); malformed != "https://example.test/a?x=bad%25zz" {
+		t.Fatalf("malformed URI escape=%q", malformed)
+	}
+}
+
 func TestReleaseExternalLinkPrefersProviderLinks(t *testing.T) {
 	if got := releaseExternalLink(store.CalendarRelease{Release: store.Release{SpotifyURL: "https://open.spotify.com/album/1", ITunesURL: "https://music.apple.com/album/1", MusicBrainzURL: "https://musicbrainz.org/release-group/1"}}); got != "https://open.spotify.com/album/1" {
 		t.Fatalf("Spotify link preference = %q", got)
@@ -53,6 +81,35 @@ func TestCalendarReleaseStatus(t *testing.T) {
 				t.Fatalf("calendarReleaseStatus() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCalendarMonthBoundsUseLocalDatesAcrossDST(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to := calendarMonthBounds(time.Date(2026, time.March, 18, 12, 0, 0, 0, location), location)
+	if got := from.Format("2006-01-02 15:04 MST"); got != "2026-03-01 00:00 EST" {
+		t.Fatalf("March start=%q", got)
+	}
+	if got := to.Format("2006-01-02 15:04 MST"); got != "2026-03-31 00:00 EDT" {
+		t.Fatalf("March end=%q, want local March 31 midnight after spring-forward", got)
+	}
+
+	from, to = calendarMonthBounds(time.Date(2024, time.February, 18, 12, 0, 0, 0, location), location)
+	if from.Format("2006-01-02") != "2024-02-01" || to.Format("2006-01-02") != "2024-02-29" {
+		t.Fatalf("leap-year bounds=%s..%s, want 2024-02-01..2024-02-29", from.Format("2006-01-02"), to.Format("2006-01-02"))
+	}
+}
+
+func TestCalendarMonthBoundsDefaultsNilLocationToUTC(t *testing.T) {
+	from, to := calendarMonthBounds(time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC), nil)
+	if from.Location() != time.UTC || to.Location() != time.UTC {
+		t.Fatalf("nil location returned from=%v to=%v", from.Location(), to.Location())
+	}
+	if from.Format("2006-01-02") != "2026-08-01" || to.Format("2006-01-02") != "2026-08-31" {
+		t.Fatalf("UTC bounds=%s..%s, want 2026-08-01..2026-08-31", from.Format("2006-01-02"), to.Format("2006-01-02"))
 	}
 }
 

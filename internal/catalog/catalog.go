@@ -70,6 +70,15 @@ type ITunesReleaseProvider interface {
 	ArtistReleases(context.Context, string) ([]store.Release, error)
 }
 
+// CanonicalITunesReleaseProvider resolves an iTunes artist in the context of
+// one canonical MusicBrainz artist. The resolved provider identity is
+// returned so callers can persist it and avoid repeating ambiguous name
+// lookups. Implementations must keep release caches keyed by both canonicalID
+// and providerID; a display name is not a stable artist identity.
+type CanonicalITunesReleaseProvider interface {
+	ArtistReleasesForCanonical(context.Context, string, string, string) ([]store.Release, string, string, error)
+}
+
 // ListenBrainzProvider exposes public, aggregate artist popularity statistics.
 // It is intentionally separate from release providers so it can never create
 // release observations or notification events.
@@ -123,6 +132,25 @@ type HTTPStatusError struct {
 type CatalogLimitError struct {
 	Provider string
 	Pages    int
+}
+
+// ErrCoalescedRequestCanceled is returned to a still-live waiter when the
+// request that originally owned an in-flight coalesced call was canceled.
+// Returning the leader's context error would make an unrelated follower look
+// canceled and can cause provider fallback to be skipped incorrectly.
+var ErrCoalescedRequestCanceled = errors.New("coalesced provider request was canceled")
+
+func coalescedRequestError(ctx context.Context, leaderErr error) error {
+	if leaderErr == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if errors.Is(leaderErr, context.Canceled) || errors.Is(leaderErr, context.DeadlineExceeded) {
+		return ErrCoalescedRequestCanceled
+	}
+	return leaderErr
 }
 
 func (e *CatalogLimitError) Error() string {
@@ -305,6 +333,9 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 	if err := m.getJSON(ctx, endpoint, &item); err != nil {
 		return ArtistResult{}, err
 	}
+	if !validMBID(item.ID) {
+		return ArtistResult{}, errors.New("MusicBrainz returned an invalid artist ID")
+	}
 	result := ArtistResult{
 		MBID: item.ID, Name: item.Name, SortName: item.SortName, Type: item.Type,
 		Country: item.Country, Disambiguation: item.Disambiguation,
@@ -360,6 +391,9 @@ func (m *MusicBrainz) ResolveExternalArtist(ctx context.Context, externalURL str
 }
 
 func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.Release, error) {
+	if !validMBID(mbid) {
+		return nil, errors.New("invalid MusicBrainz artist ID")
+	}
 	var all []store.Release
 	offset := 0
 	const pageSize = 100
@@ -386,6 +420,9 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 			return nil, err
 		}
 		for _, item := range response.ReleaseGroups {
+			if !validMBID(item.ID) {
+				return nil, errors.New("MusicBrainz returned an invalid release-group ID")
+			}
 			precision := 0
 			switch len(item.FirstReleaseDate) {
 			case 4:
@@ -639,6 +676,26 @@ type spotifyReleaseCache struct {
 	releases   []store.Release
 }
 
+type spotifyAlbumPage struct {
+	Total int                `json:"total"`
+	Items []spotifyAlbumItem `json:"items"`
+}
+
+type spotifyAlbumItem struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	AlbumType     string            `json:"album_type"`
+	AlbumGroup    string            `json:"album_group"`
+	TotalTracks   int               `json:"total_tracks"`
+	ReleaseDate   string            `json:"release_date"`
+	DatePrecision string            `json:"release_date_precision"`
+	ExternalURLs  map[string]string `json:"external_urls"`
+	Images        []struct {
+		URL   string `json:"url"`
+		Width int    `json:"width"`
+	} `json:"images"`
+}
+
 type spotifySearchCache struct {
 	observedAt time.Time
 	expiresAt  time.Time
@@ -805,7 +862,7 @@ func (s *Spotify) SearchArtists(ctx context.Context, query string) ([]SpotifyArt
 		s.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return cloneSpotifyArtists(call.results), call.err
+			return cloneSpotifyArtists(call.results), coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -879,7 +936,7 @@ func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) 
 		s.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return call.artist, call.err
+			return call.artist, coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return SpotifyArtist{}, ctx.Err()
 		}
@@ -1127,11 +1184,15 @@ func SpotifyID(value string) (string, bool) {
 		return "", false
 	}
 	for _, r := range value {
-		if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+		if !asciiAlphaNumeric(r) {
 			return "", false
 		}
 	}
 	return value, true
+}
+
+func asciiAlphaNumeric(r rune) bool {
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
 }
 
 func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.Release, error) {
@@ -1148,97 +1209,105 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	if cached, ok := s.cachedReleases(artistID, since); ok {
 		return cached, nil
 	}
-	// Spotify currently permits at most 10 items per artist-albums page. Keep
-	// pagination aligned with the provider's limit so a sync is not rejected
-	// with a 400 Invalid limit response.
-	const pageSize = 10
-	const maxPages = 100
 	var result []store.Release
 	seen := make(map[string]int)
-	complete := false
-	for page := 0; page < maxPages; page++ {
-		offset := page * pageSize
-		endpoint := fmt.Sprintf(
-			"%s/v1/artists/%s/albums?include_groups=album%%2Csingle%%2Ccompilation%%2Cappears_on&market=%s&limit=%d&offset=%d",
-			s.apiURL, url.PathEscape(artistID), url.QueryEscape(s.market), pageSize, offset,
-		)
-		var page struct {
-			Total int `json:"total"`
-			Items []struct {
-				ID            string            `json:"id"`
-				Name          string            `json:"name"`
-				AlbumType     string            `json:"album_type"`
-				AlbumGroup    string            `json:"album_group"`
-				TotalTracks   int               `json:"total_tracks"`
-				ReleaseDate   string            `json:"release_date"`
-				DatePrecision string            `json:"release_date_precision"`
-				ExternalURLs  map[string]string `json:"external_urls"`
-				Images        []struct {
-					URL   string `json:"url"`
-					Width int    `json:"width"`
-				} `json:"images"`
-			} `json:"items"`
-		}
-		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+	// A full mixed catalog is safe to page until Spotify's reported total. For
+	// incremental polling, Spotify may place appears_on entries after the
+	// primary catalog, so fetch that group independently instead of letting the
+	// primary watermark hide guest releases.
+	if since == "" {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation,appears_on", false, &result, seen); err != nil {
 			return nil, err
 		}
-		oldest := ""
-		for _, item := range page.Items {
-			if item.ReleaseDate != "" && (oldest == "" || item.ReleaseDate < oldest) {
-				oldest = item.ReleaseDate
-			}
-			if item.ID == "" {
-				continue
-			}
-			primaryType, secondaryTypes, eligible := spotifyReleaseType(
-				item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks,
-			)
-			if !eligible {
-				continue
-			}
-			role := "primary"
-			if strings.EqualFold(strings.TrimSpace(item.AlbumGroup), "appears_on") {
-				role = "featured"
-			}
-			candidate := store.Release{
-				MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
-				SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
-				DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
-				SpotifyID:     item.ID, SpotifyURL: item.ExternalURLs["spotify"],
-				SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
-				Credits: []store.ReleaseCredit{{Provider: "spotify", ProviderID: item.ID, Role: role,
-					ProviderURL: item.ExternalURLs["spotify"], Confidence: "confirmed"}},
-			}
-			if existing, ok := seen[item.ID]; ok {
-				// Spotify can expose one release in both the artist's primary
-				// catalogue and appears_on. Keep one record and prefer the
-				// direct release-level credit when both are present, while
-				// retaining the provider evidence for the graph.
-				result[existing].Credits = mergeReleaseCredits(result[existing].Credits, candidate.Credits)
-				if result[existing].ArtistCreditRole == "featured" && role == "primary" {
-					candidate.Credits = append([]store.ReleaseCredit(nil), result[existing].Credits...)
-					result[existing] = candidate
-				}
-				continue
-			}
-			seen[item.ID] = len(result)
-			result = append(result, candidate)
+	} else {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", false, &result, seen); err != nil {
+			return nil, err
 		}
-		if since == "" || oldest == "" || oldest <= since || len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
-			complete = true
-			break
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", true, &result, seen); err != nil {
+			return nil, err
 		}
-	}
-	if !complete {
-		return nil, &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
 	}
 	s.cacheReleases(artistID, result)
 	return result, nil
 }
 
+// fetchSpotifyReleasePages retrieves one Spotify artist-albums stream. The
+// provider currently permits at most ten items per page; callers must not
+// apply a partial catalog when the generous page safety cap is reached.
+func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includeGroups string, featuredOnly bool, result *[]store.Release, seen map[string]int) error {
+	const pageSize = 10
+	const maxPages = 100
+	complete := false
+	for pageNumber := 0; pageNumber < maxPages; pageNumber++ {
+		offset := pageNumber * pageSize
+		endpoint := fmt.Sprintf(
+			"%s/v1/artists/%s/albums?include_groups=%s&market=%s&limit=%d&offset=%d",
+			s.apiURL, url.PathEscape(artistID), url.QueryEscape(includeGroups), url.QueryEscape(s.market), pageSize, offset,
+		)
+		var page spotifyAlbumPage
+		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
+			return err
+		}
+		for _, item := range page.Items {
+			s.appendSpotifyRelease(result, seen, item, featuredOnly)
+		}
+		// Always page through the provider-reported catalog. Spotify groups and
+		// sorts album results independently, so a date watermark on the first
+		// page can hide newer singles/EPs or guest appearances on later pages.
+		// The normalized release hash/change check already prevents old rows from
+		// creating duplicate events, while the safety cap prevents an upstream
+		// total from causing an unbounded loop.
+		if len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
+			complete = true
+			break
+		}
+	}
+	if !complete {
+		return &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
+	}
+	return nil
+}
+
+func (s *Spotify) appendSpotifyRelease(result *[]store.Release, seen map[string]int, item spotifyAlbumItem, featuredOnly bool) {
+	if item.ID == "" {
+		return
+	}
+	primaryType, secondaryTypes, eligible := spotifyReleaseType(item.AlbumType, item.AlbumGroup, item.Name, item.TotalTracks)
+	if !eligible {
+		return
+	}
+	role := "primary"
+	if featuredOnly || strings.EqualFold(strings.TrimSpace(item.AlbumGroup), "appears_on") {
+		role = "featured"
+	}
+	providerURL := item.ExternalURLs["spotify"]
+	candidate := store.Release{
+		MBID: "spotify:" + item.ID, Title: item.Name, PrimaryType: primaryType,
+		SecondaryTypes: secondaryTypes, FirstReleaseDate: item.ReleaseDate,
+		DatePrecision: spotifyDatePrecision(item.DatePrecision, item.ReleaseDate),
+		SpotifyID:     item.ID, SpotifyURL: providerURL,
+		SpotifyImageURL: spotifyReleaseImage(item.Images), Source: "spotify", ArtistCreditRole: role,
+		Credits: []store.ReleaseCredit{{Provider: "spotify", ProviderID: item.ID, Role: role,
+			ProviderURL: providerURL, Confidence: "confirmed"}},
+	}
+	if existing, ok := seen[item.ID]; ok {
+		// Spotify can expose one release in both the primary catalogue and
+		// appears_on. Keep one record and prefer the direct release-level credit
+		// when both are present, while retaining provider evidence for the graph.
+		(*result)[existing].Credits = mergeReleaseCredits((*result)[existing].Credits, candidate.Credits)
+		if (*result)[existing].ArtistCreditRole == "featured" && role == "primary" {
+			candidate.Credits = append([]store.ReleaseCredit(nil), (*result)[existing].Credits...)
+			(*result)[existing] = candidate
+		}
+		return
+	}
+	seen[item.ID] = len(*result)
+	*result = append(*result, candidate)
+}
+
 // InvalidateArtistReleases drops the cached release pages for one artist.
-// Scheduled polling continues to use the normal cache; explicit manual sync
-// callers use this hook to request fresh Spotify metadata immediately.
+// Explicit manual sync and due scheduled observations use this hook to avoid
+// treating a stale burst cache as a completed provider check.
 func (s *Spotify) InvalidateArtistReleases(artistID string) {
 	if s == nil {
 		return
@@ -1426,20 +1495,7 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 func spotifyReleaseType(albumType, albumGroup, title string, totalTracks int) (string, []string, bool) {
-	kind := strings.ToLower(strings.TrimSpace(albumType))
-	group := strings.ToLower(strings.TrimSpace(albumGroup))
-	switch {
-	case kind == "album" && group == "compilation", kind == "compilation":
-		return "Album", []string{"Compilation"}, true
-	case kind == "album":
-		return "Album", nil, true
-	case kind == "single" && (totalTracks >= 4 || strings.Contains(strings.ToLower(title), " ep")):
-		return "EP", nil, true
-	case kind == "single":
-		return "Single", nil, true
-	default:
-		return "", nil, false
-	}
+	return classifyReleaseType(albumType, albumGroup, title, totalTracks)
 }
 
 func spotifyDatePrecision(precision, value string) int {

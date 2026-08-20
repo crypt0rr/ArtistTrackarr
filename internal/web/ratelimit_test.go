@@ -16,7 +16,13 @@ import (
 
 func TestFixedWindowLimiterBoundsRequestsAndExpires(t *testing.T) {
 	limiter := newFixedWindowLimiter(2, 20*time.Millisecond)
-	if !limiter.Allow("client") || !limiter.Allow("client") || limiter.Allow("client") {
+	if !limiter.Allow("client") {
+		t.Fatal("fixed-window limiter rejected the first request")
+	}
+	if !limiter.Allow("client") {
+		t.Fatal("fixed-window limiter rejected the second request")
+	}
+	if limiter.Allow("client") {
 		t.Fatal("fixed-window limiter did not reject the third request")
 	}
 	time.Sleep(25 * time.Millisecond)
@@ -28,7 +34,13 @@ func TestFixedWindowLimiterBoundsRequestsAndExpires(t *testing.T) {
 func TestFixedWindowLimiterCapsDistinctKeys(t *testing.T) {
 	limiter := newFixedWindowLimiter(1, time.Minute)
 	limiter.maxEntries = 2
-	if !limiter.Allow("first") || !limiter.Allow("second") || !limiter.Allow("third") {
+	if !limiter.Allow("first") {
+		t.Fatal("limiter rejected the first distinct key")
+	}
+	if !limiter.Allow("second") {
+		t.Fatal("limiter rejected the second distinct key")
+	}
+	if !limiter.Allow("third") {
 		t.Fatal("limiter rejected a request while making room for a bounded key set")
 	}
 	limiter.mu.Lock()
@@ -39,7 +51,7 @@ func TestFixedWindowLimiterCapsDistinctKeys(t *testing.T) {
 }
 
 func TestClientIPOnlyTrustsForwardedHeadersFromConfiguredProxy(t *testing.T) {
-	_, proxyNetwork, err := net.ParseCIDR("127.0.0.1/32")
+	_, proxyNetwork, err := net.ParseCIDR("127.0.0.0/8")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +75,16 @@ func TestClientIPOnlyTrustsForwardedHeadersFromConfiguredProxy(t *testing.T) {
 	if got := app.clientIP(request); got != "127.0.0.1" {
 		t.Fatalf("invalid forwarded chain address=%q", got)
 	}
+	// Once the whole proxy chain is trusted, changing its leftmost value must
+	// not change the throttling identity. The direct peer is the only trusted
+	// address available in that case.
+	request.Header.Set("X-Forwarded-For", "127.0.0.1, 127.0.0.1")
+	first := app.clientIP(request)
+	request.Header.Set("X-Forwarded-For", "127.0.0.2, 127.0.0.1")
+	second := app.clientIP(request)
+	if first != "127.0.0.1" || second != first {
+		t.Fatalf("all-trusted proxy chain changed identity: first=%q second=%q", first, second)
+	}
 
 	request.RemoteAddr = "203.0.113.10"
 	request.Header.Set("X-Forwarded-For", "198.51.100.20")
@@ -74,6 +96,13 @@ func TestClientIPOnlyTrustsForwardedHeadersFromConfiguredProxy(t *testing.T) {
 	request.Header.Set("X-Forwarded-For", "198.51.100.20")
 	if got := app.clientIP(request); got != "127.0.0.1" {
 		t.Fatalf("forwarded address accepted when proxy trust disabled: %q", got)
+	}
+}
+
+func TestLoginThrottleKeysIncludePeerAndAccount(t *testing.T) {
+	keys := loginThrottleKeys("198.51.100.20", "Member@Example.com")
+	if len(keys) != 2 || keys[0] != "198.51.100.20|member@example.com" || keys[1] != "account:member@example.com" {
+		t.Fatalf("login throttle keys=%#v", keys)
 	}
 }
 

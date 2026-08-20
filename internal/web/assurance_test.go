@@ -34,8 +34,8 @@ func TestDiagnosticReportExcludesSensitiveProviderDetails(t *testing.T) {
 	report := diagnosticReport(store.DiagnosticsSnapshot{
 		CheckedAt: now, DatabaseHealthy: true, SchemaVersion: 24, FollowedArtists: 3,
 		Providers: []store.DiagnosticsProvider{{Provider: "spotify", Status: "healthy", NextCheckAt: &now}},
-	}, jobs.RunnerStatus{Running: true, LastActivityAt: &now})
-	for _, want := range []string{"ArtistTrackarr release assurance report", "Database: healthy", "spotify", "Scheduler: healthy"} {
+	}, jobs.RunnerStatus{Running: true, LastActivityAt: &now}, "UTC")
+	for _, want := range []string{"ArtistTrackarr release assurance report", "Timezone: UTC", "Database: healthy", "spotify", "Scheduler: healthy"} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("diagnostic report missing %q: %q", want, report)
 		}

@@ -170,6 +170,38 @@ func TestSecurityHeadersAndDebugRequestLog(t *testing.T) {
 	}
 }
 
+func TestReadyRejectsReadOnlyDatabase(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "ready-read-only.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	public, _ := url.Parse("http://example.test")
+	cfg := config.Config{
+		PublicURL: public, SessionSecret: "the session secret has more than 32 bytes",
+		EncryptionKey: "the encryption key has more than 32 bytes",
+	}
+	cipher, err := security.NewCipher(cfg.EncryptionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOnly := &store.Store{DB: database.Reader}
+	app, err := New(cfg, readOnly, fakeCatalog{}, nil, fakeSender{}, cipher, fakeArtwork{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("read-only readiness status=%d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if got := response.Header().Get("X-ArtistTrackarr-Database"); got != string(store.DatabaseReadOnly) {
+		t.Fatalf("read-only readiness database header=%q, want %q", got, store.DatabaseReadOnly)
+	}
+}
+
 func TestSetupLoginAndDashboard(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "web.db"))
 	if err != nil {
@@ -197,12 +229,16 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if loginPage.Header.Get("Cache-Control") != "private, no-store" || loginPage.Header.Get("Vary") != "Cookie" {
+		t.Fatalf("login cache headers=%q vary=%q", loginPage.Header.Get("Cache-Control"), loginPage.Header.Get("Vary"))
+	}
 	loginBody, _ := io.ReadAll(loginPage.Body)
 	_ = loginPage.Body.Close()
 	if !strings.Contains(string(loginBody), "/static/logo-full.png") ||
 		!strings.Contains(string(loginBody), "/static/favicon.ico") ||
 		!strings.Contains(string(loginBody), "/static/theme.js") ||
 		!strings.Contains(string(loginBody), "v"+version.Current) ||
+		!strings.Contains(string(loginBody), "v="+version.Current+"-") ||
 		!strings.Contains(string(loginBody), "https://github.com/crypt0rr/ArtistTrackarr") ||
 		!strings.Contains(string(loginBody), `data-theme-toggle`) ||
 		strings.Contains(string(loginBody), `data-theme-select`) ||
@@ -235,6 +271,24 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 			t.Fatalf("static asset %s status/type = %d, %q", asset.path,
 				staticResponse.StatusCode, staticResponse.Header.Get("Content-Type"))
 		}
+	}
+	rangeRequest, err := http.NewRequest(http.MethodGet, server.URL+"/static/app.js", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rangeRequest.Header.Set("Range", "bytes=0-15")
+	rangeRequest.Header.Set("Accept-Encoding", "gzip")
+	rangeResponse, err := client.Do(rangeRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, rangeResponse.Body)
+	_ = rangeResponse.Body.Close()
+	if rangeResponse.StatusCode != http.StatusOK || rangeResponse.Header.Get("Accept-Ranges") != "none" || rangeResponse.Header.Get("Content-Range") != "" {
+		t.Fatalf("static range request status/headers=%d accept-ranges=%q content-range=%q", rangeResponse.StatusCode, rangeResponse.Header.Get("Accept-Ranges"), rangeResponse.Header.Get("Content-Range"))
+	}
+	if rangeResponse.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("static range request content-encoding=%q, want gzip", rangeResponse.Header.Get("Content-Encoding"))
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/setup")
@@ -293,6 +347,8 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Never miss the next record") ||
 		!strings.Contains(string(body), "/static/logo-mark.png") ||
+		!strings.Contains(string(body), "Manage your followed artists") ||
+		!strings.Contains(string(body), `href="/artists"`) ||
 		!strings.Contains(string(body), "ArtistTrackarr") ||
 		strings.Contains(string(body), "Artist Trackarr") ||
 		strings.Contains(string(body), "Artist Tracker") ||
@@ -374,8 +430,24 @@ func TestSetupLoginAndDashboard(t *testing.T) {
 	if err != nil || destination.Name != "My phone" {
 		t.Fatalf("renamed destination = %#v, %v", destination, err)
 	}
+	art, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "artwork-test-artist", Name: "Artwork Test Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), user.ID, art.ID); err != nil {
+		t.Fatal(err)
+	}
+	const artworkMBID = "6e335887-60ba-38f0-95af-fae7774336bf"
+	if _, err := database.DB.ExecContext(context.Background(), `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, artworkMBID, art.ID, "Artwork Test Release", "Album", "[]", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+artworkMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 
-	response, err = client.Get(server.URL + "/art/release-group/6e335887-60ba-38f0-95af-fae7774336bf")
+	response, err = client.Get(server.URL + "/art/release-group/" + artworkMBID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +480,93 @@ func TestSearchUsesSpotifyBeforeMusicBrainz(t *testing.T) {
 	}
 }
 
+func TestReleaseGroupArtworkIsOwnerScopedAndRateLimited(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	member, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "artwork-owner-artist", Name: "Artwork Owner Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, member.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	const ownedMBID = "11111111-1111-4111-8111-111111111111"
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, ownedMBID, artist.ID, "Owned artwork", "Album", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+ownedMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/art/release-group/" + ownedMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("owned artwork status=%d", response.StatusCode)
+	}
+
+	response, err = client.Get(server.URL + "/art/release-group/not-a-mbid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid artwork status=%d, want 404", response.StatusCode)
+	}
+
+	otherID, err := database.CreateUser(ctx, "other@example.com", "other-user", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherArtist, err := database.UpsertArtist(ctx, store.Artist{MBID: "artwork-foreign-artist", Name: "Artwork Foreign Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, otherID, otherArtist.ID); err != nil {
+		t.Fatal(err)
+	}
+	const foreignMBID = "22222222-2222-4222-8222-222222222222"
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, foreignMBID, otherArtist.ID, "Foreign artwork", "Album", "2026-08-01", 3,
+		"https://musicbrainz.org/release-group/"+foreignMBID, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Get(server.URL + "/art/release-group/" + foreignMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign artwork status=%d, want 404", response.StatusCode)
+	}
+
+	for request := 0; request < 119; request++ {
+		response, err = client.Get(server.URL + "/art/release-group/" + ownedMBID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("artwork request %d status=%d", request+1, response.StatusCode)
+		}
+	}
+	response, err = client.Get(server.URL + "/art/release-group/" + ownedMBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited artwork status=%d, want 429", response.StatusCode)
+	}
+}
+
 func TestLoginRejectsInvalidAndUnknownCredentials(t *testing.T) {
 	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	csrf := getCSRF(t, client, server.URL+"/")
@@ -434,7 +593,7 @@ func TestLoginRejectsInvalidAndUnknownCredentials(t *testing.T) {
 }
 
 func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
-	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
 	csrf := getCSRF(t, client, server.URL+"/")
 	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {csrf}})
 	_ = response.Body.Close()
@@ -458,6 +617,13 @@ func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
 	if response.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(body), "Too many attempts") {
 		t.Fatalf("throttled login status/body=%d %q", response.StatusCode, body)
 	}
+	var keys int
+	if err := database.DB.QueryRow(`SELECT COUNT(*) FROM login_attempts`).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if keys != 2 {
+		t.Fatalf("login failures created %d throttle keys, want peer and account keys", keys)
+	}
 }
 
 func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
@@ -466,7 +632,7 @@ func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
 		mb:     &searchCatalog{err: errors.New(`Get "https://musicbrainz.org/ws/2/artist?query=private-artist": EOF`)},
 		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
-	d := PageData{Query: "private-artist"}
+	d := PageData{PageDiscovery: PageDiscovery{Query: "private-artist"}}
 	app.populateSearch(context.Background(), &d)
 	if strings.Contains(logs.String(), "private-artist") || strings.Contains(logs.String(), "musicbrainz.org") {
 		t.Fatalf("search failure log leaked query or URL: %q", logs.String())
@@ -533,6 +699,60 @@ func TestSettingsOwnsUsernameAndNotificationManagement(t *testing.T) {
 	}
 }
 
+func TestSettingsPasswordChangeRevokesSessions(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	ctx := context.Background()
+	currentHash, err := security.HashPassword("current password long enough")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, currentHash, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	response := postForm(t, client, server.URL+"/settings/password", url.Values{
+		"_csrf": {csrf}, "current_password": {"wrong password"},
+		"new_password": {"new password long enough"}, "confirm_password": {"new password long enough"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "current password is incorrect") {
+		t.Fatalf("wrong current password status/body=%d %q", response.StatusCode, body)
+	}
+
+	csrf = getCSRF(t, client, server.URL+"/settings")
+	noFollow := noRedirectClient(client)
+	response, err = noFollow.PostForm(server.URL+"/settings/password", url.Values{
+		"_csrf": {csrf}, "current_password": {"current password long enough"},
+		"new_password": {"new password long enough"}, "confirm_password": {"new password long enough"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	wantLocation := "/login?message=" + url.QueryEscape(security.SignedToken("the session secret has more than 32 bytes", "Password updated"))
+	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != wantLocation {
+		t.Fatalf("password change status/location=%d %q", response.StatusCode, response.Header.Get("Location"))
+	}
+	updated, err := database.UserByID(ctx, user.ID)
+	if err != nil || !security.CheckPassword(updated.PasswordHash, "new password long enough") {
+		t.Fatalf("password was not updated: err=%v", err)
+	}
+	response, err = noFollow.Get(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != "/login" {
+		t.Fatalf("revoked session status/location=%d %q", response.StatusCode, response.Header.Get("Location"))
+	}
+}
+
 func TestSettingsPreferencesRedirectsOnStoreFailure(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "settings-error.db"))
 	if err != nil {
@@ -552,7 +772,8 @@ func TestSettingsPreferencesRedirectsOnStoreFailure(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	app.settingsPreferences(response, request)
-	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+	if response.Code != http.StatusSeeOther || strings.Contains(response.Header().Get("Location"), "context+canceled") ||
+		!strings.Contains(response.Header().Get("Location"), "Notification+preferences+could+not+be+saved") {
 		t.Fatalf("settings preferences failure status=%d location=%q", response.Code, response.Header().Get("Location"))
 	}
 
@@ -563,7 +784,8 @@ func TestSettingsPreferencesRedirectsOnStoreFailure(t *testing.T) {
 	compatRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	compatResponse := httptest.NewRecorder()
 	app.updatePreferences(compatResponse, compatRequest)
-	if compatResponse.Code != http.StatusSeeOther || !strings.Contains(compatResponse.Header().Get("Location"), "context+canceled") {
+	if compatResponse.Code != http.StatusSeeOther || strings.Contains(compatResponse.Header().Get("Location"), "context+canceled") ||
+		!strings.Contains(compatResponse.Header().Get("Location"), "Notification+preferences+could+not+be+saved") {
 		t.Fatalf("compatibility preferences failure status=%d location=%q", compatResponse.Code, compatResponse.Header().Get("Location"))
 	}
 }
@@ -613,12 +835,13 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	body, _ = io.ReadAll(response.Body)
 	_ = response.Body.Close()
 	ics := string(body)
+	unfolded := strings.ReplaceAll(ics, "\r\n ", "")
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/calendar; charset=utf-8" ||
 		response.Header.Get("Content-Disposition") != `attachment; filename="artisttrackarr-releases.ics"` ||
 		response.Header.Get("Cache-Control") != "no-store" ||
-		!strings.Contains(ics, "BEGIN:VCALENDAR") || !strings.Contains(ics, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
-		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
-		!strings.Contains(ics, "https://music.apple.com/us/album/calendar-web-release") {
+		!strings.Contains(unfolded, "BEGIN:VCALENDAR") || !strings.Contains(unfolded, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
+		!strings.Contains(unfolded, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
+		!strings.Contains(unfolded, "https://music.apple.com/us/album/calendar-web-release") {
 		t.Fatalf("calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
 	}
 }
@@ -961,12 +1184,14 @@ func TestArtistSearchAndOwnerScopedCSVExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 2 || len(records[0]) != 6 ||
+	if len(records) != 2 || len(records[0]) != 11 ||
 		records[0][0] != "artist" ||
 		records[1][0] != "https://musicbrainz.org/artist/11111111-1111-4111-8111-111111111111" ||
 		records[1][1] != "Comma, Artist" ||
-		records[1][2] != "11111111-1111-4111-8111-111111111111" ||
-		records[1][4] != "0OdUWJ0sBjDrqHygGUXeCF" ||
+		records[1][2] != "Artist, Comma" ||
+		records[1][3] != "" ||
+		records[1][6] != "11111111-1111-4111-8111-111111111111" ||
+		records[1][8] != "0OdUWJ0sBjDrqHygGUXeCF" ||
 		strings.Contains(string(body), "Other User Artist") {
 		t.Fatalf("unexpected owner-scoped CSV records=%#v body=%q", records, body)
 	}
@@ -1034,8 +1259,8 @@ func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.WriteString(part, "artist,display_name,musicbrainz_id,musicbrainz_url,spotify_id,spotify_url\n"+
-		"https://musicbrainz.org/artist/"+mbid+",Imported Artist,"+mbid+",https://musicbrainz.org/artist/"+mbid+",,\n"+
+	_, _ = io.WriteString(part, "artist,display_name,sort_name,artist_type,country,disambiguation,musicbrainz_id,musicbrainz_url,spotify_id,spotify_url,spotify_image_url\n"+
+		"https://musicbrainz.org/artist/"+mbid+",Imported Artist,Artist Imported,Group,NL,aka Import,"+mbid+",https://musicbrainz.org/artist/"+mbid+",0OdUWJ0sBjDrqHygGUXeCF,https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF,https://i.scdn.co/image\n"+
 		"bad,Broken,,bad,,\n")
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
@@ -1058,6 +1283,16 @@ func TestArtistCSVImportProcessesRowsAndScopesResults(t *testing.T) {
 	user, _ := database.UserByEmail(context.Background(), "member@example.com")
 	if count, err := database.FollowedArtistCount(context.Background(), user.ID); err != nil || count != 1 {
 		t.Fatalf("imported follow count=%d err=%v", count, err)
+	}
+	var sortName, artistType, country, disambiguation, image string
+	if err := database.DB.QueryRow(`SELECT sort_name,artist_type,country,disambiguation,spotify_image_url FROM artists WHERE mbid=?`, mbid).
+		Scan(&sortName, &artistType, &country, &disambiguation, &image); err != nil {
+		t.Fatal(err)
+	}
+	if sortName != "Artist Imported" || artistType != "Group" || country != "NL" ||
+		disambiguation != "aka Import" || image != "https://i.scdn.co/image" {
+		t.Fatalf("imported metadata lost: sort=%q type=%q country=%q disambiguation=%q image=%q",
+			sortName, artistType, country, disambiguation, image)
 	}
 	if !strings.Contains(response.Header.Get("Content-Security-Policy"), "script-src 'self'") ||
 		!strings.Contains(response.Header.Get("Content-Security-Policy"), "https://*.mzstatic.com") ||
@@ -1105,6 +1340,9 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := database.AddDestination(context.Background(), user.ID, "Kitchen display", "ntfy", []byte("encrypted-secret")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Exec(`UPDATE destinations SET created_at=? WHERE user_id=?`, time.Date(2026, 7, 30, 7, 0, 0, 0, time.UTC).Format(time.RFC3339Nano), user.ID); err != nil {
 		t.Fatal(err)
 	}
 	artist, err := database.UpsertArtist(context.Background(), store.Artist{
@@ -1271,6 +1509,30 @@ func TestArtistResolutionReviewAndOwnerScope(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-user resolution cancel status=%d", response.StatusCode)
+	}
+
+	// Pending retry times are stored in UTC but must be rendered in the
+	// signed-in member's configured timezone, just like the other authenticated
+	// operational timestamps.
+	pending, _, err := database.CreateArtistResolution(context.Background(), user.ID, "spotify", "pending-spotify", "Pending Example", "https://open.spotify.com/artist/pending-spotify", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextAttempt := time.Date(2026, time.July, 1, 1, 30, 0, 0, time.UTC)
+	if _, err := database.DB.Exec(`UPDATE users SET timezone=? WHERE id=?`, "America/Los_Angeles", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.Exec(`UPDATE artist_resolutions SET next_attempt_at=? WHERE id=?`, nextAttempt.Format(time.RFC3339Nano), pending.ID); err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Get(server.URL + "/artist-resolutions/" + strconv.FormatInt(pending.ID, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(pendingBody), "2026-06-30 18:30:00 PDT") {
+		t.Fatalf("pending resolution timezone status/body=%d %q", response.StatusCode, pendingBody)
 	}
 }
 
@@ -1788,6 +2050,25 @@ func TestCompactCount(t *testing.T) {
 		if got := compactCount(value); got != want {
 			t.Errorf("compactCount(%d) = %q, want %q", value, got, want)
 		}
+	}
+}
+
+func TestCSRFRejectsInvalidCookieSignature(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, ok := client.Jar.(*cookiejar.Jar)
+	if !ok {
+		t.Fatal("authenticated test client does not use a cookie jar")
+	}
+	jar.SetCookies(serverURL, []*http.Cookie{{Name: "artist_csrf", Value: "forged.invalid-signature", Path: "/"}})
+
+	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {"forged"}})
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("forged CSRF cookie status=%d, want %d", response.StatusCode, http.StatusForbidden)
 	}
 }
 

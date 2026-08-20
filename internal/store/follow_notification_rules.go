@@ -43,10 +43,20 @@ func (r FollowNotificationRule) effectiveDeliveryMode(now time.Time) string {
 }
 
 // AllowsContent determines whether an event for this follow should exist in
-// the member's notification/inbox history. DeliveryMode is intentionally not
-// considered here: digest and paused rules retain the event for visibility,
-// while deciding whether a destination receives it is handled separately.
+// the member's notification/inbox history. It is retained as a compatibility
+// helper for callers that do not have secondary release metadata. New release
+// paths should use AllowsRelease so compilations can be distinguished from
+// ordinary albums.
 func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType string, now time.Time) bool {
+	return r.AllowsRelease(primaryType, nil, creditRole, eventType, now)
+}
+
+// AllowsRelease determines whether an event for this follow should exist in
+// the member's notification/inbox history. Spotify, iTunes, and MusicBrainz
+// normalize compilations as primary type Album with Compilation in the
+// secondary types, so compilations have their own filter and must not be
+// accidentally controlled by the Albums checkbox.
+func (r FollowNotificationRule) AllowsRelease(primaryType string, secondaryTypes []string, creditRole, eventType string, now time.Time) bool {
 	if strings.EqualFold(strings.TrimSpace(creditRole), "featured") {
 		if !r.IncludeFeatured {
 			return false
@@ -54,22 +64,33 @@ func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType
 	} else if !r.IncludePrimary {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(primaryType)) {
-	case "album":
-		if !r.Albums {
-			return false
+	compilation := strings.EqualFold(strings.TrimSpace(primaryType), "compilation")
+	if !compilation {
+		for _, secondary := range secondaryTypes {
+			if strings.EqualFold(strings.TrimSpace(secondary), "compilation") {
+				compilation = true
+				break
+			}
 		}
-	case "ep":
-		if !r.EPs {
-			return false
-		}
-	case "single":
-		if !r.Singles {
-			return false
-		}
-	case "compilation":
+	}
+	if compilation {
 		if !r.Compilations {
 			return false
+		}
+	} else {
+		switch strings.ToLower(strings.TrimSpace(primaryType)) {
+		case "album":
+			if !r.Albums {
+				return false
+			}
+		case "ep":
+			if !r.EPs {
+				return false
+			}
+		case "single":
+			if !r.Singles {
+				return false
+			}
 		}
 	}
 	switch eventType {
@@ -91,6 +112,27 @@ func (r FollowNotificationRule) queuesImmediate(now time.Time) bool {
 func (r FollowNotificationRule) belongsInDigest(now time.Time) bool {
 	mode := r.effectiveDeliveryMode(now)
 	return mode == FollowDeliveryInherit || mode == FollowDeliveryDigest
+}
+
+// allowsAccountNotificationMoment applies the account-wide event-moment
+// preferences to follows that still inherit account defaults. A follow with
+// an explicit delivery mode is intentionally treated as an override: its
+// content filters continue to decide whether the event is eligible, while the
+// mode controls whether it is delivered immediately, in a digest, or retained
+// only in history. This keeps the account settings useful without making an
+// explicit per-follow rule impossible to use.
+func (r FollowNotificationRule) allowsAccountNotificationMoment(p NotificationPreferences, eventType string) bool {
+	if normalizeFollowDeliveryMode(r.DeliveryMode) != FollowDeliveryInherit {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "announcement":
+		return p.Announcements
+	case "release_day":
+		return p.ReleaseDay
+	default:
+		return true
+	}
 }
 
 func scanFollowNotificationRule(row interface{ Scan(...any) error }) (FollowNotificationRule, error) {
@@ -156,19 +198,15 @@ func (s *Store) FollowNotificationRules(ctx context.Context, userID int64, artis
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = followRows.Close() }()
 	for followRows.Next() {
 		var artistID int64
 		if err := followRows.Scan(&artistID); err != nil {
-			_ = followRows.Close()
 			return nil, err
 		}
 		result[artistID] = defaultFollowNotificationRule(userID, artistID, now)
 	}
 	if err := followRows.Err(); err != nil {
-		_ = followRows.Close()
-		return nil, err
-	}
-	if err := followRows.Close(); err != nil {
 		return nil, err
 	}
 	rows, err := s.readerDB().QueryContext(ctx, query, args...)
@@ -228,26 +266,22 @@ func (s *Store) UpdateFollowNotificationRules(ctx context.Context, userID int64,
 	}
 	rule.DeliveryMode = normalizeFollowDeliveryMode(rule.DeliveryMode)
 	now := time.Now().UTC()
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, userID)
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	var followed int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
-		return 0, err
-	}
-	if followed != len(ids) {
-		return 0, sql.ErrNoRows
-	}
-	for _, artistID := range ids {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, userID)
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		var followed int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+			return 0, err
+		}
+		if followed != len(ids) {
+			return 0, sql.ErrNoRows
+		}
+		for _, artistID := range ids {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
 			(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,paused_until,updated_at)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(user_id,artist_id) DO UPDATE SET
@@ -256,16 +290,14 @@ func (s *Store) UpdateFollowNotificationRules(ctx context.Context, userID int64,
 			singles=excluded.singles,compilations=excluded.compilations,
 			announcements=excluded.announcements,release_day=excluded.release_day,
 			paused_until=excluded.paused_until,updated_at=excluded.updated_at`,
-			userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
-			boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
-			boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
-			return 0, err
+				userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
+				boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
+				boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
+				return 0, err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return len(ids), nil
+		return len(ids), nil
+	})
 }
 
 func (s *Store) UpdateFollowNotificationRule(ctx context.Context, userID, artistID int64, rule FollowNotificationRule) error {
@@ -295,41 +327,35 @@ func (s *Store) SetFollowNotificationDeliveryMode(ctx context.Context, userID in
 	if len(ids) == 0 {
 		return 0, errors.New("select at least one followed artist")
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, userID)
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	var followed int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
-		return 0, err
-	}
-	if followed != len(ids) {
-		return 0, sql.ErrNoRows
-	}
-	args = []any{mode, timeText(time.Now().UTC()), userID}
-	for _, artistID := range ids {
-		args = append(args, artistID)
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE follow_notification_rules SET delivery_mode=?,updated_at=?
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, userID)
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		var followed int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+			return 0, err
+		}
+		if followed != len(ids) {
+			return 0, sql.ErrNoRows
+		}
+		args = []any{mode, timeText(time.Now().UTC()), userID}
+		for _, artistID := range ids {
+			args = append(args, artistID)
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE follow_notification_rules SET delivery_mode=?,updated_at=?
 		WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...)
-	if err != nil {
-		return 0, err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return int(changed), nil
+		if err != nil {
+			return 0, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		return int(changed), nil
+	})
 }
 
 func (s *Store) PauseFollowNotificationRule(ctx context.Context, userID, artistID int64, until *time.Time) error {

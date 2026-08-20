@@ -83,7 +83,7 @@ SELECT 'credits',release_group_id,artist_id,provider,provider_id,role,track_titl
 SQL
 sha256sum \"\$fingerprint_file\" > \"\$fingerprint_file.sha256\"
 fingerprint_hash=\$(cut -d' ' -f1 \"\$fingerprint_file.sha256\")
-printf '%s\\n' "\$fingerprint_hash"
+printf '%s\n' \"\$fingerprint_hash\"
 "
 }
 
@@ -131,5 +131,5 @@ if [ "$before_fingerprint" != "$after_fingerprint" ]; then
 	exit 1
 fi
 docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec \
-	'printf "%s\\n%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok" > /data/.artist-trackarr-last-restore && chmod 600 /data/.artist-trackarr-last-restore'
+	'printf "%s\\n%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok" > /data/.artist-trackarr-last-restore && chown 10001:10001 /data/.artist-trackarr-last-restore && chmod 640 /data/.artist-trackarr-last-restore'
 echo "restore: readiness, foreign-key check, key-preserving startup, and restart persistence passed (state $after_fingerprint)"

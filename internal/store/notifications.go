@@ -19,6 +19,16 @@ import (
 // remain visible but cannot initiate network activity.
 const destinationAdmissionPredicate = `COALESCE(dh.status,'healthy')<>'paused'`
 
+// Keep member-owned destinations bounded so fan-out, settings rendering, and
+// delivery admission remain predictable. Existing rows are preserved; the
+// limit applies only when creating a new destination.
+const maxDestinationsPerUser = 25
+
+// A single household account should not fill the whole delivery claim batch
+// while other members wait behind it. The claim query applies this per-user
+// ceiling before the global batch limit; retries remain ordered by due time.
+const maxDeliveryClaimsPerUser = 5
+
 func supportedDestinationServicePredicate(alias string) string {
 	return `COALESCE(` + alias + `.transport_status,'supported')='supported' AND LOWER(` + alias + `.service) IN ('discord','telegram','ntfy','generic')`
 }
@@ -57,9 +67,18 @@ func (s *Store) AddDestination(ctx context.Context, userID int64, name, service 
 		return err
 	}
 	status, message := destinationTransportStatus(service)
-	_, err = s.execWriteContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at,transport_status,transport_message)
-		VALUES(?,?,?,?,?,?,?)`, userID, name, service, encrypted, nowText(), status, message)
-	return err
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM destinations WHERE user_id=?`, userID).Scan(&count); err != nil {
+			return err
+		}
+		if count >= maxDestinationsPerUser {
+			return ErrDestinationLimit
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO destinations(user_id,name,service,encrypted_url,created_at,transport_status,transport_message)
+			VALUES(?,?,?,?,?,?,?)`, userID, name, service, encrypted, nowText(), status, message)
+		return err
+	})
 }
 
 // ValidateDestinationCiphertexts verifies that every persisted destination can
@@ -257,22 +276,18 @@ func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinatio
 	if len(message) > 500 {
 		message = message[:500]
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	status := "failed"
-	if success {
-		status = "sent"
-		message = ""
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status=?,finished_at=?,last_error=? WHERE id=?`,
-		status, timeText(finished), message, attemptID); err != nil {
-		return err
-	}
-	if success {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_success_at,next_retry_at,last_error,updated_at)
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		status := "failed"
+		if success {
+			status = "sent"
+			message = ""
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status=?,finished_at=?,last_error=? WHERE id=?`,
+			status, timeText(finished), message, attemptID); err != nil {
+			return err
+		}
+		if success {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_success_at,next_retry_at,last_error,updated_at)
 			VALUES(?,'healthy',0,?,NULL,'',?)
 			ON CONFLICT(destination_id) DO UPDATE SET
 				status=CASE WHEN destination_health.status='paused' THEN 'paused' ELSE 'healthy' END,
@@ -281,91 +296,86 @@ func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinatio
 				next_retry_at=CASE WHEN destination_health.status='paused' THEN destination_health.next_retry_at ELSE NULL END,
 				last_error=CASE WHEN destination_health.status='paused' THEN destination_health.last_error ELSE '' END,
 				updated_at=excluded.updated_at`,
-			destinationID, timeText(finished), timeText(finished)); err != nil {
-			return err
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_failure_at,next_retry_at,last_error,updated_at)
+				destinationID, timeText(finished), timeText(finished)); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_failure_at,next_retry_at,last_error,updated_at)
 			VALUES(?,CASE WHEN 1>=5 THEN 'paused' ELSE 'degraded' END,1,?,?,?,?)
 			ON CONFLICT(destination_id) DO UPDATE SET
 			consecutive_failures=destination_health.consecutive_failures+1,
 			status=CASE WHEN destination_health.consecutive_failures+1>=5 THEN 'paused' ELSE 'degraded' END,
 			last_failure_at=excluded.last_failure_at,next_retry_at=excluded.next_retry_at,last_error=excluded.last_error,updated_at=excluded.updated_at`,
-			destinationID, timeText(finished), nullableTime(nextRetry), message, timeText(finished)); err != nil {
-			return err
-		}
-		// Once the circuit pauses a destination, work that was already queued
-		// must remain durable but cannot stay in the runnable queue. Convert all
-		// currently pending rows to blocked atomically with the health update so
-		// a maintenance tick cannot repeatedly claim work that is guaranteed to
-		// fail. RetryFailedDeliveries explicitly moves these rows back to pending
-		// after an operator recovers the destination.
-		var healthStatus string
-		if err := tx.QueryRowContext(ctx, `SELECT status FROM destination_health WHERE destination_id=?`, destinationID).Scan(&healthStatus); err != nil {
-			return err
-		}
-		if healthStatus == "paused" {
-			for _, query := range []string{
-				`UPDATE deliveries
+				destinationID, timeText(finished), nullableTime(nextRetry), message, timeText(finished)); err != nil {
+				return err
+			}
+			// Once the circuit pauses a destination, work that was already queued
+			// must remain durable but cannot stay in the runnable queue. Convert all
+			// currently pending rows to blocked atomically with the health update so
+			// a maintenance tick cannot repeatedly claim work that is guaranteed to
+			// fail. RetryFailedDeliveries explicitly moves these rows back to pending
+			// after an operator recovers the destination.
+			var healthStatus string
+			if err := tx.QueryRowContext(ctx, `SELECT status FROM destination_health WHERE destination_id=?`, destinationID).Scan(&healthStatus); err != nil {
+				return err
+			}
+			if healthStatus == "paused" {
+				for _, query := range []string{
+					`UPDATE deliveries
 				 SET status='blocked',claim_owner=NULL,claim_expires_at=NULL,
 				     last_error=CASE WHEN last_error='' THEN 'destination paused after repeated failures' ELSE last_error END
 				 WHERE destination_id=? AND status='pending'`,
-				`UPDATE release_digest_deliveries
+					`UPDATE release_digest_deliveries
 				 SET status='blocked',claim_owner=NULL,claim_expires_at=NULL,
 				     last_error=CASE WHEN last_error='' THEN 'destination paused after repeated failures' ELSE last_error END
 				 WHERE destination_id=? AND status='pending'`,
-			} {
-				if _, err := tx.ExecContext(ctx, query, destinationID); err != nil {
-					return err
+				} {
+					if _, err := tx.ExecContext(ctx, query, destinationID); err != nil {
+						return err
+					}
 				}
 			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // RetryFailedDeliveries requeues all permanently failed deliveries for an
 // owned destination. It is intentionally owner-scoped and resets the circuit
 // only after the queue has been made runnable.
 func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID int64, now time.Time) (int, error) {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var owned int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM destinations WHERE id=? AND user_id=?`, destinationID, userID).Scan(&owned); err != nil {
-		return 0, err
-	}
-	if owned == 0 {
-		return 0, sql.ErrNoRows
-	}
-	count := 0
-	for _, query := range []string{
-		`UPDATE deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
-			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
-		`UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
-			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
-	} {
-		result, updateErr := tx.ExecContext(ctx, query, timeText(now), destinationID)
-		if updateErr != nil {
-			return 0, updateErr
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		var owned int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM destinations WHERE id=? AND user_id=?`, destinationID, userID).Scan(&owned); err != nil {
+			return 0, err
 		}
-		changed, rowsErr := result.RowsAffected()
-		if rowsErr != nil {
-			return 0, rowsErr
+		if owned == 0 {
+			return 0, sql.ErrNoRows
 		}
-		count += int(changed)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,next_retry_at,last_error,updated_at)
+		count := 0
+		for _, query := range []string{
+			`UPDATE deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
+			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
+			`UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
+			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
+		} {
+			result, updateErr := tx.ExecContext(ctx, query, timeText(now), destinationID)
+			if updateErr != nil {
+				return 0, updateErr
+			}
+			changed, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return 0, rowsErr
+			}
+			count += int(changed)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,next_retry_at,last_error,updated_at)
 		VALUES(?,'healthy',0,NULL,'',?)
 		ON CONFLICT(destination_id) DO UPDATE SET status='healthy',consecutive_failures=0,next_retry_at=NULL,last_error='',updated_at=excluded.updated_at`, destinationID, timeText(now)); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return count, nil
+			return 0, err
+		}
+		return count, nil
+	})
 }
 func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination, error) {
 	var d Destination
@@ -467,89 +477,90 @@ func (s *Store) ClaimDueDeliveries(ctx context.Context, now time.Time, limit int
 		lease = 2 * time.Minute
 	}
 	expires := now.Add(lease)
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, `SELECT d.id FROM deliveries d
-		JOIN destinations dst ON dst.id=d.destination_id
-		LEFT JOIN destination_health dh ON dh.destination_id=dst.id
-		WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1
-		AND (d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
-		AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
-		ORDER BY d.next_attempt_at,d.id LIMIT ?`, timeText(now), timeText(now), limit)
-	if err != nil {
-		return nil, err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) ([]Delivery, error) {
+		rows, err := tx.QueryContext(ctx, `WITH eligible AS (
+			SELECT d.id,d.next_attempt_at,dst.user_id
+			FROM deliveries d
+			JOIN destinations dst ON dst.id=d.destination_id
+			LEFT JOIN destination_health dh ON dh.destination_id=dst.id
+			WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1
+			AND (d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
+			AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
+		), eligible_user_count AS (
+			SELECT COUNT(DISTINCT user_id) AS users FROM eligible
+		), ranked AS (
+			SELECT id,next_attempt_at,ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY next_attempt_at,id) AS user_rank
+			FROM eligible
+		)
+		SELECT ranked.id FROM ranked CROSS JOIN eligible_user_count
+		WHERE user_rank<=CASE WHEN users>1 THEN ? ELSE ? END
+		ORDER BY next_attempt_at,id LIMIT ?`,
+			timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
+		if err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET claim_owner=?,claim_expires_at=? WHERE id=? AND status='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?)`, owner, timeText(expires), id, timeText(now)); err != nil {
+		var ids []int64
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
+				ids = append(ids, id)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-	}
-	if len(ids) == 0 {
-		if err := tx.Commit(); err != nil {
-			return nil, err
+		for _, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET claim_owner=?,claim_expires_at=? WHERE id=? AND status='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?)`, owner, timeText(expires), id, timeText(now)); err != nil {
+				return nil, err
+			}
 		}
-		return nil, nil
-	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	args = append(args, owner)
-	rows, err = tx.QueryContext(ctx, `SELECT d.id,d.event_id,d.attempts,d.next_attempt_at,
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		args = append(args, owner)
+		rows, err = tx.QueryContext(ctx, `SELECT d.id,d.event_id,d.attempts,d.next_attempt_at,
 		dst.id,dst.user_id,dst.name,dst.service,dst.encrypted_url,dst.enabled,COALESCE(dst.transport_status,'supported'),COALESCE(dst.transport_message,''),
 		e.title,e.body,e.event_type,rg.title
 		FROM deliveries d JOIN destinations dst ON dst.id=d.destination_id
 		JOIN notification_events e ON e.id=d.event_id JOIN release_groups rg ON rg.id=e.release_group_id
 		WHERE d.id IN (`+placeholders+`) AND d.claim_owner=? ORDER BY d.id`, args...)
-	if err != nil {
-		return nil, err
-	}
-	var result []Delivery
-	for rows.Next() {
-		var d Delivery
-		var next string
-		if err := rows.Scan(&d.ID, &d.EventID, &d.Attempts, &next,
-			&d.Destination.ID, &d.Destination.UserID, &d.Destination.Name, &d.Destination.Service,
-			&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Destination.TransportStatus, &d.Destination.TransportMessage,
-			&d.Title, &d.Body, &d.EventType, &d.ReleaseTitle); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		d.NextAttempt, err = parseStoredTime(next, "delivery next_attempt_at")
 		if err != nil {
-			_ = rows.Close()
 			return nil, err
 		}
-		d.ClaimOwner = owner
-		result = append(result, d)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return result, nil
+		var result []Delivery
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var d Delivery
+				var next string
+				if err := rows.Scan(&d.ID, &d.EventID, &d.Attempts, &next,
+					&d.Destination.ID, &d.Destination.UserID, &d.Destination.Name, &d.Destination.Service,
+					&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Destination.TransportStatus, &d.Destination.TransportMessage,
+					&d.Title, &d.Body, &d.EventType, &d.ReleaseTitle); err != nil {
+					return err
+				}
+				d.NextAttempt, err = parseStoredTime(next, "delivery next_attempt_at")
+				if err != nil {
+					return err
+				}
+				d.ClaimOwner = owner
+				result = append(result, d)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	})
 }
 
 // ClaimDueDigestDeliveries is the digest counterpart of ClaimDueDeliveries.
@@ -565,89 +576,90 @@ func (s *Store) ClaimDueDigestDeliveries(ctx context.Context, now time.Time, lim
 		lease = 2 * time.Minute
 	}
 	expires := now.Add(lease)
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, `SELECT dd.id FROM release_digest_deliveries dd
-		JOIN destinations dst ON dst.id=dd.destination_id
-		LEFT JOIN destination_health dh ON dh.destination_id=dst.id
-		WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
-		AND (dd.claim_expires_at IS NULL OR dd.claim_expires_at<=?)
-		AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
-		ORDER BY dd.next_attempt_at,dd.id LIMIT ?`, timeText(now), timeText(now), limit)
-	if err != nil {
-		return nil, err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) ([]DigestDelivery, error) {
+		rows, err := tx.QueryContext(ctx, `WITH eligible AS (
+			SELECT dd.id,dd.next_attempt_at,dst.user_id
+			FROM release_digest_deliveries dd
+			JOIN destinations dst ON dst.id=dd.destination_id
+			LEFT JOIN destination_health dh ON dh.destination_id=dst.id
+			WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
+			AND (dd.claim_expires_at IS NULL OR dd.claim_expires_at<=?)
+			AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
+		), eligible_user_count AS (
+			SELECT COUNT(DISTINCT user_id) AS users FROM eligible
+		), ranked AS (
+			SELECT id,next_attempt_at,ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY next_attempt_at,id) AS user_rank
+			FROM eligible
+		)
+		SELECT ranked.id FROM ranked CROSS JOIN eligible_user_count
+		WHERE user_rank<=CASE WHEN users>1 THEN ? ELSE ? END
+		ORDER BY next_attempt_at,id LIMIT ?`,
+			timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
+		if err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries SET claim_owner=?,claim_expires_at=? WHERE id=? AND status='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?)`, owner, timeText(expires), id, timeText(now)); err != nil {
+		var ids []int64
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
+				ids = append(ids, id)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-	}
-	if len(ids) == 0 {
-		if err := tx.Commit(); err != nil {
-			return nil, err
+		for _, id := range ids {
+			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries SET claim_owner=?,claim_expires_at=? WHERE id=? AND status='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?)`, owner, timeText(expires), id, timeText(now)); err != nil {
+				return nil, err
+			}
 		}
-		return nil, nil
-	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-	args := make([]any, 0, len(ids)+1)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	args = append(args, owner)
-	rows, err = tx.QueryContext(ctx, `SELECT dd.id,dd.run_id,dd.attempts,dd.next_attempt_at,
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids)+1)
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		args = append(args, owner)
+		rows, err = tx.QueryContext(ctx, `SELECT dd.id,dd.run_id,dd.attempts,dd.next_attempt_at,
 		dst.id,dst.user_id,dst.name,dst.service,dst.encrypted_url,dst.enabled,COALESCE(dst.transport_status,'supported'),COALESCE(dst.transport_message,''),
 		r.title,r.body
 		FROM release_digest_deliveries dd JOIN release_digest_runs r ON r.id=dd.run_id
 		JOIN destinations dst ON dst.id=dd.destination_id
 		WHERE dd.id IN (`+placeholders+`) AND dd.claim_owner=? ORDER BY dd.id`, args...)
-	if err != nil {
-		return nil, err
-	}
-	var result []DigestDelivery
-	for rows.Next() {
-		var d DigestDelivery
-		var next string
-		if err := rows.Scan(&d.ID, &d.RunID, &d.Attempts, &next,
-			&d.Destination.ID, &d.Destination.UserID, &d.Destination.Name, &d.Destination.Service,
-			&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Destination.TransportStatus, &d.Destination.TransportMessage,
-			&d.Title, &d.Body); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		d.NextAttempt, err = parseStoredTime(next, "digest delivery next_attempt_at")
 		if err != nil {
-			_ = rows.Close()
 			return nil, err
 		}
-		d.ClaimOwner = owner
-		result = append(result, d)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return result, nil
+		var result []DigestDelivery
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var d DigestDelivery
+				var next string
+				if err := rows.Scan(&d.ID, &d.RunID, &d.Attempts, &next,
+					&d.Destination.ID, &d.Destination.UserID, &d.Destination.Name, &d.Destination.Service,
+					&d.Destination.EncryptedURL, &d.Destination.Enabled, &d.Destination.TransportStatus, &d.Destination.TransportMessage,
+					&d.Title, &d.Body); err != nil {
+					return err
+				}
+				d.NextAttempt, err = parseStoredTime(next, "digest delivery next_attempt_at")
+				if err != nil {
+					return err
+				}
+				d.ClaimOwner = owner
+				result = append(result, d)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	})
 }
 func (s *Store) MarkDeliverySent(ctx context.Context, id int64, now time.Time) error {
 	err := s.MarkDeliverySentOwned(ctx, id, "", now)
@@ -672,10 +684,47 @@ func (s *Store) MarkDeliverySentOwned(ctx context.Context, id int64, owner strin
 	if err != nil {
 		return err
 	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
+	}
 	if changed == 0 {
 		return nil
 	}
 	return nil
+}
+
+// FinalizeDeliverySent records a successful external send after the worker's
+// lease was lost. It only takes ownership of an unclaimed pending/blocked row;
+// an active claim is left to its current worker. This closes the small window
+// between network I/O and the owner-scoped state transition without allowing a
+// stale worker to overwrite a newer attempt.
+func (s *Store) FinalizeDeliverySent(ctx context.Context, id int64, now time.Time) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE deliveries
+		SET status='sent',attempts=attempts+1,sent_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL
+		WHERE id=? AND status IN ('pending','blocked') AND claim_owner IS NULL`, timeText(now), id)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed > 0 {
+			return nil
+		}
+		// An active worker may have claimed the row between the failed owned
+		// update and this fallback. Treat that as success: that worker owns the
+		// eventual state transition and must not be overwritten by us.
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE id=?`, id).Scan(&status); err != nil {
+			return err
+		}
+		if status == "sent" || status == "failed" {
+			return nil
+		}
+		return nil
+	})
 }
 func (s *Store) MarkDeliveryFailed(ctx context.Context, id int64, attempts int, message string, now time.Time) error {
 	err := s.MarkDeliveryFailedOwned(ctx, id, attempts, message, "", now)
@@ -709,6 +758,9 @@ func (s *Store) MarkDeliveryFailedOwned(ctx context.Context, id int64, attempts 
 	if err != nil {
 		return err
 	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
+	}
 	if changed == 0 {
 		return nil
 	}
@@ -724,37 +776,69 @@ func (s *Store) MarkDigestDeliverySent(ctx context.Context, id int64, now time.T
 }
 
 func (s *Store) MarkDigestDeliverySentOwned(ctx context.Context, id int64, owner string, now time.Time) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	query := `UPDATE release_digest_deliveries
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		query := `UPDATE release_digest_deliveries
 		SET status='sent',attempts=attempts+1,sent_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-	args := []any{timeText(now), id}
-	if strings.TrimSpace(owner) != "" {
-		query += ` AND claim_owner=?`
-		args = append(args, owner)
-	}
-	result, err := tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed == 0 {
-		return nil
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status=CASE WHEN EXISTS (
+		args := []any{timeText(now), id}
+		if strings.TrimSpace(owner) != "" {
+			query += ` AND claim_owner=?`
+			args = append(args, owner)
+		}
+		result, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 && strings.TrimSpace(owner) != "" {
+			return sql.ErrNoRows
+		}
+		if changed == 0 {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE release_digest_runs SET status=CASE WHEN EXISTS (
 		SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status='failed'
 	) THEN 'failed' ELSE 'sent' END
-		WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
-		AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id); err != nil {
+			WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
+			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id)
 		return err
-	}
-	return tx.Commit()
+	})
+}
+
+// FinalizeDigestDeliverySent is the digest counterpart of
+// FinalizeDeliverySent. It updates the digest run only when this call actually
+// completes an unclaimed row.
+func (s *Store) FinalizeDigestDeliverySent(ctx context.Context, id int64, now time.Time) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries
+		SET status='sent',attempts=attempts+1,sent_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL
+		WHERE id=? AND status IN ('pending','blocked') AND claim_owner IS NULL`, timeText(now), id)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			var status string
+			if err := tx.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE id=?`, id).Scan(&status); err != nil {
+				return err
+			}
+			if status == "sent" || status == "failed" {
+				return nil
+			}
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE release_digest_runs SET status=CASE WHEN EXISTS (
+			SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status='failed'
+		) THEN 'failed' ELSE 'sent' END
+			WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
+			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id)
+		return err
+	})
 }
 
 func (s *Store) MarkDigestDeliveryFailed(ctx context.Context, id int64, attempts int, message string, now time.Time) error {
@@ -775,69 +859,125 @@ func (s *Store) MarkDigestDeliveryFailedOwned(ctx context.Context, id int64, att
 	if len(message) > 500 {
 		message = message[:500]
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	query := `UPDATE release_digest_deliveries
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		query := `UPDATE release_digest_deliveries
 		SET status=?,attempts=?,next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-	args := []any{status, attempts, timeText(now.Add(delay)), message, id}
-	if strings.TrimSpace(owner) != "" {
-		query += ` AND claim_owner=?`
-		args = append(args, owner)
-	}
-	result, err := tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed == 0 {
-		return nil
-	}
-	if status == "failed" {
-		if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='failed'
-			WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
-			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id); err != nil {
+		args := []any{status, attempts, timeText(now.Add(delay)), message, id}
+		if strings.TrimSpace(owner) != "" {
+			query += ` AND claim_owner=?`
+			args = append(args, owner)
+		}
+		result, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 && strings.TrimSpace(owner) != "" {
+			return sql.ErrNoRows
+		}
+		if changed == 0 {
+			return nil
+		}
+		if status == "failed" {
+			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='failed'
+			WHERE id=(SELECT run_id FROM release_digest_deliveries WHERE id=?)
+			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // RecoverExpiredWork makes abandoned claims runnable again. It is safe to
 // call at startup and during maintenance: only expired ownership metadata is
 // cleared, and sent/failed rows are never resurrected.
 func (s *Store) RecoverExpiredWork(ctx context.Context, now time.Time) (int, error) {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return 0, err
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		recovered := 0
+		staleBefore := now.Add(-10 * time.Minute)
+		statements := []string{
+			`UPDATE manual_sync_requests SET status='queued',started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,last_error='worker lease expired'
+			 WHERE status='running' AND ((lease_expires_at IS NOT NULL AND lease_expires_at<=?)
+			 OR (lease_expires_at IS NULL AND COALESCE(started_at,created_at)<=?))`,
+			`UPDATE deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE status='pending' AND claim_expires_at IS NOT NULL AND claim_expires_at<=?`,
+			`UPDATE release_digest_deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE status='pending' AND claim_expires_at IS NOT NULL AND claim_expires_at<=?`,
+		}
+		for index, statement := range statements {
+			args := []any{timeText(now)}
+			if index == 0 {
+				args = append(args, timeText(staleBefore))
+			}
+			result, err := tx.ExecContext(ctx, statement, args...)
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			recovered += int(changed)
+		}
+		return recovered, nil
+	})
+}
+
+// ClockSkewRepairStats reports durable work moved back into the runnable
+// window by RepairClockSkewedDeliveries. Normal retry scheduling is left
+// untouched; only rows parked beyond the diagnostic horizon are changed.
+type ClockSkewRepairStats struct {
+	Deliveries       int
+	DigestDeliveries int
+}
+
+// RepairClockSkewedDeliveries makes an explicit operator action available for
+// work whose retry time is implausibly far in the future. A bad host clock or
+// malformed provider retry interval can otherwise make pending work appear
+// healthy while it never reaches the due queue. Active leases are excluded so
+// this cannot steal work from a live worker; blocked rows remain blocked until
+// their destination is recovered or retried explicitly.
+func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, horizon time.Duration) (ClockSkewRepairStats, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
 	}
-	defer func() { _ = tx.Rollback() }()
-	recovered := 0
-	statements := []string{
-		`UPDATE manual_sync_requests SET status='queued',started_at=NULL,lease_owner=NULL,lease_expires_at=NULL,last_error='worker lease expired' WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?`,
-		`UPDATE deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE status='pending' AND claim_expires_at IS NOT NULL AND claim_expires_at<=?`,
-		`UPDATE release_digest_deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE status='pending' AND claim_expires_at IS NOT NULL AND claim_expires_at<=?`,
+	if horizon <= 0 {
+		horizon = 24 * time.Hour
 	}
-	for _, statement := range statements {
-		result, err := tx.ExecContext(ctx, statement, timeText(now))
+	cutoff := now.Add(horizon)
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ClockSkewRepairStats, error) {
+		var stats ClockSkewRepairStats
+		result, err := tx.ExecContext(ctx, `UPDATE deliveries
+		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?
+		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)`,
+			timeText(now), timeText(cutoff), timeText(now))
 		if err != nil {
-			return 0, err
+			return stats, err
 		}
 		changed, err := result.RowsAffected()
 		if err != nil {
-			return 0, err
+			return stats, err
 		}
-		recovered += int(changed)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return recovered, nil
+		stats.Deliveries = int(changed)
+
+		result, err = tx.ExecContext(ctx, `UPDATE release_digest_deliveries
+		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?
+		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)`,
+			timeText(now), timeText(cutoff), timeText(now))
+		if err != nil {
+			return stats, err
+		}
+		changed, err = result.RowsAffected()
+		if err != nil {
+			return stats, err
+		}
+		stats.DigestDeliveries = int(changed)
+		return stats, nil
+	})
 }
 
 // ReconcileStaleDeliveryAttempts turns attempts that have no completion
@@ -900,10 +1040,66 @@ func (s *Store) DeliveryHistory(ctx context.Context, userID int64, limit int) ([
 }
 func (s *Store) AdminDeliveryHistoryCount(ctx context.Context) (int, error) {
 	var count int
-	err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_events e
-		LEFT JOIN deliveries d ON d.event_id=e.id`).Scan(&count)
+	err := s.readerDB().QueryRowContext(ctx, adminDeliveryAuditCTE+` SELECT COUNT(*) FROM audit`).Scan(&count)
 	return count, err
 }
+
+// adminDeliveryAuditCTE is the single household-audit projection. Normal
+// notification deliveries and release digests use separate queue tables, but
+// administrators should see both through the same count, pagination, and
+// export APIs. parent_id and kind_order provide a stable keyset order even
+// when SQLite assigned the same numeric ID in both tables.
+const adminDeliveryAuditCTE = `WITH audit(
+	delivery_id,delivery_kind,user_email,title,body,event_type,destination,service,
+	status,attempts,last_error,created_at,next_attempt_at,sent_at,parent_id,kind_order
+) AS (
+	SELECT d.id,'notification',u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,
+		d.next_attempt_at,d.sent_at,e.id,0
+	FROM notification_events e
+	JOIN users u ON u.id=e.user_id
+	LEFT JOIN deliveries d ON d.event_id=e.id
+	LEFT JOIN destinations dst ON dst.id=d.destination_id
+	UNION ALL
+	SELECT dd.id,'digest',u.email,r.title,r.body,'digest',
+		dst.name,dst.service,dd.status,dd.attempts,dd.last_error,r.created_at,
+		dd.next_attempt_at,dd.sent_at,r.id,1
+	FROM release_digest_runs r
+	JOIN users u ON u.id=r.user_id
+	LEFT JOIN release_digest_deliveries dd ON dd.run_id=r.id
+	LEFT JOIN destinations dst ON dst.id=dd.destination_id
+)`
+
+func adminDeliveryAuditKindOrder(kind string) int64 {
+	if kind == "digest" {
+		return 1
+	}
+	return 0
+}
+
+func normalizeAdminDeliveryHistory(h *AdminDeliveryHistory, deliveryID sql.NullInt64, kind string, destination, service, status, lastError sql.NullString, attempts sql.NullInt64, created, nextAttempt, sent sql.NullString, contextName string) error {
+	if deliveryID.Valid {
+		h.DeliveryID = deliveryID.Int64
+	}
+	h.DeliveryKind = kind
+	h.Destination, h.Service = destination.String, service.String
+	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
+	if h.Destination == "" {
+		h.Destination, h.Status = "No destination configured", "not sent"
+	}
+	var err error
+	if h.CreatedAt, err = parseStoredTime(created.String, contextName+" created_at"); err != nil {
+		return err
+	}
+	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, contextName+" next_attempt_at"); err != nil {
+		return err
+	}
+	if h.SentAt, err = parseStoredNullableTime(sent, contextName+" sent_at"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]AdminDeliveryHistory, error) {
 	if limit < 1 {
 		limit = 50
@@ -911,13 +1107,9 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
-		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
-		FROM notification_events e
-		JOIN users u ON u.id=e.user_id
-		LEFT JOIN deliveries d ON d.event_id=e.id
-		LEFT JOIN destinations dst ON dst.id=d.destination_id
-		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.readerDB().QueryContext(ctx, adminDeliveryAuditCTE+` SELECT delivery_id,delivery_kind,user_email,title,body,event_type,
+		destination,service,status,attempts,last_error,created_at,next_attempt_at,sent_at
+		FROM audit ORDER BY created_at DESC,parent_id DESC,kind_order DESC,COALESCE(delivery_id,0) DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -925,39 +1117,82 @@ func (s *Store) AdminDeliveryHistory(ctx context.Context, limit, offset int) ([]
 	var result []AdminDeliveryHistory
 	for rows.Next() {
 		var h AdminDeliveryHistory
+		var deliveryKind sql.NullString
 		var destination, service, status, lastError sql.NullString
 		var attempts sql.NullInt64
 		var deliveryID sql.NullInt64
-		var created string
+		var created sql.NullString
 		var nextAttempt, sent sql.NullString
-		if err := rows.Scan(
-			&deliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
-			&destination, &service, &status, &attempts, &lastError,
-			&created, &nextAttempt, &sent,
-		); err != nil {
+		if err := rows.Scan(&deliveryID, &deliveryKind, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+			&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent); err != nil {
 			return nil, err
 		}
-		if deliveryID.Valid {
-			h.DeliveryID = deliveryID.Int64
-		}
-		h.Destination, h.Service = destination.String, service.String
-		h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
-		if h.Destination == "" {
-			h.Destination, h.Status = "No destination configured", "not sent"
-		}
-		h.CreatedAt, err = parseStoredTime(created, "admin delivery history created_at")
-		if err != nil {
-			return nil, err
-		}
-		if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "admin delivery history next_attempt_at"); err != nil {
-			return nil, err
-		}
-		if h.SentAt, err = parseStoredNullableTime(sent, "admin delivery history sent_at"); err != nil {
+		if err := normalizeAdminDeliveryHistory(&h, deliveryID, deliveryKind.String, destination, service, status, lastError, attempts, created, nextAttempt, sent, "admin delivery history"); err != nil {
 			return nil, err
 		}
 		result = append(result, h)
 	}
 	return result, rows.Err()
+}
+
+// AdminDeliveryHistoryExportPage returns a stable keyset-paginated page for
+// the full delivery audit export. Unlike OFFSET pagination, the cursor keeps
+// a deterministic position when new events are inserted while an export is
+// being generated. The page includes events without an admitted delivery so
+// the export retains the same household audit semantics as the admin view.
+func (s *Store) AdminDeliveryHistoryExportPage(ctx context.Context, limit int, after *AdminDeliveryExportCursor) ([]AdminDeliveryHistory, *AdminDeliveryExportCursor, error) {
+	if limit < 1 {
+		limit = 500
+	}
+	query := adminDeliveryAuditCTE + ` SELECT delivery_id,delivery_kind,user_email,title,body,event_type,
+		destination,service,status,attempts,last_error,created_at,next_attempt_at,sent_at,
+		parent_id,kind_order,COALESCE(delivery_id,0)
+		FROM audit`
+	args := make([]any, 0, 10)
+	if after != nil {
+		query += ` WHERE created_at < ?
+			OR (created_at = ? AND parent_id < ?)
+			OR (created_at = ? AND parent_id = ? AND kind_order < ?)
+			OR (created_at = ? AND parent_id = ? AND kind_order = ? AND COALESCE(delivery_id,0) < ?)`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.EventID,
+			after.CreatedAt, after.EventID, adminDeliveryAuditKindOrder(after.DeliveryKind),
+			after.CreatedAt, after.EventID, adminDeliveryAuditKindOrder(after.DeliveryKind), after.DeliveryID)
+	}
+	query += ` ORDER BY created_at DESC,parent_id DESC,kind_order DESC,COALESCE(delivery_id,0) DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.readerDB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]AdminDeliveryHistory, 0, limit)
+	var last *AdminDeliveryExportCursor
+	for rows.Next() {
+		var h AdminDeliveryHistory
+		var deliveryKind sql.NullString
+		var destination, service, status, lastError sql.NullString
+		var attempts sql.NullInt64
+		var deliveryID sql.NullInt64
+		var created sql.NullString
+		var nextAttempt, sent sql.NullString
+		var eventID, kindOrder, sortDeliveryID int64
+		if err := rows.Scan(
+			&deliveryID, &deliveryKind, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+			&destination, &service, &status, &attempts, &lastError,
+			&created, &nextAttempt, &sent, &eventID, &kindOrder, &sortDeliveryID,
+		); err != nil {
+			return nil, nil, err
+		}
+		if err := normalizeAdminDeliveryHistory(&h, deliveryID, deliveryKind.String, destination, service, status, lastError, attempts, created, nextAttempt, sent, "admin delivery export"); err != nil {
+			return nil, nil, err
+		}
+		result = append(result, h)
+		last = &AdminDeliveryExportCursor{CreatedAt: created.String, EventID: eventID, DeliveryID: sortDeliveryID, DeliveryKind: deliveryKind.String}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return result, last, nil
 }
 
 // AdminDeliveryHistorySummary deliberately omits notification bodies and
@@ -971,13 +1206,9 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT d.id,u.email,e.title,e.event_type,
-		dst.name,dst.service,d.status,d.attempts,e.created_at,d.next_attempt_at,d.sent_at
-		FROM notification_events e
-		JOIN users u ON u.id=e.user_id
-		LEFT JOIN deliveries d ON d.event_id=e.id
-		LEFT JOIN destinations dst ON dst.id=d.destination_id
-		ORDER BY e.created_at DESC,d.id DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.readerDB().QueryContext(ctx, adminDeliveryAuditCTE+` SELECT delivery_id,delivery_kind,user_email,title,event_type,
+		destination,service,status,attempts,created_at,next_attempt_at,sent_at
+		FROM audit ORDER BY created_at DESC,parent_id DESC,kind_order DESC,COALESCE(delivery_id,0) DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -986,30 +1217,15 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 	for rows.Next() {
 		var h AdminDeliveryHistory
 		var deliveryID, attempts sql.NullInt64
+		var deliveryKind sql.NullString
 		var destination, service, status sql.NullString
 		var created, nextAttempt, sent sql.NullString
-		if err := rows.Scan(&deliveryID, &h.UserEmail, &h.Title, &h.EventType,
+		if err := rows.Scan(&deliveryID, &deliveryKind, &h.UserEmail, &h.Title, &h.EventType,
 			&destination, &service, &status, &attempts, &created, &nextAttempt, &sent); err != nil {
 			return nil, err
 		}
-		if deliveryID.Valid {
-			h.DeliveryID = deliveryID.Int64
-		}
-		h.Destination, h.Service = destination.String, service.String
-		h.Status, h.Attempts = status.String, int(attempts.Int64)
-		if h.Destination == "" {
-			h.Destination, h.Status = "No destination configured", "not sent"
-		}
-		var parseErr error
-		h.CreatedAt, parseErr = parseStoredTime(created.String, "admin delivery history created_at")
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		if h.NextAttempt, parseErr = parseStoredNullableTime(nextAttempt, "admin delivery history next_attempt_at"); parseErr != nil {
-			return nil, parseErr
-		}
-		if h.SentAt, parseErr = parseStoredNullableTime(sent, "admin delivery history sent_at"); parseErr != nil {
-			return nil, parseErr
+		if err := normalizeAdminDeliveryHistory(&h, deliveryID, deliveryKind.String, destination, service, status, sql.NullString{}, attempts, created, nextAttempt, sent, "admin delivery summary"); err != nil {
+			return nil, err
 		}
 		result = append(result, h)
 	}
@@ -1030,6 +1246,7 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 	if err != nil {
 		return h, err
 	}
+	h.DeliveryKind = "notification"
 	h.Destination, h.Service = destination.String, service.String
 	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
 	if h.Destination == "" {
@@ -1047,6 +1264,43 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 	}
 	return h, nil
 }
+
+// AdminDigestDeliveryDetail returns the explicit detail view for a digest
+// delivery. Digest queue IDs are independent from normal delivery IDs, so the
+// web layer uses a distinct route to avoid ambiguous links when both tables
+// contain the same numeric ID.
+func (s *Store) AdminDigestDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+	var h AdminDeliveryHistory
+	var destination, service, status, lastError sql.NullString
+	var attempts sql.NullInt64
+	var created, nextAttempt, sent sql.NullString
+	err := s.readerDB().QueryRowContext(ctx, `SELECT dd.id,u.email,r.title,r.body,'digest',
+		dst.name,dst.service,dd.status,dd.attempts,dd.last_error,r.created_at,dd.next_attempt_at,dd.sent_at
+		FROM release_digest_deliveries dd JOIN release_digest_runs r ON r.id=dd.run_id
+		JOIN users u ON u.id=r.user_id LEFT JOIN destinations dst ON dst.id=dd.destination_id
+		WHERE dd.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
+	if err != nil {
+		return h, err
+	}
+	h.DeliveryKind = "digest"
+	h.Destination, h.Service = destination.String, service.String
+	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
+	if h.Destination == "" {
+		h.Destination, h.Status = "No destination configured", "not sent"
+	}
+	h.CreatedAt, err = parseStoredTime(created.String, "digest delivery detail created_at")
+	if err != nil {
+		return h, err
+	}
+	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "digest delivery detail next_attempt_at"); err != nil {
+		return h, err
+	}
+	if h.SentAt, err = parseStoredNullableTime(sent, "digest delivery detail sent_at"); err != nil {
+		return h, err
+	}
+	return h, nil
+}
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences
 	p.UserID = userID
@@ -1055,7 +1309,7 @@ func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (Noti
 	err := s.readerDB().QueryRowContext(ctx, `SELECT albums,eps,singles,announcements,release_day,
 		release_digest_enabled,release_digest_frequency,hold_conflicting_notifications
 		FROM notification_preferences WHERE user_id=?`, userID).Scan(&albums, &eps, &singles, &announcements, &releaseDay, &digestEnabled, &digestFrequency, &holdConflicts)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		_, err = s.execWriteContext(ctx, `INSERT OR IGNORE INTO notification_preferences(user_id,updated_at) VALUES(?,?)`, userID, nowText())
 		if err == nil {
 			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = true, true, true, true, true

@@ -1,12 +1,15 @@
 {{template "head" .}}
 {{with .Import}}
-<section class="page-head split-head"><div><p class="eyebrow">Watchlist restore</p><h1>Import results</h1><p>Each row was processed independently; no provider calls were made during the upload.</p></div><a class="button secondary" href="/artists">Back to Artists</a></section>
+<section class="page-head split-head"><div><p class="eyebrow">Watchlist restore</p><h1>Import results</h1><p>Each row was processed independently; no provider calls were made during the upload.</p></div><div class="actions"><span class="badge {{.Status}}">{{.Status}}</span><a class="button secondary" href="/artists">Back to Artists</a></div></section>
+{{if $.Error}}<div class="notice error">{{$.Error}}</div>{{end}}
+{{if eq .Status "interrupted"}}<div class="notice">This import was interrupted before all rows were processed. The rows shown here are durable, but the upload is incomplete{{if .CanResume}}; use Resume import above to retry it{{else}}; upload the original CSV again to retry the missing rows{{end}}.</div>{{else if eq .Status "failed"}}<div class="notice">Some rows could not be persisted, so this upload is incomplete{{if .CanResume}}; use Resume import above to retry it{{else}}; upload the original CSV again if needed{{end}}.</div>{{end}}
+{{if .CanResume}}<section class="panel import-resume"><div class="section-head"><div><p class="eyebrow">Recovery</p><h2>Resume this import</h2><p>The original CSV is retained in the application database for this incomplete job. Resuming creates a new idempotent import record and leaves this audit history intact.</p></div><form method="post" action="/artists/imports/{{.ID}}/resume">{{template "csrf" $}}<button type="submit">Resume import</button></form></div></section>{{end}}
 <section class="stats">
   <article><strong>{{.Added}}</strong><span>added</span></article>
   <article><strong>{{.AlreadyFollowed}}</strong><span>already followed</span></article>
   <article><strong>{{.Invalid}}</strong><span>invalid</span></article>
 </section>
-<section class="panel"><div class="section-head"><div><p class="eyebrow">CSV import</p><h2>Row details</h2></div><span class="badge">{{len .Rows}} rows · {{formatTime .CreatedAt}}</span></div>
+<section class="panel"><div class="section-head"><div><p class="eyebrow">CSV import</p><h2>Row details</h2></div><span class="badge">{{len .Rows}} rows · {{formatTime .CreatedAt $.User.Timezone}}</span></div>
   {{if .Rows}}<div class="table-scroll"><table><thead><tr><th>Source</th><th>Display name</th><th>Status</th><th>Reason</th></tr></thead><tbody>{{range .Rows}}<tr><td>{{.SourceValue}}</td><td>{{.DisplayName}}</td><td><span class="badge {{.Status}}">{{.Status}}</span></td><td>{{.Reason}}</td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No rows were recorded.</div>{{end}}
 </section>
 {{end}}

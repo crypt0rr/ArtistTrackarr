@@ -104,8 +104,13 @@ func TestArtistActionsReadyAndLogout(t *testing.T) {
 	if ready.StatusCode != http.StatusNoContent {
 		t.Fatalf("ready status=%d", ready.StatusCode)
 	}
-	if ready.Header.Get("X-ArtistTrackarr-Database") != "healthy" || ready.Header.Get("X-ArtistTrackarr-Operational") == "" {
-		t.Fatalf("readiness headers database=%q operational=%q", ready.Header.Get("X-ArtistTrackarr-Database"), ready.Header.Get("X-ArtistTrackarr-Operational"))
+	if ready.Header.Get("X-ArtistTrackarr-Database") != "healthy" ||
+		ready.Header.Get("X-ArtistTrackarr-Operational") != "" ||
+		ready.Header.Get("X-ArtistTrackarr-Operational-Reason") != "" ||
+		ready.Header.Get("X-ArtistTrackarr-Runner") != "" {
+		t.Fatalf("readiness exposed operational headers: database=%q operational=%q reason=%q runner=%q",
+			ready.Header.Get("X-ArtistTrackarr-Database"), ready.Header.Get("X-ArtistTrackarr-Operational"),
+			ready.Header.Get("X-ArtistTrackarr-Operational-Reason"), ready.Header.Get("X-ArtistTrackarr-Runner"))
 	}
 
 	csrf := getCSRF(t, client, server.URL+"/artists")
@@ -183,6 +188,21 @@ func TestArtistActionsReadyAndLogout(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "Sign in") {
 		t.Fatalf("post-logout dashboard status/body=%d %q", response.StatusCode, body)
+	}
+}
+
+func TestLogoutClearsSiteData(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/")
+	noRedirect := *client
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	response := postForm(t, &noRedirect, server.URL+"/logout", url.Values{"_csrf": {csrf}})
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("logout status=%d, want %d", response.StatusCode, http.StatusSeeOther)
+	}
+	if got := response.Header.Get("Clear-Site-Data"); got != `"cache", "cookies", "storage"` {
+		t.Fatalf("Clear-Site-Data=%q", got)
 	}
 }
 
@@ -389,6 +409,11 @@ func TestAdminInvitationAndResetRoutes(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(cleanupBody), "Cleanup was not confirmed") {
 		t.Fatalf("unconfirmed retention cleanup status/body=%d %q", response.StatusCode, cleanupBody)
 	}
+	response = postForm(t, client, server.URL+"/admin/deliveries/repair-clock-skew", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("clock-skew delivery repair status=%d", response.StatusCode)
+	}
 	csrf = getCSRF(t, client, server.URL+"/admin")
 	response = postForm(t, client, server.URL+"/admin/sync/artists/"+strconv.FormatInt(artist.ID, 10), url.Values{"_csrf": {csrf}})
 	_ = response.Body.Close()
@@ -524,7 +549,8 @@ func TestAdminQueueActionsHandleCanceledStoreContext(t *testing.T) {
 	request = request.WithContext(context.WithValue(context.WithValue(canceled, sessionKey, session), csrfKey, "csrf"))
 	response := httptest.NewRecorder()
 	app.queueRetrySync(response, request)
-	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+	if response.Code != http.StatusSeeOther || strings.Contains(response.Header().Get("Location"), "context+canceled") ||
+		!strings.Contains(response.Header().Get("Location"), "Retry+synchronization+could+not+be+queued") {
 		t.Fatalf("canceled retry queue status=%d location=%q", response.Code, response.Header().Get("Location"))
 	}
 
@@ -619,7 +645,8 @@ func TestOwnerActionsHandleCanceledStoreContext(t *testing.T) {
 	request = request.WithContext(context.WithValue(context.WithValue(canceled, sessionKey, session), csrfKey, "csrf"))
 	response = httptest.NewRecorder()
 	app.profile(response, request)
-	if response.Code != http.StatusSeeOther || !strings.Contains(response.Header().Get("Location"), "context+canceled") {
+	if response.Code != http.StatusSeeOther || strings.Contains(response.Header().Get("Location"), "context+canceled") ||
+		!strings.Contains(response.Header().Get("Location"), "Reminder+settings+could+not+be+saved") {
 		t.Fatalf("canceled legacy profile status=%d location=%q", response.Code, response.Header().Get("Location"))
 	}
 
@@ -1084,5 +1111,19 @@ func TestNotificationHoldActionsAreOwnerScoped(t *testing.T) {
 	}
 	if status != "discarded" {
 		t.Fatalf("discarded hold status=%q", status)
+	}
+	csrf = getCSRF(t, client, server.URL+"/inbox")
+	response = postForm(t, client, server.URL+"/notifications/holds/"+strconv.FormatInt(discardID, 10)+"/restore", url.Values{
+		"_csrf": {csrf}, "return": {"/inbox?state=held"},
+	})
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("restore hold status=%d", response.StatusCode)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE id=?`, discardID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "held" {
+		t.Fatalf("restored hold status=%q, want held while evidence remains open", status)
 	}
 }

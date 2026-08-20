@@ -35,6 +35,9 @@
     {{range .AssuranceSummary.AtRisk}}<a class="assurance-risk-row" href="/artists?q={{query .Artist.Name}}"><span><strong>{{.Artist.Name}}</strong><small>{{.AssuranceReason}}</small></span><span class="badge {{assuranceStatusClass .AssuranceStatus}}">{{assuranceStatusLabel .AssuranceStatus}}</span></a>{{end}}
   </div>{{else}}<p class="assurance-clear">All followed artists have recent provider data.</p>{{end}}
 </section>{{end}}
+{{if not (or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown)}}<section class="panel watchlist-action">
+  <div class="section-head"><div><p class="eyebrow">Watchlist</p><h2>Manage your followed artists</h2><p>Add artists, review provider matches, and keep your watchlist metadata up to date.</p></div><a class="button secondary" href="/artists">Manage artists</a></div>
+</section>{{end}}
 {{if or .ListenBrainzArtists .GenreBreakdown .CountryBreakdown .TypeBreakdown}}<section class="panel insights-panel">
   <div class="section-head insights-heading"><div><p class="eyebrow">Watchlist insights</p><h2>Explore your artists</h2><p>Quick patterns from your followed artists, with one-click filters.</p></div><div class="insights-heading-actions"><span class="badge">{{.FollowCount}} artists</span><a href="/artists">View all artists</a></div></div>
   <div class="insights-grid">
@@ -87,7 +90,7 @@
   <p class="eyebrow">Delivery log</p><h2>Recent notifications</h2>
   {{if .History}}<div class="list delivery-scroll" data-delivery-scroll tabindex="0" aria-label="Recent notification deliveries">{{range .History}}<article class="list-row delivery-row">
     <div><strong>{{.Title}}</strong><span>{{.EventType}} · {{.Destination}}</span></div>
-    <div class="delivery-state"><span class="badge {{.Status}}">{{.Status}}</span><small>{{formatTime .CreatedAt}}</small></div>
+    <div class="delivery-state"><span class="badge {{.Status}}">{{.Status}}</span><small>{{formatTime .CreatedAt $.User.Timezone}}</small></div>
   </article>{{end}}</div>{{else}}<div class="empty">No notification events yet.</div>{{end}}
 </section>
 {{template "foot" .}}

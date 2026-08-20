@@ -20,20 +20,23 @@
 </div>
 <section class="panel diagnostics-panel">
   <div class="section-head"><div><p class="eyebrow">Release assurance</p><h2>System diagnostics</h2><p>Safe counters and scheduler state help troubleshoot a missed sync without exposing credentials or notification content.</p></div><div class="section-actions"><span class="badge {{operationalStatusClass .OperationalStatus}}">{{operationalStatusLabel .OperationalStatus}}</span><a class="button secondary" href="/admin/diagnostics">Open report</a><a class="button secondary" href="/admin/diagnostics.json">JSON</a></div></div>
-  {{if .OperationalReasons}}<p class="diagnostic-warning"><strong>Needs attention:</strong> {{join .OperationalReasons ", "}}. The database remains available; resolve these conditions before treating the household as fully healthy.</p>{{end}}
+  {{if .OperationalReasons}}<p class="{{if eq .OperationalStatus "degraded"}}diagnostic-warning{{else}}diagnostic-note{{end}}"><strong>{{if eq .OperationalStatus "degraded"}}Needs attention:{{else}}Operational note:{{end}}</strong> {{join .OperationalReasons ", "}}{{if eq .OperationalStatus "degraded"}}. The database remains available; resolve these conditions before treating the household as fully healthy.{{end}}</p>{{end}}
   <div class="diagnostics-grid">
-    <div><strong>{{if .Diagnostics.DatabaseHealthy}}Healthy{{else}}Unavailable{{end}}</strong><span>database · schema {{.Diagnostics.SchemaVersion}}</span></div>
-    <div><strong>{{if .RunnerStatus.Running}}Running{{else}}Stopped{{end}}</strong><span>scheduler{{if .RunnerStatus.LastActivityAt}} · last activity {{formatProviderTime .RunnerStatus.LastActivityAt}}{{end}}</span></div>
+    <div><strong>{{databaseHealthLabel .Diagnostics}}</strong><span>database · schema {{.Diagnostics.SchemaVersion}}</span></div>
+    <div><strong>{{if .RunnerStatus.Running}}Running{{else}}Stopped{{end}}</strong><span>scheduler{{if .RunnerStatus.LastActivityAt}} · last activity {{formatProviderTime .RunnerStatus.LastActivityAt $.User.Timezone}}{{end}}</span></div>
     <div><strong>{{.Diagnostics.QueuedSyncs}}</strong><span>queued syncs</span></div>
     <div><strong>{{.Diagnostics.RunningSyncs}}</strong><span>running syncs</span></div>
+    <div><strong>{{.Diagnostics.DueSyncArtists}}</strong><span>due artist syncs{{if .Diagnostics.OldestDueSyncAt}} · oldest {{formatProviderTime .Diagnostics.OldestDueSyncAt $.User.Timezone}}{{end}}</span></div>
     <div><strong>{{.Diagnostics.PendingDeliveries}}</strong><span>pending deliveries</span></div>
+    <div><strong>{{.Diagnostics.FutureDeliveries}}</strong><span>future deliveries{{if .Diagnostics.EarliestFutureDelivery}} · earliest {{formatProviderTime .Diagnostics.EarliestFutureDelivery $.User.Timezone}}{{end}}</span>{{if .Diagnostics.FutureDeliveries}}<form method="post" action="/admin/deliveries/repair-clock-skew" class="inline-form">{{template "csrf" .}}<button class="secondary" type="submit">Repair future deliveries</button></form><small>Only unclaimed rows more than 24 hours ahead are moved to due now.</small>{{end}}</div>
     <div><strong>{{.Diagnostics.DigestBacklog}}</strong><span>digest backlog</span></div>
     <div><strong>{{.Diagnostics.FailedDeliveries}}</strong><span>failed deliveries</span></div>
     <div><strong>{{.Diagnostics.StaleClaims}}</strong><span>stale work claims</span></div>
     <div><strong>{{.Diagnostics.PausedDestinations}}</strong><span>paused destinations</span></div>
     <div><strong>{{.Diagnostics.ProviderFailures}}</strong><span>provider failures</span></div>
     <div><strong>{{formatBytes .Diagnostics.DatabaseBytes}}</strong><span>database size</span></div>
-    <div><strong>{{if .Diagnostics.LastBackupAt}}{{formatProviderTime .Diagnostics.LastBackupAt}}{{else}}—{{end}}</strong><span>last backup</span></div>
+    <div><strong>{{formatBytes .Diagnostics.DatabaseFreeBytes}}</strong><span>reusable database space</span></div>
+    <div><strong>{{if .Diagnostics.LastBackupAt}}{{formatProviderTime .Diagnostics.LastBackupAt $.User.Timezone}}{{else}}Not established{{end}}</strong><span>last backup</span></div>
     <div><strong>{{if .Diagnostics.LastRestoreAt}}{{.Diagnostics.LastRestoreResult}}{{else}}—{{end}}</strong><span>restore rehearsal</span></div>
     <div><strong>{{.Diagnostics.RecentLogEntries}}</strong><span>application events (24h)</span></div>
     <div><strong>{{.Diagnostics.FollowedArtists}}</strong><span>followed artists</span></div>
@@ -48,11 +51,11 @@
     <button type="button" class="secondary" data-copy data-copy-target="#diagnostic-report">Copy report</button>
   </details>
   <details class="diagnostic-details"><summary>Recent persisted health snapshots</summary>
-    {{if .OperationalSnapshots}}<div class="table-scroll diagnostic-history"><table><thead><tr><th>Captured</th><th>Status</th><th>Queue</th><th>Provider failures</th><th>Paused</th><th>Database</th></tr></thead><tbody>{{range .OperationalSnapshots}}<tr><td>{{formatProviderTime .CapturedAt}}</td><td><span class="badge {{operationalStatusClass .Status}}">{{operationalStatusLabel .Status}}</span><small>runner {{.RunnerStatus}}</small></td><td><strong>{{.PendingDeliveries}}</strong><small>{{.StaleClaims}} stale claims</small></td><td>{{.ProviderFailures}}</td><td>{{.PausedDestinations}}</td><td>{{formatBytes .DatabaseBytes}}</td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No persisted snapshots yet; the first one is recorded during maintenance.</div>{{end}}
+    {{if .OperationalSnapshots}}<div class="table-scroll diagnostic-history"><table><thead><tr><th>Captured</th><th>Status</th><th>Queue</th><th>Provider failures</th><th>Paused</th><th>Database</th></tr></thead><tbody>{{range .OperationalSnapshots}}<tr><td>{{formatProviderTime .CapturedAt $.User.Timezone}}</td><td><span class="badge {{operationalStatusClass .Status}}">{{operationalStatusLabel .Status}}</span><small>runner {{.RunnerStatus}}</small></td><td><strong>{{.PendingDeliveries}}</strong><small>{{.StaleClaims}} stale claims</small></td><td>{{.ProviderFailures}}</td><td>{{.PausedDestinations}}</td><td>{{formatBytes .DatabaseBytes}}</td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No persisted snapshots yet; the first one is recorded during maintenance.</div>{{end}}
   </details>
 </section>
 <section class="panel retention-panel">
-  <div class="section-head"><div><p class="eyebrow">Retention governance</p><h2>Operational history</h2><p>This is a read-only dry run until you explicitly confirm cleanup. Notification events, deliveries, inbox state, blocked work, and delivery-attempt audit records are retained indefinitely for existing accounts; deleting an account still removes its private data.</p></div><div class="section-actions"><span class="badge {{if .Retention.HistoryReviewDue}}ambiguous{{else}}sent{{end}}">{{if .Retention.HistoryReviewDue}}Review recommended{{else}}No review due{{end}}</span><span class="badge">Checked {{formatProviderTime .Retention.CheckedAt}}</span></div></div>
+  <div class="section-head"><div><p class="eyebrow">Retention governance</p><h2>Operational history</h2><p>This is a read-only dry run until you explicitly confirm cleanup. Notification events, deliveries, inbox state, blocked work, and delivery-attempt audit records are retained indefinitely for existing accounts; deleting an account still removes its private data.</p></div><div class="section-actions"><span class="badge {{if .Retention.HistoryReviewDue}}ambiguous{{else}}sent{{end}}">{{if .Retention.HistoryReviewDue}}Review recommended{{else}}No review due{{end}}</span><span class="badge">Checked {{formatProviderTime .Retention.CheckedAt $.User.Timezone}}</span></div></div>
   <div class="diagnostics-grid">
     <div><strong>{{.Retention.PrunableApplicationLogs}}</strong><span>application logs eligible ({{.Retention.Policy.ApplicationLogsDays}} days)</span></div>
     <div><strong>{{.Retention.PrunableTransientSessions}}</strong><span>expired sessions eligible</span></div>
@@ -68,10 +71,10 @@
   <details class="diagnostic-details"><summary>Retention policy and history ages</summary>
     <p>Application logs are kept for {{.Retention.Policy.ApplicationLogsDays}} days. Expired sessions, used tokens, old login attempts, and completed transient work are eligible after {{.Retention.Policy.TransientStateDays}} days (login attempts use a 24-hour safety window). Notification and delivery history has no automatic expiry for existing accounts. A review is recommended once the oldest history reaches {{.Retention.Policy.HistoryReviewDays}} days; this signal never deletes data.</p>
     {{if .Retention.HistoryReviewDue}}<p class="diagnostic-warning"><strong>Retention review recommended:</strong> history is {{.Retention.HistoryAgeDays}} days old. Export or back up the household before adopting any future deletion policy.</p>{{end}}
-    {{if .Retention.OldestNotificationEvent}}<small>Oldest notification event: {{formatProviderTime .Retention.OldestNotificationEvent}}</small>{{end}}
-    {{if .Retention.OldestDelivery}}<small>Oldest delivery row: {{formatProviderTime .Retention.OldestDelivery}}</small>{{end}}
-    {{if .Retention.OldestDeliveryAttempt}}<small>Oldest delivery attempt: {{formatProviderTime .Retention.OldestDeliveryAttempt}}</small>{{end}}
-    {{if .Retention.OldestApplicationLog}}<small>Oldest application log: {{formatProviderTime .Retention.OldestApplicationLog}}</small>{{end}}
+    {{if .Retention.OldestNotificationEvent}}<small>Oldest notification event: {{formatProviderTime .Retention.OldestNotificationEvent $.User.Timezone}}</small>{{end}}
+    {{if .Retention.OldestDelivery}}<small>Oldest delivery row: {{formatProviderTime .Retention.OldestDelivery $.User.Timezone}}</small>{{end}}
+    {{if .Retention.OldestDeliveryAttempt}}<small>Oldest delivery attempt: {{formatProviderTime .Retention.OldestDeliveryAttempt $.User.Timezone}}</small>{{end}}
+    {{if .Retention.OldestApplicationLog}}<small>Oldest application log: {{formatProviderTime .Retention.OldestApplicationLog $.User.Timezone}}</small>{{end}}
   </details>
   <p class="retention-export-note">Before changing any future history policy, download the delivery-audit export or use the complete encrypted database backup. The CSV includes notification text, but never destination credentials or encrypted URLs.</p>
   <p><a class="button secondary" href="/admin/retention/export">Download delivery audit CSV</a></p>
@@ -91,7 +94,7 @@
         <td><strong>{{.Username}}</strong><small>{{.Email}} · {{.Role}}{{if eq .ID $.User.ID}} · Current account{{end}}</small></td>
         <td><strong>{{.ReminderTime}}</strong><small>{{.Timezone}}</small></td>
         <td><strong>{{.FollowCount}} artist{{if ne .FollowCount 1}}s{{end}}</strong><small>{{.DestinationCount}} destination{{if ne .DestinationCount 1}}s{{end}}</small></td>
-        <td><small>{{formatTime .CreatedAt}}</small></td>
+        <td><small>{{formatTime .CreatedAt $.User.Timezone}}</small></td>
         <td>{{if eq .ID $.User.ID}}<span class="badge">Signed in</span>{{else}}<details class="user-delete">
           <summary>Delete user</summary>
           <p>This permanently deletes {{.Email}} and their private data.</p>
@@ -104,21 +107,21 @@
 <section class="panel destination-admin">
   <div class="section-head"><div><p class="eyebrow">Delivery assurance</p><h2>Destination health</h2></div><span class="badge">{{len .AdminDestinationHealth}} destination{{if ne (len .AdminDestinationHealth) 1}}s{{end}}</span></div>
   {{if .AdminDestinationHealth}}<div class="table-scroll"><table><thead><tr><th>Account</th><th>Destination</th><th>Health</th><th>Queue</th><th>Last error</th><th>Updated</th></tr></thead><tbody>
-    {{range .AdminDestinationHealth}}<tr><td><strong>{{.UserEmail}}</strong></td><td><strong>{{.DestinationName}}</strong><small>{{.Service}}</small></td><td><span class="badge {{destinationHealthClass .Status}}">{{destinationHealthLabel .Status}}</span>{{if .ConsecutiveFailures}}<small>{{.ConsecutiveFailures}} consecutive failures</small>{{end}}</td><td><small>{{.PendingCount}} pending</small><small>{{.BlockedCount}} blocked</small><small>{{.FailedCount}} failed</small></td><td>{{if eq .Status "unsupported"}}<small class="health-error">Transport is unsupported; replace the destination.</small>{{else if .LastError}}<small class="health-error">{{.LastError}}</small>{{else}}<small>—</small>{{end}}</td><td>{{if .UpdatedAt}}{{formatTime .UpdatedAt}}{{end}}</td></tr>{{end}}
+    {{range .AdminDestinationHealth}}<tr><td><strong>{{.UserEmail}}</strong></td><td><strong>{{.DestinationName}}</strong><small>{{.Service}}</small></td><td><span class="badge {{destinationHealthClass .Status}}">{{destinationHealthLabel .Status}}</span>{{if .ConsecutiveFailures}}<small>{{.ConsecutiveFailures}} consecutive failures</small>{{end}}</td><td><small>{{.PendingCount}} pending</small><small>{{.BlockedCount}} blocked</small><small>{{.FailedCount}} failed</small></td><td>{{if eq .Status "unsupported"}}<small class="health-error">Transport is unsupported; replace the destination.</small>{{else if .LastError}}<small class="health-error">{{.LastError}}</small>{{else}}<small>—</small>{{end}}</td><td>{{if .UpdatedAt}}{{formatTime .UpdatedAt $.User.Timezone}}{{end}}</td></tr>{{end}}
   </tbody></table></div>{{else}}<div class="empty">No notification destinations configured.</div>{{end}}
 </section>
 <section class="panel admin-ops">
   <div class="section-head"><div><p class="eyebrow">Operations</p><h2>Provider health &amp; sync</h2></div><form method="post" action="/admin/sync/retry">{{template "csrf" .}}<button class="secondary">Retry due/failed artists</button></form></div>
   <div class="grid two admin-ops-grid">
-    <div><div class="section-head health-section-head"><h3>Providers</h3><span class="health-live" data-health-refresh-status aria-live="polite">Live status</span></div><div class="health-list" data-provider-health data-refresh-url="/admin/provider-health">{{if .ProviderHealth}}{{range .ProviderHealth}}<div class="health-row"><div class="health-heading"><strong>{{.Provider}}</strong><span class="badge {{providerHealthClass .}}" data-health-status>{{providerHealthStatus .}}</span></div>{{if .LastSuccessAt}}<small>Last success <time datetime="{{providerTimeAttr .LastSuccessAt}}">{{formatProviderTime .LastSuccessAt}}</time></small>{{end}}{{if .LastFailureAt}}<small>Last failure <time datetime="{{providerTimeAttr .LastFailureAt}}">{{formatProviderTime .LastFailureAt}}</time></small>{{end}}{{if .NextCheckAt}}<small>Next check <time datetime="{{providerTimeAttr .NextCheckAt}}">{{formatProviderTime .NextCheckAt}}</time> <span data-health-countdown="{{providerTimeAttr .NextCheckAt}}"></span></small>{{end}}{{if providerHealthError .}}<small class="health-error">{{providerHealthError .}}</small>{{end}}<small>Updated <time datetime="{{providerTimeAttr .UpdatedAt}}">{{formatProviderTime .UpdatedAt}}</time></small></div>{{end}}{{else}}<div class="empty">No provider health data yet.</div>{{end}}</div></div>
+    <div><div class="section-head health-section-head"><h3>Providers</h3><span class="health-live" data-health-refresh-status aria-live="polite">Live status</span></div><div class="health-list" data-provider-health data-refresh-url="/admin/provider-health">{{if .ProviderHealth}}{{range .ProviderHealth}}<div class="health-row"><div class="health-heading"><strong>{{.Provider}}</strong><span class="badge {{providerHealthClass .}}" data-health-status>{{providerHealthStatus .}}</span></div>{{if .LastSuccessAt}}<small>Last success <time datetime="{{providerTimeAttr .LastSuccessAt}}">{{formatProviderTime .LastSuccessAt $.User.Timezone}}</time></small>{{end}}{{if .LastFailureAt}}<small>Last failure <time datetime="{{providerTimeAttr .LastFailureAt}}">{{formatProviderTime .LastFailureAt $.User.Timezone}}</time></small>{{end}}{{if .NextCheckAt}}<small>Next check <time datetime="{{providerTimeAttr .NextCheckAt}}">{{formatProviderTime .NextCheckAt $.User.Timezone}}</time> <span data-health-countdown="{{providerTimeAttr .NextCheckAt}}"></span></small>{{end}}{{if providerHealthError .}}<small class="health-error">{{providerHealthError .}}</small>{{end}}<small>Updated <time datetime="{{providerTimeAttr .UpdatedAt}}">{{formatProviderTime .UpdatedAt $.User.Timezone}}</time></small></div>{{end}}{{else}}<div class="empty">No provider health data yet.</div>{{end}}</div></div>
     <div><h3>Sync artists</h3>{{if .AdminArtists}}<div class="table-scroll"><table><thead><tr><th>Artist</th><th>Action</th></tr></thead><tbody>{{range .AdminArtists}}<tr><td>{{.Name}}</td><td><form method="post" action="/admin/sync/artists/{{.ID}}">{{template "csrf" $}}<button class="secondary">Queue sync</button></form></td></tr>{{end}}</tbody></table></div>{{else}}<div class="empty">No followed artists.</div>{{end}}</div>
   </div>
-  {{if .ManualSyncs}}<details><summary>Recent manual sync requests</summary><div class="table-scroll"><table><thead><tr><th>Scope</th><th>Status</th><th>Created</th><th>Error</th></tr></thead><tbody>{{range .ManualSyncs}}<tr><td>{{.Scope}}{{if .ArtistID}} #{{.ArtistID}}{{end}}</td><td><span class="badge {{.Status}}">{{.Status}}</span></td><td>{{formatTime .CreatedAt}}</td><td>{{.LastError}}</td></tr>{{end}}</tbody></table></div></details>{{end}}
+  {{if .ManualSyncs}}<details><summary>Recent manual sync requests</summary><div class="table-scroll"><table><thead><tr><th>Scope</th><th>Status</th><th>Created</th><th>Error</th></tr></thead><tbody>{{range .ManualSyncs}}<tr><td>{{.Scope}}{{if .ArtistID}} #{{.ArtistID}}{{end}}</td><td><span class="badge {{.Status}}">{{.Status}}</span></td><td>{{formatTime .CreatedAt $.User.Timezone}}</td><td>{{.LastError}}</td></tr>{{end}}</tbody></table></div></details>{{end}}
 </section>
 <section class="panel admin-log app-log">
   <div class="section-head"><div><p class="eyebrow">Application log</p><h2>Recent container events</h2></div><span class="badge">{{len .AppLogs}} entries</span></div>
   {{if .AppLogs}}<div class="app-log-scroll" tabindex="0" aria-label="Recent application log entries">
-    {{range .AppLogs}}<div class="app-log-row"><time datetime="{{.Time.Format "2006-01-02T15:04:05Z07:00"}}">{{.Time.Format "2006-01-02 15:04:05"}}</time><span class="badge {{lower .Level}}">{{.Level}}</span><strong>{{.Message}}</strong>{{if .Attributes}}<span class="app-log-fields">{{range .Attributes}}{{.Key}}={{.Value}} {{end}}</span>{{end}}</div>{{end}}
+    {{range .AppLogs}}<div class="app-log-row"><time datetime="{{.Time.Format "2006-01-02T15:04:05Z07:00"}}">{{formatProviderTime .Time $.User.Timezone}}</time><span class="badge {{lower .Level}}">{{.Level}}</span><strong>{{.Message}}</strong>{{if .Attributes}}<span class="app-log-fields">{{range .Attributes}}{{.Key}}={{.Value}} {{end}}</span>{{end}}</div>{{end}}
   </div>{{else}}<div class="empty">No application events have been recorded in the retention window.</div>{{end}}
 </section>
 <section class="panel admin-log">
@@ -128,10 +131,10 @@
       <thead><tr><th>User</th><th>Notification</th><th>Destination</th><th>Delivery</th><th>Timing</th></tr></thead>
       <tbody>{{range .AdminHistory}}<tr>
         <td><strong>{{.UserEmail}}</strong></td>
-        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small>{{if .DeliveryID}}<a class="admin-detail-link" href="/admin/deliveries/{{.DeliveryID}}">View details</a>{{else}}<small>Content unavailable: no delivery record</small>{{end}}</td>
+        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small>{{if .DeliveryID}}{{if eq .DeliveryKind "digest"}}<a class="admin-detail-link" href="/admin/digest-deliveries/{{.DeliveryID}}">View details</a>{{else}}<a class="admin-detail-link" href="/admin/deliveries/{{.DeliveryID}}">View details</a>{{end}}{{else}}<small>Content unavailable: no delivery record</small>{{end}}</td>
         <td><strong>{{.Destination}}</strong>{{if .Service}}<small>{{.Service}}</small>{{end}}</td>
         <td><span class="badge {{.Status}}">{{.Status}}</span><small>{{.Attempts}} attempts</small>{{if .DeliveryID}}<small>Details require explicit access</small>{{end}}</td>
-        <td><small>Created {{formatTime .CreatedAt}}</small>{{if .NextAttempt}}<small>Next {{.NextAttempt.Format "2006-01-02 15:04"}}</small>{{end}}{{if .SentAt}}<small>Sent {{.SentAt.Format "2006-01-02 15:04"}}</small>{{end}}</td>
+        <td><small>Created {{formatTime .CreatedAt $.User.Timezone}}</small>{{if .NextAttempt}}<small>Next {{formatTime .NextAttempt $.User.Timezone}}</small>{{end}}{{if .SentAt}}<small>Sent {{formatTime .SentAt $.User.Timezone}}</small>{{end}}</td>
       </tr>{{end}}</tbody>
     </table>
   </div>

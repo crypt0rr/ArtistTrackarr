@@ -83,6 +83,8 @@ type resolutionStats struct {
 
 type syncStats struct {
 	Due       int
+	Queued    int
+	OldestDue *time.Time
 	Succeeded int
 	Failed    int
 	Changed   int
@@ -112,6 +114,12 @@ type deliveryWork struct {
 	normal *store.Delivery
 	digest *store.DigestDelivery
 }
+
+// Keep the outer worker watchdog aligned with the sender's transport timeout.
+// This still leaves a small amount of room for transactional state updates
+// after Send returns without allowing a stuck transport to hold a worker
+// indefinitely.
+const notificationSendTimeout = notify.DefaultSendTimeout
 
 type artworkBackfillStats struct {
 	ArtistID int64
@@ -482,7 +490,7 @@ func (r *Runner) safeDelivery(ctx context.Context, now time.Time, item deliveryW
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			r.logPanic("notification delivery", "worker", recovered)
-			result = deliveryResult{failed: true, err: errors.New("notification delivery panic recovered")}
+			result = r.recordDeliveryPanic(ctx, now, item)
 		}
 	}()
 	if item.normal != nil {
@@ -492,6 +500,61 @@ func (r *Runner) safeDelivery(ctx context.Context, now time.Time, item deliveryW
 		return r.deliverDigestOne(ctx, now, *item.digest)
 	}
 	return deliveryResult{failed: true, err: errors.New("empty notification delivery")}
+}
+
+func (r *Runner) recordDeliveryPanic(ctx context.Context, now time.Time, item deliveryWork) deliveryResult {
+	stateCtx, cancel := deliveryStateContext(ctx)
+	defer cancel()
+	panicErr := errors.New("notification delivery panic recovered")
+	if item.normal != nil {
+		if err := r.store.MarkDeliveryFailedOwned(stateCtx, item.normal.ID, item.normal.Attempts+1,
+			panicErr.Error(), item.normal.ClaimOwner, now); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return deliveryResult{failed: true, err: err}
+		}
+		return deliveryResult{failed: true}
+	}
+	if item.digest != nil {
+		if err := r.store.MarkDigestDeliveryFailedOwned(stateCtx, item.digest.ID, item.digest.Attempts+1,
+			panicErr.Error(), item.digest.ClaimOwner, now); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return deliveryResult{failed: true, err: err}
+		}
+		return deliveryResult{failed: true}
+	}
+	return deliveryResult{failed: true, err: panicErr}
+}
+
+// sendNotification keeps a non-cooperative notification implementation from
+// pinning the delivery cadence forever. The production Shoutrrr sender has
+// its own shorter transport deadline; this outer deadline also protects test
+// and future sender implementations. A send that ignores cancellation may
+// finish in its own goroutine later, but its durable delivery claim is already
+// released by the bounded failure path.
+func (r *Runner) sendNotification(ctx context.Context, serviceURL, title, body string) error {
+	if r.sender == nil {
+		return errors.New("notification sender is unavailable")
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, notificationSendTimeout)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result <- fmt.Errorf("notification sender panic: %v", recovered)
+			}
+		}()
+		result <- r.sender.Send(sendCtx, serviceURL, title, body)
+	}()
+	select {
+	case err := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-sendCtx.Done():
+		return sendCtx.Err()
+	}
 }
 
 func (r *Runner) launchSync(ctx context.Context) {
@@ -537,12 +600,14 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 	if err != nil {
 		r.metrics.RecordSync(syncSummary.Due, syncSummary.Succeeded, syncSummary.Failed,
 			syncSummary.Changed, syncSummary.Unchanged, syncSummary.Backoff)
-		r.logger.Error("catalog sync failed", "error", err)
+		r.logger.Error("catalog sync failed", "queued", syncSummary.Queued,
+			"batch", syncSummary.Due, "oldest_due_at", syncSummary.OldestDue, "error", err)
 	} else {
 		r.metrics.RecordSync(syncSummary.Due, syncSummary.Succeeded, syncSummary.Failed,
 			syncSummary.Changed, syncSummary.Unchanged, syncSummary.Backoff)
 		r.logger.Info("catalog synchronization completed",
-			"due", syncSummary.Due, "succeeded", syncSummary.Succeeded,
+			"queued", syncSummary.Queued, "oldest_due_at", syncSummary.OldestDue,
+			"batch", syncSummary.Due, "succeeded", syncSummary.Succeeded,
 			"failed", syncSummary.Failed, "changed", syncSummary.Changed,
 			"unchanged", syncSummary.Unchanged, "backoff", syncSummary.Backoff)
 	}
@@ -583,6 +648,14 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 			"sessions", maintenance.Sessions, "auth_tokens", maintenance.AuthTokens,
 			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
 			"import_jobs", maintenance.ImportJobs)
+	}
+	if recovered, err := r.store.RecoverInterruptedImportJobs(ctx, now, time.Hour); err != nil {
+		r.logger.Warn("interrupted import recovery failed", "error", err)
+	} else if recovered > 0 {
+		r.logger.Info("interrupted imports recovered", "jobs", recovered)
+	}
+	if err := r.store.Optimize(ctx); err != nil {
+		r.logger.Debug("SQLite query optimization failed", "error", err)
 	}
 	if r.artwork != nil {
 		stats, err := r.artwork.Prune(ctx, artwork.DefaultMaxCacheBytes, artwork.DefaultMaxCacheFiles)
@@ -654,7 +727,7 @@ func (r *Runner) backfillITunesArtwork(ctx context.Context, now time.Time) (*art
 			"artist_id", artist.ID, "retry_after", cooldown.Sub(now).String())
 		return nil, nil
 	}
-	releases, err := r.itunes.ArtistReleases(ctx, artist.Name)
+	releases, err := r.itunesReleasesForArtist(ctx, store.Artist{ID: artist.ID, MBID: artist.MBID, Name: artist.Name})
 	if err != nil {
 		var rateLimit *catalog.ITunesRateLimitError
 		if errors.As(err, &rateLimit) {
@@ -752,6 +825,10 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 			var artist store.Artist
 			artist, syncErr = r.store.ArtistByID(ctx, *req.ArtistID)
 			if syncErr == nil {
+				// A manual request is an explicit refresh. Do not let the
+				// adaptive Spotify watermark turn this into a bookkeeping-only
+				// cycle for artists whose next Spotify check is still in the future.
+				artist.SpotifyNextCheckAt = nil
 				r.invalidateSpotifyReleaseCache(artist)
 				_, syncErr = r.syncOne(ctx, artist, now)
 			}
@@ -761,8 +838,14 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 				_, syncErr = r.syncArtists(ctx, now)
 			}
 		}
-		if err := r.store.CompleteManualSyncRequestOwned(ctx, req.ID, r.workerID, syncErr); err != nil {
-			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", err)
+		// Completion must remain durable even when the runner context was
+		// cancelled during shutdown. Keep it bounded while allowing the write
+		// to finish independently of the cancelled work context.
+		completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		completionErr := r.store.CompleteManualSyncRequestOwned(completionCtx, req.ID, r.workerID, syncErr)
+		cancel()
+		if completionErr != nil {
+			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", completionErr)
 		}
 	}
 	return len(requests)
@@ -913,6 +996,9 @@ func (r *Runner) SyncArtistNow(ctx context.Context, artist store.Artist) error {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	// A manual sync is an explicit request to refresh both providers.
+	if err := r.store.ResetArtistIdentity(ctx, artist.ID, time.Now().UTC()); err != nil {
+		return err
+	}
 	artist.SpotifyNextCheckAt = nil
 	r.invalidateSpotifyReleaseCache(artist)
 	_, err := r.syncOne(ctx, artist, time.Now().UTC())
@@ -932,8 +1018,55 @@ func (r *Runner) invalidateSpotifyReleaseCache(artist store.Artist) {
 	}
 }
 
+// itunesReleasesForArtist keeps the fallback provider tied to the canonical
+// MusicBrainz artist. Real iTunes clients use the optional canonical-aware
+// interface; small test providers and legacy implementations retain the
+// existing name-based interface for compatibility.
+func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artist) ([]store.Release, error) {
+	if r.itunes == nil {
+		return nil, errors.New("iTunes is not configured")
+	}
+	identity, found, err := r.store.ArtistProviderIdentity(ctx, artist.ID, "itunes")
+	if err != nil {
+		return nil, err
+	}
+	if !found && strings.TrimSpace(artist.Disambiguation) != "" {
+		// A name-only iTunes search cannot distinguish homonyms. Require an
+		// explicit reviewed provider identity when MusicBrainz has useful
+		// disambiguation metadata, then let the normal MusicBrainz fallback
+		// provide the canonical catalog.
+		return nil, &catalog.ITunesAmbiguousArtistError{Name: artist.Name}
+	}
+	canonical, ok := r.itunes.(catalog.CanonicalITunesReleaseProvider)
+	if !ok {
+		return r.itunes.ArtistReleases(ctx, artist.Name)
+	}
+	providerID := ""
+	if found {
+		providerID = identity.ProviderID
+	}
+	releases, resolvedID, resolvedURL, err := canonical.ArtistReleasesForCanonical(
+		ctx, artist.MBID, artist.Name, providerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(resolvedID) != "" && (!found || identity.ProviderID != resolvedID) {
+		if err := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); err != nil {
+			return nil, fmt.Errorf("persist iTunes artist identity: %w", err)
+		}
+	}
+	return releases, nil
+}
+
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {
 	var summary syncStats
+	backlog, err := r.store.DueArtistSyncBacklog(ctx, now)
+	if err != nil {
+		return summary, err
+	}
+	summary.Queued = backlog.Count
+	summary.OldestDue = backlog.OldestDueAt
 	artists, err := r.store.ArtistsDue(ctx, now, 25)
 	if err != nil {
 		return summary, err
@@ -962,6 +1095,47 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, err
 
 func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time) (syncOutcome, error) {
 	var outcome syncOutcome
+	identity, found, err := r.store.ArtistIdentityStatus(ctx, artist.ID)
+	if err != nil {
+		return outcome, err
+	}
+	if found && identity.Status == "unresolvable" {
+		return outcome, fmt.Errorf("MusicBrainz identity is marked unresolvable; run an explicit sync to retry")
+	}
+	if found && identity.Status == "pending" {
+		resolved, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID)
+		if resolveErr == nil {
+			if !strings.EqualFold(strings.TrimSpace(resolved.MBID), strings.TrimSpace(artist.MBID)) || strings.TrimSpace(resolved.Name) == "" {
+				resolveErr = fmt.Errorf("MusicBrainz returned a different or incomplete artist identity")
+			}
+		}
+		if resolveErr != nil {
+			attempts := identity.Attempts + 1
+			terminal := attempts >= artistIdentityMaxAttempts
+			delay := artistIdentityRetryDelay(attempts, terminal)
+			message := "MusicBrainz artist identity could not be verified"
+			if terminal {
+				message = "MusicBrainz artist identity could not be verified after bounded retries"
+			}
+			if scheduleErr := r.store.ScheduleArtistIdentityFailure(ctx, artist.ID, attempts, now.Add(delay), message, terminal); scheduleErr != nil {
+				return outcome, errors.Join(resolveErr, scheduleErr)
+			}
+			return outcome, resolveErr
+		}
+		canonical := resolved.StoreArtist()
+		canonical.ID = artist.ID
+		canonical.SpotifyID, canonical.SpotifyURL, canonical.SpotifyImageURL = artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL
+		if err := r.store.VerifyArtistIdentity(ctx, artist.ID, canonical); err != nil {
+			return outcome, err
+		}
+		if len(canonical.Genres) > 0 {
+			if err := r.store.SaveArtistGenres(ctx, artist.ID, canonical.Genres); err != nil {
+				r.logger.Debug("imported artist genre metadata save failed", "artist_id", artist.ID, "error", err)
+			}
+		}
+		artist.Name, artist.SortName, artist.Type = canonical.Name, canonical.SortName, canonical.Type
+		artist.Country, artist.Disambiguation, artist.Genres = canonical.Country, canonical.Disambiguation, canonical.Genres
+	}
 	if genres, genreErr := r.store.ArtistGenres(ctx, artist.ID); genreErr == nil && len(genres) == 0 {
 		if metadata, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID); resolveErr == nil && len(metadata.Genres) > 0 {
 			if saveErr := r.store.SaveArtistGenres(ctx, artist.ID, metadata.Genres); saveErr != nil {
@@ -1097,6 +1271,16 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	return outcome, nil
 }
 
+const artistIdentityMaxAttempts = 5
+
+func artistIdentityRetryDelay(attempts int, terminal bool) time.Duration {
+	if terminal {
+		return 24 * time.Hour
+	}
+	delays := [...]time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour}
+	return delays[min(max(attempts-1, 0), len(delays)-1)]
+}
+
 // scheduleSyncPersistenceFailure keeps a malformed or otherwise failed
 // persistence step from pinning an artist at the front of the due queue. The
 // original error remains the caller's primary signal; retry scheduling is a
@@ -1210,31 +1394,36 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 			}
 		}()
 	}
+	feedCanceled := false
 	for _, delivery := range deliveries {
 		item := delivery
 		select {
 		case <-ctx.Done():
-			close(work)
-			workers.Wait()
-			close(results)
-			return summary, ctx.Err()
+			feedCanceled = true
 		case work <- deliveryWork{normal: &item}:
 		}
+		if feedCanceled {
+			break
+		}
 	}
-	for _, delivery := range digestDeliveries {
-		item := delivery
-		select {
-		case <-ctx.Done():
-			close(work)
-			workers.Wait()
-			close(results)
-			return summary, ctx.Err()
-		case work <- deliveryWork{digest: &item}:
+	if !feedCanceled {
+		for _, delivery := range digestDeliveries {
+			item := delivery
+			select {
+			case <-ctx.Done():
+				feedCanceled = true
+			case work <- deliveryWork{digest: &item}:
+			}
+			if feedCanceled {
+				break
+			}
 		}
 	}
 	close(work)
-	workers.Wait()
-	close(results)
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
 
 	var storageErrors []error
 	for result := range results {
@@ -1252,12 +1441,30 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 	if len(storageErrors) > 0 {
 		return summary, errors.Join(storageErrors...)
 	}
+	if feedCanceled {
+		return summary, ctx.Err()
+	}
 	return summary, nil
+}
+
+// deliveryStateContext keeps the durable state transition independent from a
+// cancelled request or runner context. A provider send may have completed
+// immediately before shutdown; recording that outcome prevents an avoidable
+// duplicate on the next run. The bounded context still guarantees shutdown
+// cannot wait indefinitely on a locked database.
+func deliveryStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	return context.WithTimeout(base, 5*time.Second)
 }
 
 func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
 	result := deliveryResult{}
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(ctx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	stateCtx, cancelState := deliveryStateContext(ctx)
+	defer cancelState()
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(stateCtx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
 	if attemptErr != nil {
 		r.logger.Warn("record delivery attempt failed", "digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
 	}
@@ -1267,22 +1474,35 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	} else {
 		var serviceURL string
 		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
-		if err == nil && r.sender == nil {
-			err = errors.New("notification sender is unavailable")
-		}
 		if err == nil {
-			err = r.sender.Send(ctx, serviceURL, delivery.Title, delivery.Body)
+			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
 		}
 	}
 	if err == nil {
-		if markErr := r.store.MarkDigestDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
+		if markErr := r.store.MarkDigestDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
+			if errors.Is(markErr, sql.ErrNoRows) {
+				r.logger.Warn("notification delivery claim lost after send",
+					"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+				if attemptID > 0 {
+					if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+						return deliveryResult{sent: true, err: finishErr}
+					}
+				}
+				if finalizeErr := r.store.FinalizeDigestDeliverySent(stateCtx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
+					r.logger.Warn("notification delivery post-send finalization failed",
+						"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
+						"error", notify.RedactError(finalizeErr))
+					return deliveryResult{sent: true, err: finalizeErr}
+				}
+				return deliveryResult{sent: true}
+			}
 			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
 			return deliveryResult{failed: true, err: markErr}
 		}
 		if attemptID > 0 {
-			if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
 				return deliveryResult{sent: true, err: finishErr}
 			}
 		}
@@ -1294,8 +1514,13 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	redactedError := notify.RedactError(err)
 	r.logger.Warn("release digest delivery attempt failed",
 		"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDigestDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		result.err = markErr
+	if markErr := r.store.MarkDigestDeliveryFailedOwned(stateCtx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
+		if errors.Is(markErr, sql.ErrNoRows) {
+			r.logger.Warn("notification delivery claim lost after failure",
+				"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+		} else {
+			result.err = markErr
+		}
 	}
 	if attemptID > 0 {
 		var nextRetry *time.Time
@@ -1303,16 +1528,21 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
 			nextRetry = &next
 		}
-		if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
 			result.err = finishErr
 		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.err = ctxErr
 	}
 	return result
 }
 
 func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
 	result := deliveryResult{}
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(ctx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	stateCtx, cancelState := deliveryStateContext(ctx)
+	defer cancelState()
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(stateCtx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
 	if attemptErr != nil {
 		r.logger.Warn("record delivery attempt failed", "delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
 	}
@@ -1322,22 +1552,35 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	} else {
 		var serviceURL string
 		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
-		if err == nil && r.sender == nil {
-			err = errors.New("notification sender is unavailable")
-		}
 		if err == nil {
-			err = r.sender.Send(ctx, serviceURL, delivery.Title, delivery.Body)
+			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
 		}
 	}
 	if err == nil {
-		if markErr := r.store.MarkDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
+		if markErr := r.store.MarkDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
+			if errors.Is(markErr, sql.ErrNoRows) {
+				r.logger.Warn("notification delivery claim lost after send",
+					"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+				if attemptID > 0 {
+					if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+						return deliveryResult{sent: true, err: finishErr}
+					}
+				}
+				if finalizeErr := r.store.FinalizeDeliverySent(stateCtx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
+					r.logger.Warn("notification delivery post-send finalization failed",
+						"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
+						"error", notify.RedactError(finalizeErr))
+					return deliveryResult{sent: true, err: finalizeErr}
+				}
+				return deliveryResult{sent: true}
+			}
 			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
 			return deliveryResult{failed: true, err: markErr}
 		}
 		if attemptID > 0 {
-			if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
 				return deliveryResult{sent: true, err: finishErr}
 			}
 		}
@@ -1349,8 +1592,13 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	redactedError := notify.RedactError(err)
 	r.logger.Warn("notification attempt failed",
 		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDeliveryFailedOwned(ctx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		result.err = markErr
+	if markErr := r.store.MarkDeliveryFailedOwned(stateCtx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
+		if errors.Is(markErr, sql.ErrNoRows) {
+			r.logger.Warn("notification delivery claim lost after failure",
+				"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
+		} else {
+			result.err = markErr
+		}
 	}
 	if attemptID > 0 {
 		var nextRetry *time.Time
@@ -1358,9 +1606,12 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
 			nextRetry = &next
 		}
-		if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
 			result.err = finishErr
 		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.err = ctxErr
 	}
 	return result
 }

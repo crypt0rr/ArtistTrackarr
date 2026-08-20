@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,30 @@ func TestStoreOpenRejectsMissingParentAndCloseHandlesNilHandles(t *testing.T) {
 	}
 	if err := (&Store{}).Close(); err != nil {
 		t.Fatalf("nil store close error=%v", err)
+	}
+}
+
+func TestStoreOpenEscapesSQLiteURIPathCharacters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "artist ? # ü.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open path with URI-significant characters: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database was not created at the requested path: %v", err)
+	}
+
+	dsn := sqliteDSN("relative/artist ? # ü.db", false)
+	for _, escaped := range []string{"%3F", "%23", "%20", "%C3%BC"} {
+		if !strings.Contains(dsn, escaped) {
+			t.Fatalf("sqlite DSN %q does not escape %s", dsn, escaped)
+		}
+	}
+	if strings.Contains(dsn, "? #") || strings.Contains(dsn, "# ü") {
+		t.Fatalf("sqlite DSN left path delimiters unescaped: %q", dsn)
 	}
 }
 
@@ -84,6 +109,43 @@ func TestArtistProviderStatusValidationAndRetention(t *testing.T) {
 	}
 	if coverage, err := s.FollowedArtistCoveragePage(ctx, 1, 1000, -10); err != nil || len(coverage) != 0 {
 		t.Fatalf("empty bounded coverage=%#v err=%v", coverage, err)
+	}
+}
+
+func TestStandbyProviderStatusPreservesFailureEvidence(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "provider-standby", Name: "Provider Standby"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failureAt := time.Date(2026, time.August, 18, 10, 0, 0, 0, time.UTC)
+	nextCheck := failureAt.Add(time.Hour)
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "failed",
+		LastAttemptAt: &failureAt, LastFailureAt: &failureAt, NextCheckAt: &nextCheck,
+		ReleaseCount: 7, LastError: "provider unavailable", UpdatedAt: failureAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "standby", UpdatedAt: failureAt.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastFailure, lastError, storedNext string
+	var releaseCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT status,last_failure_at,last_error,next_check_at
+		FROM artist_provider_status WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).
+		Scan(&status, &lastFailure, &lastError, &storedNext); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT release_count FROM artist_provider_status
+		WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).Scan(&releaseCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != "standby" || lastFailure == "" || lastError != "provider unavailable" || storedNext == "" || releaseCount != 7 {
+		t.Fatalf("standby state lost failure evidence status=%q failure=%q error=%q next=%q releases=%d", status, lastFailure, lastError, storedNext, releaseCount)
 	}
 }
 
@@ -340,6 +402,84 @@ func TestResolveNotificationHoldDiscardsOwnerScopedHold(t *testing.T) {
 	}
 }
 
+func TestDiscardedNotificationHoldIsTerminalUntilRestored(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	userID, err := s.CreateUser(ctx, "hold-terminal@example.com", "hash", "member", "UTC", "hold-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences, err := s.NotificationPreferences(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences.HoldConflictingNotifications = true
+	if err := s.UpdateNotificationPreferences(ctx, preferences); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "hold-terminal-artist", Name: "Hold Terminal Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "hold-terminal-release", artist.ID, "Hold Terminal Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/hold-terminal-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,evidence_json,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, releaseID, "title_conflict", "warning", "hold-terminal-fingerprint", "title conflict", "[]", "open", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.QueueDueReleaseDays(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	holds, err := s.NotificationHoldsForRelease(ctx, userID, releaseID)
+	if err != nil || len(holds) != 1 {
+		t.Fatalf("initial holds=%#v err=%v", holds, err)
+	}
+	if err := s.ResolveNotificationHold(ctx, userID, holds[0].ID, "discard"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueDueReleaseDays(ctx, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if holds, err := s.NotificationHolds(ctx, userID, 20); err != nil || len(holds) != 0 {
+		t.Fatalf("discarded hold was recreated: holds=%#v err=%v", holds, err)
+	}
+	allHolds, err := s.NotificationHoldsForReleaseIncludingDiscarded(ctx, userID, releaseID)
+	if err != nil || len(allHolds) != 1 || allHolds[0].Status != "discarded" {
+		t.Fatalf("discarded hold projection=%#v err=%v", allHolds, err)
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `UPDATE release_evidence_issues SET status='resolved',resolved_at=? WHERE release_group_id=?`, nowText(), releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResolveNotificationHold(ctx, userID, allHolds[0].ID, "restore"); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 1)
+	var status string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM notification_holds WHERE id=?`, allHolds[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "released" {
+		t.Fatalf("restored hold status=%q, want released", status)
+	}
+}
+
 func TestWriteTransactionCancellationAndClosedDatabase(t *testing.T) {
 	s := testStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -398,6 +538,12 @@ func TestStoreFilterAndClassificationHelpers(t *testing.T) {
 			}
 		})
 	}
+	if got := releaseTypeEnabled(NotificationPreferences{Albums: false}, "Album", []string{"Compilation"}); !got {
+		t.Fatal("compilation was incorrectly controlled by the account Albums preference")
+	}
+	if got := releaseTypeEnabled(NotificationPreferences{Albums: false}, "Compilation"); !got {
+		t.Fatal("legacy compilation primary type was incorrectly controlled by the account Albums preference")
+	}
 
 	release := Release{Confidence: "confirmed"}
 	if got := calendarConfidenceLabel(release, true); got != "held for review" {
@@ -451,5 +597,98 @@ func TestStoreFilterAndClassificationHelpers(t *testing.T) {
 	}
 	if got := firstNonEmpty("", ""); got != "" {
 		t.Fatalf("empty first non-empty=%q", got)
+	}
+}
+
+func TestHealthyRequiresMigratedSchema(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	if err := s.Healthy(ctx); err != nil {
+		t.Fatalf("healthy migrated store=%v", err)
+	}
+	// A read-only connection can still read the migrated schema, while the
+	// separate write capability probe classifies why it cannot serve writes.
+	readOnly := &Store{DB: s.Reader}
+	if err := readOnly.Healthy(ctx); err != nil {
+		t.Fatalf("read-only schema health=%v", err)
+	}
+	err := readOnly.Writable(ctx)
+	var healthErr *DatabaseHealthError
+	if !errors.As(err, &healthErr) || healthErr.State != DatabaseReadOnly {
+		t.Fatalf("read-only health error=%v, want read_only", err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DROP TABLE schema_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Healthy(ctx); err == nil {
+		t.Fatal("healthy reported a database without the application schema")
+	}
+}
+
+func TestReadyRequiresWritableDatabase(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	if err := s.Ready(ctx); err != nil {
+		t.Fatalf("writable store readiness=%v", err)
+	}
+	readOnly := &Store{DB: s.Reader}
+	err := readOnly.Ready(ctx)
+	var healthErr *DatabaseHealthError
+	if !errors.As(err, &healthErr) || healthErr.State != DatabaseReadOnly {
+		t.Fatalf("read-only readiness=%v, want read_only", err)
+	}
+}
+
+func TestHealthyReadsThroughReaderWhileWriterTransactionIsOpen(t *testing.T) {
+	s := testStore(t)
+	tx, err := s.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if err := s.Healthy(ctx); err != nil {
+		t.Fatalf("reader-backed health probe blocked by writer transaction: %v", err)
+	}
+}
+
+func TestDatabaseHealthClassifiesWriteFailureStates(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want DatabaseHealthState
+	}{
+		{name: "readonly", err: errors.New("attempt to write a readonly database"), want: DatabaseReadOnly},
+		{name: "full", err: errors.New("database or disk is full"), want: DatabaseFull},
+		{name: "other", err: errors.New("database is locked"), want: DatabaseWriteFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyDatabaseHealthError(test.err); got != test.want {
+				t.Fatalf("classifyDatabaseHealthError(%q)=%q, want %q", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticsReportsLiveWriteHealthState(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	readOnly := &Store{DB: s.Reader}
+	snapshot, err := readOnly.Diagnostics(ctx)
+	if err != nil {
+		t.Fatalf("read-only diagnostics: %v", err)
+	}
+	if snapshot.DatabaseHealthy || snapshot.DatabaseHealthState != DatabaseReadOnly {
+		t.Fatalf("read-only diagnostics healthy=%v state=%q", snapshot.DatabaseHealthy, snapshot.DatabaseHealthState)
+	}
+
+	healthy, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatalf("healthy diagnostics: %v", err)
+	}
+	if !healthy.DatabaseHealthy || healthy.DatabaseHealthState != DatabaseHealthy {
+		t.Fatalf("healthy diagnostics healthy=%v state=%q", healthy.DatabaseHealthy, healthy.DatabaseHealthState)
 	}
 }

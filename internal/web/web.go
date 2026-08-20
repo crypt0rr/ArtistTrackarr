@@ -10,7 +10,6 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
-	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -42,8 +41,11 @@ type App struct {
 	importLimiter           *fixedWindowLimiter
 	importSlots             chan struct{}
 	providerLimiter         *fixedWindowLimiter
+	artworkLimiter          *fixedWindowLimiter
 	destinationTestLimiter  *fixedWindowLimiter
 	destinationRetryLimiter *fixedWindowLimiter
+	calendarFeedLimiter     *fixedWindowLimiter
+	passwordChangeLimiter   *fixedWindowLimiter
 	loginSlots              chan struct{}
 }
 
@@ -57,126 +59,6 @@ type UserView struct {
 	Role         string
 	Timezone     string
 	ReminderTime string
-}
-
-type PageData struct {
-	Title                    string
-	Version                  string
-	User                     *UserView
-	CSRF                     string
-	Error                    string
-	Message                  string
-	SetupNeeded              bool
-	Artists                  []store.Artist
-	Results                  []catalog.ArtistResult
-	SpotifyResults           []catalog.SpotifyArtist
-	ITunesResults            []catalog.ITunesArtist
-	UpcomingReleases         []store.Release
-	RecentReleases           []store.Release
-	CalendarDays             []CalendarDay
-	CalendarMonth            string
-	CalendarPrevMonth        string
-	CalendarNextMonth        string
-	CalendarICSURL           string
-	ReleaseCount             int
-	Preferences              store.NotificationPreferences
-	NotificationHolds        []store.NotificationHold
-	ReleaseNotificationHolds []store.NotificationHold
-	ReleaseDetail            *store.ReleaseDetail
-	ReleaseEvidenceIssues    []store.EvidenceIssue
-	ReleaseUnavailable       bool
-	Resolutions              []store.ArtistResolution
-	Resolution               *store.ArtistResolution
-	Destinations             []store.Destination
-	DestinationHealth        map[int64]store.DestinationHealth
-	History                  []store.DeliveryHistory
-	AdminHistory             []store.AdminDeliveryHistory
-	AdminDelivery            *store.AdminDeliveryHistory
-	AppLogs                  []logging.Entry
-	AdminUsers               []store.AdminUser
-	AdminArtists             []store.AdminArtist
-	ProviderHealth           []store.ProviderHealth
-	AdminDestinationHealth   []store.AdminDestinationHealth
-	ManualSyncs              []store.ManualSyncRequest
-	Import                   *store.ImportJob
-	FollowCount              int
-	FollowRules              map[int64]store.FollowNotificationRule
-	ListenBrainzArtists      []store.Artist
-	GenreBreakdown           []store.ArtistBreakdown
-	CountryBreakdown         []store.ArtistBreakdown
-	TypeBreakdown            []store.ArtistBreakdown
-	CoverageSummary          store.CoverageSummary
-	CoverageArtists          []store.ArtistCoverage
-	CoveragePage             int
-	CoveragePages            int
-	CoveragePrevPage         int
-	CoverageNextPage         int
-	CoveragePrevURL          string
-	CoverageNextURL          string
-	CoveragePageLinks        []PaginationLink
-	CoveragePageStart        int
-	CoveragePageEnd          int
-	AssuranceSummary         store.AssuranceSummary
-	Diagnostics              store.DiagnosticsSnapshot
-	Retention                store.RetentionReport
-	OperationalStatus        string
-	OperationalReasons       []string
-	OperationalSnapshots     []store.OperationalSnapshot
-	RunnerStatus             jobs.RunnerStatus
-	DiagnosticReport         string
-	EvidenceIssues           []store.EvidenceIssue
-	EvidenceIssueCount       int
-	EvidenceIssueUnreadCount int
-	EvidenceIssueStatus      string
-	EvidenceIssueState       string
-	EvidenceIssueType        string
-	EvidenceIssueSeverity    string
-	EvidenceIssuePage        int
-	EvidenceIssuePages       int
-	EvidenceIssuePrevURL     string
-	EvidenceIssueNextURL     string
-	EvidenceIssuePageLinks   []PaginationLink
-	EvidenceIssuePageStart   int
-	EvidenceIssuePageEnd     int
-	EvidenceIssueURL         string
-	GenreFilter              string
-	CountryFilter            string
-	TypeFilter               string
-	InboxItems               []store.ReleaseInboxItem
-	InboxUnreadCount         int
-	InboxCount               int
-	InboxState               string
-	InboxSource              string
-	InboxType                string
-	InboxPage                int
-	InboxPages               int
-	InboxPrevURL             string
-	InboxNextURL             string
-	InboxPageLinks           []PaginationLink
-	InboxPageStart           int
-	InboxPageEnd             int
-	InboxURL                 string
-	AdminPage                int
-	AdminPages               int
-	AdminPrevPage            int
-	AdminNextPage            int
-	ArtistPage               int
-	ArtistPages              int
-	ArtistPrevPage           int
-	ArtistNextPage           int
-	ArtistPrevURL            string
-	ArtistNextURL            string
-	ArtistPageLinks          []PaginationLink
-	ArtistPageStart          int
-	ArtistPageEnd            int
-	FilteredArtistCount      int
-	Query                    string
-	GeneratedURL             string
-	Token                    string
-	TokenKind                string
-	TokenEmail               string
-	SpotifyOn                bool
-	ProviderNotice           string
 }
 
 func followDeliveryLabel(mode string) string {

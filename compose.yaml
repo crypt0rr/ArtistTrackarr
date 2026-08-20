@@ -23,13 +23,14 @@ services:
       APP_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       SESSION_SECRET_FILE: /run/secrets/session_secret
       SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
-      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
+      SPOTIFY_CLIENT_SECRET_FILE: /run/secrets/spotify_client_secret
       SPOTIFY_MARKET: "${SPOTIFY_MARKET:-US}"
       ITUNES_MARKET: "${ITUNES_MARKET:-US}"
     secrets:
       - setup_token
       - encryption_key
       - session_secret
+      - spotify_client_secret
     volumes:
       - artist-tracker-data:/data
     healthcheck:
@@ -53,3 +54,5 @@ secrets:
     environment: APP_ENCRYPTION_KEY
   session_secret:
     environment: SESSION_SECRET
+  spotify_client_secret:
+    environment: SPOTIFY_CLIENT_SECRET

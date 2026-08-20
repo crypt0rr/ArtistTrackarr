@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -57,11 +56,11 @@ func (a *App) setup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := a.data(r, "Create administrator")
-		d.Error = err.Error()
+		d.Error = safeActionMessage(err, "The administrator account could not be created. Please try again.")
 		a.render(w, "setup", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Administrator+created", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Administrator created"), http.StatusSeeOther)
 }
 func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 	if _, ok := currentSession(r); ok {
@@ -85,18 +84,20 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
-	key := clientIP + "|" + email
-	allowed, err := a.store.LoginAllowed(r.Context(), key)
-	if err != nil {
-		a.logger.Error("login throttling lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
-		http.Error(w, "could not sign in", http.StatusInternalServerError)
-		return
-	}
-	if !allowed {
-		d := a.data(r, "Sign in")
-		d.Error = "Too many attempts. Try again in 15 minutes."
-		a.render(w, "login", d, http.StatusTooManyRequests)
-		return
+	keys := loginThrottleKeys(clientIP, email)
+	for _, key := range keys {
+		allowed, err := a.store.LoginAllowed(r.Context(), key)
+		if err != nil {
+			a.logger.Error("login throttling lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
+			http.Error(w, "could not sign in", http.StatusInternalServerError)
+			return
+		}
+		if !allowed {
+			d := a.data(r, "Sign in")
+			d.Error = "Too many attempts. Try again in 15 minutes."
+			a.render(w, "login", d, http.StatusTooManyRequests)
+			return
+		}
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -113,14 +114,17 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		_ = security.CheckPassword(security.DummyPasswordHash, r.FormValue("password"))
 	}
 	if err != nil || !passwordValid {
-		_ = a.store.RecordLoginFailure(r.Context(), key)
-		time.Sleep(250 * time.Millisecond)
+		for _, key := range keys {
+			_ = a.store.RecordLoginFailure(r.Context(), key)
+		}
 		d := a.data(r, "Sign in")
 		d.Error = "Email or password is incorrect."
 		a.render(w, "login", d, http.StatusUnauthorized)
 		return
 	}
-	a.store.ClearLoginFailures(r.Context(), key)
+	for _, key := range keys {
+		a.store.ClearLoginFailures(r.Context(), key)
+	}
 	raw, _, err := a.store.CreateSession(r.Context(), user.ID, sessionLifetime)
 	if err != nil {
 		a.logger.Error("create session", "user_id", user.ID, "error", err)
@@ -140,7 +144,11 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 			_ = a.store.DeleteSession(r.Context(), raw)
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: "artist_session", Path: "/", MaxAge: -1, HttpOnly: true})
+	w.Header().Set("Clear-Site-Data", `"cache", "cookies", "storage"`)
+	http.SetCookie(w, &http.Cookie{
+		Name: "artist_session", Path: "/", MaxAge: -1, HttpOnly: true,
+		Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 func (a *App) tokenForm(kind string) http.HandlerFunc {
@@ -166,12 +174,33 @@ func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			digest := security.Digest(chi.URLParam(r, "token"))
+			a.logger.Warn("invitation acceptance failed", "page", "Accept invitation", "route", "/invite/{token}",
+				"token_fingerprint", fmt.Sprintf("%x", digest[:6]), "error", err)
+		}
 		d := a.data(r, "Accept invitation")
-		d.Error, d.Token, d.TokenKind = "Invitation is invalid, expired, or already used: "+err.Error(), chi.URLParam(r, "token"), "invite"
+		d.Error, d.Token, d.TokenKind = invitationErrorMessage(err), chi.URLParam(r, "token"), "invite"
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Account+created", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Account created"), http.StatusSeeOther)
+}
+
+// invitationErrorMessage intentionally keeps token-backed account errors
+// generic. Validation errors are actionable without exposing database details;
+// the full cause is retained in the structured server log above.
+func invitationErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, store.ErrInvalidUsername):
+		return "Invitation is invalid, expired, or already used. Choose a username with 3–32 letters, numbers, dots, underscores, or hyphens."
+	case errors.Is(err, store.ErrUsernameTaken):
+		return "Invitation is invalid, expired, or already used. That username is already in use; choose another."
+	case strings.Contains(strings.ToLower(err.Error()), "invalid iana timezone"):
+		return "Invitation is invalid, expired, or already used. Choose a valid IANA timezone."
+	default:
+		return "Invitation is invalid, expired, or already used. Check your details and try again."
+	}
 }
 func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
 	_, release, ok := a.acquirePasswordSlot(w, r, a.tokenLimiter, 300, "too many password reset attempts; try again later")
@@ -194,7 +223,7 @@ func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Password+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Password updated"), http.StatusSeeOther)
 }
 
 // acquirePasswordSlot bounds the expensive Argon2 work used by login and
@@ -239,12 +268,18 @@ func (a *App) clientIP(r *http.Request) string {
 			return candidate.String()
 		}
 	}
-	if len(forwarded) > 0 {
-		if candidate := net.ParseIP(strings.TrimSpace(forwarded[0])); candidate != nil {
-			return candidate.String()
-		}
-	}
+	// If every forwarded entry is trusted (or malformed), there is no
+	// trustworthy client identity in the header. Use the direct peer instead
+	// of accepting a caller-controlled leftmost value as a throttling key.
 	return host
+}
+
+// loginThrottleKeys applies both the peer identity and an account identity.
+// The peer key protects a single source while the account key keeps failures
+// throttled when an attacker rotates addresses through a trusted proxy.
+func loginThrottleKeys(clientIP, email string) []string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	return []string{clientIP + "|" + email, "account:" + email}
 }
 
 func (a *App) trustedProxy(ip net.IP) bool {

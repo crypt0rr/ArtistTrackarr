@@ -63,12 +63,22 @@ func TestManualSyncAdmissionIsAtomicAndBounded(t *testing.T) {
 		t.Fatalf("queued duplicate count=%d, want 1", count)
 	}
 
+	// Spread the global-cap fixture over several household members so the
+	// per-user admission limit does not mask the global queue boundary.
+	queuedUsers := []int64{userID}
+	for i := 0; i < 4; i++ {
+		queuedUser, createErr := s.CreateUser(ctx, "manual-admission-"+strconv.Itoa(i)+"@example.com", "hash", "member", "UTC", "manual-admission-"+strconv.Itoa(i))
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		queuedUsers = append(queuedUsers, queuedUser)
+	}
 	for i := 0; i < maxQueuedManualSyncRequests-1; i++ {
 		queuedArtist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: "manual-admission-" + strconv.Itoa(i), Name: "Queued Artist"})
 		if upsertErr != nil {
 			t.Fatal(upsertErr)
 		}
-		if _, requestErr := s.CreateManualSyncRequest(ctx, userID, "artist", &queuedArtist.ID); requestErr != nil {
+		if _, requestErr := s.CreateManualSyncRequest(ctx, queuedUsers[i%len(queuedUsers)], "artist", &queuedArtist.ID); requestErr != nil {
 			t.Fatalf("fill queue at %d: %v", i, requestErr)
 		}
 	}
@@ -79,6 +89,67 @@ func TestManualSyncAdmissionIsAtomicAndBounded(t *testing.T) {
 	}
 	if _, err := s.CreateManualSyncRequest(ctx, userID, "artist", &lastArtist.ID); !errors.Is(err, ErrManualSyncQueueFull) {
 		t.Fatalf("full queue error=%v, want %v", err, ErrManualSyncQueueFull)
+	}
+}
+
+func TestManualSyncAdmissionIsFairAcrossUsers(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	firstUser, err := s.CreateUser(ctx, "manual-fair-first@example.com", "hash", "member", "UTC", "manual-fair-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondUser, err := s.CreateUser(ctx, "manual-fair-second@example.com", "hash", "member", "UTC", "manual-fair-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		artist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: "manual-fair-first-" + strconv.Itoa(i), Name: "First queued artist"})
+		if upsertErr != nil {
+			t.Fatal(upsertErr)
+		}
+		if _, requestErr := s.CreateManualSyncRequest(ctx, firstUser, "artist", &artist.ID); requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	}
+	secondArtist, err := s.UpsertArtist(ctx, Artist{MBID: "manual-fair-second", Name: "Second queued artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateManualSyncRequest(ctx, secondUser, "artist", &secondArtist.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimManualSyncRequests(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 || claimed[0].RequestedBy != firstUser || claimed[1].RequestedBy != secondUser {
+		t.Fatalf("manual claims were not owner-interleaved: %#v", claimed)
+	}
+}
+
+func TestManualSyncAdmissionCapsEachUser(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "manual-per-user@example.com", "hash", "member", "UTC", "manual-per-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxQueuedManualSyncRequestsPerUser; i++ {
+		artist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: "manual-per-user-" + strconv.Itoa(i), Name: "Per-user queued artist"})
+		if upsertErr != nil {
+			t.Fatal(upsertErr)
+		}
+		if _, requestErr := s.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); requestErr != nil {
+			t.Fatalf("per-user queue at %d: %v", i, requestErr)
+		}
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "manual-per-user-overflow", Name: "Per-user overflow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); !errors.Is(err, ErrManualSyncQueueFull) {
+		t.Fatalf("per-user queue error=%v, want %v", err, ErrManualSyncQueueFull)
 	}
 }
 
@@ -200,7 +271,7 @@ func TestProviderHealthAndAdminArtistQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	followed, err := s.UpsertArtist(ctx, Artist{MBID: "health-followed", Name: "Followed", SortName: "Followed", Type: "Group", Country: "NL"})
+	followed, err := s.UpsertArtist(ctx, Artist{MBID: "health-followed", Name: "Followed", SortName: "Followed", Type: "Group", Country: "NL", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,12 +281,16 @@ func TestProviderHealthAndAdminArtistQueries(t *testing.T) {
 	if added, err := s.Follow(ctx, userID, followed.ID); err != nil || !added {
 		t.Fatalf("follow artist: added=%v err=%v", added, err)
 	}
+	future := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=? WHERE id=?`, timeText(future), timeText(future), followed.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.MarkAllArtistsDue(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var next string
-	if err := s.DB.QueryRowContext(ctx, `SELECT next_check_at FROM artists WHERE id=?`, followed.ID).Scan(&next); err != nil || next == "" {
-		t.Fatalf("artist was not marked due: next=%q err=%v", next, err)
+	var next, spotifyNext string
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_check_at,spotify_next_check_at FROM artists WHERE id=?`, followed.ID).Scan(&next, &spotifyNext); err != nil || next == "" || spotifyNext == "" {
+		t.Fatalf("artist was not marked due: next=%q spotify_next=%q err=%v", next, spotifyNext, err)
 	}
 	got, err := s.ArtistByID(ctx, followed.ID)
 	if err != nil || got.ID != followed.ID || got.Country != "NL" || got.Type != "Group" {

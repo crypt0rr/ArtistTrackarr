@@ -1,9 +1,13 @@
 package notify
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/containrrr/shoutrrr"
 	"github.com/containrrr/shoutrrr/pkg/types"
@@ -21,6 +26,59 @@ import (
 type NotificationSender interface {
 	Validate(string) error
 	Send(context.Context, string, string, string) error
+}
+
+// MessageLimitError identifies a payload that cannot be delivered safely by
+// the selected transport.  Delivery workers persist this error and apply the
+// normal retry policy, while the explicit message avoids silently dropping
+// content inside a provider library.
+type MessageLimitError struct {
+	Service string
+	Limit   int
+	Length  int
+	Unit    string
+}
+
+func (e *MessageLimitError) Error() string {
+	if e == nil {
+		return "notification message exceeds transport limit"
+	}
+	return fmt.Sprintf("%s notification message exceeds the %d %s transport limit (got %d)", e.Service, e.Limit, e.Unit, e.Length)
+}
+
+const (
+	telegramMessageLimit   = 4096 // Telegram counts Unicode characters.
+	discordMessageLimit    = 6000 // Shoutrrr chunks Discord messages up to this total.
+	notificationTitleLimit = 1024
+	// Generic webhooks and ntfy do not expose one portable server-side limit.
+	// Keep payloads bounded so a provider-controlled title/body cannot consume
+	// unbounded memory or request bandwidth. This is above every application-
+	// generated digest and release message.
+	genericMessageLimitBytes = 64 << 10
+)
+
+func validateNotificationMessage(serviceURL, title, body string) error {
+	scheme := strings.ToLower(parsedScheme(serviceURL))
+	if length := utf8.RuneCountInString(title); length > notificationTitleLimit {
+		return &MessageLimitError{Service: strings.ToUpper(scheme), Limit: notificationTitleLimit, Length: length, Unit: "title characters"}
+	}
+	switch scheme {
+	case "telegram":
+		// The final Telegram representation is assembled in sendTelegram after
+		// its parse-mode options are read, so it is checked there.
+		return nil
+	case "discord":
+		length := utf8.RuneCountInString(title) + utf8.RuneCountInString(body)
+		if length > discordMessageLimit {
+			return &MessageLimitError{Service: "Discord", Limit: discordMessageLimit, Length: length, Unit: "characters"}
+		}
+	case "ntfy", "generic+http", "generic+https":
+		length := len([]byte(body))
+		if length > genericMessageLimitBytes {
+			return &MessageLimitError{Service: strings.ToUpper(scheme), Limit: genericMessageLimitBytes, Length: length, Unit: "bytes"}
+		}
+	}
+	return nil
 }
 
 // ErrUnsupportedTransport is returned before Shoutrrr is allowed to create a
@@ -90,23 +148,35 @@ type ShoutrrrSender struct {
 	dial     func(context.Context, string, string) (net.Conn, error)
 }
 
-const DefaultSendTimeout = 15 * time.Second
+// Shoutrrr's router uses a ten-second per-send timeout. Keeping the
+// application deadline aligned prevents a caller from waiting longer than
+// the compatibility layer can deliver and makes retry timing predictable.
+const DefaultSendTimeout = 10 * time.Second
 
 var notificationHTTPClientMu sync.Mutex
 
-// ConfigureHTTPClient installs the bounded client used by Shoutrrr's HTTP
-// services. Redirects are checked again so a public endpoint cannot redirect
-// a notification into a private network.
-func ConfigureHTTPClient(timeout time.Duration, allowPrivateTargets bool) {
+// NewShoutrrrSender constructs one sender-owned HTTP client and transport for
+// the application lifetime. Individual sends still use shallow client copies
+// so request contexts and observers remain isolated, while the underlying
+// keep-alive transport is reused across destinations.
+func NewShoutrrrSender(allowPrivateTargets bool, timeout time.Duration) ShoutrrrSender {
 	if timeout <= 0 {
 		timeout = DefaultSendTimeout
 	}
-	notificationHTTPClientMu.Lock()
-	defer notificationHTTPClientMu.Unlock()
-	client := newHTTPClient(timeout, allowPrivateTargets, net.DefaultResolver.LookupIP,
-		(&net.Dialer{Timeout: timeout}).DialContext)
-	http.DefaultClient = client
-	jsonclient.DefaultClient = jsonclient.NewWithHTTPClient(client)
+	return ShoutrrrSender{
+		AllowPrivateTargets: allowPrivateTargets,
+		SendTimeout:         timeout,
+		client:              newHTTPClient(timeout, allowPrivateTargets, nil, nil),
+	}
+}
+
+// CloseIdleConnections releases pooled notification connections during a
+// graceful application shutdown. It is safe to call when the sender was
+// created as a zero value in tests.
+func (s ShoutrrrSender) CloseIdleConnections() {
+	if s.client != nil {
+		s.client.CloseIdleConnections()
+	}
 }
 
 func newHTTPClient(timeout time.Duration, allowPrivateTargets bool,
@@ -143,7 +213,11 @@ func newHTTPClient(timeout time.Duration, allowPrivateTargets bool,
 
 func (s ShoutrrrSender) httpClient() *http.Client {
 	if s.client != nil {
-		return s.client
+		client := *s.client
+		if client.Timeout <= 0 || client.Timeout > s.sendTimeout() {
+			client.Timeout = s.sendTimeout()
+		}
+		return &client
 	}
 	return newHTTPClient(s.sendTimeout(), s.AllowPrivateTargets, s.lookupIP, s.dial)
 }
@@ -302,9 +376,25 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := ValidateTransportPolicy(serviceURL); err != nil {
 		return err
 	}
+	if err := validateNotificationMessage(serviceURL, title, body); err != nil {
+		return err
+	}
 	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
 	defer cancel()
 	if err := validateOutboundTargetWithLookup(sendCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP); err != nil {
+		return err
+	}
+	// Shoutrrr's Telegram service reaches jsonclient.DefaultClient through a
+	// package-level singleton. Use the Telegram Bot API directly so this
+	// transport never needs to swap process-global clients, and its request
+	// carries the caller's cancellation/timeout context all the way to the
+	// sender-owned HTTP client.
+	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
+		started := time.Now()
+		err := s.sendTelegram(sendCtx, serviceURL, title, body)
+		if observer != nil {
+			observer(0, time.Since(started))
+		}
 		return err
 	}
 	// Several Shoutrrr services dereference http.DefaultClient internally.
@@ -371,9 +461,171 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	return nil
 }
 
+type telegramSendPayload struct {
+	Text                string `json:"text"`
+	ChatID              string `json:"chat_id"`
+	MessageThreadID     *int   `json:"message_thread_id,omitempty"`
+	ParseMode           string `json:"parse_mode,omitempty"`
+	DisablePreview      bool   `json:"disable_web_page_preview"`
+	DisableNotification bool   `json:"disable_notification"`
+}
+
+type telegramSendResponse struct {
+	OK          bool   `json:"ok"`
+	ErrorCode   int    `json:"error_code"`
+	Description string `json:"description"`
+}
+
+func parsedScheme(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed == nil {
+		return ""
+	}
+	return parsed.Scheme
+}
+
+func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, body string) error {
+	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || parsed == nil || !strings.EqualFold(parsed.Scheme, "telegram") {
+		return ErrUnsupportedTransport
+	}
+	if parsed.User == nil {
+		return errors.New("telegram bot token is invalid")
+	}
+	password, hasPassword := parsed.User.Password()
+	if !hasPassword {
+		return errors.New("telegram bot token is invalid")
+	}
+	token := parsed.User.Username() + ":" + password
+	if !telegramTokenPattern.MatchString(token) {
+		return errors.New("telegram bot token is invalid")
+	}
+	query := parsed.Query()
+	for _, option := range []string{"preview", "notification"} {
+		value := strings.TrimSpace(query.Get(option))
+		if value != "" && !telegramOptionPattern.MatchString(value) {
+			return errors.New("telegram option is invalid")
+		}
+	}
+	chats := append([]string{}, query["chats"]...)
+	if len(chats) == 0 {
+		chats = append(chats, query["channels"]...)
+	}
+	var expandedChats []string
+	for _, value := range chats {
+		for _, chat := range strings.Split(value, ",") {
+			if chat = strings.TrimSpace(chat); chat != "" {
+				expandedChats = append(expandedChats, chat)
+			}
+		}
+	}
+	if len(expandedChats) == 0 {
+		return errors.New("telegram chat is required")
+	}
+	parseMode := strings.TrimSpace(query.Get("parsemode"))
+	if strings.EqualFold(parseMode, "none") {
+		parseMode = ""
+	}
+	if parseMode != "" && !telegramParseModePattern.MatchString(parseMode) {
+		return errors.New("telegram parse mode is invalid")
+	}
+	switch strings.ToLower(parseMode) {
+	case "markdown":
+		parseMode = "Markdown"
+	case "markdownv2":
+		parseMode = "MarkdownV2"
+	case "html":
+		parseMode = "HTML"
+	}
+	message := body
+	if strings.TrimSpace(title) != "" {
+		switch parseMode {
+		case "":
+			parseMode = "HTML"
+			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), html.EscapeString(message))
+		case "HTML":
+			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), message)
+		}
+	}
+	if length := utf8.RuneCountInString(message); length > telegramMessageLimit {
+		return &MessageLimitError{Service: "Telegram", Limit: telegramMessageLimit, Length: length, Unit: "characters"}
+	}
+	preview := !telegramOptionDisabled(query.Get("preview"))
+	notification := !telegramOptionDisabled(query.Get("notification"))
+	client := s.httpClient()
+	for _, chat := range expandedChats {
+		chatID, thread, hasThread := strings.Cut(chat, ":")
+		if strings.TrimSpace(chatID) == "" {
+			return errors.New("telegram chat is invalid")
+		}
+		var threadID *int
+		if hasThread {
+			parsedThread, parseErr := strconv.Atoi(thread)
+			if parseErr != nil {
+				return errors.New("telegram message thread is invalid")
+			}
+			threadID = &parsedThread
+		}
+		payload := telegramSendPayload{
+			Text:                message,
+			ChatID:              chatID,
+			MessageThreadID:     threadID,
+			ParseMode:           parseMode,
+			DisablePreview:      !preview,
+			DisableNotification: !notification,
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		endpoint := "https://api.telegram.org/bot" + token + "/sendMessage"
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			return err
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		var result telegramSendResponse
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+				return fmt.Errorf("telegram API returned %s", response.Status)
+			}
+			return fmt.Errorf("telegram API returned an invalid response")
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || !result.OK {
+			if result.Description != "" {
+				return fmt.Errorf("telegram API error %d: %s", result.ErrorCode, result.Description)
+			}
+			return fmt.Errorf("telegram API returned %s", response.Status)
+		}
+	}
+	return nil
+}
+
+func telegramOptionDisabled(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
 var (
-	destinationURLPattern = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
-	credentialPattern     = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
+	destinationURLPattern    = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+	credentialPattern        = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
+	bearerPattern            = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+	telegramTokenPattern     = regexp.MustCompile(`^[0-9]+:[a-zA-Z0-9_-]+$`)
+	telegramParseModePattern = regexp.MustCompile(`(?i)^(markdown|markdownv2|html)$`)
+	telegramOptionPattern    = regexp.MustCompile(`(?i)^(0|1|true|false|yes|no|on|off)$`)
 )
 
 // RedactError removes service URLs and common credential query parameters from
@@ -386,6 +638,7 @@ func RedactError(err error) string {
 	}
 	message := destinationURLPattern.ReplaceAllString(err.Error(), "[redacted destination]")
 	message = credentialPattern.ReplaceAllString(message, "$1=[redacted]")
+	message = bearerPattern.ReplaceAllString(message, "Bearer [redacted]")
 	return strings.TrimSpace(message)
 }
 
@@ -442,19 +695,102 @@ func outboundHost(parsed *url.URL) string {
 }
 
 func isBlockedHost(host string, allowPrivate bool) bool {
+	if allowPrivate {
+		return false
+	}
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
 	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
-		return !allowPrivate
+		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
+		return isBlockedIP(ip, allowPrivate)
+	}
+	// Some URL parsers and libc resolvers accept the historical inet_aton
+	// spellings of IPv4 addresses (for example 2130706433, 0x7f000001, or
+	// 0177.0.0.1). Treat those forms as IP literals before DNS resolution so
+	// an obfuscated loopback/private target cannot pass the hostname check.
+	if ip := parseLegacyIPv4(host); ip != nil {
 		return isBlockedIP(ip, allowPrivate)
 	}
 	return false
 }
 
+// parseLegacyIPv4 recognizes the numeric IPv4 forms accepted by common URL
+// and socket implementations. It deliberately returns nil for ordinary DNS
+// names so they continue through the resolver and are checked again at dial
+// time. Components use the inet_aton bases (decimal, 0x-prefixed hex, or
+// leading-zero octal) and may contain one to four components.
+func parseLegacyIPv4(host string) net.IP {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.HasSuffix(host, ".") {
+		return nil
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return nil
+	}
+	values := make([]uint64, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			return nil
+		}
+		base := 10
+		digits := part
+		if strings.HasPrefix(strings.ToLower(part), "0x") {
+			base, digits = 16, part[2:]
+		} else if len(part) > 1 && strings.HasPrefix(part, "0") {
+			base = 8
+		}
+		if digits == "" {
+			return nil
+		}
+		value, err := strconv.ParseUint(digits, base, 32)
+		if err != nil {
+			// A leading-zero component containing 8 or 9 is not valid octal,
+			// but it may still be a decimal hostname label. Do not classify it
+			// as an IP literal in that case.
+			return nil
+		}
+		values[i] = value
+	}
+	var value uint64
+	switch len(values) {
+	case 1:
+		value = values[0]
+	case 2:
+		if values[0] > 0xff || values[1] > 0xffffff {
+			return nil
+		}
+		value = values[0]<<24 | values[1]
+	case 3:
+		if values[0] > 0xff || values[1] > 0xff || values[2] > 0xffff {
+			return nil
+		}
+		value = values[0]<<24 | values[1]<<16 | values[2]
+	case 4:
+		for _, part := range values {
+			if part > 0xff {
+				return nil
+			}
+		}
+		value = values[0]<<24 | values[1]<<16 | values[2]<<8 | values[3]
+	}
+	if value > 0xffffffff {
+		return nil
+	}
+	return net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value))
+}
+
 func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	if allowPrivate {
 		return false
+	}
+	// IPv4-mapped IPv6 addresses inherit the IPv4 policy. Without this
+	// conversion, an address such as ::ffff:127.0.0.1 can bypass the
+	// loopback/private checks below on platforms where net.IP reports it as
+	// a 16-byte value.
+	if v4 := ip.To4(); v4 != nil && len(ip) == net.IPv6len {
+		return isBlockedIP(v4, false)
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
@@ -464,6 +800,7 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	// reserved address blocks as global-unicast. They are not public service
 	// destinations, however, and should not be reachable through a webhook.
 	for _, cidr := range []string{
+		"0.0.0.0/8",       // this-network/reserved addresses
 		"100.64.0.0/10",   // RFC 6598 shared address space
 		"192.0.0.0/24",    // IETF protocol assignments
 		"192.0.2.0/24",    // TEST-NET-1
@@ -472,6 +809,10 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 		"203.0.113.0/24",  // TEST-NET-3
 		"240.0.0.0/4",     // reserved/future use
 		"2001:db8::/32",   // IPv6 documentation
+		"2001::/32",       // Teredo transition addresses
+		"2002::/16",       // 6to4 transition addresses
+		"64:ff9b::/96",    // well-known NAT64 prefix
+		"64:ff9b:1::/48",  // network-specific NAT64 prefix
 	} {
 		if _, network, err := net.ParseCIDR(cidr); err == nil && network.Contains(ip) {
 			return true
@@ -500,12 +841,12 @@ func BuildURL(input DestinationInput) (string, error) {
 		return strings.TrimSpace(input.RawURL), nil
 	case "discord":
 		if input.Token == "" || input.Target == "" {
-			return "", errors.New("Discord token and channel/webhook ID are required")
+			return "", errors.New("discord token and channel/webhook ID are required")
 		}
 		return "discord://" + url.PathEscape(input.Token) + "@" + url.PathEscape(input.Target), nil
 	case "telegram":
 		if input.Token == "" || input.Target == "" {
-			return "", errors.New("Telegram bot token and chat are required")
+			return "", errors.New("telegram bot token and chat are required")
 		}
 		q := url.Values{"chats": []string{input.Target}}
 		return "telegram://" + url.PathEscape(input.Token) + "@telegram?" + q.Encode(), nil
@@ -524,7 +865,7 @@ func BuildURL(input DestinationInput) (string, error) {
 		return u.String(), nil
 	case "gotify":
 		if input.Host == "" || input.Token == "" {
-			return "", errors.New("Gotify host and token are required")
+			return "", errors.New("gotify host and token are required")
 		}
 		return (&url.URL{Scheme: "gotify", Host: input.Host, Path: "/" + input.Token}).String(), nil
 	case "generic":

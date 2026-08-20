@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
-FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS dependencies
+FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS dependencies
 WORKDIR /src
 RUN apk add --no-cache ca-certificates tzdata
 COPY go.mod go.sum* ./
@@ -9,7 +9,22 @@ FROM dependencies AS test
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go vet ./... && go test ./...
+    go vet ./... && go test -p 1 ./... -count=1
+
+# The test stage is intentionally fast and is used by the regular image
+# smoke-build. The quality stage is the reproducible, resource-bounded gate
+# for local release validation: it serializes race tests and runs the same
+# pinned lint and vulnerability tools as CI.
+FROM dependencies AS quality
+COPY . .
+RUN apk add --no-cache build-base
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go vet ./... && \
+    go test -p 1 ./... -count=1 && \
+    go test -race -p 1 ./... -count=1 && \
+    go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.0 run ./... && \
+    go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 FROM dependencies AS build
 COPY . .

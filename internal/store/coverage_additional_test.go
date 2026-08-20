@@ -333,6 +333,32 @@ func TestCreateArtistResolutionValidatesProviderIdentity(t *testing.T) {
 	}
 }
 
+func TestArtistProviderIdentityPersistsAndPreventsCrossCanonicalReuse(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	first, err := s.UpsertArtist(ctx, Artist{MBID: "itunes-canonical-one", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.UpsertArtist(ctx, Artist{MBID: "itunes-canonical-two", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveArtistProviderIdentity(ctx, first.ID, "itunes", "101", "https://music.apple.com/artist/example/101"); err != nil {
+		t.Fatal(err)
+	}
+	identity, found, err := s.ArtistProviderIdentity(ctx, first.ID, "itunes")
+	if err != nil || !found || identity.ProviderID != "101" || identity.ProviderURL == "" {
+		t.Fatalf("identity=%#v found=%v err=%v", identity, found, err)
+	}
+	if err := s.SaveArtistProviderIdentity(ctx, second.ID, "itunes", "101", "https://music.apple.com/artist/example/101"); err == nil {
+		t.Fatal("same iTunes artist was assigned to two canonical artists")
+	}
+	if _, found, err := s.ArtistProviderIdentity(ctx, second.ID, "itunes"); err != nil || found {
+		t.Fatalf("second identity found=%v err=%v after rejected mapping", found, err)
+	}
+}
+
 func TestCompleteArtistResolutionPersistsGenresWithoutProviderLeakage(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -863,6 +889,64 @@ func TestQueueDueReleaseDaysSkipsInvalidAndFutureSchedules(t *testing.T) {
 	assertEventCount(t, s, lateUser, "release_day", 1)
 }
 
+func TestQueueDueReleaseDaysDescribesCreditedFollowedArtist(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	userID, err := s.CreateUser(ctx, "release-day-credit@example.com", "hash", "member", "UTC", "release-day-credit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.UpsertArtist(ctx, Artist{MBID: "release-day-credit-primary", Name: "Release Day Primary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := s.UpsertArtist(ctx, Artist{MBID: "release-day-credit-guest", Name: "Release Day Guest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, guest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Release-day credit", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "release-day-credit-release", primary.ID, "Shared Release Day", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/release-day-credit-release",
+		"musicbrainz", timeText(now), timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_credits
+		(release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,provider_url,confidence,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, releaseID, guest.ID, "musicbrainz", "release-day-credit-recording", "guest", "Guest track",
+		"Release Day Primary feat. Release Day Guest", "https://musicbrainz.org/recording/release-day-credit-recording", "confirmed", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueueDueReleaseDays(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	var title, body string
+	if err := s.DB.QueryRowContext(ctx, `SELECT title,body FROM notification_events WHERE user_id=? AND release_group_id=? AND event_type='release_day'`, userID, releaseID).Scan(&title, &body); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Guest appearance released today: Shared Release Day" {
+		t.Fatalf("title=%q, want credited release-day title", title)
+	}
+	if !strings.Contains(body, "Release Day Guest is credited on \"Shared Release Day\", released today.") ||
+		!strings.Contains(body, "Release Day Guest (guest)") {
+		t.Fatalf("body=%q, missing credited artist context", body)
+	}
+}
+
 func TestLegacyUsernameMigrationSanitizesAndSuffixesRows(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -1023,6 +1107,13 @@ func TestITunesFallbackMigrationFaultRollsBackBeforeMarkerAndCanRerun(t *testing
 	}
 	if err := (&Store{DB: db}).migrateITunesFallback(ctx); err != nil {
 		t.Fatalf("rerun migration failed: %v", err)
+	}
+	var foreignKeys int
+	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatal(err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign key enforcement=%d after successful migration, want enabled", foreignKeys)
 	}
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("rerun marker count=%d err=%v", count, err)

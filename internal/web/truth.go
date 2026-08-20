@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -51,6 +50,6 @@ func (a *App) releaseTruthAction(w http.ResponseWriter, r *http.Request) {
 	if action == "clear" {
 		message = "Release source decision cleared"
 	}
-	redirect := "/releases/" + strconv.FormatInt(id, 10) + "?message=" + url.QueryEscape(message)
+	redirect := "/releases/" + strconv.FormatInt(id, 10) + "?" + a.statusQuery(message)
 	http.Redirect(w, r, redirect, http.StatusSeeOther)
 }

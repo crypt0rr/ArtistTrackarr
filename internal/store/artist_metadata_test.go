@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -131,6 +132,48 @@ func TestArtistMetadataFiltersStatsAndScheduling(t *testing.T) {
 	}
 }
 
+func TestFollowBringsSpotifyScheduleForwardForNewFollower(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	firstUser, err := s.CreateUser(ctx, "first-follower@example.com", "hash", "member", "UTC", "first-follower")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondUser, err := s.CreateUser(ctx, "second-follower@example.com", "hash", "member", "UTC", "second-follower")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "new-follower-schedule", Name: "Scheduled Artist", SpotifyID: "0OdUWJ0sBjDrqHygGUXeCF"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added, err := s.Follow(ctx, firstUser, artist.ID); err != nil || !added {
+		t.Fatalf("first follow added=%v err=%v", added, err)
+	}
+	future := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=? WHERE id=?`, timeText(future), timeText(future), artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if added, err := s.Follow(ctx, secondUser, artist.ID); err != nil || !added {
+		t.Fatalf("second follow added=%v err=%v", added, err)
+	}
+	var next, spotifyNext string
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_check_at,spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&next, &spotifyNext); err != nil {
+		t.Fatal(err)
+	}
+	nextAt, err := time.Parse(time.RFC3339Nano, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spotifyAt, err := time.Parse(time.RFC3339Nano, spotifyNext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextAt.After(time.Now().UTC().Add(time.Second)) || spotifyAt.After(time.Now().UTC().Add(time.Second)) {
+		t.Fatalf("new follower did not bring schedules forward: next=%v spotify_next=%v", nextAt, spotifyAt)
+	}
+}
+
 func TestLatestSpotifyReleaseDateAndArtistResolutionLifecycle(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -188,6 +231,73 @@ func TestLatestSpotifyReleaseDateAndArtistResolutionLifecycle(t *testing.T) {
 	completed, added, err := s.CompleteArtistResolution(ctx, ArtistResolution{ID: 0, UserID: userID}, Artist{})
 	if !errors.Is(err, sql.ErrNoRows) || completed.ID != 0 || added {
 		t.Fatalf("missing resolution completion=%#v added=%v err=%v", completed, added, err)
+	}
+}
+
+func TestDueArtistResolutionsAreFairAcrossUsers(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	first, err := s.CreateInitialAdmin(ctx, "resolution-fair-first@example.com", "hash", "UTC", "resolution-fair-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.CreateUser(ctx, "resolution-fair-second@example.com", "hash", "member", "UTC", "resolution-fair-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{first, second} {
+		for i := 0; i < maxArtistResolutionBatchPerUser+2; i++ {
+			providerID := fmt.Sprintf("fair-%d-%d", userID, i)
+			if _, created, err := s.CreateArtistResolution(ctx, userID, "spotify", providerID,
+				"Fair Resolution", "https://open.spotify.com/artist/"+providerID, ""); err != nil || !created {
+				t.Fatalf("user %d resolution %d created=%v err=%v", userID, i, created, err)
+			}
+		}
+	}
+
+	due, err := s.DueArtistResolutions(ctx, time.Now().UTC().Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[int64]int{}
+	for _, resolution := range due {
+		counts[resolution.UserID]++
+	}
+	if len(due) != 8 || counts[first] != maxArtistResolutionBatchPerUser || counts[second] != maxArtistResolutionBatchPerUser {
+		t.Fatalf("due resolutions=%d per user=%v, want eight total and %d each", len(due), counts, maxArtistResolutionBatchPerUser)
+	}
+	if due, err := s.DueArtistResolutions(ctx, time.Now().UTC(), 0); err != nil || len(due) != 0 {
+		t.Fatalf("zero-limit due resolutions=%#v err=%v, want empty result", due, err)
+	}
+}
+
+func TestMemberOwnedDestinationsAndResolutionsAreBounded(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "bounded-work@example.com", "hash", "member", "UTC", "bounded-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxDestinationsPerUser; i++ {
+		if err := s.AddDestination(ctx, userID, fmt.Sprintf("Destination %d", i), "ntfy", []byte("encrypted")); err != nil {
+			t.Fatalf("destination %d: %v", i, err)
+		}
+	}
+	if err := s.AddDestination(ctx, userID, "one too many", "ntfy", []byte("encrypted")); !errors.Is(err, ErrDestinationLimit) {
+		t.Fatalf("destination limit error=%v, want ErrDestinationLimit", err)
+	}
+
+	for i := 0; i < maxArtistResolutionsPerUser; i++ {
+		if _, created, err := s.CreateArtistResolution(ctx, userID, "spotify", fmt.Sprintf("bounded-%d", i), "Bounded Artist", "https://open.spotify.com/artist/bounded", ""); err != nil || !created {
+			t.Fatalf("resolution %d created=%v err=%v", i, created, err)
+		}
+	}
+	duplicate, created, err := s.CreateArtistResolution(ctx, userID, "spotify", "bounded-0", "Bounded Artist", "https://open.spotify.com/artist/bounded", "")
+	if err != nil || created || duplicate.ID == 0 {
+		t.Fatalf("duplicate resolution=%#v created=%v err=%v", duplicate, created, err)
+	}
+	if _, created, err := s.CreateArtistResolution(ctx, userID, "spotify", "bounded-extra", "Bounded Artist", "https://open.spotify.com/artist/bounded", ""); !errors.Is(err, ErrArtistResolutionLimit) || created {
+		t.Fatalf("resolution limit created=%v err=%v, want ErrArtistResolutionLimit", created, err)
 	}
 }
 

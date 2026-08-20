@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -203,7 +204,7 @@ func evidenceIssueFingerprint(issueType string, evidence []ReleaseEvidence) stri
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write([]byte(item.FirstReleaseDate))
 		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write([]byte(fmt.Sprint(item.DatePrecision)))
+		_, _ = hash.Write([]byte(strconv.Itoa(item.DatePrecision)))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }
@@ -288,33 +289,37 @@ func upsertEvidenceIssuesTx(ctx context.Context, tx *sql.Tx, releaseID int64, is
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,issue_type,fingerprint FROM release_evidence_issues
-		WHERE release_group_id=? AND status='open'`, releaseID)
-	if err != nil {
-		return err
-	}
 	type existingIssue struct {
 		id  int64
 		key string
 	}
-	var stale []existingIssue
-	for rows.Next() {
-		var item existingIssue
-		var issueType, fingerprint string
-		if err := rows.Scan(&item.id, &issueType, &fingerprint); err != nil {
-			_ = rows.Close()
-			return err
+	stale, err := func() ([]existingIssue, error) {
+		rows, err := tx.QueryContext(ctx, `SELECT id,issue_type,fingerprint FROM release_evidence_issues
+			WHERE release_group_id=? AND status='open'`, releaseID)
+		if err != nil {
+			return nil, err
 		}
-		item.key = issueType + "\x00" + fingerprint
-		if _, ok := current[item.key]; !ok {
-			stale = append(stale, item)
+		defer func() { _ = rows.Close() }()
+		var stale []existingIssue
+		for rows.Next() {
+			var item existingIssue
+			var issueType, fingerprint string
+			if err := rows.Scan(&item.id, &issueType, &fingerprint); err != nil {
+				return nil, err
+			}
+			item.key = issueType + "\x00" + fingerprint
+			if _, ok := current[item.key]; !ok {
+				stale = append(stale, item)
+			}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return stale, nil
+	}()
+	if err != nil {
 		return err
 	}
-	_ = rows.Close()
 	for _, item := range stale {
 		if _, err := tx.ExecContext(ctx, `UPDATE release_evidence_issues SET status='resolved',resolved_at=? WHERE id=?`, timeText(observed), item.id); err != nil {
 			return err
@@ -500,42 +505,37 @@ func (s *Store) SetEvidenceIssueState(ctx context.Context, userID, issueID int64
 	} else {
 		snoozedUntil = nil
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var releaseID int64
-	err = tx.QueryRowContext(ctx, `SELECT i.release_group_id FROM release_evidence_issues i
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var releaseID int64
+		err := tx.QueryRowContext(ctx, `SELECT i.release_group_id FROM release_evidence_issues i
 		JOIN release_groups rg ON rg.id=i.release_group_id
 		WHERE i.id=? AND `+followedReleasePredicate("?")+` LIMIT 1`, issueID, userID).Scan(&releaseID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return sql.ErrNoRows
-	}
-	if err != nil {
-		return err
-	}
-	if state == "unread" {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM release_evidence_reviews WHERE user_id=? AND issue_id=?`, userID, issueID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
 			return err
 		}
-		return tx.Commit()
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO release_evidence_reviews(user_id,issue_id,state,snoozed_until,updated_at)
+		if state == "unread" {
+			_, err := tx.ExecContext(ctx, `DELETE FROM release_evidence_reviews WHERE user_id=? AND issue_id=?`, userID, issueID)
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO release_evidence_reviews(user_id,issue_id,state,snoozed_until,updated_at)
 		VALUES(?,?,?,?,?) ON CONFLICT(user_id,issue_id) DO UPDATE SET state=excluded.state,
 		snoozed_until=excluded.snoozed_until,updated_at=excluded.updated_at`, userID, issueID, state,
-		nullableTime(snoozedUntil), nowText())
-	if err != nil {
-		return err
-	}
-	if state == "confirmed" {
-		now := time.Now().UTC()
-		if err := drainResolvedNotificationHoldsTx(ctx, tx, releaseID, now); err != nil {
+			nullableTime(snoozedUntil), nowText())
+		if err != nil {
 			return err
 		}
-		if err := ensureApprovedReleaseNotificationTx(ctx, tx, userID, releaseID, now, false); err != nil {
-			return err
+		if state == "confirmed" {
+			now := time.Now().UTC()
+			if err := drainResolvedNotificationHoldsForUserTx(ctx, tx, userID, releaseID, now); err != nil {
+				return err
+			}
+			if err := ensureApprovedReleaseNotificationTx(ctx, tx, userID, releaseID, now, false); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }

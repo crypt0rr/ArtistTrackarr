@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -72,6 +73,42 @@ func TestValidateOutboundTargetTreatsProviderIdentifiersAsNonHosts(t *testing.T)
 	}
 }
 
+func TestBlockedHostRecognizesObfuscatedIPv4Literals(t *testing.T) {
+	for _, host := range []string{
+		"2130706433", // decimal 127.0.0.1
+		"0x7f000001", // hexadecimal 127.0.0.1
+		"0177.0.0.1", // octal 127.0.0.1
+		"127.1",      // 127.0.0.1 in two-component form
+		"127.0.0.1",  // ordinary spelling remains covered here
+		"3232235777", // decimal 192.168.1.1
+	} {
+		if !isBlockedHost(host, false) {
+			t.Fatalf("obfuscated private host %q was not blocked", host)
+		}
+	}
+	if isBlockedHost("2130706433", true) {
+		t.Fatal("private-target opt-in rejected an obfuscated address")
+	}
+	for _, host := range []string{"example.test", "0177.example.test", "127.0.0.1."} {
+		if parseLegacyIPv4(host) != nil {
+			t.Fatalf("ordinary hostname %q was parsed as a legacy IPv4 literal", host)
+		}
+	}
+}
+
+func TestNewShoutrrrSenderReusesTransportAcrossSends(t *testing.T) {
+	sender := NewShoutrrrSender(true, time.Second)
+	first := sender.httpClient()
+	second := sender.httpClient()
+	if first == second {
+		t.Fatal("sender returned the same client object for separate sends")
+	}
+	if first.Transport == nil || second.Transport == nil || first.Transport != second.Transport {
+		t.Fatalf("sender did not reuse its transport: first=%T second=%T", first.Transport, second.Transport)
+	}
+	sender.CloseIdleConnections()
+}
+
 func TestShoutrrrSenderValidationAndSendGuards(t *testing.T) {
 	sender := ShoutrrrSender{}
 	if err := sender.Validate("generic+https://example.com/hook"); err != nil {
@@ -87,6 +124,67 @@ func TestShoutrrrSenderValidationAndSendGuards(t *testing.T) {
 	}
 	if err := sender.Send(context.Background(), "unsupported://", "title", "body"); err == nil {
 		t.Fatal("Send accepted an unsupported destination scheme")
+	}
+}
+
+func TestNotificationMessageLimitsRejectLossyPayloadsBeforeNetwork(t *testing.T) {
+	sender := ShoutrrrSender{AllowPrivateTargets: true}
+	tests := []struct {
+		name      string
+		service   string
+		title     string
+		body      string
+		wantSvc   string
+		wantLimit int
+	}{
+		{
+			name:      "telegram counts rendered unicode title",
+			service:   "telegram://12345:mock-token@telegram?chats=-100123",
+			title:     "Titel",
+			body:      strings.Repeat("é", telegramMessageLimit),
+			wantSvc:   "Telegram",
+			wantLimit: telegramMessageLimit,
+		},
+		{
+			name:      "discord rejects beyond total chunk budget",
+			service:   "discord://token@123456",
+			body:      strings.Repeat("x", discordMessageLimit+1),
+			wantSvc:   "Discord",
+			wantLimit: discordMessageLimit,
+		},
+		{
+			name:      "generic webhook is bounded",
+			service:   "generic+https://hooks.example/releases",
+			body:      strings.Repeat("x", genericMessageLimitBytes+1),
+			wantSvc:   "GENERIC+HTTPS",
+			wantLimit: genericMessageLimitBytes,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := sender.Send(context.Background(), test.service, test.title, test.body)
+			var limitErr *MessageLimitError
+			if !errors.As(err, &limitErr) {
+				t.Fatalf("Send error=%v, want MessageLimitError", err)
+			}
+			if limitErr.Service != test.wantSvc || limitErr.Limit != test.wantLimit {
+				t.Fatalf("limit error=%#v, want service=%q limit=%d", limitErr, test.wantSvc, test.wantLimit)
+			}
+		})
+	}
+}
+
+func TestNotificationMessageLimitsAllowNormalPayloads(t *testing.T) {
+	for _, test := range []struct {
+		service string
+		body    string
+	}{
+		{service: "discord://token@123456", body: strings.Repeat("é", discordMessageLimit)},
+		{service: "generic+https://hooks.example/releases", body: strings.Repeat("x", genericMessageLimitBytes)},
+	} {
+		if err := validateNotificationMessage(test.service, "", test.body); err != nil {
+			t.Fatalf("validateNotificationMessage(%q)=%v for payload at limit", test.service, err)
+		}
 	}
 }
 
@@ -216,6 +314,72 @@ func TestTelegramUsesScopedClientAndRestoresGlobals(t *testing.T) {
 	}
 }
 
+func TestTelegramDirectClientBuildsBoundedPayload(t *testing.T) {
+	var got telegramSendPayload
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
+		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+			Request:    req,
+		}, nil
+	})}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second}
+	serviceURL := "telegram://12345:mock-token@telegram?chats=-100123&preview=No&notification=No&parsemode=HTML"
+	if err := sender.Send(context.Background(), serviceURL, "A <release>", "Body & details"); err != nil {
+		t.Fatalf("Telegram send failed: %v", err)
+	}
+	if got.ChatID != "-100123" || got.ParseMode != "HTML" || !got.DisablePreview || !got.DisableNotification {
+		t.Fatalf("payload=%#v", got)
+	}
+	if got.Text != "<b>A &lt;release&gt;</b>\nBody & details" {
+		t.Fatalf("payload text=%q", got.Text)
+	}
+}
+
+func TestObservedHTTPClientCompletesAndClearsInflightRequest(t *testing.T) {
+	base := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	client, observer := observedHTTPClient(base, context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodGet, "https://example.test/hook", nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		response, err := client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("observed client request failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observed client request did not complete")
+	}
+	if observer.hasInFlightRequest() {
+		t.Fatal("observed client retained an in-flight request after completion")
+	}
+}
+
 func TestBuildURLRejectsIncompleteInput(t *testing.T) {
 	for _, input := range []DestinationInput{
 		{Service: "ntfy"},
@@ -281,6 +445,16 @@ func TestRedactErrorRemovesDestinationCredentials(t *testing.T) {
 	}
 }
 
+func TestRedactErrorRemovesBearerTokens(t *testing.T) {
+	message := RedactError(errors.New(`request failed: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9; bearer abc.def-123`))
+	if strings.Contains(message, "eyJhbGci") || strings.Contains(message, "abc.def-123") {
+		t.Fatalf("bearer token leaked in redacted error: %q", message)
+	}
+	if !strings.Contains(message, "Bearer [redacted]") {
+		t.Fatalf("redacted bearer error lost context: %q", message)
+	}
+}
+
 func TestValidateOutboundTargetRejectsPrivateAndLoopbackTargets(t *testing.T) {
 	for _, value := range []string{
 		"generic+http://127.0.0.1/hook",
@@ -330,7 +504,7 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 	if got := outboundHost(nil); got != "" {
 		t.Fatalf("outboundHost(nil)=%q", got)
 	}
-	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "224.0.0.1"} {
+	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "2001:0000:4136:e378:8000:63bf:3fff:fdd2", "2002:c000:0201::1", "64:ff9b::c000:0201", "64:ff9b:1::1", "224.0.0.1"} {
 		ip := net.ParseIP(value)
 		if ip == nil || !isBlockedIP(ip, false) {
 			t.Fatalf("reserved address %s was not blocked", value)
@@ -341,13 +515,13 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 	}
 }
 
-func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
-	ConfigureHTTPClient(time.Second, false)
+func TestSenderHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
+	client := newHTTPClient(time.Second, false, nil, nil)
 	redirect, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/hook", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := http.DefaultClient.CheckRedirect(redirect, nil); err == nil {
+	if err := client.CheckRedirect(redirect, nil); err == nil {
 		t.Fatal("private redirect was accepted by the notification client")
 	}
 
@@ -356,8 +530,8 @@ func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	ConfigureHTTPClient(10*time.Millisecond, true)
-	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 10 * time.Millisecond}
+	sender := NewShoutrrrSender(true, 10*time.Millisecond)
+	defer sender.CloseIdleConnections()
 	before := http.DefaultClient
 	if err := sender.Send(context.Background(), "generic+"+server.URL+"/slow", "title", "body"); err == nil {
 		t.Fatal("slow notification was not bounded by the client timeout")
@@ -405,7 +579,11 @@ func TestHTTPClientUsesResolverSeamForRedirectAndDial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "local or private") {
+	response, err := client.Do(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
+	if err == nil || !strings.Contains(err.Error(), "local or private") {
 		t.Fatalf("blocked resolved address error=%v", err)
 	}
 	if dialCalled {
@@ -418,7 +596,12 @@ func BenchmarkShoutrrrSendSerialization(b *testing.B) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: time.Second}
+	// Use the production constructor so the benchmark measures both the
+	// compatibility mutex and the sender-owned keep-alive transport. A zero
+	// value sender intentionally creates a fallback client for unit tests, but
+	// that would hide transport reuse in this benchmark.
+	sender := NewShoutrrrSender(true, time.Second)
+	defer sender.CloseIdleConnections()
 	serviceURL := "generic+" + server.URL + "/hook"
 	b.ReportAllocs()
 	var queueWaitNanos, clientHoldNanos int64

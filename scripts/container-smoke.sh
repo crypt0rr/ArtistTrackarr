@@ -38,11 +38,13 @@ docker run -d --name "$container" --network host -v "$volume:/data" \
 	"$IMAGE" >/dev/null
 
 wait_ready() {
-	for attempt in {1..90}; do
+	attempt=1
+	while [ "$attempt" -le 90 ]; do
 		if curl --fail --silent "$base/readyz" >/dev/null; then
 			return 0
 		fi
 		sleep 1
+		attempt=$((attempt + 1))
 	done
 	docker logs "$container" >&2 || true
 	echo 'container smoke: application did not become ready' >&2

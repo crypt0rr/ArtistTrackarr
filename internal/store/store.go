@@ -144,6 +144,61 @@ func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
 	return nil, lastErr
 }
 
+// withWriteTx executes one logical write transaction with bounded retry for
+// transient SQLite contention. The closure is replayed in its entirety after
+// rollback, so a busy/locked error at an intermediate statement or during
+// commit cannot leave callers with a partially applied operation. Callers must
+// keep the closure limited to database work; external side effects belong
+// after this helper returns successfully.
+func (s *Store) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err := s.beginWriteTx(ctx)
+		if err != nil {
+			// beginWriteTx already exhausted its bounded transaction-start
+			// retries. Replaying the closure cannot help when no transaction
+			// could be opened, so preserve that error directly.
+			return err
+		}
+		err = fn(tx)
+		if err != nil {
+			_ = tx.Rollback()
+			lastErr = err
+		} else if err = tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			lastErr = err
+		} else {
+			return nil
+		}
+		if !sqliteBusy(lastErr) || attempt == 4 {
+			return lastErr
+		}
+		if err := waitWriteRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// withWriteTxResult is the result-bearing form used by transactional store
+// operations. The result is only published after a successful commit, so a
+// replay cannot expose values from a rolled-back attempt.
+func withWriteTxResult[T any](s *Store, ctx context.Context, fn func(*sql.Tx) (T, error)) (T, error) {
+	var zero T
+	var result T
+	err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		value, err := fn(tx)
+		if err == nil {
+			result = value
+		}
+		return err
+	})
+	if err != nil {
+		return zero, err
+	}
+	return result, nil
+}
+
 // execWriteContext applies the same bounded busy/locked retry policy to
 // single-statement writes that do not need a multi-statement transaction.
 // Keeping this behind Store prevents individual persistence paths from
@@ -298,6 +353,8 @@ var (
 	ErrCannotDeleteSelf              = errors.New("you cannot delete your own account")
 	ErrLastAdmin                     = errors.New("the last administrator cannot be deleted")
 	ErrManualSyncQueueFull           = errors.New("manual synchronization queue is full; try again later")
+	ErrDestinationLimit              = errors.New("notification destination limit reached; remove an existing destination before adding another")
+	ErrArtistResolutionLimit         = errors.New("artist identification limit reached; review or cancel an existing item before adding another")
 	ErrSetupCompleted                = errors.New("setup has already completed")
 	ErrInvalidUsername               = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
 	ErrUsernameTaken                 = errors.New("that username is already in use")
@@ -438,6 +495,21 @@ type CalendarRelease struct {
 	Release
 	CalendarDate string
 	Held         bool
+	// FollowedAssociations carries the owner-scoped artist identities that
+	// make this release visible. The canonical release artist remains in
+	// Release.ArtistID/ArtistName, while digest eligibility must evaluate the
+	// notification rule for every followed credit (including guest/featured
+	// appearances).
+	FollowedAssociations []FollowedArtistAssociation
+}
+
+// FollowedArtistAssociation is an owner-scoped release association used by
+// calendar and digest projections. Label is presentation-ready; Role is the
+// deterministic credit role for the followed artist.
+type FollowedArtistAssociation struct {
+	ArtistID int64
+	Label    string
+	Role     string
 }
 
 // DigestDelivery is a queued delivery for one generated release digest. It
@@ -563,6 +635,19 @@ type ArtistProviderStatus struct {
 	UpdatedAt     time.Time
 }
 
+// ArtistIdentityStatus tracks whether a canonical MusicBrainz identifier has
+// been verified with the provider. Imported identifiers start pending and
+// are retried with a bounded schedule; terminal failures are excluded from
+// automatic polling until an explicit manual sync resets them.
+type ArtistIdentityStatus struct {
+	ArtistID    int64
+	Status      string
+	Attempts    int
+	NextCheckAt *time.Time
+	LastError   string
+	UpdatedAt   time.Time
+}
+
 type ArtistCoverage struct {
 	Artist                 Artist
 	OverallStatus          string
@@ -608,26 +693,58 @@ type AssuranceSummary struct {
 // support view. It intentionally excludes provider error text, credentials,
 // notification bodies, and destination URLs.
 type DiagnosticsSnapshot struct {
-	CheckedAt          time.Time
-	DatabaseHealthy    bool
-	SchemaVersion      int
-	FollowedArtists    int
-	Releases           int
-	QueuedSyncs        int
-	RunningSyncs       int
-	PendingDeliveries  int
-	FailedDeliveries   int
-	RecentLogEntries   int
-	OldestQueueAt      *time.Time
-	StaleClaims        int
-	PausedDestinations int
-	ProviderFailures   int
-	DigestBacklog      int
-	DatabaseBytes      int64
-	LastBackupAt       *time.Time
-	LastRestoreAt      *time.Time
-	LastRestoreResult  string
-	Providers          []DiagnosticsProvider
+	CheckedAt       time.Time
+	DatabaseHealthy bool
+	// DatabaseHealthState distinguishes a readable database from one that is
+	// read-only, full, unavailable, or otherwise unable to persist writes.
+	// It is live diagnostic state and is not persisted in hourly snapshots.
+	DatabaseHealthState DatabaseHealthState
+	SchemaVersion       int
+	FollowedArtists     int
+	Releases            int
+	QueuedSyncs         int
+	RunningSyncs        int
+	// DueSyncArtists is the total number of distinct followed artists whose
+	// normal or Spotify schedule is due. It is intentionally separate from
+	// the runner's per-tick batch size, which is capped for fairness.
+	DueSyncArtists    int
+	OldestDueSyncAt   *time.Time
+	PendingDeliveries int
+	FailedDeliveries  int
+	RecentLogEntries  int
+	OldestQueueAt     *time.Time
+	// FutureDeliveries flags pending work parked far beyond the normal retry
+	// horizon. This is a safe clock-skew signal; it does not alter admission.
+	FutureDeliveries       int
+	EarliestFutureDelivery *time.Time
+	StaleClaims            int
+	PausedDestinations     int
+	ProviderFailures       int
+	// These live-derived timestamps let operational health distinguish a
+	// transient provider/digest condition from one that has persisted beyond
+	// its documented warning threshold. They are not persisted in the bounded
+	// hourly snapshot table.
+	OldestProviderFailureAt *time.Time
+	DigestBacklog           int
+	OldestDigestBacklogAt   *time.Time
+	DatabaseBytes           int64
+	// DatabaseFreeBytes is the SQLite freelist space that can be reused by
+	// future writes. It is intentionally separate from DatabaseBytes because
+	// deleting rows does not necessarily shrink the database file.
+	DatabaseFreeBytes int64
+	LastBackupAt      *time.Time
+	LastRestoreAt     *time.Time
+	LastRestoreResult string
+	Providers         []DiagnosticsProvider
+}
+
+// ArtistSyncBacklog describes the complete normal/Spotify due queue. It is
+// intentionally separate from the bounded per-tick batch returned by
+// ArtistsDue so operators can distinguish a healthy small batch from a
+// household backlog waiting behind the scheduler cap.
+type ArtistSyncBacklog struct {
+	Count       int
+	OldestDueAt *time.Time
 }
 
 // OperationalSnapshot is a bounded, redacted history of the administrator
@@ -671,6 +788,7 @@ type DiagnosticsProvider struct {
 // on existing rows and never create releases or notification events.
 type ITunesArtworkArtist struct {
 	ID       int64
+	MBID     string
 	Name     string
 	Attempts int
 }
@@ -750,19 +868,43 @@ type DeliveryHistory struct {
 }
 
 type AdminDeliveryHistory struct {
-	DeliveryID  int64
-	UserEmail   string
-	Title       string
-	Body        string
-	EventType   string
-	Destination string
-	Service     string
-	Status      string
-	Attempts    int
-	LastError   string
-	CreatedAt   time.Time
-	NextAttempt *time.Time
-	SentAt      *time.Time
+	DeliveryID int64
+	// DeliveryKind distinguishes normal notification deliveries from digest
+	// deliveries. Both are part of the household audit, but they live in
+	// separate queue tables and therefore require different detail routes.
+	DeliveryKind string
+	UserEmail    string
+	Title        string
+	Body         string
+	EventType    string
+	Destination  string
+	Service      string
+	Status       string
+	Attempts     int
+	LastError    string
+	CreatedAt    time.Time
+	NextAttempt  *time.Time
+	SentAt       *time.Time
+}
+
+// AdminDeliveryExportCursor identifies the last row emitted by the stable
+// delivery-audit export ordering. Cursors are intentionally opaque to the web
+// layer apart from their fields; they are never persisted or exposed to users.
+type AdminDeliveryExportCursor struct {
+	CreatedAt    string
+	EventID      int64
+	DeliveryID   int64
+	DeliveryKind string
+}
+
+// ArtistExportCursor identifies the last row emitted by the stable followed
+// artist export ordering. The normalized name keys mirror the SQL ORDER BY
+// expression so concurrent inserts cannot make OFFSET pages skip or repeat
+// existing artists.
+type ArtistExportCursor struct {
+	Name     string
+	SortName string
+	ID       int64
 }
 
 type ManualSyncRequest struct {

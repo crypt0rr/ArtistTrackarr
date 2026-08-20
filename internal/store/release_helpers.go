@@ -78,6 +78,7 @@ func saveMusicBrainzReleaseTx(
 		return syncedRelease{}, err
 	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
+	saved.ArtistCreditRole = normalizedArtistCreditRole(release.ArtistCreditRole)
 	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
 	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "musicbrainz"}, err
 }
@@ -85,7 +86,7 @@ func saveSpotifyReleaseTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
 ) (syncedRelease, error) {
 	if strings.TrimSpace(release.SpotifyID) == "" {
-		return syncedRelease{}, errors.New("Spotify release ID is required")
+		return syncedRelease{}, errors.New("spotify release ID is required")
 	}
 	var releaseID int64
 	existed := true
@@ -144,6 +145,7 @@ func saveSpotifyReleaseTx(
 		return syncedRelease{}, err
 	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
+	saved.ArtistCreditRole = normalizedArtistCreditRole(release.ArtistCreditRole)
 	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
 	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "spotify"}, err
 }
@@ -220,6 +222,7 @@ func saveITunesReleaseTx(
 		return syncedRelease{}, err
 	}
 	saved, err := releaseByIDTx(ctx, tx, releaseID)
+	saved.ArtistCreditRole = normalizedArtistCreditRole(release.ArtistCreditRole)
 	saved.Credits = append([]ReleaseCredit(nil), release.Credits...)
 	return syncedRelease{release: saved, isNew: !existed, creditNew: creditNew, provider: "itunes"}, err
 }
@@ -418,6 +421,16 @@ func normalizedArtistCreditRole(value string) string {
 }
 func normalizedReleaseTitle(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
+	// Apple commonly appends the inferred collection type to its title (for
+	// example, "Comeback - Single"). The type is persisted separately, so
+	// remove only an explicit trailing type suffix before comparing titles
+	// across providers.
+	for _, suffix := range []string{" - single", " - ep", " (single)", " (ep)", " [single]", " [ep]"} {
+		if strings.HasSuffix(value, suffix) && len(value) > len(suffix) {
+			value = strings.TrimSpace(strings.TrimSuffix(value, suffix))
+			break
+		}
+	}
 	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
 		start := strings.LastIndex(value, pair[0])
 		if start < 0 || !strings.HasSuffix(value, pair[1]) {
@@ -502,9 +515,9 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	return scanReleaseWithExtra(tx.QueryRowContext(ctx,
 		`SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE rg.id=?`, releaseID))
 }
-func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
+func selectInitialReleaseInLocation(items []syncedRelease, observed time.Time, location *time.Location) (syncedRelease, string, bool) {
 	var zero syncedRelease
-	today := dayUTC(observed)
+	today := dayInLocation(observed, location)
 	var upcoming syncedRelease
 	var upcomingStart time.Time
 	var latest syncedRelease
@@ -540,8 +553,8 @@ func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRele
 	}
 	return latest, "announcement", true
 }
-func initialReleaseMessage(artist Artist, release Release, eventType string, observed time.Time) (string, string) {
-	today := dayUTC(observed)
+func initialReleaseMessageInLocation(artist Artist, release Release, eventType string, observed time.Time, location *time.Location) (string, string) {
+	today := dayInLocation(observed, location)
 	start, _ := comparableReleaseDate(release.FirstReleaseDate)
 	link := releaseExternalURL(release)
 	creditRole, trackTitle := releaseMessageCredit(release)
@@ -669,15 +682,29 @@ func enqueueApprovedEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID i
 }
 
 func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
+	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, true)
+}
+
+// enqueueHeldEventTxMode re-evaluates a previously held event against the
+// owner's current notification rules. Hold bodies already contain the
+// association decoration that was rendered when the hold was created, so the
+// normal message decoration must not be applied a second time.
+func enqueueHeldEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
+	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, false)
+}
+
+func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold, decorateBody bool) error {
+	type candidate struct {
+		rule FollowNotificationRule
+		role string
+	}
 	var p NotificationPreferences
-	var albums, eps, singles, announcements, releaseDay, holdConflicts int
-	var primary, role, mode string
-	var includePrimary, includeFeatured int
-	var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
-	var paused, updated sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT COALESCE(p.albums,1),COALESCE(p.eps,1),COALESCE(p.singles,1),
+	var primary, secondary string
+	var candidates []candidate
+	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(p.albums,1),COALESCE(p.eps,1),COALESCE(p.singles,1),
 		COALESCE(p.announcements,1),COALESCE(p.release_day,1),COALESCE(p.hold_conflicting_notifications,0),
-		rg.primary_type,COALESCE(rg.artist_credit_role,'primary'),
+		f.artist_id,rg.primary_type,COALESCE(rg.secondary_types,'[]'),
+		COALESCE(NULLIF(`+followedReleaseAssociationRole+`,''),'primary'),
 		COALESCE(nr.delivery_mode,'inherit'),COALESCE(nr.include_primary,1),COALESCE(nr.include_featured,1),
 		COALESCE(nr.albums,1),COALESCE(nr.eps,1),COALESCE(nr.singles,1),COALESCE(nr.compilations,1),
 		COALESCE(nr.announcements,1),COALESCE(nr.release_day,1),nr.paused_until,COALESCE(nr.updated_at,'')
@@ -689,37 +716,87 @@ func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64
 		LEFT JOIN notification_preferences p ON p.user_id=?
 		LEFT JOIN follow_notification_rules nr ON nr.user_id=? AND nr.artist_id=f.artist_id
 		WHERE rg.id=?
-		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END LIMIT 1`, userID, userID, userID, releaseID).Scan(&albums, &eps, &singles, &announcements, &releaseDay,
-		&holdConflicts, &primary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
-		&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated)
+		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END,f.artist_id`, userID, userID, userID, releaseID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// The owner no longer follows this artist (or the release was
-			// removed). Do not create an orphaned notification event.
-			return nil
-		}
-		return fmt.Errorf("load notification rule for release: %w", err)
+		return fmt.Errorf("load notification rules for release: %w", err)
 	}
-	p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
-	p.HoldConflictingNotifications = holdConflicts != 0
-	rule, err := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, 0)
-	if err != nil {
+	if err := func() error {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var albums, eps, singles, announcements, releaseDay, holdConflicts int
+			var artistID int64
+			var role, mode string
+			var includePrimary, includeFeatured int
+			var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
+			var paused, updated sql.NullString
+			if err := rows.Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts, &artistID,
+				&primary, &secondary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
+				&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated); err != nil {
+				return fmt.Errorf("scan notification rule for release: %w", err)
+			}
+			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+			p.HoldConflictingNotifications = holdConflicts != 0
+			rule, err := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, artistID)
+			if err != nil {
+				return err
+			}
+			candidates = append(candidates, candidate{rule: rule, role: role})
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("scan notification rules for release: %w", err)
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
-	if !releaseTypeEnabled(p, primary) || !rule.AllowsContent(primary, role, eventType, now) {
+	if len(candidates) == 0 {
+		// The owner no longer follows this artist (or the release was
+		// removed). Do not create an orphaned notification event.
 		return nil
 	}
-	title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
-	if err != nil {
-		return err
+	var secondaryTypes []string
+	if err := json.Unmarshal([]byte(secondary), &secondaryTypes); err != nil {
+		return fmt.Errorf("parse release secondary types: %w", err)
 	}
-	if p.HoldConflictingNotifications && rule.queuesImmediate(now) && !bypassConflictHold {
+	if !releaseTypeEnabled(p, primary, secondaryTypes) {
+		return nil
+	}
+	var selected *candidate
+	selectedPriority := -1
+	for index := range candidates {
+		item := &candidates[index]
+		if !item.rule.AllowsRelease(primary, secondaryTypes, item.role, eventType, now) ||
+			!item.rule.allowsAccountNotificationMoment(p, eventType) {
+			continue
+		}
+		priority := 1
+		switch item.rule.effectiveDeliveryMode(now) {
+		case FollowDeliveryInherit, FollowDeliveryImmediate:
+			priority = 3
+		case FollowDeliveryDigest:
+			priority = 2
+		}
+		if selected == nil || priority > selectedPriority {
+			selected = item
+			selectedPriority = priority
+		}
+	}
+	if selected == nil {
+		return nil
+	}
+	if decorateBody {
+		title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
+		if err != nil {
+			return err
+		}
+	}
+	if p.HoldConflictingNotifications && selected.rule.queuesImmediate(now) && !bypassConflictHold {
 		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
 			return err
 		}
 		return nil
 	}
-	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, rule.queuesImmediate(now))
+	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, selected.rule.queuesImmediate(now))
 }
 
 func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, title, body string) (string, string, error) {
@@ -764,7 +841,8 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(event_id,destination_id,status,next_attempt_at)
 		SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
 		LEFT JOIN destination_health dh ON dh.destination_id=d.id
-		WHERE d.user_id=? AND d.enabled=1`, eventID, timeText(now), userID)
+		WHERE d.user_id=? AND d.enabled=1
+		AND d.created_at <= (SELECT created_at FROM notification_events WHERE id=?)`, eventID, timeText(now), userID, eventID)
 	return err
 }
 
@@ -874,4 +952,22 @@ func releaseDate(value string) (time.Time, bool) {
 func dayUTC(t time.Time) time.Time {
 	y, m, d := t.UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func dayInLocation(t time.Time, location *time.Location) time.Time {
+	if location == nil {
+		location = time.UTC
+	}
+	y, m, d := t.In(location).Date()
+	// Keep the returned value in UTC so it can be compared with the parsed
+	// ISO release dates without mixing location offsets into date ordering.
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func userLocation(value string) *time.Location {
+	location, err := time.LoadLocation(strings.TrimSpace(value))
+	if err != nil {
+		return time.UTC
+	}
+	return location
 }

@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,8 @@ func TestMusicBrainzSearchValidationAndResponseErrors(t *testing.T) {
 
 func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 	const mbid = "11111111-1111-4111-8111-111111111111"
+	const firstRelease = "22222222-2222-4222-8222-222222222222"
+	const secondRelease = "33333333-3333-4333-8333-333333333333"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
@@ -141,7 +144,7 @@ func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 			if request.URL.Query().Get("artist") != mbid || request.URL.Query().Get("type") != "album|ep|single" {
 				t.Fatalf("unexpected release-group query: %s", request.URL.RawQuery)
 			}
-			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"release-one","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"release-two","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
+			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"`+firstRelease+`","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"`+secondRelease+`","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
 		default:
 			http.NotFound(w, request)
 		}
@@ -192,6 +195,24 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 	credit := credits[0].Credits[0]
 	if credit.Role != "guest" || credit.ProviderID != recordingID || credit.TrackTitle != "Collab track" {
 		t.Fatalf("credit=%#v", credit)
+	}
+}
+
+func TestMusicBrainzRejectsMalformedReleaseGroupID(t *testing.T) {
+	const artistID = "11111111-1111-4111-8111-111111111111"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws/2/release-group" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"release-group-count":1,"release-groups":[{"id":"not-a-uuid","title":"Unsafe","primary-type":"Album"}]}`)
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	if releases, err := mb.ArtistReleases(context.Background(), artistID); err == nil || releases != nil {
+		t.Fatalf("malformed release group accepted: releases=%#v err=%v", releases, err)
 	}
 }
 
@@ -334,6 +355,48 @@ func TestSpotifyReleaseTypeClassification(t *testing.T) {
 	}
 }
 
+func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
+	for _, tracks := range []int{2, 4, 5, 6} {
+		for _, provider := range []string{"spotify", "itunes"} {
+			t.Run(fmt.Sprintf("%s-%d-tracks", provider, tracks), func(t *testing.T) {
+				var got string
+				if provider == "spotify" {
+					got, _, _ = spotifyReleaseType("single", "single", "", tracks)
+				} else {
+					got = iTunesReleaseType("", tracks)
+				}
+				if got != "EP" {
+					t.Fatalf("%s %d-track release=%q, want EP", provider, tracks, got)
+				}
+			})
+		}
+	}
+	for _, test := range []struct {
+		title, want string
+	}{
+		{title: "episode", want: "Album"},
+		{title: "epic", want: "Album"},
+		{title: "epilogue", want: "Album"},
+		{title: "EP", want: "EP"},
+	} {
+		for _, provider := range []string{"spotify", "itunes"} {
+			t.Run(provider+"-"+test.title, func(t *testing.T) {
+				var got string
+				var ok bool
+				if provider == "spotify" {
+					got, _, ok = spotifyReleaseType("album", "", test.title, 0)
+				} else {
+					got = iTunesReleaseType(test.title, 0)
+					ok = got != ""
+				}
+				if !ok || got != test.want {
+					t.Fatalf("%s %q=(%q,%v), want (%q,true)", provider, test.title, got, ok, test.want)
+				}
+			})
+		}
+	}
+}
+
 func TestSpotifyReleaseImageSelectionAndTrustedHosts(t *testing.T) {
 	if got := spotifyReleaseImage(nil); got != "" {
 		t.Fatalf("empty release image=%q", got)
@@ -443,6 +506,133 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 	second, err := itunes.ArtistReleases(context.Background(), "Example")
 	if err != nil || len(second) != len(first) || searchRequests.Load() != 1 || releaseRequests.Load() != 1 {
 		t.Fatalf("cached releases=%#v search=%d lookup=%d err=%v", second, searchRequests.Load(), releaseRequests.Load(), err)
+	}
+}
+
+func TestITunesRejectsAmbiguousExactArtistNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" {
+			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"results":[
+			{"wrapperType":"artist","artistId":101,"artistName":"Example"},
+			{"wrapperType":"artist","artistId":202,"artistName":"Example"}
+		]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	_, err := itunes.ArtistReleases(context.Background(), "Example")
+	var ambiguous *ITunesAmbiguousArtistError
+	if !errors.As(err, &ambiguous) || len(ambiguous.IDs) != 2 {
+		t.Fatalf("ambiguous error=%v (%T), want two exact matches", err, err)
+	}
+}
+
+func TestITunesArtistLookupCoalescesConcurrentCalls(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/lookup" || request.URL.Query().Get("entity") != "musicArtist" {
+			t.Fatalf("unexpected iTunes request: %s", request.URL.String())
+		}
+		if requests.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example"}]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+
+	type result struct {
+		artist ITunesArtist
+		err    error
+	}
+	leader := make(chan result, 1)
+	go func() {
+		artist, err := itunes.Artist(context.Background(), "123")
+		leader <- result{artist: artist, err: err}
+	}()
+	<-started
+	follower := make(chan result, 1)
+	go func() {
+		artist, err := itunes.Artist(context.Background(), "123")
+		follower <- result{artist: artist, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		itunes.cacheMu.Lock()
+		coalesced := len(itunes.artistCalls) == 1
+		itunes.cacheMu.Unlock()
+		if coalesced {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	for _, ch := range []chan result{leader, follower} {
+		select {
+		case got := <-ch:
+			if got.err != nil || got.artist.ID != "123" {
+				t.Fatalf("coalesced lookup result=%#v", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("coalesced iTunes lookup did not finish")
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("iTunes artist requests=%d, want 1", requests.Load())
+	}
+}
+
+func TestITunesNotFoundIsTypedNegativeLookup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" {
+			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"resultCount":0,"results":[]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	_, err := itunes.ArtistReleases(context.Background(), "Missing Artist")
+	var notFound *ITunesArtistNotFoundError
+	if !errors.As(err, &notFound) || notFound.Name != "Missing Artist" {
+		t.Fatalf("not-found error=%v (%T), want typed negative lookup", err, err)
+	}
+}
+
+func TestITunesCanonicalReleaseCacheIncludesCanonicalAndProviderIDs(t *testing.T) {
+	var searches, lookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/search":
+			searches.Add(1)
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/artist/example"}]}`)
+		case "/lookup":
+			lookups.Add(1)
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"Example Album","collectionArtistName":"Example","trackCount":10,"releaseDate":"2026-01-02T00:00:00Z"}]}`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	if _, id, _, err := itunes.ArtistReleasesForCanonical(context.Background(), "mbid-one", "Example", ""); err != nil || id != "123" {
+		t.Fatalf("first canonical lookup id=%q err=%v", id, err)
+	}
+	if _, id, _, err := itunes.ArtistReleasesForCanonical(context.Background(), "mbid-two", "Example", ""); err != nil || id != "123" {
+		t.Fatalf("second canonical lookup id=%q err=%v", id, err)
+	}
+	if searches.Load() != 1 {
+		t.Fatalf("searches=%d, want cached name lookup", searches.Load())
+	}
+	if lookups.Load() != 2 {
+		t.Fatalf("album lookups=%d, want one per canonical cache key", lookups.Load())
 	}
 }
 
@@ -711,8 +901,12 @@ func TestSpotifyCoalescedLookupsHonorResultsAndCancellation(t *testing.T) {
 		t.Fatalf("coalesced search results=%#v err=%v", results, err)
 	}
 
-	cancelledSearch := &spotifySearchCall{done: make(chan struct{})}
+	cancelledSearch := &spotifySearchCall{done: make(chan struct{}), err: context.Canceled}
+	close(cancelledSearch.done)
 	spotify.searchCalls[normalizeSpotifySearchQuery("cancelled")] = cancelledSearch
+	if _, err := spotify.SearchArtists(context.Background(), "cancelled"); !errors.Is(err, ErrCoalescedRequestCanceled) {
+		t.Fatalf("leader cancellation leaked to follower: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := spotify.SearchArtists(ctx, "cancelled"); !errors.Is(err, context.Canceled) {
@@ -732,7 +926,12 @@ func TestSpotifyCoalescedLookupsHonorResultsAndCancellation(t *testing.T) {
 	}
 
 	cancelledArtistID := "artist-cancelled"
-	spotify.artistCalls[cancelledArtistID] = &spotifyArtistCall{done: make(chan struct{})}
+	cancelledArtist := &spotifyArtistCall{done: make(chan struct{}), err: context.Canceled}
+	close(cancelledArtist.done)
+	spotify.artistCalls[cancelledArtistID] = cancelledArtist
+	if _, err := spotify.Artist(context.Background(), cancelledArtistID); !errors.Is(err, ErrCoalescedRequestCanceled) {
+		t.Fatalf("leader artist cancellation leaked to follower: %v", err)
+	}
 	ctx, cancel = context.WithCancel(context.Background())
 	cancel()
 	if _, err := spotify.Artist(ctx, cancelledArtistID); !errors.Is(err, context.Canceled) {
@@ -1082,6 +1281,14 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 		}
 		albumRequests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		groups := request.URL.Query().Get("include_groups")
+		if groups != "album,single,compilation" && groups != "appears_on" {
+			t.Fatalf("unexpected incremental include_groups=%q", groups)
+		}
+		if groups == "appears_on" {
+			_, _ = io.WriteString(w, `{"total":1,"items":[{"id":"guest","name":"Guest","album_type":"album","album_group":"appears_on","total_tracks":10,"release_date":"2026-08-02","release_date_precision":"day"}]}`)
+			return
+		}
 		if request.URL.Query().Get("offset") == "0" {
 			_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"new","name":"New","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}]}`)
 			return
@@ -1096,8 +1303,168 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
 	spotify.requestInterval = 0
 	releases, err := spotify.ArtistReleasesSince(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF", "2026-07-01")
-	if err != nil || len(releases) != 2 || albumRequests.Load() != 2 {
+	if err != nil || len(releases) != 3 || albumRequests.Load() != 3 {
 		t.Fatalf("requests=%d releases=%#v err=%v", albumRequests.Load(), releases, err)
+	}
+	for _, release := range releases {
+		if release.SpotifyID == "guest" && release.ArtistCreditRole != "featured" {
+			t.Fatalf("appears_on release role=%q, want featured", release.ArtistCreditRole)
+		}
+	}
+}
+
+func TestSpotifyArtistReleasesSincePagesPastWatermarkForLaterSingles(t *testing.T) {
+	var albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		if request.URL.Path != "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums" {
+			http.NotFound(w, request)
+			return
+		}
+		albumRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		groups := request.URL.Query().Get("include_groups")
+		offset := request.URL.Query().Get("offset")
+		switch {
+		case groups == "appears_on":
+			_, _ = io.WriteString(w, `{"total":0,"items":[]}`)
+		case offset == "0":
+			items := make([]string, 10)
+			for i := range items {
+				items[i] = fmt.Sprintf(`{"id":"old-%d","name":"Old %d","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-06-01","release_date_precision":"day"}`, i, i)
+			}
+			_, _ = fmt.Fprintf(w, `{"total":12,"items":[%s]}`, strings.Join(items, ","))
+		case offset == "10":
+			_, _ = io.WriteString(w, `{"total":12,"items":[
+				{"id":"new-single","name":"New single","album_type":"single","album_group":"single","total_tracks":1,"release_date":"2026-08-10","release_date_precision":"day"},
+				{"id":"new-ep","name":"New EP","album_type":"single","album_group":"single","total_tracks":5,"release_date":"2026-08-11","release_date_precision":"day"}
+			]}`)
+		default:
+			t.Fatalf("unexpected Spotify page groups=%q offset=%q", groups, offset)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	releases, err := spotify.ArtistReleasesSince(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF", "2026-07-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if albumRequests.Load() != 3 || len(releases) != 12 {
+		t.Fatalf("requests=%d releases=%d, want two primary pages plus appears_on and 12 releases", albumRequests.Load(), len(releases))
+	}
+	var foundSingle, foundEP bool
+	for _, release := range releases {
+		foundSingle = foundSingle || release.SpotifyID == "new-single"
+		foundEP = foundEP || release.SpotifyID == "new-ep"
+	}
+	if !foundSingle || !foundEP {
+		t.Fatalf("later single/EP was hidden by the release-date watermark: %#v", releases)
+	}
+}
+
+func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testing.T) {
+	var albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		if request.URL.Path != "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums" {
+			http.NotFound(w, request)
+			return
+		}
+		if request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" {
+			t.Fatalf("unexpected include_groups=%q", request.URL.Query().Get("include_groups"))
+		}
+		albumRequests.Add(1)
+		offset := 0
+		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
+			t.Fatalf("invalid offset: %v", err)
+		}
+		count := 10
+		if offset == 20 {
+			count = 5
+		}
+		items := make([]string, count)
+		for index := range items {
+			id := fmt.Sprintf("release-%02d", offset+index)
+			group := "album"
+			if offset == 0 && index == 0 {
+				id = "shared"
+			}
+			if offset == 20 && index == 0 {
+				id, group = "shared", "appears_on"
+			}
+			if offset == 20 && index == 1 {
+				id, group = "featured-late", "appears_on"
+			}
+			items[index] = fmt.Sprintf(`{"id":%q,"name":%q,"album_type":"album","album_group":%q,"total_tracks":10,"release_date":"2026-08-%02d","release_date_precision":"day"}`,
+				id, id, group, (offset+index)%28+1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"total":25,"items":[%s]}`, strings.Join(items, ","))
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	releases, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if albumRequests.Load() != 3 || len(releases) != 24 {
+		t.Fatalf("requests=%d releases=%d, want 3 requests and 24 deduplicated releases", albumRequests.Load(), len(releases))
+	}
+	var shared, featured bool
+	for _, release := range releases {
+		switch release.SpotifyID {
+		case "shared":
+			shared = true
+			if release.ArtistCreditRole != "primary" || len(release.Credits) != 2 {
+				t.Fatalf("shared release=%#v, want primary role and both credits", release)
+			}
+		case "featured-late":
+			featured = release.ArtistCreditRole == "featured"
+		}
+	}
+	if !shared || !featured {
+		t.Fatalf("missing shared or late featured release: %#v", releases)
+	}
+}
+
+func TestSpotifyArtistReleasesFailsAtCatalogPageSafetyCap(t *testing.T) {
+	var albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		albumRequests.Add(1)
+		offset := 0
+		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
+			t.Fatalf("invalid offset: %v", err)
+		}
+		items := make([]string, 10)
+		for index := range items {
+			id := fmt.Sprintf("capped-%d", offset+index)
+			items[index] = fmt.Sprintf(`{"id":%q,"name":%q,"album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}`, id, id)
+		}
+		_, _ = fmt.Fprintf(w, `{"total":1001,"items":[%s]}`, strings.Join(items, ","))
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	_, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
+	var limitErr *CatalogLimitError
+	if !errors.As(err, &limitErr) || limitErr.Pages != 100 || albumRequests.Load() != 100 {
+		t.Fatalf("requests=%d limit=%#v err=%v", albumRequests.Load(), limitErr, err)
 	}
 }
 

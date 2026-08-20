@@ -31,6 +31,14 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminDeliveryDetail(w, r, false)
+}
+
+func (a *App) adminDigestDeliveryDetail(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminDeliveryDetail(w, r, true)
+}
+
+func (a *App) renderAdminDeliveryDetail(w http.ResponseWriter, r *http.Request, digest bool) {
 	// Notification bodies and provider errors are deliberately only fetched
 	// after this explicit request. Keep the page out of browser/proxy caches
 	// because it contains household-private delivery content.
@@ -40,7 +48,12 @@ func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	detail, err := a.store.AdminDeliveryDetail(r.Context(), id)
+	var detail store.AdminDeliveryHistory
+	if digest {
+		detail, err = a.store.AdminDigestDeliveryDetail(r.Context(), id)
+	} else {
+		detail, err = a.store.AdminDeliveryDetail(r.Context(), id)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
@@ -51,7 +64,7 @@ func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "admin_delivery", d, http.StatusInternalServerError)
 		return
 	}
-	a.logger.Info("admin delivery details viewed", "delivery_id", id)
+	a.logger.Info("admin delivery details viewed", "delivery_id", id, "delivery_kind", detail.DeliveryKind)
 	d := a.data(r, "Delivery details")
 	d.AdminDelivery = &detail
 	a.render(w, "admin_delivery", d, http.StatusOK)
@@ -65,8 +78,12 @@ func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := make([]providerHealthPayload, 0, len(health))
+	timezone := ""
+	if session, ok := currentSession(r); ok {
+		timezone = session.User.Timezone
+	}
 	for _, provider := range health {
-		response = append(response, providerHealthPayloadForConfig(provider, a.cfg))
+		response = append(response, providerHealthPayloadForConfig(provider, a.cfg, timezone))
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -86,10 +103,11 @@ func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 	if a.jobs != nil {
 		runner = a.jobs.Status()
 	}
+	session, _ := currentSession(r)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `inline; filename="artisttrackarr-diagnostics.txt"`)
-	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner)); err != nil {
+	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner, session.User.Timezone)); err != nil {
 		a.logger.Debug("system diagnostics response interrupted", "error", err)
 	}
 }
@@ -132,26 +150,34 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		OperationalReasons: reasons,
 		Database: diagnosticsJSONDatabase{
 			Healthy:       snapshot.DatabaseHealthy,
+			State:         string(snapshot.DatabaseHealthState),
 			Schema:        snapshot.SchemaVersion,
 			SizeBytes:     snapshot.DatabaseBytes,
+			FreeBytes:     snapshot.DatabaseFreeBytes,
 			LastBackupAt:  snapshot.LastBackupAt,
 			LastRestoreAt: snapshot.LastRestoreAt,
 			RestoreResult: snapshot.LastRestoreResult,
 		},
 		Inventory: diagnosticsJSONInventory{
-			FollowedArtists:  snapshot.FollowedArtists,
-			Releases:         snapshot.Releases,
-			RecentLogEntries: snapshot.RecentLogEntries,
-			ProviderFailures: snapshot.ProviderFailures,
+			FollowedArtists:         snapshot.FollowedArtists,
+			Releases:                snapshot.Releases,
+			RecentLogEntries:        snapshot.RecentLogEntries,
+			ProviderFailures:        snapshot.ProviderFailures,
+			OldestProviderFailureAt: snapshot.OldestProviderFailureAt,
 		},
 		Queue: diagnosticsJSONQueue{
-			QueuedSyncs:       snapshot.QueuedSyncs,
-			RunningSyncs:      snapshot.RunningSyncs,
-			PendingDeliveries: snapshot.PendingDeliveries,
-			FailedDeliveries:  snapshot.FailedDeliveries,
-			DigestBacklog:     snapshot.DigestBacklog,
-			OldestQueueAt:     snapshot.OldestQueueAt,
-			StaleClaims:       snapshot.StaleClaims,
+			QueuedSyncs:            snapshot.QueuedSyncs,
+			RunningSyncs:           snapshot.RunningSyncs,
+			DueSyncArtists:         snapshot.DueSyncArtists,
+			OldestDueSyncAt:        snapshot.OldestDueSyncAt,
+			PendingDeliveries:      snapshot.PendingDeliveries,
+			FailedDeliveries:       snapshot.FailedDeliveries,
+			DigestBacklog:          snapshot.DigestBacklog,
+			OldestDigestBacklogAt:  snapshot.OldestDigestBacklogAt,
+			OldestQueueAt:          snapshot.OldestQueueAt,
+			FutureDeliveries:       snapshot.FutureDeliveries,
+			EarliestFutureDelivery: snapshot.EarliestFutureDelivery,
+			StaleClaims:            snapshot.StaleClaims,
 		},
 		Destinations: diagnosticsJSONDestinations{
 			Paused: snapshot.PausedDestinations,
@@ -222,28 +248,36 @@ type diagnosticsJSONPayload struct {
 
 type diagnosticsJSONDatabase struct {
 	Healthy       bool       `json:"healthy"`
+	State         string     `json:"state"`
 	Schema        int        `json:"schema"`
 	SizeBytes     int64      `json:"size_bytes"`
+	FreeBytes     int64      `json:"free_bytes"`
 	LastBackupAt  *time.Time `json:"last_backup_at,omitempty"`
 	LastRestoreAt *time.Time `json:"last_restore_at,omitempty"`
 	RestoreResult string     `json:"restore_result,omitempty"`
 }
 
 type diagnosticsJSONQueue struct {
-	QueuedSyncs       int        `json:"queued_syncs"`
-	RunningSyncs      int        `json:"running_syncs"`
-	PendingDeliveries int        `json:"pending_deliveries"`
-	FailedDeliveries  int        `json:"failed_deliveries"`
-	DigestBacklog     int        `json:"digest_backlog"`
-	OldestQueueAt     *time.Time `json:"oldest_queue_at,omitempty"`
-	StaleClaims       int        `json:"stale_claims"`
+	QueuedSyncs            int        `json:"queued_syncs"`
+	RunningSyncs           int        `json:"running_syncs"`
+	DueSyncArtists         int        `json:"due_sync_artists"`
+	OldestDueSyncAt        *time.Time `json:"oldest_due_sync_at,omitempty"`
+	PendingDeliveries      int        `json:"pending_deliveries"`
+	FailedDeliveries       int        `json:"failed_deliveries"`
+	DigestBacklog          int        `json:"digest_backlog"`
+	OldestDigestBacklogAt  *time.Time `json:"oldest_digest_backlog_at,omitempty"`
+	OldestQueueAt          *time.Time `json:"oldest_queue_at,omitempty"`
+	FutureDeliveries       int        `json:"future_deliveries"`
+	EarliestFutureDelivery *time.Time `json:"earliest_future_delivery,omitempty"`
+	StaleClaims            int        `json:"stale_claims"`
 }
 
 type diagnosticsJSONInventory struct {
-	FollowedArtists  int `json:"followed_artists"`
-	Releases         int `json:"releases"`
-	RecentLogEntries int `json:"recent_log_entries"`
-	ProviderFailures int `json:"provider_failures"`
+	FollowedArtists         int        `json:"followed_artists"`
+	Releases                int        `json:"releases"`
+	RecentLogEntries        int        `json:"recent_log_entries"`
+	ProviderFailures        int        `json:"provider_failures"`
+	OldestProviderFailureAt *time.Time `json:"oldest_provider_failure_at,omitempty"`
 }
 
 type diagnosticsJSONDestinations struct {
@@ -298,39 +332,45 @@ func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
 		return
 	}
+	payload, err := buildBufferedCSV(func(writer *csv.Writer) error {
+		if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at", "delivery_kind"}); err != nil {
+			return err
+		}
+		var cursor *store.AdminDeliveryExportCursor
+		for {
+			rows, next, err := a.store.AdminDeliveryHistoryExportPage(r.Context(), pageSize, cursor)
+			if err != nil {
+				return fmt.Errorf("delivery audit page lookup: %w", err)
+			}
+			for _, item := range rows {
+				row := []string{
+					strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
+					item.EventType, item.Destination, item.Service, item.Status,
+					strconv.Itoa(item.Attempts), item.LastError,
+					item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt), item.DeliveryKind,
+				}
+				if err := writer.Write(neutralizeCSVRow(row)); err != nil {
+					return err
+				}
+			}
+			if len(rows) < pageSize || next == nil {
+				break
+			}
+			cursor = next
+		}
+		return nil
+	})
+	if err != nil {
+		a.logger.Error("delivery audit export failed", "path", r.URL.Path, "error", err)
+		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-delivery-audit.csv"`)
-	writer := csv.NewWriter(w)
-	if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at"}); err != nil {
-		a.logger.Debug("write delivery audit header failed", "error", err)
-		return
-	}
-	for offset := 0; ; offset += pageSize {
-		rows, err := a.store.AdminDeliveryHistory(r.Context(), pageSize, offset)
-		if err != nil {
-			a.logger.Error("delivery audit export lookup failed", "path", r.URL.Path, "offset", offset, "error", err)
-			return
-		}
-		for _, item := range rows {
-			row := []string{
-				strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
-				item.EventType, item.Destination, item.Service, item.Status,
-				strconv.Itoa(item.Attempts), item.LastError,
-				item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt),
-			}
-			if err := writer.Write(neutralizeCSVRow(row)); err != nil {
-				a.logger.Debug("write delivery audit row failed", "error", err)
-				return
-			}
-		}
-		if len(rows) < pageSize {
-			break
-		}
-	}
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		a.logger.Warn("write delivery audit export failed", "error", err)
+	w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+	if _, err := w.Write(payload); err != nil {
+		a.logger.Debug("delivery audit export response interrupted", "error", err)
 	}
 }
 
@@ -387,7 +427,11 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.OperationalStatus, d.OperationalReasons = store.OperationalStatus(d.Diagnostics, runnerState, time.Now().UTC())
 	d.OperationalSnapshots, err = a.store.OperationalSnapshots(r.Context(), 24)
 	failed = a.pageStoreError(r, &d, "Household administration", "operational snapshot history", err) || failed
-	d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus)
+	if d.User != nil {
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, d.User.Timezone)
+	} else {
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, "UTC")
+	}
 	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
 	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
@@ -409,24 +453,54 @@ func (a *App) adminData(r *http.Request) PageData {
 
 func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(r.FormValue("confirm")) != "cleanup" {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Cleanup was not confirmed; no records were removed."), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Cleanup was not confirmed; no records were removed."), http.StatusSeeOther)
 		return
 	}
 	stats, err := a.store.CleanupRetention(r.Context(), time.Now().UTC())
 	if err != nil {
 		a.logger.Error("retention cleanup failed", "path", r.URL.Path, "error", err)
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Retention cleanup could not be completed."), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Retention cleanup could not be completed."), http.StatusSeeOther)
 		return
 	}
 	removed := stats.ApplicationLogs + stats.Sessions + stats.AuthTokens + stats.LoginAttempts + stats.ManualSyncs + stats.ImportJobs
 	a.logger.Info("retention cleanup completed", "removed", removed,
 		"application_logs", stats.ApplicationLogs, "sessions", stats.Sessions,
 		"auth_tokens", stats.AuthTokens, "login_attempts", stats.LoginAttempts,
-		"manual_syncs", stats.ManualSyncs, "import_jobs", stats.ImportJobs)
-	http.Redirect(w, r, "/admin?message="+url.QueryEscape(fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)), http.StatusSeeOther)
+		"manual_syncs", stats.ManualSyncs, "import_jobs", stats.ImportJobs,
+		"wal_checkpointed", stats.WALCheckpointed, "wal_checkpoint_busy", stats.WALCheckpointBusy,
+		"wal_checkpoint_error", stats.WALCheckpointError)
+	message := fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)
+	if stats.WALCheckpointed {
+		message += " WAL space was checkpointed; freelist pages remain reusable and VACUUM is not run automatically."
+	} else if stats.WALCheckpointBusy {
+		message += " WAL truncation was deferred because the database was busy; freelist pages remain reusable."
+	} else {
+		message += " Database file size was not compacted; freelist pages remain reusable and VACUUM is not run automatically."
+	}
+	http.Redirect(w, r, "/admin?"+a.statusQuery(message), http.StatusSeeOther)
 }
 
-func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus) string {
+func (a *App) repairClockSkewedDeliveries(w http.ResponseWriter, r *http.Request) {
+	stats, err := a.store.RepairClockSkewedDeliveries(r.Context(), time.Now().UTC(), 24*time.Hour)
+	if err != nil {
+		a.logger.Error("clock-skewed delivery repair failed", "path", r.URL.Path, "error", err)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Future deliveries could not be repaired."), http.StatusSeeOther)
+		return
+	}
+	total := stats.Deliveries + stats.DigestDeliveries
+	message := fmt.Sprintf("Requeued %d clock-skewed delivery row%s (%d release, %d digest).", total, pluralSuffix(total), stats.Deliveries, stats.DigestDeliveries)
+	a.logger.Info("clock-skewed deliveries repaired", "deliveries", stats.Deliveries, "digest_deliveries", stats.DigestDeliveries)
+	http.Redirect(w, r, "/admin?"+a.statusQuery(message), http.StatusSeeOther)
+}
+
+func pluralSuffix(value int) string {
+	if value == 1 {
+		return ""
+	}
+	return "s"
+}
+
+func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string) string {
 	var report strings.Builder
 	runnerState := "stopped"
 	if runner.Running {
@@ -434,40 +508,66 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	}
 	status, reasons := store.OperationalStatus(snapshot, runnerState, snapshot.CheckedAt)
 	report.WriteString("ArtistTrackarr release assurance report\n")
-	fmt.Fprintf(&report, "Generated: %s\n", snapshot.CheckedAt.Format(time.RFC3339))
+	if strings.TrimSpace(timezone) == "" {
+		timezone = "UTC"
+	}
+	fmt.Fprintf(&report, "Timezone: %s\n", timezone)
+	fmt.Fprintf(&report, "Generated: %s\n", providerHealthTime(snapshot.CheckedAt, timezone))
 	fmt.Fprintf(&report, "Operational status: %s\n", store.DiagnosticStatusLabel(status))
 	if len(reasons) > 0 {
 		fmt.Fprintf(&report, "Operational reasons: %s\n", strings.Join(reasons, ", "))
 	}
-	fmt.Fprintf(&report, "Database: %s (schema %d)\n", diagnosticHealthLabel(snapshot.DatabaseHealthy), snapshot.SchemaVersion)
+	databaseState := string(snapshot.DatabaseHealthState)
+	if databaseState == "" {
+		if snapshot.DatabaseHealthy {
+			databaseState = string(store.DatabaseHealthy)
+		} else {
+			databaseState = string(store.DatabaseUnavailable)
+		}
+	}
+	fmt.Fprintf(&report, "Database: %s (schema %d)\n", databaseState, snapshot.SchemaVersion)
 	fmt.Fprintf(&report, "Followed artists: %d\n", snapshot.FollowedArtists)
 	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)
 	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)
 	fmt.Fprintf(&report, "Running syncs: %d\n", snapshot.RunningSyncs)
+	fmt.Fprintf(&report, "Due artist syncs: %d\n", snapshot.DueSyncArtists)
+	if snapshot.OldestDueSyncAt != nil {
+		fmt.Fprintf(&report, "Oldest due artist sync: %s\n", providerHealthTime(snapshot.OldestDueSyncAt, timezone))
+	}
 	fmt.Fprintf(&report, "Pending deliveries: %d\n", snapshot.PendingDeliveries)
+	fmt.Fprintf(&report, "Clock-skewed future deliveries: %d\n", snapshot.FutureDeliveries)
+	if snapshot.EarliestFutureDelivery != nil {
+		fmt.Fprintf(&report, "Earliest clock-skewed delivery: %s\n", providerHealthTime(snapshot.EarliestFutureDelivery, timezone))
+	}
 	fmt.Fprintf(&report, "Digest backlog: %d\n", snapshot.DigestBacklog)
 	fmt.Fprintf(&report, "Failed deliveries: %d\n", snapshot.FailedDeliveries)
 	fmt.Fprintf(&report, "Stale work claims: %d\n", snapshot.StaleClaims)
 	fmt.Fprintf(&report, "Paused destinations: %d\n", snapshot.PausedDestinations)
 	fmt.Fprintf(&report, "Provider failures: %d\n", snapshot.ProviderFailures)
-	fmt.Fprintf(&report, "Database size: %d bytes\n", snapshot.DatabaseBytes)
+	if snapshot.OldestProviderFailureAt != nil {
+		fmt.Fprintf(&report, "Oldest provider failure: %s\n", providerHealthTime(snapshot.OldestProviderFailureAt, timezone))
+	}
+	if snapshot.OldestDigestBacklogAt != nil {
+		fmt.Fprintf(&report, "Oldest digest backlog: %s\n", providerHealthTime(snapshot.OldestDigestBacklogAt, timezone))
+	}
+	fmt.Fprintf(&report, "Database size: %d bytes; reusable space: %d bytes\n", snapshot.DatabaseBytes, snapshot.DatabaseFreeBytes)
 	if snapshot.OldestQueueAt != nil {
-		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", snapshot.OldestQueueAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", providerHealthTime(snapshot.OldestQueueAt, timezone))
 	}
 	if snapshot.LastBackupAt != nil {
-		fmt.Fprintf(&report, "Last backup: %s\n", snapshot.LastBackupAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Last backup: %s\n", providerHealthTime(snapshot.LastBackupAt, timezone))
 	} else {
-		fmt.Fprintln(&report, "Last backup: not recorded")
+		fmt.Fprintln(&report, "Last backup: not yet established")
 	}
 	if snapshot.LastRestoreAt != nil {
-		fmt.Fprintf(&report, "Last restore rehearsal: %s (%s)\n", snapshot.LastRestoreAt.Format(time.RFC3339), snapshot.LastRestoreResult)
+		fmt.Fprintf(&report, "Last restore rehearsal: %s (%s)\n", providerHealthTime(snapshot.LastRestoreAt, timezone), snapshot.LastRestoreResult)
 	} else {
 		fmt.Fprintln(&report, "Last restore rehearsal: not recorded")
 	}
 	fmt.Fprintf(&report, "Application events (24h): %d\n", snapshot.RecentLogEntries)
 	fmt.Fprintf(&report, "Scheduler: %s\n", diagnosticHealthLabel(runner.Running))
 	if runner.LastActivityAt != nil {
-		fmt.Fprintf(&report, "Scheduler last activity: %s\n", runner.LastActivityAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Scheduler last activity: %s\n", providerHealthTime(runner.LastActivityAt, timezone))
 	}
 	fmt.Fprintf(&report, "Scheduler wakes: %d; overlaps: %d; recovered panics: %d\n",
 		runner.Metrics.WakeSignals, runner.Metrics.TaskOverlaps, runner.Metrics.TaskPanics)
@@ -487,7 +587,7 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	for _, provider := range snapshot.Providers {
 		fmt.Fprintf(&report, "- %s: %s", provider.Provider, provider.Status)
 		if provider.NextCheckAt != nil {
-			fmt.Fprintf(&report, "; next check %s", provider.NextCheckAt.Format(time.RFC3339))
+			fmt.Fprintf(&report, "; next check %s", providerHealthTime(provider.NextCheckAt, timezone))
 		}
 		report.WriteByte('\n')
 	}
@@ -500,19 +600,39 @@ func diagnosticHealthLabel(healthy bool) string {
 	}
 	return "unavailable"
 }
+
+func databaseHealthLabel(snapshot store.DiagnosticsSnapshot) string {
+	switch snapshot.DatabaseHealthState {
+	case store.DatabaseHealthy:
+		return "healthy"
+	case store.DatabaseReadOnly:
+		return "read-only"
+	case store.DatabaseFull:
+		return "full"
+	case store.DatabaseWriteFailed:
+		return "write failed"
+	case store.DatabaseUnavailable:
+		return "unavailable"
+	default:
+		if snapshot.DatabaseHealthy {
+			return "healthy"
+		}
+		return "unavailable"
+	}
+}
 func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
 		return
 	}
 	session, _ := currentSession(r)
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "retry", nil); err != nil {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery(safeActionMessage(err, "Retry synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/admin?message=Retry+sync+queued", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("Retry sync queued"), http.StatusSeeOther)
 }
 func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -534,13 +654,13 @@ func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err = a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery(safeActionMessage(err, "Artist synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/admin?message=Artist+sync+queued", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("Artist sync queued"), http.StatusSeeOther)
 }
 func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -556,7 +676,7 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, store.ErrCannotDeleteSelf) || errors.Is(err, store.ErrLastAdmin) {
 			d := a.adminData(r)
-			d.Error = err.Error()
+			d.Error = safeActionMessage(err, "The account could not be deleted.")
 			a.render(w, "admin", d, http.StatusBadRequest)
 			return
 		}
@@ -564,7 +684,7 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user could not be deleted", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin?message=User+deleted", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("User deleted"), http.StatusSeeOther)
 }
 func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)

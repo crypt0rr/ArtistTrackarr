@@ -2,9 +2,13 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const calendarPreferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (
@@ -21,8 +25,19 @@ const calendarPreferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (
 // watchlist within an inclusive ISO date range. Partial dates are intentionally
 // excluded from ICS output because assigning them to a day would be misleading.
 func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to string, limit int) ([]CalendarRelease, error) {
+	return s.CalendarReleasesPage(ctx, userID, from, to, limit, 0)
+}
+
+// CalendarReleasesPage returns one deterministic page of precise, dated
+// releases for a followed artist watchlist. The offset form is used by the
+// authenticated and tokenized ICS exporters so large calendars are never
+// silently truncated.
+func (s *Store) CalendarReleasesPage(ctx context.Context, userID int64, from, to string, limit, offset int) ([]CalendarRelease, error) {
 	if limit < 1 {
 		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+`,
 		EXISTS(SELECT 1 FROM notification_holds nh
@@ -32,8 +47,8 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 		WHERE `+followedReleasePredicate("?")+` AND `+calendarPreferredProvider+`
 		AND rg.date_precision=3 AND length(rg.first_release_date)=10
 		AND rg.first_release_date BETWEEN ? AND ?
-		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
-		userID, userID, strings.TrimSpace(from), strings.TrimSpace(to), limit)
+		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ? OFFSET ?`,
+		userID, userID, strings.TrimSpace(from), strings.TrimSpace(to), limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -67,12 +82,17 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 	for i := range result {
 		releaseIDs[i] = result[i].ID
 	}
-	followedArtists, err := s.followedReleaseArtistsBatch(ctx, userID, releaseIDs)
+	followedAssociations, err := s.followedReleaseAssociationsBatch(ctx, userID, releaseIDs)
 	if err != nil {
 		return nil, err
 	}
 	for i := range result {
-		result[i].FollowedArtists = followedArtists[result[i].ID]
+		associations := followedAssociations[result[i].ID]
+		result[i].FollowedAssociations = associations
+		result[i].FollowedArtists = make([]string, 0, len(associations))
+		for _, association := range associations {
+			result[i].FollowedArtists = append(result[i].FollowedArtists, association.Label)
+		}
 	}
 	return result, nil
 }
@@ -92,27 +112,29 @@ type digestUser struct {
 // and retry path, while keeping aggregate content separate from per-release
 // notification event uniqueness.
 func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int, error) {
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,u.timezone,u.reminder_time,
-		p.release_digest_frequency,p.albums,p.eps,p.singles
-		FROM users u JOIN notification_preferences p ON p.user_id=u.id
-		WHERE p.release_digest_enabled=1`)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = rows.Close() }()
 	var users []digestUser
-	for rows.Next() {
-		var user digestUser
-		var frequency string
-		var albums, eps, singles int
-		if err := rows.Scan(&user.ID, &user.Timezone, &user.Reminder, &frequency, &albums, &eps, &singles); err != nil {
-			return 0, err
+	if err := func() error {
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,u.timezone,u.reminder_time,
+			p.release_digest_frequency,p.albums,p.eps,p.singles
+			FROM users u JOIN notification_preferences p ON p.user_id=u.id
+			WHERE p.release_digest_enabled=1`)
+		if err != nil {
+			return err
 		}
-		user.Frequency = normalizeDigestFrequency(frequency)
-		user.Albums, user.EPs, user.Singles = albums != 0, eps != 0, singles != 0
-		users = append(users, user)
-	}
-	if err := rows.Err(); err != nil {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var user digestUser
+			var frequency string
+			var albums, eps, singles int
+			if err := rows.Scan(&user.ID, &user.Timezone, &user.Reminder, &frequency, &albums, &eps, &singles); err != nil {
+				return err
+			}
+			user.Frequency = normalizeDigestFrequency(frequency)
+			user.Albums, user.EPs, user.Singles = albums != 0, eps != 0, singles != 0
+			users = append(users, user)
+		}
+		return rows.Err()
+	}(); err != nil {
 		return 0, err
 	}
 
@@ -123,18 +145,26 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			continue
 		}
 		localNow := now.In(location)
-		if reminder, parseErr := time.Parse("15:04", user.Reminder); parseErr != nil ||
-			localNow.Hour()*60+localNow.Minute() < reminder.Hour()*60+reminder.Minute() {
+		if reminder, ok := reminderMinutes(user.Reminder); !ok ||
+			localNow.Hour()*60+localNow.Minute() < reminder {
 			continue
 		}
 
-		periodStart := localNow
+		// Keep the de-duplication period anchored to local midnight. The prior
+		// implementation used the current instant as the period start and only
+		// stored its date, which made a timezone change on the same UTC day look
+		// like a brand-new digest period. The explicit bounds below let us find a
+		// run created in the same logical local period even when the profile's
+		// timezone has since changed.
+		periodStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
+		periodEnd := periodStart.AddDate(0, 0, 1)
 		// The upper bound is converted to an inclusive date below. Include
 		// today and tomorrow in a daily digest.
 		windowEnd := localNow.AddDate(0, 0, 2)
 		if user.Frequency == "weekly" {
 			daysSinceMonday := (int(localNow.Weekday()) + 6) % 7
-			periodStart = localNow.AddDate(0, 0, -daysSinceMonday)
+			periodStart = periodStart.AddDate(0, 0, -daysSinceMonday)
+			periodEnd = periodStart.AddDate(0, 0, 7)
 			// Deduplicate by the local week, but show the next seven days from
 			// the time the digest is generated so a late-week setup is useful.
 			windowEnd = localNow.AddDate(0, 0, 8)
@@ -152,12 +182,29 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		}
 		var releases []CalendarRelease
 		for _, item := range items {
-			rule, ok := rules[item.ArtistID]
-			if !ok {
-				rule = defaultFollowNotificationRule(user.ID, item.ArtistID, now.UTC())
+			if !releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType, item.SecondaryTypes) {
+				continue
 			}
-			if !releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType) ||
-				!rule.AllowsContent(item.PrimaryType, item.ArtistCreditRole, "", now) || !rule.belongsInDigest(now) {
+			// Calendar visibility can come from a credited followed artist rather
+			// than the canonical release artist. Evaluate every owner-scoped
+			// association and admit the release when at least one follow is
+			// configured for digest delivery.
+			associations := item.FollowedAssociations
+			if len(associations) == 0 {
+				associations = []FollowedArtistAssociation{{ArtistID: item.ArtistID, Role: item.ArtistCreditRole}}
+			}
+			eligible := false
+			for _, association := range associations {
+				rule, ok := rules[association.ArtistID]
+				if !ok {
+					rule = defaultFollowNotificationRule(user.ID, association.ArtistID, now.UTC())
+				}
+				if rule.AllowsRelease(item.PrimaryType, item.SecondaryTypes, association.Role, "", now) && rule.belongsInDigest(now) {
+					eligible = true
+					break
+				}
+			}
+			if !eligible {
 				continue
 			}
 			releases = append(releases, item)
@@ -167,65 +214,120 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		}
 		body := buildDigestBody(releases, user.Frequency)
 		title := fmt.Sprintf("Upcoming releases · %s", localNow.Format("2006-01-02"))
-		tx, err := s.beginWriteTx(ctx)
-		if err != nil {
-			return queued, err
-		}
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_runs
-			(user_id,frequency,period_start,title,body,release_count,status,created_at)
-			VALUES(?,?,?,?,?,?, 'pending',?)`, user.ID, user.Frequency, periodKey, title, body, len(releases), timeText(now))
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		inserted, err := result.RowsAffected()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		if inserted == 0 {
-			_ = tx.Rollback()
-			continue
-		}
-		runID, err := result.LastInsertId()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		deliveryResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_deliveries
-			(run_id,destination_id,status,next_attempt_at)
-			SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
-			LEFT JOIN destination_health dh ON dh.destination_id=d.id
-			WHERE d.user_id=? AND d.enabled=1`, runID, timeText(now), user.ID)
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		deliveryCount, err := deliveryResult.RowsAffected()
-		if err != nil {
-			_ = tx.Rollback()
-			return queued, err
-		}
-		if deliveryCount == 0 {
-			// No admitted destination is not a successful send. Keep the run
-			// pending so it remains visible for an explicit replay/recovery action.
-			if _, err := tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='pending' WHERE id=?`, runID); err != nil {
-				_ = tx.Rollback()
-				return queued, err
+		queuedRun := false
+		err = s.withWriteTx(ctx, func(tx *sql.Tx) error {
+			// A profile can change timezone between scheduler runs. Only use the
+			// wider time window when the stored run was created under another
+			// timezone; same-timezone periods continue to use the exact key and
+			// cannot suppress a legitimate next-day/week digest.
+			periodLookback := 24 * time.Hour
+			if user.Frequency == "weekly" {
+				periodLookback = 7 * 24 * time.Hour
 			}
-		}
-		if err := tx.Commit(); err != nil {
+			periodStartUTC := timeText(periodStart.Add(-periodLookback).UTC())
+			periodEndUTC := timeText(periodEnd.Add(periodLookback).UTC())
+			var runID int64
+			var runStatus string
+			lookupErr := tx.QueryRowContext(ctx, `SELECT id,status FROM release_digest_runs
+				WHERE user_id=? AND frequency=? AND (period_start=? OR
+					(COALESCE(timezone,'UTC')<>? AND created_at>=? AND created_at<?))
+				ORDER BY created_at DESC,id DESC LIMIT 1`, user.ID, user.Frequency, periodKey,
+				user.Timezone, periodStartUTC, periodEndUTC).Scan(&runID, &runStatus)
+			insertedRun := errors.Is(lookupErr, sql.ErrNoRows)
+			if lookupErr != nil && !insertedRun {
+				return lookupErr
+			}
+			if insertedRun {
+				result, err := tx.ExecContext(ctx, `INSERT INTO release_digest_runs
+					(user_id,frequency,period_start,timezone,title,body,release_count,status,created_at)
+					VALUES(?,?,?,?,?,?,?, 'pending',?)`, user.ID, user.Frequency, periodKey, user.Timezone, title, body, len(releases), timeText(now))
+				if err != nil {
+					return err
+				}
+				runID, err = result.LastInsertId()
+				if err != nil {
+					return err
+				}
+			} else if runStatus != "pending" {
+				// A completed or failed run already has a durable outcome for this
+				// logical period. Never attach a newly-added destination to it.
+				return nil
+			} else {
+				var deliveries int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_digest_deliveries WHERE run_id=?`, runID).Scan(&deliveries); err != nil {
+					return err
+				}
+				if deliveries > 0 {
+					return nil
+				}
+			}
+			deliveryResult, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO release_digest_deliveries
+				(run_id,destination_id,status,next_attempt_at)
+				SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
+				LEFT JOIN destination_health dh ON dh.destination_id=d.id
+				WHERE d.user_id=? AND d.enabled=1
+				AND d.created_at <= (SELECT created_at FROM release_digest_runs WHERE id=?)`, runID, timeText(now), user.ID, runID)
+			if err != nil {
+				return err
+			}
+			deliveryCount, err := deliveryResult.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if deliveryCount == 0 {
+				// Keep an orphan run pending for auditability. Destinations added after
+				// this run was created are intentionally not backfilled into historical
+				// work; only a newly created future digest can admit them.
+				return nil
+			}
+			queuedRun = true
+			return nil
+		})
+		if err != nil {
 			return queued, err
 		}
-		queued++
+		if queuedRun {
+			queued++
+		}
 	}
 	return queued, nil
 }
 
+// reminderMinutes accepts the persisted HH:MM form and harmless legacy
+// values such as H:MM, normalizing both before local-time comparisons. New
+// profile writes remain strict; this keeps older rows from being skipped just
+// because their hour was not zero-padded.
+func reminderMinutes(value string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, errHour := strconv.Atoi(strings.TrimSpace(parts[0]))
+	minute, errMinute := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errHour != nil || errMinute != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
+// normalizeReminderTime returns the canonical zero-padded form used for new
+// profile values. Older rows are still accepted by reminderMinutes, but
+// normalizing writes keeps comparisons, exports, and future queries
+// deterministic.
+func normalizeReminderTime(value string) (string, bool) {
+	minutes, ok := reminderMinutes(value)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%02d:%02d", minutes/60, minutes%60), true
+}
+
 func buildDigestBody(releases []CalendarRelease, frequency string) string {
+	const maxDigestBodyBytes = 3500
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Your %s ArtistTrackarr release digest:\n", frequency)
 	for _, item := range releases {
+		var entry strings.Builder
 		status := calendarConfidenceLabel(item.Release, item.Held)
 		artistName := item.ArtistName
 		association := ""
@@ -233,19 +335,43 @@ func buildDigestBody(releases []CalendarRelease, frequency string) string {
 			association = "; followed association(s): " + strings.Join(item.FollowedArtists, ", ")
 		}
 		if item.ArtistCreditRole == "featured" && item.GuestCreditCount > 0 {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Guest appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; Guest appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else if item.ArtistCreditRole == "featured" {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Featured appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; Featured appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		}
 		if link := releaseExternalURL(item.Release); link != "" {
-			builder.WriteString("\n  ")
-			builder.WriteString(link)
+			entry.WriteString("\n  ")
+			entry.WriteString(link)
+		}
+		entryText := entry.String()
+		if builder.Len()+1+len(entryText) > maxDigestBodyBytes {
+			marker := "\n… additional releases omitted"
+			if builder.Len()+len(marker) > maxDigestBodyBytes {
+				return strings.TrimSpace(truncateUTF8(builder.String(), maxDigestBodyBytes))
+			}
+			builder.WriteString(marker)
+			break
 		}
 		builder.WriteByte('\n')
+		builder.WriteString(entryText)
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+func truncateUTF8(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	data := []byte(value[:limit])
+	for len(data) > 0 && !utf8.Valid(data) {
+		data = data[:len(data)-1]
+	}
+	return string(data)
 }
 
 func calendarConfidenceLabel(release Release, held bool) string {

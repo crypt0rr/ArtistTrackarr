@@ -31,6 +31,18 @@ func validateUsername(value string) (string, error) {
 	}
 	return value, nil
 }
+
+func validateTimezone(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("invalid IANA timezone")
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return "", errors.New("invalid IANA timezone")
+	}
+	return value, nil
+}
+
 func derivedUsername(email string, id int64, taken map[string]struct{}) string {
 	local := email
 	if at := strings.IndexByte(local, '@'); at >= 0 {
@@ -76,69 +88,42 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, errors.New("a valid email address is required")
 	}
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return 0, errors.New("invalid IANA timezone")
-	}
-	tx, err := s.beginWriteTx(ctx)
+	timezone, err := validateTimezone(timezone)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	username = strings.TrimSpace(username)
-	if username == "" {
-		var id int64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
-			return 0, err
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int64, error) {
+		candidate := strings.TrimSpace(username)
+		if candidate == "" {
+			var id int64
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
+				return 0, err
+			}
+			taken, err := usernamesTakenTx(ctx, tx)
+			if err != nil {
+				return 0, err
+			}
+			candidate = derivedUsername(email, id, taken)
 		}
-		var existing []string
-		rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+		validatedUsername, err := validateUsername(candidate)
 		if err != nil {
 			return 0, err
 		}
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				_ = rows.Close()
-				return 0, err
-			}
-			existing = append(existing, name)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+		candidate = validatedUsername
+		taken, err := usernameTakenTx(ctx, tx, candidate, 0)
+		if err != nil {
 			return 0, err
 		}
-		_ = rows.Close()
-		taken := make(map[string]struct{}, len(existing))
-		for _, name := range existing {
-			taken[strings.ToLower(name)] = struct{}{}
+		if taken {
+			return 0, ErrUsernameTaken
 		}
-		username = derivedUsername(email, id, taken)
-	}
-	validatedUsername, err := validateUsername(username)
-	if err != nil {
-		return 0, err
-	}
-	username = validatedUsername
-	taken, err := usernameTakenTx(ctx, tx, username, 0)
-	if err != nil {
-		return 0, err
-	}
-	if taken {
-		return 0, ErrUsernameTaken
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
-		VALUES(?,?,?,?,?,?)`, email, username, hash, role, timezone, nowText())
-	if err != nil {
-		return 0, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return id, nil
+		result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
+			VALUES(?,?,?,?,?,?)`, email, candidate, hash, role, timezone, nowText())
+		if err != nil {
+			return 0, err
+		}
+		return result.LastInsertId()
+	})
 }
 
 // CreateInitialAdmin atomically establishes the first account.  The setup
@@ -150,42 +135,33 @@ func (s *Store) CreateInitialAdmin(ctx context.Context, email, hash, timezone, u
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, errors.New("a valid email address is required")
 	}
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return 0, errors.New("invalid IANA timezone")
-	}
-	tx, err := s.beginWriteTx(ctx)
+	timezone, err := validateTimezone(timezone)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
-		return 0, err
-	}
-	if count != 0 {
-		return 0, ErrSetupCompleted
-	}
-	username = strings.TrimSpace(username)
-	if username == "" {
-		username = derivedUsername(email, 1, nil)
-	}
-	username, err = validateUsername(username)
-	if err != nil {
-		return 0, err
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
-		VALUES(?,?,?,?,?,?)`, email, username, hash, "admin", timezone, nowText())
-	if err != nil {
-		return 0, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return id, nil
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int64, error) {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+			return 0, err
+		}
+		if count != 0 {
+			return 0, ErrSetupCompleted
+		}
+		candidate := strings.TrimSpace(username)
+		if candidate == "" {
+			candidate = derivedUsername(email, 1, nil)
+		}
+		candidate, err := validateUsername(candidate)
+		if err != nil {
+			return 0, err
+		}
+		result, err := tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at)
+			VALUES(?,?,?,?,?,?)`, email, candidate, hash, "admin", timezone, nowText())
+		if err != nil {
+			return 0, err
+		}
+		return result.LastInsertId()
+	})
 }
 
 func usernameTakenTx(ctx context.Context, tx *sql.Tx, username string, exceptID int64) (bool, error) {
@@ -201,6 +177,26 @@ func usernameTakenTx(ctx context.Context, tx *sql.Tx, username string, exceptID 
 		return false, err
 	}
 	return taken != 0, nil
+}
+
+func usernamesTakenTx(ctx context.Context, tx *sql.Tx) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	taken := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		taken[strings.ToLower(name)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return taken, nil
 }
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
@@ -254,146 +250,125 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 	if actingAdminID == userID {
 		return ErrCannotDeleteSelf
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var actingRole string
-	if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id=?`, actingAdminID).Scan(&actingRole); err != nil {
-		return err
-	}
-	if actingRole != "admin" {
-		return ErrAdminRequired
-	}
-	var email, role string
-	if err := tx.QueryRowContext(ctx, `SELECT email,role FROM users WHERE id=?`, userID).Scan(&email, &role); err != nil {
-		return err
-	}
-	if role == "admin" {
-		var admins int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role='admin'`).Scan(&admins); err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var actingRole string
+		if err := tx.QueryRowContext(ctx, `SELECT role FROM users WHERE id=?`, actingAdminID).Scan(&actingRole); err != nil {
 			return err
 		}
-		if admins <= 1 {
-			return ErrLastAdmin
+		if actingRole != "admin" {
+			return ErrAdminRequired
 		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_tokens WHERE email=? OR created_by=?`, email, userID); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id=?`, userID)
-	if err != nil {
-		return err
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		return sql.ErrNoRows
-	}
-	return tx.Commit()
+		var email, role string
+		if err := tx.QueryRowContext(ctx, `SELECT email,role FROM users WHERE id=?`, userID).Scan(&email, &role); err != nil {
+			return err
+		}
+		if role == "admin" {
+			var admins int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role='admin'`).Scan(&admins); err != nil {
+				return err
+			}
+			if admins <= 1 {
+				return ErrLastAdmin
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM auth_tokens WHERE email=? OR created_by=?`, email, userID); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id=?`, userID)
+		if err != nil {
+			return err
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID); err == nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return sql.ErrNoRows
+		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
-	}
-	if err != nil {
-		_ = tx.Rollback()
 		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, reminder, username string) error {
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return errors.New("invalid IANA timezone")
+	var err error
+	if timezone, err = validateTimezone(timezone); err != nil {
+		return err
 	}
-	if _, err := time.Parse("15:04", reminder); err != nil {
+	canonicalReminder, ok := normalizeReminderTime(reminder)
+	if !ok {
 		return errors.New("reminder time must use HH:MM")
 	}
-	username, err := validateUsername(username)
+	username, err = validateUsername(username)
 	if err != nil {
 		return err
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		taken, err := usernameTakenTx(ctx, tx, username, userID)
+		if err != nil {
+			return err
+		}
+		if taken {
+			return ErrUsernameTaken
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, canonicalReminder, userID)
 		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	taken, err := usernameTakenTx(ctx, tx, username, userID)
-	if err != nil {
-		return err
-	}
-	if taken {
-		return ErrUsernameTaken
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, reminder, userID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 
 // CreateUserFromInvite consumes an invitation and creates its account in one
 // transaction. Validation and uniqueness failures therefore leave the token
 // available for correction and retry.
 func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, timezone string) error {
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return errors.New("invalid IANA timezone")
-	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
+	var err error
+	if timezone, err = validateTimezone(timezone); err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	var email string
-	if err := tx.QueryRowContext(ctx, `SELECT email FROM auth_tokens WHERE token_hash=? AND kind='invite' AND used_at IS NULL AND expires_at>?`, security.Digest(raw), nowText()).Scan(&email); err != nil {
-		return err
-	}
-	if strings.TrimSpace(username) == "" {
-		var nextID int64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&nextID); err != nil {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var email string
+		if err := tx.QueryRowContext(ctx, `SELECT email FROM auth_tokens WHERE token_hash=? AND kind='invite' AND used_at IS NULL AND expires_at>?`, security.Digest(raw), nowText()).Scan(&email); err != nil {
 			return err
 		}
-		taken := make(map[string]struct{})
-		rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+		candidate := strings.TrimSpace(username)
+		if candidate == "" {
+			var nextID int64
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&nextID); err != nil {
+				return err
+			}
+			taken, err := usernamesTakenTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+			candidate = derivedUsername(email, nextID, taken)
+		}
+		candidate, err := validateUsername(candidate)
 		if err != nil {
 			return err
 		}
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				_ = rows.Close()
-				return err
-			}
-			taken[strings.ToLower(name)] = struct{}{}
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+		taken, err := usernameTakenTx(ctx, tx, candidate, 0)
+		if err != nil {
 			return err
 		}
-		_ = rows.Close()
-		username = derivedUsername(email, nextID, taken)
-	}
-	username, err = validateUsername(username)
-	if err != nil {
+		if taken {
+			return ErrUsernameTaken
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at) VALUES(?,?,?,'member',?,?)`, email, candidate, hash, timezone, nowText()); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=? AND kind='invite'`, nowText(), security.Digest(raw))
 		return err
-	}
-	taken, err := usernameTakenTx(ctx, tx, username, 0)
-	if err != nil {
-		return err
-	}
-	if taken {
-		return ErrUsernameTaken
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO users(email,username,password_hash,role,timezone,created_at) VALUES(?,?,?,'member',?,?)`, email, username, hash, timezone, nowText())
-	if err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=? AND kind='invite'`, nowText(), security.Digest(raw)); err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (raw, csrf string, err error) {
 	raw, err = security.Token(32)
@@ -446,66 +421,65 @@ func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID 
 	return raw, err
 }
 func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email string, userID *int64, err error) {
-	tx, err := s.beginWriteTx(ctx)
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (struct {
+		email string
+		id    sql.NullInt64
+	}, error) {
+		var result struct {
+			email string
+			id    sql.NullInt64
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT email,user_id FROM auth_tokens
+			WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>?`,
+			security.Digest(raw), kind, nowText()).Scan(&result.email, &result.id); err != nil {
+			return result, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=?`, nowText(), security.Digest(raw)); err != nil {
+			return result, err
+		}
+		return result, nil
+	})
 	if err != nil {
 		return "", nil, err
 	}
-	var id sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT email,user_id FROM auth_tokens
-		WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>?`,
-		security.Digest(raw), kind, nowText()).Scan(&email, &id)
-	if err != nil {
-		_ = tx.Rollback()
-		return "", nil, err
+	if result.id.Valid {
+		userID = &result.id.Int64
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=?`, nowText(), security.Digest(raw)); err != nil {
-		_ = tx.Rollback()
-		return "", nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return "", nil, err
-	}
-	if id.Valid {
-		userID = &id.Int64
-	}
-	return email, userID, nil
+	return result.email, userID, nil
 }
 
 // ResetPasswordWithToken updates the password, revokes existing sessions, and
 // consumes a reset token in one transaction. A transient database failure no
 // longer burns a still-valid recovery link.
 func (s *Store) ResetPasswordWithToken(ctx context.Context, raw, hash string) error {
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var userID sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT user_id FROM auth_tokens
-		WHERE token_hash=? AND kind='reset' AND used_at IS NULL AND expires_at>?`,
-		security.Digest(raw), nowText()).Scan(&userID); err != nil {
-		return err
-	}
-	if !userID.Valid {
-		return errors.New("reset token has no user")
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID.Int64); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID.Int64); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
-		WHERE token_hash=? AND kind='reset' AND used_at IS NULL`, nowText(), security.Digest(raw))
-	if err != nil {
-		return err
-	}
-	if changed, err := result.RowsAffected(); err != nil {
-		return err
-	} else if changed != 1 {
-		return sql.ErrNoRows
-	}
-	return tx.Commit()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var userID sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT user_id FROM auth_tokens
+			WHERE token_hash=? AND kind='reset' AND used_at IS NULL AND expires_at>?`,
+			security.Digest(raw), nowText()).Scan(&userID); err != nil {
+			return err
+		}
+		if !userID.Valid {
+			return errors.New("reset token has no user")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID.Int64); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID.Int64); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
+			WHERE token_hash=? AND kind='reset' AND used_at IS NULL`, nowText(), security.Digest(raw))
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil {
+			return err
+		} else if changed != 1 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 
 func (s *Store) LoginAllowed(ctx context.Context, key string) (bool, error) {
@@ -528,44 +502,35 @@ func (s *Store) LoginAllowed(ctx context.Context, key string) (bool, error) {
 }
 func (s *Store) RecordLoginFailure(ctx context.Context, key string) error {
 	now := time.Now().UTC()
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var failures int
-	var first string
-	err = tx.QueryRowContext(ctx, `SELECT failures,first_at FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&failures, &first)
-	if errors.Is(err, sql.ErrNoRows) {
-		_, err = tx.ExecContext(ctx, `INSERT INTO login_attempts(key_hash,failures,first_at) VALUES(?,?,?)`,
-			security.Digest(key), 1, timeText(now))
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var failures int
+		var first string
+		err := tx.QueryRowContext(ctx, `SELECT failures,first_at FROM login_attempts WHERE key_hash=?`, security.Digest(key)).Scan(&failures, &first)
+		if errors.Is(err, sql.ErrNoRows) {
+			_, err = tx.ExecContext(ctx, `INSERT INTO login_attempts(key_hash,failures,first_at) VALUES(?,?,?)`,
+				security.Digest(key), 1, timeText(now))
+			return err
+		}
 		if err != nil {
 			return err
 		}
-		return tx.Commit()
-	}
-	if err != nil {
+		firstAt, err := parseStoredTime(first, "login attempt first_at")
+		if err != nil {
+			return err
+		}
+		if now.Sub(firstAt) > 15*time.Minute {
+			failures = 0
+			firstAt = now
+		}
+		failures++
+		var blocked any
+		if failures >= 5 {
+			blocked = timeText(now.Add(15 * time.Minute))
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE login_attempts SET failures=?,first_at=?,blocked_until=? WHERE key_hash=?`,
+			failures, timeText(firstAt), blocked, security.Digest(key))
 		return err
-	}
-	firstAt, err := parseStoredTime(first, "login attempt first_at")
-	if err != nil {
-		return err
-	}
-	if now.Sub(firstAt) > 15*time.Minute {
-		failures = 0
-		firstAt = now
-	}
-	failures++
-	var blocked any
-	if failures >= 5 {
-		blocked = timeText(now.Add(15 * time.Minute))
-	}
-	_, err = tx.ExecContext(ctx, `UPDATE login_attempts SET failures=?,first_at=?,blocked_until=? WHERE key_hash=?`,
-		failures, timeText(firstAt), blocked, security.Digest(key))
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
+	})
 }
 func (s *Store) ClearLoginFailures(ctx context.Context, key string) {
 	_, _ = s.execWriteContext(ctx, `DELETE FROM login_attempts WHERE key_hash=?`, security.Digest(key))

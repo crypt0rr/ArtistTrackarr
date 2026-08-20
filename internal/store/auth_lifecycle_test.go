@@ -36,6 +36,9 @@ func TestAuthSessionTokenAndLoginLifecycle(t *testing.T) {
 	if err := s.UpdatePassword(canceled, userID, "should-not-apply"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled password update error=%v", err)
 	}
+	if err := s.UpdatePassword(ctx, 999999, "missing-user"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing password user error=%v, want sql.ErrNoRows", err)
+	}
 	updatedUser, err := s.UserByID(ctx, userID)
 	if err != nil || updatedUser.PasswordHash != "new-hash" {
 		t.Fatalf("canceled password update changed hash=%q err=%v", updatedUser.PasswordHash, err)
@@ -106,6 +109,9 @@ func TestUserValidationAndCaseInsensitiveUsernameOwnership(t *testing.T) {
 	if _, err := s.CreateUser(ctx, "timezone@example.com", "hash", "member", "Not/AZone", "valid-user"); err == nil {
 		t.Fatal("invalid timezone was accepted")
 	}
+	if _, err := s.CreateUser(ctx, "empty-timezone@example.com", "hash", "member", "  ", "empty-timezone"); err == nil {
+		t.Fatal("empty timezone was accepted")
+	}
 	for _, username := range []string{"ab", "this username is invalid", ""}[:2] {
 		if _, err := s.CreateUser(ctx, "invalid-"+username+"@example.com", "hash", "member", "UTC", username); !errors.Is(err, ErrInvalidUsername) {
 			t.Fatalf("username %q error=%v, want ErrInvalidUsername", username, err)
@@ -121,6 +127,9 @@ func TestUserValidationAndCaseInsensitiveUsernameOwnership(t *testing.T) {
 	if err := s.UpdateProfile(ctx, firstID, "Not/AZone", "09:00", "CaseUser"); err == nil {
 		t.Fatal("invalid profile timezone was accepted")
 	}
+	if err := s.UpdateProfile(ctx, firstID, "  ", "09:00", "CaseUser"); err == nil {
+		t.Fatal("empty profile timezone was accepted")
+	}
 	if err := s.UpdateProfile(ctx, firstID, "UTC", "not-a-time", "CaseUser"); err == nil {
 		t.Fatal("invalid reminder time was accepted")
 	}
@@ -129,6 +138,16 @@ func TestUserValidationAndCaseInsensitiveUsernameOwnership(t *testing.T) {
 	}
 	if err := s.UpdateProfile(ctx, firstID, "UTC", "09:00", "CaseUser"); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.UpdateProfile(ctx, firstID, "UTC", " 9:30 ", "CaseUser"); err != nil {
+		t.Fatalf("legacy reminder input rejected: %v", err)
+	}
+	profile, err := s.UserByID(ctx, firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.ReminderTime != "09:30" {
+		t.Fatalf("reminder time=%q, want canonical 09:30", profile.ReminderTime)
 	}
 	generatedID, err := s.CreateUser(ctx, "A+generated@example.com", "hash", "member", "UTC", "")
 	if err != nil {

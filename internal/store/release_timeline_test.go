@@ -129,3 +129,43 @@ func TestReleaseTimelineIsOwnerScopedAndExplainsDecisions(t *testing.T) {
 		t.Fatalf("missing timeline error=%v, want sql.ErrNoRows", err)
 	}
 }
+
+func TestReleaseTimelineClosesRowsAfterMalformedTimestamp(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "timeline-malformed@example.com", "hash", "member", "UTC", "timeline-malformed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "timeline-malformed-artist", Name: "Timeline Malformed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "timeline-malformed-release", artist.ID, "Timeline Malformed Release", "Album", "[]",
+		"2026-08-12", 3, "https://musicbrainz.org/release-group/timeline-malformed-release", "musicbrainz", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO provider_observations
+		(provider,provider_id,release_group_id,payload_hash,observed_at) VALUES(?,?,?,?,?)`, "musicbrainz", "timeline-malformed-observation", releaseID, "hash", "not-a-timestamp"); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, time.Second)
+		_, err := s.ReleaseTimeline(callCtx, userID, releaseID)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "invalid persisted release timeline observation") {
+			t.Fatalf("attempt %d timeline error=%v", attempt, err)
+		}
+	}
+}

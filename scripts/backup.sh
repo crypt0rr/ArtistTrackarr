@@ -16,8 +16,11 @@ output_file="$output_dir/$(basename -- "$output")"
 checksum_file="$output_file.sha256"
 container_id=""
 restart_needed=0
+archive_tmp="$output_file.$$.tmp"
+checksum_tmp="$checksum_file.$$.tmp"
 
 cleanup() {
+	rm -f -- "$archive_tmp" "$checksum_tmp"
 	if [ "$restart_needed" -eq 1 ]; then
 		docker compose start "$service" >/dev/null || true
 	fi
@@ -62,16 +65,25 @@ if ! docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec 'test
 	exit 1
 fi
 
-docker run --rm --volumes-from "$container_id" -v "$output_dir:/backup" "$HELPER_IMAGE" \
-	tar czf "/backup/$(basename -- "$output_file")" -C /data .
-(
-	cd "$output_dir"
-	sha256sum "$(basename -- "$output_file")" > "$(basename -- "$checksum_file")"
-)
-chmod 600 "$output_file" "$checksum_file"
+# Stream the archive to the invoking operator instead of asking a privileged
+# helper container to create a host-side file and chown it. This works with
+# rootless Docker as well as ordinary Docker: the shell redirection and final
+# rename are performed by the operator's own UID/GID. A temporary filename
+# keeps an interrupted tar from looking like a valid backup.
+docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" tar czf - -C /data . > "$archive_tmp"
+chmod 600 "$archive_tmp"
+archive_hash=$(sha256sum "$archive_tmp" | awk '{print $1}')
+printf '%s  %s\n' "$archive_hash" "$(basename -- "$output_file")" > "$checksum_tmp"
+chmod 600 "$checksum_tmp"
+mv -f -- "$archive_tmp" "$output_file"
+mv -f -- "$checksum_tmp" "$checksum_file"
 # Write the marker only after both the archive and checksum are complete. It is
 # deliberately not part of the just-created archive; the next backup will
 # include it, while the live application immediately sees the latest result.
-docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec \
-	'printf "%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/.artist-trackarr-last-backup && chmod 600 /data/.artist-trackarr-last-backup'
+docker run --rm --user 10001:10001 --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec '
+umask 027
+marker=/data/.artist-trackarr-last-backup
+temporary="$marker.$$"
+printf "%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$temporary"
+mv -f "$temporary" "$marker"'
 echo "backup: wrote $output_file and $checksum_file from volume $mount_name"

@@ -4,6 +4,15 @@ linters:
   default: none
   enable:
     - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - rowserrcheck
+    - sqlclosecheck
+    - bodyclose
+    - errorlint
+    - nilerr
 
 run:
   timeout: 5m

@@ -55,7 +55,7 @@
       <div><strong>{{.Name}}</strong><span>{{.Service}} · credentials hidden</span>
         <span class="destination-health"><span class="badge {{destinationHealthClass $health.Status}}">{{destinationHealthLabel $health.Status}}</span>{{if $health.PendingCount}}<small>{{$health.PendingCount}} pending</small>{{end}}{{if $health.BlockedCount}}<small>{{$health.BlockedCount}} blocked</small>{{end}}{{if $health.FailedCount}}<small>{{$health.FailedCount}} failed</small>{{end}}{{if $health.ConsecutiveFailures}}<small>{{$health.ConsecutiveFailures}} consecutive failure{{if ne $health.ConsecutiveFailures 1}}s{{end}}</small>{{end}}</span>
         {{if eq $health.Status "unsupported"}}<small class="health-error">This transport is no longer supported. Replace it with an HTTP(S)-based destination.</small>{{else if $health.LastError}}<small class="health-error">{{$health.LastError}}</small>{{end}}
-        {{if $health.NextRetryAt}}<small>Retry after {{formatProviderTime $health.NextRetryAt}}</small>{{end}}
+        {{if $health.NextRetryAt}}<small>Retry after {{formatProviderTime $health.NextRetryAt $.User.Timezone}}</small>{{end}}
         <details class="rename"><summary>Rename</summary>
           <form method="post" action="/destinations/{{.ID}}/rename" class="rename-form">
             {{template "csrf" $}}<label>New name<input name="name" value="{{.Name}}" maxlength="80" required></label><button class="secondary">Save</button>

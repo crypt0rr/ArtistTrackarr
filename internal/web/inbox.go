@@ -155,8 +155,7 @@ func (a *App) inboxStateAction(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(redirect, "?") {
 		separator = "&"
 	}
-	message := url.QueryEscape("Release inbox updated")
-	http.Redirect(w, r, redirect+separator+"message="+message, http.StatusSeeOther)
+	http.Redirect(w, r, redirect+separator+a.statusQuery("Release inbox updated"), http.StatusSeeOther)
 }
 
 // inboxReadRedirect returns the first page while preserving any explicit

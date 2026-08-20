@@ -132,33 +132,30 @@ func (s *Store) SetReleaseInboxState(ctx context.Context, userID, releaseID int6
 	} else {
 		snoozedUntil = nil
 	}
-	tx, err := s.beginWriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var exists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM notification_events e
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var exists int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_events e
 		JOIN release_groups rg ON rg.id=e.release_group_id
 		WHERE e.release_group_id=? AND e.user_id=? AND `+followedReleasePredicate("e.user_id")+` LIMIT 1`,
-		releaseID, userID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return sql.ErrNoRows
-	}
-	if err != nil {
-		return err
-	}
-	var until any
-	if snoozedUntil != nil {
-		until = timeText(snoozedUntil.UTC())
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO user_release_states(user_id,release_group_id,state,snoozed_until,updated_at)
+			releaseID, userID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return err
+		}
+		var until any
+		if snoozedUntil != nil {
+			until = timeText(snoozedUntil.UTC())
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO user_release_states(user_id,release_group_id,state,snoozed_until,updated_at)
 		VALUES(?,?,?,?,?)
 		ON CONFLICT(user_id,release_group_id) DO UPDATE SET state=excluded.state,
 			snoozed_until=excluded.snoozed_until,updated_at=excluded.updated_at`,
-		userID, releaseID, state, until, nowText())
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
+			userID, releaseID, state, until, nowText())
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }

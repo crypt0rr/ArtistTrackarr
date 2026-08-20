@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -20,7 +19,7 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "action")))
-	if action != "notify" && action != "discard" {
+	if action != "notify" && action != "discard" && action != "restore" {
 		http.Error(w, "invalid notification hold action", http.StatusBadRequest)
 		return
 	}
@@ -40,12 +39,15 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 	}
 	redirect := localReturnPath(r.FormValue("return"), "/", "/")
 	message := "Notification released"
-	if action == "discard" {
+	switch action {
+	case "discard":
 		message = "Notification discarded"
+	case "restore":
+		message = "Notification restored"
 	}
 	separator := "?"
 	if strings.Contains(redirect, "?") {
 		separator = "&"
 	}
-	http.Redirect(w, r, redirect+separator+"message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, redirect+separator+a.statusQuery(message), http.StatusSeeOther)
 }
