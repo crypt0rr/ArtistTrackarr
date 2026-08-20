@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 func (c ResolutionCandidate) Artist() Artist {
@@ -448,6 +448,8 @@ type DatabaseHealthState string
 const (
 	DatabaseHealthy     DatabaseHealthState = "healthy"
 	DatabaseUnavailable DatabaseHealthState = "unavailable"
+	DatabaseReadOnly    DatabaseHealthState = "read_only"
+	DatabaseFull        DatabaseHealthState = "full"
 	DatabaseWriteFailed DatabaseHealthState = "write_failed"
 )
 
@@ -473,6 +475,35 @@ func (e *DatabaseHealthError) Unwrap() error {
 	return e.Err
 }
 
+// classifyDatabaseHealthError turns SQLite's write error into a small safe
+// state vocabulary for readiness and authenticated diagnostics. The driver
+// error is retained for logs, but the state is all that crosses the web/API
+// boundary.
+func classifyDatabaseHealthError(err error) DatabaseHealthState {
+	if err == nil {
+		return DatabaseHealthy
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code() & 0xff
+		name := strings.ToUpper(sqlite.ErrorCodeString[code])
+		switch {
+		case strings.Contains(name, "SQLITE_READONLY"):
+			return DatabaseReadOnly
+		case strings.Contains(name, "SQLITE_FULL"):
+			return DatabaseFull
+		}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "readonly") || strings.Contains(message, "read-only") {
+		return DatabaseReadOnly
+	}
+	if strings.Contains(message, "database or disk is full") || strings.Contains(message, "no space left") {
+		return DatabaseFull
+	}
+	return DatabaseWriteFailed
+}
+
 // Healthy proves both that the migrated schema can be read and that the
 // writer can complete a tiny rollback-only write. A read-only or full
 // database must not be reported as ready merely because SELECT succeeds.
@@ -492,14 +523,23 @@ func (s *Store) Healthy(ctx context.Context) error {
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+		return &DatabaseHealthError{State: classifyDatabaseHealthError(err), Err: err}
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, nowText(), "INFO", "health probe", "[]"); err != nil {
-		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+	result, err := tx.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, nowText(), "INFO", "health probe", "[]")
+	if err != nil {
+		return &DatabaseHealthError{State: classifyDatabaseHealthError(err), Err: err}
+	}
+	probeID, err := result.LastInsertId()
+	if err != nil {
+		return &DatabaseHealthError{State: classifyDatabaseHealthError(err), Err: err}
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM application_logs WHERE id=?`, probeID).Scan(&found); err != nil {
+		return &DatabaseHealthError{State: DatabaseUnavailable, Err: err}
 	}
 	if err := tx.Rollback(); err != nil {
-		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+		return &DatabaseHealthError{State: classifyDatabaseHealthError(err), Err: err}
 	}
 	return nil
 }

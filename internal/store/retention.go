@@ -41,6 +41,13 @@ type RetentionCleanupStats struct {
 	LoginAttempts   int64
 	ManualSyncs     int64
 	ImportJobs      int64
+	// WALCheckpointed indicates that SQLite truncated the write-ahead log
+	// after cleanup. A successful checkpoint does not compact freelist pages;
+	// operators must schedule an explicit VACUUM during a maintenance window
+	// if shrinking the database file is required.
+	WALCheckpointed    bool
+	WALCheckpointBusy  bool
+	WALCheckpointError bool
 }
 
 func (s *Store) RetentionReport(ctx context.Context, now time.Time) (RetentionReport, error) {
@@ -128,7 +135,7 @@ func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionC
 		now = time.Now().UTC()
 	}
 	policy := s.retention()
-	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (RetentionCleanupStats, error) {
+	stats, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (RetentionCleanupStats, error) {
 		var resultStats RetentionCleanupStats
 		statements := []struct {
 			query string
@@ -155,4 +162,18 @@ func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionC
 		}
 		return resultStats, nil
 	})
+	if err != nil {
+		return RetentionCleanupStats{}, err
+	}
+	// Cleanup has already committed at this point. Do not turn a successful
+	// deletion into a misleading failure if a concurrent reader prevents WAL
+	// truncation; report the outcome explicitly instead.
+	var busy, logPages, checkpointedPages int64
+	checkpointErr := s.DB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logPages, &checkpointedPages)
+	stats.WALCheckpointError = checkpointErr != nil
+	// Treat an inability to checkpoint like a busy reader for operator-facing
+	// messaging. The committed row cleanup remains successful either way.
+	stats.WALCheckpointBusy = checkpointErr != nil || busy != 0
+	stats.WALCheckpointed = checkpointErr == nil && busy == 0
+	return stats, nil
 }

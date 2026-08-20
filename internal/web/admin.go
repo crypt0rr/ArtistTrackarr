@@ -137,6 +137,7 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		OperationalReasons: reasons,
 		Database: diagnosticsJSONDatabase{
 			Healthy:       snapshot.DatabaseHealthy,
+			State:         string(snapshot.DatabaseHealthState),
 			Schema:        snapshot.SchemaVersion,
 			SizeBytes:     snapshot.DatabaseBytes,
 			FreeBytes:     snapshot.DatabaseFreeBytes,
@@ -234,6 +235,7 @@ type diagnosticsJSONPayload struct {
 
 type diagnosticsJSONDatabase struct {
 	Healthy       bool       `json:"healthy"`
+	State         string     `json:"state"`
 	Schema        int        `json:"schema"`
 	SizeBytes     int64      `json:"size_bytes"`
 	FreeBytes     int64      `json:"free_bytes"`
@@ -451,8 +453,18 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	a.logger.Info("retention cleanup completed", "removed", removed,
 		"application_logs", stats.ApplicationLogs, "sessions", stats.Sessions,
 		"auth_tokens", stats.AuthTokens, "login_attempts", stats.LoginAttempts,
-		"manual_syncs", stats.ManualSyncs, "import_jobs", stats.ImportJobs)
-	http.Redirect(w, r, "/admin?message="+url.QueryEscape(fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)), http.StatusSeeOther)
+		"manual_syncs", stats.ManualSyncs, "import_jobs", stats.ImportJobs,
+		"wal_checkpointed", stats.WALCheckpointed, "wal_checkpoint_busy", stats.WALCheckpointBusy,
+		"wal_checkpoint_error", stats.WALCheckpointError)
+	message := fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)
+	if stats.WALCheckpointed {
+		message += " WAL space was checkpointed; freelist pages remain reusable and VACUUM is not run automatically."
+	} else if stats.WALCheckpointBusy {
+		message += " WAL truncation was deferred because the database was busy; freelist pages remain reusable."
+	} else {
+		message += " Database file size was not compacted; freelist pages remain reusable and VACUUM is not run automatically."
+	}
+	http.Redirect(w, r, "/admin?message="+url.QueryEscape(message), http.StatusSeeOther)
 }
 
 func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string) string {
@@ -472,7 +484,15 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	if len(reasons) > 0 {
 		fmt.Fprintf(&report, "Operational reasons: %s\n", strings.Join(reasons, ", "))
 	}
-	fmt.Fprintf(&report, "Database: %s (schema %d)\n", diagnosticHealthLabel(snapshot.DatabaseHealthy), snapshot.SchemaVersion)
+	databaseState := string(snapshot.DatabaseHealthState)
+	if databaseState == "" {
+		if snapshot.DatabaseHealthy {
+			databaseState = string(store.DatabaseHealthy)
+		} else {
+			databaseState = string(store.DatabaseUnavailable)
+		}
+	}
+	fmt.Fprintf(&report, "Database: %s (schema %d)\n", databaseState, snapshot.SchemaVersion)
 	fmt.Fprintf(&report, "Followed artists: %d\n", snapshot.FollowedArtists)
 	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)
 	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)
@@ -546,6 +566,26 @@ func diagnosticHealthLabel(healthy bool) string {
 		return "healthy"
 	}
 	return "unavailable"
+}
+
+func databaseHealthLabel(snapshot store.DiagnosticsSnapshot) string {
+	switch snapshot.DatabaseHealthState {
+	case store.DatabaseHealthy:
+		return "healthy"
+	case store.DatabaseReadOnly:
+		return "read-only"
+	case store.DatabaseFull:
+		return "full"
+	case store.DatabaseWriteFailed:
+		return "write failed"
+	case store.DatabaseUnavailable:
+		return "unavailable"
+	default:
+		if snapshot.DatabaseHealthy {
+			return "healthy"
+		}
+		return "unavailable"
+	}
 }
 func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {

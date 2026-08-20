@@ -467,6 +467,11 @@ delivery-attempt audit records have no automatic expiry and are not removed by
 this action while the account exists (account deletion still removes that
 account's private data). Backups should therefore be treated as confidential and retained
 according to the household's own recovery policy.
+Explicit cleanup checkpoints the SQLite WAL when possible and reports if a
+reader delayed truncation. It does not run `VACUUM` or promise a smaller
+database file: deleted pages are reported separately as reusable freelist
+space. Run `VACUUM` only during a planned maintenance window with a recent
+backup and enough temporary disk space.
 
 The administrator page marks a retention review when the oldest notification or
 delivery history reaches 365 days. This is a review recommendation only: no

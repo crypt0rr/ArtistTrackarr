@@ -39,6 +39,24 @@ func TestOperationalStatusSeparatesDatabaseAndBackgroundHealth(t *testing.T) {
 	}
 }
 
+func TestOperationalStatusPreservesDatabaseFailureClass(t *testing.T) {
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		state  DatabaseHealthState
+		reason string
+	}{
+		{state: DatabaseReadOnly, reason: "database read-only"},
+		{state: DatabaseFull, reason: "database full"},
+		{state: DatabaseWriteFailed, reason: "database write failed"},
+		{state: DatabaseUnavailable, reason: "database unavailable"},
+	} {
+		status, reasons := OperationalStatus(DiagnosticsSnapshot{DatabaseHealthState: test.state}, "running", now)
+		if status != "unavailable" || len(reasons) != 1 || reasons[0] != test.reason {
+			t.Fatalf("state=%q status=%q reasons=%v, want %q", test.state, status, reasons, test.reason)
+		}
+	}
+}
+
 func TestOperationalStatusReportsRecoveredAndMissingAgeSafely(t *testing.T) {
 	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 	status, reasons := OperationalStatus(DiagnosticsSnapshot{

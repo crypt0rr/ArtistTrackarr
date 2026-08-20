@@ -665,11 +665,15 @@ type AssuranceSummary struct {
 type DiagnosticsSnapshot struct {
 	CheckedAt       time.Time
 	DatabaseHealthy bool
-	SchemaVersion   int
-	FollowedArtists int
-	Releases        int
-	QueuedSyncs     int
-	RunningSyncs    int
+	// DatabaseHealthState distinguishes a readable database from one that is
+	// read-only, full, unavailable, or otherwise unable to persist writes.
+	// It is live diagnostic state and is not persisted in hourly snapshots.
+	DatabaseHealthState DatabaseHealthState
+	SchemaVersion       int
+	FollowedArtists     int
+	Releases            int
+	QueuedSyncs         int
+	RunningSyncs        int
 	// DueSyncArtists is the total number of distinct followed artists whose
 	// normal or Spotify schedule is due. It is intentionally separate from
 	// the runner's per-tick batch size, which is capped for fairness.

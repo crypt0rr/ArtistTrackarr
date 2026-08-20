@@ -282,6 +282,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"formatProviderTime":     providerHealthTime,
 		"providerTimeAttr":       providerHealthTimeAttr,
 		"formatBytes":            formatBytes,
+		"databaseHealthLabel":    databaseHealthLabel,
 		"operationalStatusLabel": store.DiagnosticStatusLabel,
 		"operationalStatusClass": func(status string) string {
 			switch strings.ToLower(strings.TrimSpace(status)) {

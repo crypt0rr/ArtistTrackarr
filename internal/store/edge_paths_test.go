@@ -601,17 +601,56 @@ func TestHealthyRequiresMigratedSchema(t *testing.T) {
 		t.Fatalf("healthy migrated store=%v", err)
 	}
 	// A read-only connection can still read the migrated schema, but the
-	// rollback-only write probe must classify it as a write failure.
+	// rollback-only write probe must preserve the more actionable state.
 	readOnly := &Store{DB: s.Reader}
 	err := readOnly.Healthy(ctx)
 	var healthErr *DatabaseHealthError
-	if !errors.As(err, &healthErr) || healthErr.State != DatabaseWriteFailed {
-		t.Fatalf("read-only health error=%v, want write_failed", err)
+	if !errors.As(err, &healthErr) || healthErr.State != DatabaseReadOnly {
+		t.Fatalf("read-only health error=%v, want read_only", err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `DROP TABLE schema_migrations`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Healthy(ctx); err == nil {
 		t.Fatal("healthy reported a database without the application schema")
+	}
+}
+
+func TestDatabaseHealthClassifiesWriteFailureStates(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want DatabaseHealthState
+	}{
+		{name: "readonly", err: errors.New("attempt to write a readonly database"), want: DatabaseReadOnly},
+		{name: "full", err: errors.New("database or disk is full"), want: DatabaseFull},
+		{name: "other", err: errors.New("database is locked"), want: DatabaseWriteFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyDatabaseHealthError(test.err); got != test.want {
+				t.Fatalf("classifyDatabaseHealthError(%q)=%q, want %q", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticsReportsLiveWriteHealthState(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	readOnly := &Store{DB: s.Reader}
+	snapshot, err := readOnly.Diagnostics(ctx)
+	if err != nil {
+		t.Fatalf("read-only diagnostics: %v", err)
+	}
+	if snapshot.DatabaseHealthy || snapshot.DatabaseHealthState != DatabaseReadOnly {
+		t.Fatalf("read-only diagnostics healthy=%v state=%q", snapshot.DatabaseHealthy, snapshot.DatabaseHealthState)
+	}
+
+	healthy, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatalf("healthy diagnostics: %v", err)
+	}
+	if !healthy.DatabaseHealthy || healthy.DatabaseHealthState != DatabaseHealthy {
+		t.Fatalf("healthy diagnostics healthy=%v state=%q", healthy.DatabaseHealthy, healthy.DatabaseHealthState)
 	}
 }

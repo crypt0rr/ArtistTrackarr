@@ -390,6 +390,16 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	var snapshot DiagnosticsSnapshot
 	snapshot.CheckedAt = time.Now().UTC()
+	snapshot.DatabaseHealthState = DatabaseHealthy
+	if healthErr := s.Healthy(ctx); healthErr != nil {
+		var classified *DatabaseHealthError
+		if errors.As(healthErr, &classified) && classified != nil && classified.State != "" {
+			snapshot.DatabaseHealthState = classified.State
+		} else {
+			snapshot.DatabaseHealthState = DatabaseUnavailable
+		}
+	}
+	snapshot.DatabaseHealthy = snapshot.DatabaseHealthState == DatabaseHealthy
 	err := s.readerDB().QueryRowContext(ctx, `SELECT
 		COALESCE((SELECT MAX(version) FROM schema_migrations),0),
 		(SELECT COUNT(*) FROM follows),
@@ -406,7 +416,6 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	if err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	snapshot.DatabaseHealthy = true
 	var oldestDue sql.NullString
 	if err := s.readerDB().QueryRowContext(ctx, `WITH due AS (
 		SELECT a.id,a.next_check_at AS due_at

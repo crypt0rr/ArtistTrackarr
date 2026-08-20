@@ -30,7 +30,16 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 		now = time.Now().UTC()
 	}
 	if !snapshot.DatabaseHealthy {
-		return "unavailable", []string{"database unavailable"}
+		switch snapshot.DatabaseHealthState {
+		case DatabaseReadOnly:
+			return "unavailable", []string{"database read-only"}
+		case DatabaseFull:
+			return "unavailable", []string{"database full"}
+		case DatabaseWriteFailed:
+			return "unavailable", []string{"database write failed"}
+		default:
+			return "unavailable", []string{"database unavailable"}
+		}
 	}
 	status := "healthy"
 	reasons := make([]string, 0, 6)

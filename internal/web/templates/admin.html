@@ -22,7 +22,7 @@
   <div class="section-head"><div><p class="eyebrow">Release assurance</p><h2>System diagnostics</h2><p>Safe counters and scheduler state help troubleshoot a missed sync without exposing credentials or notification content.</p></div><div class="section-actions"><span class="badge {{operationalStatusClass .OperationalStatus}}">{{operationalStatusLabel .OperationalStatus}}</span><a class="button secondary" href="/admin/diagnostics">Open report</a><a class="button secondary" href="/admin/diagnostics.json">JSON</a></div></div>
   {{if .OperationalReasons}}<p class="{{if eq .OperationalStatus "degraded"}}diagnostic-warning{{else}}diagnostic-note{{end}}"><strong>{{if eq .OperationalStatus "degraded"}}Needs attention:{{else}}Operational note:{{end}}</strong> {{join .OperationalReasons ", "}}{{if eq .OperationalStatus "degraded"}}. The database remains available; resolve these conditions before treating the household as fully healthy.{{end}}</p>{{end}}
   <div class="diagnostics-grid">
-    <div><strong>{{if .Diagnostics.DatabaseHealthy}}Healthy{{else}}Unavailable{{end}}</strong><span>database · schema {{.Diagnostics.SchemaVersion}}</span></div>
+    <div><strong>{{databaseHealthLabel .Diagnostics}}</strong><span>database · schema {{.Diagnostics.SchemaVersion}}</span></div>
     <div><strong>{{if .RunnerStatus.Running}}Running{{else}}Stopped{{end}}</strong><span>scheduler{{if .RunnerStatus.LastActivityAt}} · last activity {{formatProviderTime .RunnerStatus.LastActivityAt $.User.Timezone}}{{end}}</span></div>
     <div><strong>{{.Diagnostics.QueuedSyncs}}</strong><span>queued syncs</span></div>
     <div><strong>{{.Diagnostics.RunningSyncs}}</strong><span>running syncs</span></div>
