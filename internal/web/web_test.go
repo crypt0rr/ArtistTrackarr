@@ -155,6 +155,15 @@ func TestSecurityHeadersAndDebugRequestLog(t *testing.T) {
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("health status=%d", response.Code)
 	}
+	readyRequest := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	readyResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(readyResponse, readyRequest)
+	if readyResponse.Code != http.StatusNoContent {
+		t.Fatalf("ready status=%d, want %d", readyResponse.Code, http.StatusNoContent)
+	}
+	if got := readyResponse.Header().Get("X-ArtistTrackarr-Database"); got != "healthy" {
+		t.Fatalf("ready database header=%q, want healthy", got)
+	}
 	if response.Header().Get("Strict-Transport-Security") != "max-age=31536000" {
 		t.Fatalf("HSTS=%q", response.Header().Get("Strict-Transport-Security"))
 	}
@@ -796,6 +805,26 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	otherUserID, err := database.CreateUser(context.Background(), "calendar-other@example.com", "unused", "member", "UTC", "calendar-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRawSession, _, err := database.CreateSession(context.Background(), otherUserID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJar.SetCookies(serverURL, []*http.Cookie{{
+		Name: "artist_session", Value: security.SignedToken("the session secret has more than 32 bytes", otherRawSession), Path: "/",
+	}})
+	otherClient := &http.Client{Jar: otherJar}
 	artist, err := database.UpsertArtist(context.Background(), store.Artist{
 		MBID: "88888888-8888-4888-8888-888888888888", Name: "Calendar Web Artist", SortName: "Calendar Web Artist",
 	})
@@ -805,12 +834,30 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
 		t.Fatal(err)
 	}
+	otherArtist, err := database.UpsertArtist(context.Background(), store.Artist{
+		MBID: "99999999-9999-4999-8999-999999999999", Name: "Other Calendar Artist", SortName: "Other Calendar Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(context.Background(), otherUserID, otherArtist.ID); err != nil {
+		t.Fatal(err)
+	}
 	releaseDate := time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")
 	if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
 		Provider: "itunes",
 		Releases: []store.Release{{
 			MBID: "itunes:calendar-web", ITunesID: "calendar-web", Title: "Calendar Web Release", PrimaryType: "Album",
 			FirstReleaseDate: releaseDate, DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/calendar-web-release",
+		}},
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ApplyReleaseBatches(context.Background(), otherArtist, []store.ReleaseBatch{{
+		Provider: "itunes",
+		Releases: []store.Release{{
+			MBID: "itunes:calendar-web-other", ITunesID: "calendar-web-other", Title: "Other Calendar Release", PrimaryType: "Album",
+			FirstReleaseDate: releaseDate, DatePrecision: 3, ITunesURL: "https://music.apple.com/us/album/other-calendar-release",
 		}},
 	}}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
@@ -824,8 +871,8 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	_ = response.Body.Close()
 	page := string(body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(page, "Release calendar") ||
-		!strings.Contains(page, "Calendar Web Release") || !strings.Contains(page, "Download ICS") ||
-		!strings.Contains(page, `href="/releases/1"`) {
+		!strings.Contains(page, "Calendar Web Release") || strings.Contains(page, "Other Calendar Release") ||
+		!strings.Contains(page, "Download ICS") {
 		t.Fatalf("calendar status/body=%d %q", response.StatusCode, body)
 	}
 	response, err = client.Get(server.URL + "/calendar.ics")
@@ -841,8 +888,31 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 		response.Header.Get("Cache-Control") != "no-store" ||
 		!strings.Contains(unfolded, "BEGIN:VCALENDAR") || !strings.Contains(unfolded, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
 		!strings.Contains(unfolded, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
-		!strings.Contains(unfolded, "https://music.apple.com/us/album/calendar-web-release") {
+		!strings.Contains(unfolded, "https://music.apple.com/us/album/calendar-web-release") ||
+		strings.Contains(unfolded, "Other Calendar Release") {
 		t.Fatalf("calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
+	}
+	response, err = otherClient.Get(server.URL + "/calendar?month=" + month)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	otherPage := string(body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(otherPage, "Other Calendar Release") ||
+		strings.Contains(otherPage, "Calendar Web Release") {
+		t.Fatalf("other calendar status/body=%d %q", response.StatusCode, body)
+	}
+	response, err = otherClient.Get(server.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	otherICS := strings.ReplaceAll(string(body), "\r\n ", "")
+	if response.StatusCode != http.StatusOK || !strings.Contains(otherICS, "SUMMARY:Other Calendar Release — Other Calendar Artist") ||
+		strings.Contains(otherICS, "Calendar Web Release") || strings.Contains(otherICS, "calendar-web-release") {
+		t.Fatalf("other calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
 	}
 }
 
