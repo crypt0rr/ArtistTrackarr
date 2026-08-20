@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"errors"
 	"html/template"
 	"log/slog"
@@ -559,6 +560,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		artworkLimiter:          newFixedWindowLimiter(120, time.Minute),
 		destinationTestLimiter:  newFixedWindowLimiter(5, 15*time.Minute),
 		destinationRetryLimiter: newFixedWindowLimiter(10, 15*time.Minute),
+		calendarFeedLimiter:     newFixedWindowLimiter(60, time.Minute),
 		loginSlots:              make(chan struct{}, 8),
 	}, nil
 }
@@ -641,6 +643,7 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artists", a.artists)
 		private.Get("/calendar", a.calendar)
 		private.Get("/calendar.ics", a.calendarICS)
+		private.Post("/settings/calendar-feed", a.calendarFeedAction)
 		private.Get("/inbox", a.inbox)
 		private.Post("/inbox/{id}/{action}", a.inboxStateAction)
 		private.Post("/notifications/holds/{id}/{action}", a.notificationHoldAction)
@@ -697,6 +700,7 @@ func (a *App) Handler() http.Handler {
 			admin.Post("/admin/retention/cleanup", a.cleanupRetention)
 		})
 	})
+	r.Get("/calendar/feed/{token}", a.calendarFeed)
 	return r
 }
 func (a *App) securityHeaders(next http.Handler) http.Handler {
@@ -740,7 +744,7 @@ func (a *App) requestLogging(next http.Handler) http.Handler {
 }
 func (a *App) csrf(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || strings.HasPrefix(r.URL.Path, "/calendar/feed/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -907,6 +911,16 @@ func (a *App) loadSettingsData(r *http.Request, d *PageData) bool {
 	failed = a.pageStoreError(r, d, "Settings", "notification destinations", err) || failed
 	d.DestinationHealth, err = a.store.DestinationHealthByUser(r.Context(), session.User.ID)
 	failed = a.pageStoreError(r, d, "Settings", "destination health", err) || failed
+	feed, feedErr := a.store.CalendarFeedTokenStatus(r.Context(), session.User.ID)
+	if errors.Is(feedErr, sql.ErrNoRows) {
+		return failed
+	}
+	failed = a.pageStoreError(r, d, "Settings", "calendar feed token", feedErr) || failed
+	if feedErr == nil {
+		d.CalendarFeedCreatedAt = &feed.CreatedAt
+		d.CalendarFeedExpiresAt = &feed.ExpiresAt
+		d.CalendarFeedActive = feed.Active
+	}
 	return failed
 }
 func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {

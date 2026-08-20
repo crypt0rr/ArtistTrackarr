@@ -2,12 +2,74 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
+
+func TestCalendarFeedTokenLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "calendar-feed@example.com", "hash", "member", "UTC", "calendar-feed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CalendarFeedTokenStatus(ctx, userID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing token status error=%v, want sql.ErrNoRows", err)
+	}
+	first, err := s.CreateCalendarFeedToken(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) < 32 {
+		t.Fatalf("token length=%d, want opaque token", len(first))
+	}
+	if got, err := s.UserIDByCalendarFeedToken(ctx, first); err != nil || got != userID {
+		t.Fatalf("first token lookup=(%d,%v), want user %d", got, err, userID)
+	}
+	status, err := s.CalendarFeedTokenStatus(ctx, userID)
+	if err != nil || !status.Active || status.ExpiresAt.Before(status.CreatedAt) {
+		t.Fatalf("token status=%#v err=%v", status, err)
+	}
+	second, err := s.CreateCalendarFeedToken(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserIDByCalendarFeedToken(ctx, first); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rotated token remained valid: %v", err)
+	}
+	if got, err := s.UserIDByCalendarFeedToken(ctx, second); err != nil || got != userID {
+		t.Fatalf("rotated token lookup=(%d,%v), want user %d", got, err, userID)
+	}
+	if err := s.RevokeCalendarFeedToken(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserIDByCalendarFeedToken(ctx, second); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoked token remained valid: %v", err)
+	}
+	status, err = s.CalendarFeedTokenStatus(ctx, userID)
+	if err != nil || status.Active || status.RevokedAt == nil {
+		t.Fatalf("revoked status=%#v err=%v", status, err)
+	}
+	if err := s.RevokeCalendarFeedToken(ctx, userID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("second revoke error=%v, want sql.ErrNoRows", err)
+	}
+
+	third, err := s.CreateCalendarFeedToken(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE calendar_feed_tokens SET expires_at=? WHERE user_id=?`, timeText(time.Now().UTC().Add(-time.Minute)), userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserIDByCalendarFeedToken(ctx, third); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired token remained valid: %v", err)
+	}
+}
 
 func TestReminderMinutesNormalizesLegacyValues(t *testing.T) {
 	cases := []struct {
@@ -193,6 +255,17 @@ func TestCalendarReleasesBatchesLargeAssociationSets(t *testing.T) {
 	}
 	if len(items) != 501 {
 		t.Fatalf("calendar items=%d, want 501", len(items))
+	}
+	firstPage, err := s.CalendarReleasesPage(queryCtx, userID, from, to, 25, 0)
+	if err != nil || len(firstPage) != 25 {
+		t.Fatalf("first calendar page len=%d err=%v", len(firstPage), err)
+	}
+	secondPage, err := s.CalendarReleasesPage(queryCtx, userID, from, to, 25, 25)
+	if err != nil || len(secondPage) != 25 {
+		t.Fatalf("second calendar page len=%d err=%v", len(secondPage), err)
+	}
+	if firstPage[0].ID == secondPage[0].ID {
+		t.Fatalf("calendar pages overlap at release %d", firstPage[0].ID)
 	}
 	for _, item := range items {
 		if len(item.FollowedArtists) != 1 || item.FollowedArtists[0] != "Calendar Batch Artist (primary)" {

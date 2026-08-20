@@ -360,11 +360,14 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=30`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("import job status migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=31`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("calendar feed token migration marker=%d err=%v", migrationsApplied, err)
+	}
 	var importStatus string
 	if err := db.QueryRow(`SELECT status FROM import_jobs WHERE id=(SELECT MIN(id) FROM import_jobs)`).Scan(&importStatus); err != nil || importStatus != "complete" {
 		t.Fatalf("legacy import status=%q err=%v, want complete", importStatus, err)
 	}
-	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id"} {
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id", "calendar_feed_tokens_active"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
 			t.Fatalf("migration index %q missing: %v", indexName, err)
@@ -381,6 +384,10 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	var snapshotsTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='operational_snapshots'`).Scan(&snapshotsTable); err != nil {
 		t.Fatalf("operational snapshots table missing: %v", err)
+	}
+	var calendarFeedTable string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_feed_tokens'`).Scan(&calendarFeedTable); err != nil {
+		t.Fatalf("calendar feed token table missing: %v", err)
 	}
 	var rulesTable string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='follow_notification_rules'`).Scan(&rulesTable); err != nil {

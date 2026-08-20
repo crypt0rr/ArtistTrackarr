@@ -45,6 +45,7 @@ type App struct {
 	artworkLimiter          *fixedWindowLimiter
 	destinationTestLimiter  *fixedWindowLimiter
 	destinationRetryLimiter *fixedWindowLimiter
+	calendarFeedLimiter     *fixedWindowLimiter
 	loginSlots              chan struct{}
 }
 
@@ -79,6 +80,10 @@ type PageData struct {
 	CalendarPrevMonth        string
 	CalendarNextMonth        string
 	CalendarICSURL           string
+	CalendarFeedURL          string
+	CalendarFeedCreatedAt    *time.Time
+	CalendarFeedExpiresAt    *time.Time
+	CalendarFeedActive       bool
 	ReleaseCount             int
 	Preferences              store.NotificationPreferences
 	NotificationHolds        []store.NotificationHold

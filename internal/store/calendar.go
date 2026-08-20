@@ -24,8 +24,19 @@ const calendarPreferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (
 // watchlist within an inclusive ISO date range. Partial dates are intentionally
 // excluded from ICS output because assigning them to a day would be misleading.
 func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to string, limit int) ([]CalendarRelease, error) {
+	return s.CalendarReleasesPage(ctx, userID, from, to, limit, 0)
+}
+
+// CalendarReleasesPage returns one deterministic page of precise, dated
+// releases for a followed artist watchlist. The offset form is used by the
+// authenticated and tokenized ICS exporters so large calendars are never
+// silently truncated.
+func (s *Store) CalendarReleasesPage(ctx context.Context, userID int64, from, to string, limit, offset int) ([]CalendarRelease, error) {
 	if limit < 1 {
 		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+`,
 		EXISTS(SELECT 1 FROM notification_holds nh
@@ -35,8 +46,8 @@ func (s *Store) CalendarReleases(ctx context.Context, userID int64, from, to str
 		WHERE `+followedReleasePredicate("?")+` AND `+calendarPreferredProvider+`
 		AND rg.date_precision=3 AND length(rg.first_release_date)=10
 		AND rg.first_release_date BETWEEN ? AND ?
-		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
-		userID, userID, strings.TrimSpace(from), strings.TrimSpace(to), limit)
+		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ? OFFSET ?`,
+		userID, userID, strings.TrimSpace(from), strings.TrimSpace(to), limit, offset)
 	if err != nil {
 		return nil, err
 	}

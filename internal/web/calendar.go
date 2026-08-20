@@ -1,6 +1,8 @@
 package web
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -9,8 +11,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
+
+const (
+	calendarExportPageSize = 500
+	calendarExportMax      = 5000
+)
+
+var errCalendarExportTooLarge = errors.New("calendar export exceeds the safety limit")
 
 func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -61,17 +72,63 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
-	location, err := time.LoadLocation(session.User.Timezone)
+	a.writeCalendarICS(w, r, session.User)
+}
+
+// calendarFeed serves the owner-scoped ICS export without requiring a browser
+// session. The opaque token is revocable and expires automatically; invalid
+// credentials intentionally look identical to a missing feed.
+func (a *App) calendarFeed(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(chi.URLParam(r, "token"))
+	if a.calendarFeedLimiter != nil && !a.calendarFeedLimiter.Allow(raw) {
+		rateLimited(w, 60, "calendar feed requests are temporarily rate limited; try again later")
+		return
+	}
+	userID, err := a.store.UserIDByCalendarFeedToken(r.Context(), raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Error("calendar feed token lookup failed", "path", r.URL.Path, "error", err)
+		}
+		http.Error(w, "calendar feed unavailable", http.StatusInternalServerError)
+		return
+	}
+	user, err := a.store.UserByID(r.Context(), userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Error("calendar feed owner lookup failed", "user_id", userID, "error", err)
+		}
+		http.Error(w, "calendar feed unavailable", http.StatusInternalServerError)
+		return
+	}
+	a.writeCalendarICS(w, r, user)
+}
+
+func (a *App) writeCalendarICS(w http.ResponseWriter, r *http.Request, user store.User) {
+	location, err := time.LoadLocation(user.Timezone)
 	if err != nil {
 		location = time.UTC
 	}
 	now := time.Now().In(location)
 	from := now.Format("2006-01-02")
 	to := now.AddDate(1, 0, 0).Format("2006-01-02")
-	releases, err := a.store.CalendarReleases(r.Context(), session.User.ID, from, to, 500)
+	releases, err := a.calendarExportReleases(r, user.ID, from, to)
 	if err != nil {
-		a.logger.Error("calendar export failed", "operation", "calendar releases", "path", r.URL.Path, "error", err)
-		http.Error(w, "calendar export unavailable", http.StatusInternalServerError)
+		if a.logger != nil {
+			a.logger.Error("calendar export failed", "operation", "calendar releases", "path", r.URL.Path, "error", err)
+		}
+		if errors.Is(err, errCalendarExportTooLarge) {
+			http.Error(w, "calendar export is too large; narrow the date range", http.StatusUnprocessableEntity)
+		} else {
+			http.Error(w, "calendar export unavailable", http.StatusInternalServerError)
+		}
 		return
 	}
 	publicURL := a.cfg.PublicURL
@@ -106,6 +163,39 @@ func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-releases.ics"`)
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(builder.String()))
+}
+
+// calendarExportReleases paginates the full one-year export and fails loudly
+// at a generous safety cap instead of silently omitting releases.
+func (a *App) calendarExportReleases(r *http.Request, userID int64, from, to string) ([]store.CalendarRelease, error) {
+	all := make([]store.CalendarRelease, 0, calendarExportPageSize)
+	offset := 0
+	for {
+		remaining := calendarExportMax - len(all)
+		if remaining <= 0 {
+			probe, err := a.store.CalendarReleasesPage(r.Context(), userID, from, to, 1, offset)
+			if err != nil {
+				return nil, err
+			}
+			if len(probe) > 0 {
+				return nil, errCalendarExportTooLarge
+			}
+			return all, nil
+		}
+		limit := calendarExportPageSize
+		if limit > remaining {
+			limit = remaining
+		}
+		page, err := a.store.CalendarReleasesPage(r.Context(), userID, from, to, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < limit {
+			return all, nil
+		}
+		offset += len(page)
+	}
 }
 
 func icsEscape(value string) string {

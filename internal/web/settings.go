@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -208,6 +209,55 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, "settings", d, status)
 }
+
+func (a *App) calendarFeedURL(raw string) string {
+	path := "/calendar/feed/" + url.PathEscape(raw)
+	if a.cfg.PublicURL == nil {
+		return path
+	}
+	return a.cfg.PublicURL.ResolveReference(&url.URL{Path: path}).String()
+}
+
+func (a *App) calendarFeedAction(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	switch strings.ToLower(strings.TrimSpace(r.FormValue("action"))) {
+	case "generate", "rotate", "":
+		raw, err := a.store.CreateCalendarFeedToken(r.Context(), session.User.ID)
+		if err != nil {
+			d := a.data(r, "Settings")
+			d.Error = "We couldn't create the calendar feed right now. Please try again."
+			if a.logger != nil {
+				a.logger.Error("calendar feed token creation failed", "user_id", session.User.ID, "error", err)
+			}
+			status := http.StatusInternalServerError
+			if a.loadSettingsData(r, &d) {
+				status = http.StatusInternalServerError
+			}
+			a.render(w, "settings", d, status)
+			return
+		}
+		d := a.data(r, "Settings")
+		d.Message = "Calendar feed created. Copy this URL now; it will not be shown again."
+		d.CalendarFeedURL = a.calendarFeedURL(raw)
+		status := http.StatusOK
+		if a.loadSettingsData(r, &d) {
+			status = http.StatusInternalServerError
+		}
+		a.render(w, "settings", d, status)
+	case "revoke":
+		if err := a.store.RevokeCalendarFeedToken(r.Context(), session.User.ID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			if a.logger != nil {
+				a.logger.Error("calendar feed token revocation failed", "user_id", session.User.ID, "error", err)
+			}
+			http.Error(w, "calendar feed could not be revoked", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/settings?message=Calendar+feed+revoked", http.StatusSeeOther)
+	default:
+		http.Error(w, "invalid calendar feed action", http.StatusBadRequest)
+	}
+}
+
 func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	username := session.User.Username

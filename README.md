@@ -49,7 +49,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.48.2`; local and published images use the
+footer. The current release is `v0.49.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -113,9 +113,11 @@ browsing, and the watchlist total stays separate from the filtered result count.
 The **Release calendar** gives each member a timezone-aware view of precise,
 day-dated releases from their followed artists. Calendar entries retain source
 confidence, review/hold state, and links to the internal release details page;
-the authenticated ICS export contains the next year of releases and can be
-subscribed to by a calendar application. Partial and unknown dates are kept
-out of the export rather than being assigned a misleading day.
+the authenticated ICS export contains the next year of releases. Settings can
+also issue a revocable, one-year private feed URL for unattended calendar
+subscriptions; the raw token is shown only once and is never stored. Partial
+and unknown dates are kept out of the export rather than being assigned a
+misleading day.
 
 Settings can optionally queue a daily or weekly upcoming-release digest at the
 member's existing reminder time. Digest runs are deduplicated per local period,
@@ -216,6 +218,12 @@ actionable username and timezone guidance, and emits RFC 5545-safe calendar
 `URL:` properties by normalizing whitespace, Unicode query values, and malformed
 percent escapes.
 
+The v0.49.0 calendar subscription patch adds a revocable, owner-scoped ICS feed
+token. Generate or rotate it in Settings and paste the private URL into a
+calendar app; tokens expire after one year and can be revoked immediately.
+Exports paginate the next year of precise releases and fail clearly instead of
+silently truncating an unusually large watchlist.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -298,7 +306,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.48.2` publishes `0.48.2`, `0.48`, and `latest`.
+- Pushing a tag such as `v0.49.0` publishes `0.49.0`, `0.49`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -321,7 +329,7 @@ spurious SQLite disk-full failures.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.48.2 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.49.0 docker compose up -d
 ```
 
 ## Configuration
