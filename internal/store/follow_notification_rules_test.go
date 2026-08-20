@@ -474,6 +474,50 @@ func TestCompilationFilterAppliesAcrossReleaseProviders(t *testing.T) {
 	}
 }
 
+func TestCompilationFollowRuleStillAppliesWhenAccountAlbumsDisabled(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "compilation-account@example.com", "hash", "member", "UTC", "compilation-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{UserID: userID, Albums: false, EPs: true, Singles: true, Announcements: true, ReleaseDay: true}); err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "compilation-account-artist", Name: "Compilation Account"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.Albums = false
+	rule.Compilations = true
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	release := compilationProviderRelease("spotify", "account-albums-disabled", "2026-09-01")
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+
+	rule.Compilations = false
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	filtered := compilationProviderRelease("spotify", "account-compilation-disabled", "2026-09-02")
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{release, filtered}}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
 func compilationProviderRelease(provider, suffix, date string) Release {
 	release := Release{
 		Title: "Compilation " + provider + " " + suffix, PrimaryType: "Album",

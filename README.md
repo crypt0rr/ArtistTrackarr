@@ -28,9 +28,10 @@ deployment:
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
    first administrator with a unique username.
 
-Password changes use the administrator's one-hour reset-link flow in the
-household administration page. Consuming a reset link revokes the account's
-existing sessions; email remains the recovery and login identity.
+Members can change their password from Settings after confirming their current
+password. The change revokes every active session, including the session used
+to submit it; administrators can also issue the existing one-hour reset link.
+Email remains the recovery and login identity.
 
 Application data remains on the existing Compose volume mapping so upgrades do
 not move user data. Docker Compose names the container `artist-trackarr` for
@@ -49,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.49.0`; local and published images use the
+footer. The current release is `v0.54.15`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -151,8 +152,8 @@ The v0.44.0 operations release also persists a redacted hourly health snapshot
 for up to 30 days. Snapshots contain only scheduler state, queue/provider
 counters, database size, and backup/restore timestamps, so administrators can
 see whether a problem is recurring after a restart without retaining provider
-payloads or notification content. `/readyz` is deliberately a cheap,
-unauthenticated database/schema readiness probe; detailed queue, provider,
+payloads or notification content. `/readyz` is a bounded,
+unauthenticated database/schema/write readiness probe; detailed queue, provider,
 runner, and backup state remains available only through authenticated admin
 diagnostics. A provider cooldown or overdue backup does not cause a restart
 loop.
@@ -224,6 +225,69 @@ calendar app; tokens expire after one year and can be revoked immediately.
 Exports paginate the next year of precise releases and fail clearly instead of
 silently truncating an unusually large watchlist.
 
+The v0.50.0 reliability patch keeps an empty-destination digest pending and
+replayable without creating duplicate periods, suppresses duplicate digest
+periods after a timezone change, and keeps replayable pending runs separate
+from completed history. Calendar exports now fold ASCII and Unicode lines
+within the RFC 5545 75-octet limit, and iTunes artist validation reuses a
+bounded cache to avoid duplicate concurrent lookups. The v0.51.0 reliability
+patch widens release discovery after a prolonged provider outage to the last
+successful catalog check, validates timezones before persistence, invalidates
+Spotify release caches for scheduled observations, and keeps a direct artist
+management action visible when the dashboard has no insight data.
+The v0.52.0 hardening patch keeps readiness reads off the serialized writer,
+prevents authenticated pages from being cached after logout, resumes provider
+health refreshes after back-forward-cache restores, adds a plain-HTTP clipboard
+fallback, and mounts the optional Spotify client secret through a Docker secret.
+The v0.54.0 reliability patch verifies imported MusicBrainz identities before
+release polling, preserves artist metadata in CSV exports and imports,
+including sort names, types, countries, disambiguation, and Spotify artwork
+URLs, while remaining compatible with older six-column exports. Static assets
+disable byte ranges so compressed responses cannot advertise offsets for an
+uncompressed representation.
+The v0.54.1 patch closes a reader-pool exhaustion path in digest scheduling by
+materializing eligible users before nested calendar and notification-rule
+queries begin.
+The v0.54.2 patch bounds manual synchronization per household member and
+interleaves claims across members so one large manual refresh cannot starve
+other users' requests.
+The v0.54.3 patch prevents destinations added after an event or digest run
+from being backfilled into that historical work. New destinations receive
+future events, while existing delivery rows remain replayable after recovery.
+The v0.54.4 patch renders pending artist-resolution retry times in each
+member's configured timezone, matching the rest of the authenticated UI.
+The v0.54.5 patch adds a testable HTTP bind seam and regression coverage so
+startup bind failures remain observable before readiness is announced. The
+v0.54.6 patch makes every lifecycle drain/serve failure a non-zero process
+result, so supervisors cannot treat an unsafe shutdown as successful.
+The v0.54.7 patch includes digest deliveries in the household admin audit,
+pagination, export, and detail views so normal notifications and scheduled
+release digests have one consistent operational history.
+The v0.54.8 patch retains bounded CSV source payloads for interrupted or
+failed imports and adds an owner-scoped Resume import action. Resuming creates
+a new idempotent import job while preserving the original incomplete audit.
+The v0.54.10 patch makes `/readyz` fail closed when the migrated database is
+readable but cannot complete a bounded write probe, so read-only/full SQLite
+failures are distinguishable before work is admitted. The v0.54.9 patch clears
+retained CSV payloads as soon as an import completes; only interrupted or
+failed jobs retain their bounded source for recovery.
+The v0.54.11 patch keeps compilation releases independent from the account
+Albums switch, so the per-follow Compilations rule remains authoritative for
+Spotify, iTunes, and MusicBrainz observations.
+The v0.54.12 security patch blocks Teredo transition addresses during
+notification-target resolution, alongside the existing private, 6to4, and
+NAT64 ranges, so transition mechanisms cannot bypass outbound target policy.
+The v0.54.13 security patch applies the same reserved, transition, and
+IPv4-mapped address protections to Cover Art Archive DNS resolution, keeping
+approved artwork hosts from reaching non-public endpoints after a rebinding.
+The v0.54.14 patch verifies that SQLite foreign-key enforcement remains enabled
+after the complete migration sequence; startup now fails closed if a migration
+leaves ownership cascades disabled.
+The v0.54.15 patch keeps release-day notifications clear when a release is
+visible through a followed guest or featured artist: the event title and body
+identify the credited appearance while preserving one owner-scoped event and
+delivery for the shared release.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -273,6 +337,14 @@ Telegram uses the sender-owned bounded Bot API client directly. SQLite keeps
 one serialized writer and a small read-only pool so dashboard queries do not
 queue behind provider work.
 
+The four delivery workers bound queue management and durable state updates, but
+production sends that use Shoutrrr's compatibility adapter are serialized by
+its process-global client lock. Measure the effective transport wait and lock
+hold time with `make benchmark-notify`; the benchmark reports
+`queue-wait-ns/op` and `client-mutex-ns/op` without contacting an external
+provider. The Telegram adapter uses the sender-owned client directly and is
+not subject to that compatibility lock.
+
 Delivery assurance records every normal and digest attempt, keeps a durable
 health state for each destination, and pauses destinations after five
 consecutive failures. Settings shows the latest failure and provides an
@@ -306,30 +378,31 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.49.0` publishes `0.49.0`, `0.49`, and `latest`.
+- Pushing a tag such as `v0.54.15` publishes `0.54.15`, `0.54`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
 version in the interface and User-Agent. Build provenance remains available
 through image labels and immutable SHA tags.
 
-The module targets Go 1.26; CI and the Docker build use the pinned patched Go
-1.26.6 toolchain so local builds and release images share the same supported
+The module targets Go 1.27; CI and the Docker build use the pinned Go 1.27.0
+toolchain so local builds and release images share the same supported
 language/runtime line.
 
-`make lint` runs the pinned `golangci-lint` v2.12.2 configuration. The focused
+`make lint` runs the pinned `golangci-lint` v2.13.0 configuration. The focused
 quality gate covers unchecked errors, Go vet, static analysis, ineffective
 assignments, unused code, row and SQL resource handling, HTTP body closure,
 wrapped errors, and nil-error paths. `make test` builds the fast Docker test
 stage; `make docker-quality` builds the full Docker quality stage, which runs
-serialized race tests plus the pinned lint and vulnerability checks. Race tests
-use one package at a time so constrained Docker/CI filesystems do not report
-spurious SQLite disk-full failures.
+serialized tests plus the pinned lint and vulnerability checks. Both Docker
+stages serialize package tests (`-p 1`) so constrained Docker/CI filesystems
+do not report spurious SQLite disk-full failures; the quality stage additionally
+runs the race detector and pinned lint/vulnerability tools.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.49.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.54.15 docker compose up -d
 ```
 
 ## Configuration
@@ -338,14 +411,14 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.49.0 docker compose up 
 | --- | --- | --- | --- |
 | `PUBLIC_URL` | yes | `http://localhost:8080` | External base URL; use HTTPS behind a reverse proxy. |
 | `ARTIST_TRACKARR_BIND` | no | `127.0.0.1` | Host address for the Compose port; expose wider only behind a trusted TLS proxy/firewall. |
-| `SETUP_TOKEN` | first run | — | Protects initial administrator creation; must be at least 32 characters. |
+| `SETUP_TOKEN` | yes | — | Protects initial administrator creation and is validated at every startup; must be at least 32 characters. Keep it available if the database ever needs to be initialized again. |
 | `APP_ENCRYPTION_KEY` | yes | — | Encrypts notification credentials at rest. |
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
 | `MUSICBRAINZ_CONTACT` | yes | — | Single-line contact included in the required MusicBrainz User-Agent; values over 200 characters are rejected. |
 | `POLL_INTERVAL` | no | `6h` | Catalog polling interval; values below one hour are rejected. |
 | `SPOTIFY_POLL_INTERVAL` | no | `24h` | Independent Spotify observation interval; values below one hour are rejected. |
 | `SPOTIFY_CLIENT_ID` | no | — | Enables Spotify-first artist discovery. |
-| `SPOTIFY_CLIENT_SECRET` | no | — | Spotify application secret. |
+| `SPOTIFY_CLIENT_SECRET` or `SPOTIFY_CLIENT_SECRET_FILE` | no | — | Spotify application secret; Compose mounts the optional value as a Docker secret when configured. |
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `ITUNES_MARKET` | no | `US` | Two-letter Apple/iTunes storefront used for fallback searches and release lookups. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location; startup rejects directory paths and missing parent directories. |
@@ -439,8 +512,8 @@ work or the SQLite writer. Provider calls are never made during the upload
 request.
 
 The account menu shows each member's unique username and links to personal
-Settings, where they can update their username, timezone, release-day reminder
-time, notification preferences, and all notification destinations. The old
+Settings, where they can update their username, password, timezone, release-day
+reminder time, notification preferences, and all notification destinations. The old
 `/destinations` address redirects to Settings for compatibility, while
 household account administration remains restricted to the Admin page.
 
@@ -550,10 +623,11 @@ persistent data directory and is accompanied by a restrictive-permission
 Successful backups write a non-sensitive timestamp marker into the persistent
 volume so administrator diagnostics can show an approximate backup age. The
 marker is archived with the next backup and is not a substitute for an
-off-host backup inventory. The helper preserves the invoking operator's UID/GID
-on the archive and checksum, and makes the marker readable by the application
-user (UID 10001); the operator therefore only needs Docker access and write
-permission to the output directory.
+off-host backup inventory. The archive and checksum are streamed through the
+invoking shell, so they keep the operator's UID/GID even with rootless Docker;
+the helper never needs to chown a host-side file. The marker is written as the
+application user (UID 10001), so the operator only needs Docker access and
+write permission to the output directory.
 
 Restore into an empty Compose volume while the app is stopped, keep the
 original `APP_ENCRYPTION_KEY` available, and run the temporary restore

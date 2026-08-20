@@ -1,11 +1,19 @@
 package web
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -35,17 +43,80 @@ func TestImportConcurrencyGateBoundsConcurrentUploads(t *testing.T) {
 	a.releaseImportSlot()
 }
 
+func TestResumeArtistImportReplaysOwnerPayloadIntoFreshJob(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(t.TempDir() + "/resume.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	userID, err := database.CreateUser(ctx, "resume-web@example.com", "hash", "member", "UTC", "resume-web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "33333333-3333-4333-8333-333333333333"
+	payload := []byte("artist,display_name,musicbrainz_id,musicbrainz_url,spotify_id,spotify_url\n" +
+		"https://musicbrainz.org/artist/" + mbid + ",Resumed Artist," + mbid + ",https://musicbrainz.org/artist/" + mbid + ",,\n")
+	job, err := database.CreateImportJobWithPayload(ctx, userID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `UPDATE import_jobs SET status='interrupted',finished_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{
+		store:       database,
+		importSlots: make(chan struct{}, 1),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/artists/imports/"+strconv.FormatInt(job.ID, 10)+"/resume", nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", strconv.FormatInt(job.ID, 10))
+	request = request.WithContext(context.WithValue(context.WithValue(request.Context(), sessionKey,
+		store.Session{User: store.User{ID: userID}}), chi.RouteCtxKey, routeCtx))
+	response := httptest.NewRecorder()
+	app.resumeArtistImport(response, request)
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("resume status=%d body=%q", response.Code, response.Body.String())
+	}
+	location := response.Header().Get("Location")
+	if !strings.HasPrefix(location, "/artists/imports/") {
+		t.Fatalf("resume location=%q", location)
+	}
+	newID, err := strconv.ParseInt(strings.TrimPrefix(location, "/artists/imports/"), 10, 64)
+	if err != nil || newID == job.ID {
+		t.Fatalf("resume location id=%q err=%v", location, err)
+	}
+	resumed, err := database.ImportJob(ctx, userID, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != "complete" || resumed.Added != 1 || len(resumed.Rows) != 1 {
+		t.Fatalf("resumed job=%#v", resumed)
+	}
+	if _, err := database.ImportJobPayload(ctx, userID, job.ID); err != nil {
+		t.Fatalf("original interrupted job lost resumability: %v", err)
+	}
+	if _, err := database.ImportJobPayload(ctx, userID, newID); !errors.Is(err, store.ErrImportNotResumable) {
+		t.Fatalf("completed resumed job payload err=%v", err)
+	}
+}
+
 func TestParseArtistTrackarrCSVRoundTripAndReorderedColumns(t *testing.T) {
 	mbid := "11111111-1111-4111-8111-111111111111"
 	spotifyID := "0OdUWJ0sBjDrqHygGUXeCF"
-	input := "spotify_url,extra,musicbrainz_url,display_name,artist,spotify_id,musicbrainz_id\n" +
-		"https://open.spotify.com/artist/" + spotifyID + ",ignored,https://musicbrainz.org/artist/" + mbid + ",\"Comma, Artist\",https://musicbrainz.org/artist/" + mbid + "," + spotifyID + "," + mbid + "\n"
+	input := "spotify_image_url,spotify_url,extra,musicbrainz_url,artist_type,display_name,artist,spotify_id,musicbrainz_id,sort_name,country,disambiguation\n" +
+		"https://i.scdn.co/image,https://open.spotify.com/artist/" + spotifyID + ",ignored,https://musicbrainz.org/artist/" + mbid + ",Person,\"Comma, Artist\",https://musicbrainz.org/artist/" + mbid + "," + spotifyID + "," + mbid + ",Artist,NL,alt\n"
 	rows, err := parseArtistTrackarrCSV(strings.NewReader(input))
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("rows=%#v err=%v", rows, err)
 	}
 	if rows[0].Reason != "" || rows[0].DisplayName != "Comma, Artist" || rows[0].MBID != mbid || rows[0].SpotifyID != spotifyID {
 		t.Fatalf("unexpected parsed row=%#v", rows[0])
+	}
+	if rows[0].SortName != "Artist" || rows[0].ArtistType != "Person" || rows[0].Country != "NL" ||
+		rows[0].Disambiguation != "alt" || rows[0].SpotifyImageURL != "https://i.scdn.co/image" {
+		t.Fatalf("optional metadata was not preserved: %#v", rows[0])
 	}
 }
 
@@ -118,6 +189,11 @@ func TestValidateArtistImportInputRejectsInvalidIdentities(t *testing.T) {
 			input.SpotifyID, input.SpotifyURL = "0OdUWJ0sBjDrqHygGUXeCF", "https://open.spotify.com/artist/1OdUWJ0sBjDrqHygGUXeCF"
 			return input
 		}(), want: "invalid Spotify artist URL"},
+		{name: "invalid Spotify image URL", input: func() store.ImportInput {
+			input := base
+			input.SpotifyImageURL = "https://127.0.0.1/image"
+			return input
+		}(), want: "invalid Spotify image URL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

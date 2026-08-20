@@ -37,11 +37,7 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 			month = parsed
 		}
 	}
-	fromTime := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, location)
-	// Build the last calendar day by date rather than subtracting 24 hours
-	// from the next month. The latter can land on the wrong local date around
-	// DST transitions.
-	toTime := time.Date(month.Year(), month.Month()+1, 1, 0, 0, 0, 0, location).AddDate(0, 0, -1)
+	fromTime, toTime := calendarMonthBounds(month, location)
 	from := fromTime.Format("2006-01-02")
 	to := toTime.Format("2006-01-02")
 	releases, err := a.store.CalendarReleases(r.Context(), session.User.ID, from, to, 300)
@@ -68,6 +64,22 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusInternalServerError
 	}
 	a.render(w, "calendar", d, status)
+}
+
+// calendarMonthBounds returns the first and last local dates in month. Date
+// arithmetic is intentionally used instead of subtracting a fixed duration:
+// a spring-forward transition can make the elapsed time between two local
+// midnights shorter than 24 hours, which would otherwise move the upper bound
+// onto the wrong calendar date. Constructing the final day from date parts
+// also keeps this safe for zones that change their offset at midnight.
+func calendarMonthBounds(month time.Time, location *time.Location) (time.Time, time.Time) {
+	if location == nil {
+		location = time.UTC
+	}
+	from := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, location)
+	next := time.Date(month.Year(), month.Month()+1, 1, 0, 0, 0, 0, location)
+	last := time.Date(next.Year(), next.Month(), 0, 0, 0, 0, 0, location)
+	return from, last
 }
 
 func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
@@ -267,20 +279,41 @@ func isHexByte(value byte) bool {
 // the required single space.
 func writeICSLine(builder *strings.Builder, line string) {
 	data := []byte(line)
-	for len(data) > 75 {
-		cut := 75
+	first := true
+	for len(data) > 0 {
+		// A continuation line consumes one octet for its required leading
+		// space, so its payload is at most 74 octets. The previous implementation
+		// allowed 75 payload octets on continuation lines, producing 76-octet
+		// physical lines for ASCII-heavy titles.
+		width := 75
+		if !first {
+			builder.WriteByte(' ')
+			width = 74
+		}
+		cut := width
+		if cut > len(data) {
+			cut = len(data)
+		}
 		for cut > 0 && cut < len(data) && data[cut]&0xc0 == 0x80 {
 			cut--
 		}
 		if cut == 0 {
-			cut = 75
+			// A valid UTF-8 string cannot have a code point wider than the
+			// folding width. Keep a defensive fallback for malformed input.
+			cut = width
+			if cut > len(data) {
+				cut = len(data)
+			}
 		}
 		builder.Write(data[:cut])
-		builder.WriteString("\r\n ")
+		builder.WriteString("\r\n")
 		data = data[cut:]
+		first = false
 	}
-	builder.Write(data)
-	builder.WriteString("\r\n")
+	if first {
+		// Empty properties still need their terminating line ending.
+		builder.WriteString("\r\n")
+	}
 }
 
 func releaseExternalLink(release store.CalendarRelease) string {

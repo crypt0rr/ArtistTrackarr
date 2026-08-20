@@ -83,7 +83,7 @@ SELECT 'credits',release_group_id,artist_id,provider,provider_id,role,track_titl
 SQL
 sha256sum \"\$fingerprint_file\" > \"\$fingerprint_file.sha256\"
 fingerprint_hash=\$(cut -d' ' -f1 \"\$fingerprint_file.sha256\")
-printf '%s\\n' "\$fingerprint_hash"
+printf '%s\n' \"\$fingerprint_hash\"
 "
 }
 

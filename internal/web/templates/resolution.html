@@ -24,7 +24,7 @@
 </article>{{end}}</div></section>
 {{else}}
 <section class="panel"><h2>Waiting for MusicBrainz</h2><p>{{if .Resolution.LastError}}{{.Resolution.LastError}}{{else}}Identification is queued and will retry automatically.{{end}}</p>
-  {{if .Resolution.NextAttempt}}<small>Next automatic attempt: {{.Resolution.NextAttempt.Format "2006-01-02 15:04"}}</small>{{end}}
+  {{if .Resolution.NextAttempt}}<small>Next automatic attempt: {{formatProviderTime .Resolution.NextAttempt $.User.Timezone}}</small>{{end}}
 </section>
 {{end}}
 <form method="post" action="/artist-resolutions/{{.Resolution.ID}}/cancel" class="actions">{{template "csrf" .}}<a class="button secondary" href="/">Back</a><button class="danger link">Cancel pending artist</button></form>

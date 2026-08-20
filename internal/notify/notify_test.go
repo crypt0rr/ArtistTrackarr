@@ -73,6 +73,29 @@ func TestValidateOutboundTargetTreatsProviderIdentifiersAsNonHosts(t *testing.T)
 	}
 }
 
+func TestBlockedHostRecognizesObfuscatedIPv4Literals(t *testing.T) {
+	for _, host := range []string{
+		"2130706433", // decimal 127.0.0.1
+		"0x7f000001", // hexadecimal 127.0.0.1
+		"0177.0.0.1", // octal 127.0.0.1
+		"127.1",      // 127.0.0.1 in two-component form
+		"127.0.0.1",  // ordinary spelling remains covered here
+		"3232235777", // decimal 192.168.1.1
+	} {
+		if !isBlockedHost(host, false) {
+			t.Fatalf("obfuscated private host %q was not blocked", host)
+		}
+	}
+	if isBlockedHost("2130706433", true) {
+		t.Fatal("private-target opt-in rejected an obfuscated address")
+	}
+	for _, host := range []string{"example.test", "0177.example.test", "127.0.0.1."} {
+		if parseLegacyIPv4(host) != nil {
+			t.Fatalf("ordinary hostname %q was parsed as a legacy IPv4 literal", host)
+		}
+	}
+}
+
 func TestNewShoutrrrSenderReusesTransportAcrossSends(t *testing.T) {
 	sender := NewShoutrrrSender(true, time.Second)
 	first := sender.httpClient()
@@ -320,6 +343,43 @@ func TestTelegramDirectClientBuildsBoundedPayload(t *testing.T) {
 	}
 }
 
+func TestObservedHTTPClientCompletesAndClearsInflightRequest(t *testing.T) {
+	base := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	client, observer := observedHTTPClient(base, context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodGet, "https://example.test/hook", nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		response, err := client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("observed client request failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observed client request did not complete")
+	}
+	if observer.hasInFlightRequest() {
+		t.Fatal("observed client retained an in-flight request after completion")
+	}
+}
+
 func TestBuildURLRejectsIncompleteInput(t *testing.T) {
 	for _, input := range []DestinationInput{
 		{Service: "ntfy"},
@@ -444,7 +504,7 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 	if got := outboundHost(nil); got != "" {
 		t.Fatalf("outboundHost(nil)=%q", got)
 	}
-	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "2002:c000:0201::1", "64:ff9b::c000:0201", "64:ff9b:1::1", "224.0.0.1"} {
+	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "2001:0000:4136:e378:8000:63bf:3fff:fdd2", "2002:c000:0201::1", "64:ff9b::c000:0201", "64:ff9b:1::1", "224.0.0.1"} {
 		ip := net.ParseIP(value)
 		if ip == nil || !isBlockedIP(ip, false) {
 			t.Fatalf("reserved address %s was not blocked", value)
@@ -536,7 +596,12 @@ func BenchmarkShoutrrrSendSerialization(b *testing.B) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: time.Second}
+	// Use the production constructor so the benchmark measures both the
+	// compatibility mutex and the sender-owned keep-alive transport. A zero
+	// value sender intentionally creates a fallback client for unit tests, but
+	// that would hide transport reuse in this benchmark.
+	sender := NewShoutrrrSender(true, time.Second)
+	defer sender.CloseIdleConnections()
 	serviceURL := "generic+" + server.URL + "/hook"
 	b.ReportAllocs()
 	var queueWaitNanos, clientHoldNanos int64

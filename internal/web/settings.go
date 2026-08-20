@@ -14,6 +14,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
+	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
 
@@ -94,7 +95,7 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "settings", d, status)
 		return
 	}
-	http.Redirect(w, r, "/settings?message=Destination+added", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery("Destination added"), http.StatusSeeOther)
 }
 func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -120,10 +121,11 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		http.Redirect(w, r, "/settings?message="+url.QueryEscape("Test failed: "+notify.RedactError(err)), http.StatusSeeOther)
+		a.logger.Warn("notification test failed", "path", r.URL.Path, "destination_id", id, "error", notify.RedactError(err))
+		http.Redirect(w, r, "/settings?"+a.statusQuery("Test failed; see destination health for details."), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/settings?message=Test+sent", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery("Test sent"), http.StatusSeeOther)
 }
 
 func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
@@ -150,7 +152,7 @@ func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
 	if a.jobs != nil && count > 0 {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/settings?message="+url.QueryEscape(fmt.Sprintf("%d failed deliveries queued for retry", count)), http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery(fmt.Sprintf("%d failed deliveries queued for retry", count)), http.StatusSeeOther)
 }
 func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -165,7 +167,7 @@ func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := a.data(r, "Settings")
-		d.Error = err.Error()
+		d.Error = safeActionMessage(err, "Destination could not be renamed. Please try again.")
 		if a.loadSettingsData(r, &d) {
 			a.render(w, "settings", d, http.StatusInternalServerError)
 		} else {
@@ -173,7 +175,7 @@ func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	http.Redirect(w, r, "/settings?message=Destination+renamed", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery("Destination renamed"), http.StatusSeeOther)
 }
 func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -191,15 +193,15 @@ func (a *App) deleteDestination(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "destination could not be deleted", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/settings?message=Destination+deleted", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery("Destination deleted"), http.StatusSeeOther)
 }
 func (a *App) profile(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	if err := a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time"), session.User.Username); err != nil {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/settings?"+a.statusQuery(safeActionMessage(err, "Reminder settings could not be saved. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/admin?message=Reminder+settings+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("Reminder settings updated"), http.StatusSeeOther)
 }
 func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 	d := a.data(r, "Settings")
@@ -252,7 +254,7 @@ func (a *App) calendarFeedAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "calendar feed could not be revoked", http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, "/settings?message=Calendar+feed+revoked", http.StatusSeeOther)
+		http.Redirect(w, r, "/settings?"+a.statusQuery("Calendar feed revoked"), http.StatusSeeOther)
 	default:
 		http.Error(w, "invalid calendar feed action", http.StatusBadRequest)
 	}
@@ -267,7 +269,7 @@ func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
 	err := a.store.UpdateProfile(r.Context(), session.User.ID, r.FormValue("timezone"), r.FormValue("reminder_time"), username)
 	if err != nil {
 		d := a.data(r, "Settings")
-		d.Error = err.Error()
+		d.Error = safeActionMessage(err, "Settings could not be saved. Please try again.")
 		if a.loadSettingsData(r, &d) {
 			a.render(w, "settings", d, http.StatusInternalServerError)
 		} else {
@@ -275,8 +277,57 @@ func (a *App) settingsProfile(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	http.Redirect(w, r, "/settings?message=Settings+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/settings?"+a.statusQuery("Settings updated"), http.StatusSeeOther)
 }
+
+func (a *App) settingsPassword(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	_, release, ok := a.acquirePasswordSlot(w, r, a.passwordChangeLimiter, 900, "too many password change attempts; try again later")
+	if !ok {
+		return
+	}
+	defer release()
+
+	renderError := func(message string, status int) {
+		d := a.data(r, "Settings")
+		d.Error = message
+		if a.loadSettingsData(r, &d) {
+			status = http.StatusInternalServerError
+		}
+		a.render(w, "settings", d, status)
+	}
+
+	user, err := a.store.UserByID(r.Context(), session.User.ID)
+	if err != nil {
+		a.logger.Error("load password change account failed", "user_id", session.User.ID, "error", err)
+		renderError("Password could not be changed right now. Please try again.", http.StatusInternalServerError)
+		return
+	}
+	if !security.CheckPassword(user.PasswordHash, r.FormValue("current_password")) {
+		renderError("The current password is incorrect.", http.StatusBadRequest)
+		return
+	}
+	newPassword := r.FormValue("new_password")
+	if newPassword != r.FormValue("confirm_password") {
+		renderError("The new passwords do not match.", http.StatusBadRequest)
+		return
+	}
+	hash, err := security.HashPassword(newPassword)
+	if err != nil {
+		renderError(safeActionMessage(err, "The new password could not be used."), http.StatusBadRequest)
+		return
+	}
+	if err := a.store.UpdatePassword(r.Context(), session.User.ID, hash); err != nil {
+		a.logger.Error("update password failed", "user_id", session.User.ID, "error", err)
+		renderError("Password could not be changed right now. Please try again.", http.StatusInternalServerError)
+		return
+	}
+	// UpdatePassword revokes every session, including the one used for this
+	// request. Send the user through the normal login flow rather than leaving
+	// a stale cookie that appears authenticated until its next request.
+	http.Redirect(w, r, "/login?"+a.statusQuery("Password updated"), http.StatusSeeOther)
+}
+
 func (a *App) settingsPreferences(w http.ResponseWriter, r *http.Request) {
 	if err := a.savePreferences(w, r, "/settings"); err != nil {
 		return
@@ -295,9 +346,9 @@ func (a *App) savePreferences(w http.ResponseWriter, r *http.Request, redirectPa
 		DigestEnabled: r.FormValue("digest_enabled") == "on", DigestFrequency: r.FormValue("digest_frequency"),
 		HoldConflictingNotifications: r.FormValue("hold_conflicting_notifications") == "on"}
 	if err := a.store.UpdateNotificationPreferences(r.Context(), p); err != nil {
-		http.Redirect(w, r, redirectPath+"?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, redirectPath+"?"+a.statusQuery(safeActionMessage(err, "Notification preferences could not be saved. Please try again.")), http.StatusSeeOther)
 		return err
 	}
-	http.Redirect(w, r, redirectPath+"?message=Notification+preferences+updated", http.StatusSeeOther)
+	http.Redirect(w, r, redirectPath+"?"+a.statusQuery("Notification preferences updated"), http.StatusSeeOther)
 	return nil
 }

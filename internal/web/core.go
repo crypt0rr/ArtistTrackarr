@@ -252,7 +252,12 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"join":  strings.Join,
 		"lower": strings.ToLower,
-		"query": url.QueryEscape,
+		// QueryEscape returns a complete query component. Marking that
+		// component as template.URL prevents html/template from escaping the
+		// percent signs a second time (which would turn "hip hop" into the
+		// literal filter "hip+hop"). The value is safe because QueryEscape
+		// emits only URL query characters.
+		"query": queryURL,
 		"staticURL": func(path string) string {
 			asset := strings.TrimLeft(path, "/")
 			cacheKey := version.Current + "-" + staticAssetVersion(asset)
@@ -561,9 +566,16 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		destinationTestLimiter:  newFixedWindowLimiter(5, 15*time.Minute),
 		destinationRetryLimiter: newFixedWindowLimiter(10, 15*time.Minute),
 		calendarFeedLimiter:     newFixedWindowLimiter(60, time.Minute),
+		passwordChangeLimiter:   newFixedWindowLimiter(10, 15*time.Minute),
 		loginSlots:              make(chan struct{}, 8),
 	}, nil
 }
+
+// queryURL returns one safely escaped query-component value for use in a
+// template URL. QueryEscape emits only URL query characters, so marking the
+// complete component as template.URL prevents html/template from escaping its
+// percent signs a second time.
+func queryURL(value string) template.URL { return template.URL(url.QueryEscape(value)) }
 
 func providerDisplayLabel(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
@@ -625,7 +637,17 @@ func (a *App) Handler() http.Handler {
 	staticHandler := http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles)))
 	r.Handle("/static/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		staticHandler.ServeHTTP(w, r)
+		// chi's compression middleware wraps this handler.  A byte range from
+		// http.FileServer refers to the uncompressed representation, so serving
+		// it through gzip would produce an invalid Content-Range response.  The
+		// assets are small and immutable; disable ranges at this boundary and
+		// let the normal full-response compression path handle them safely.
+		if r.Header.Get("Range") != "" {
+			r = r.Clone(r.Context())
+			r.Header = r.Header.Clone()
+			r.Header.Del("Range")
+		}
+		staticHandler.ServeHTTP(&staticResponseWriter{ResponseWriter: w}, r)
 	}))
 	r.Get("/setup", a.setupForm)
 	r.Post("/setup", a.setup)
@@ -656,6 +678,7 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artists/search", a.search)
 		private.Get("/settings", a.settings)
 		private.Post("/settings/profile", a.settingsProfile)
+		private.Post("/settings/password", a.settingsPassword)
 		private.Post("/settings/preferences", a.settingsPreferences)
 		private.Post("/artists/follow", a.follow)
 		private.Post("/artists/follow/batch", a.followBatch)
@@ -675,6 +698,7 @@ func (a *App) Handler() http.Handler {
 		private.Get("/artists/export", a.exportArtists)
 		private.Post("/artists/import", a.importArtists)
 		private.Get("/artists/imports/{id}", a.artistImport)
+		private.Post("/artists/imports/{id}/resume", a.resumeArtistImport)
 		private.Get("/art/release-group/{mbid}", a.releaseGroupArt)
 		private.Get("/destinations", a.destinations)
 		private.Post("/preferences", a.updatePreferences)
@@ -687,6 +711,7 @@ func (a *App) Handler() http.Handler {
 			admin.Use(a.requireAdmin)
 			admin.Get("/admin", a.admin)
 			admin.Get("/admin/deliveries/{id}", a.adminDeliveryDetail)
+			admin.Get("/admin/digest-deliveries/{id}", a.adminDigestDeliveryDetail)
 			admin.Post("/admin/profile", a.profile)
 			admin.Post("/admin/invite", a.createInvite)
 			admin.Post("/admin/reset", a.createReset)
@@ -696,12 +721,36 @@ func (a *App) Handler() http.Handler {
 			admin.Get("/admin/provider-health", a.providerHealth)
 			admin.Get("/admin/diagnostics", a.diagnostics)
 			admin.Get("/admin/diagnostics.json", a.diagnosticsJSON)
+			admin.Post("/admin/deliveries/repair-clock-skew", a.repairClockSkewedDeliveries)
 			admin.Get("/admin/retention/export", a.exportAdminDeliveryHistory)
 			admin.Post("/admin/retention/cleanup", a.cleanupRetention)
 		})
 	})
 	r.Get("/calendar/feed/{token}", a.calendarFeed)
 	return r
+}
+
+// staticResponseWriter prevents http.FileServer from advertising byte ranges
+// for compressed embedded assets. The handler strips incoming ranges, but
+// FileServer otherwise adds Accept-Ranges: bytes when it commits the response.
+type staticResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *staticResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Del("Content-Range")
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *staticResponseWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.ResponseWriter.Write(data)
 }
 func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -842,10 +891,16 @@ func localReturnPath(value, prefix, fallback string) string {
 
 func (a *App) data(r *http.Request, title string) PageData {
 	csrf, _ := r.Context().Value(csrfKey).(string)
-	d := PageData{
-		Title: title, Version: version.Current, CSRF: csrf,
-		Message: sanitizeStatusMessage(r.URL.Query().Get("message")), SpotifyOn: a.spotify != nil,
+	message := ""
+	if raw := r.URL.Query().Get("message"); raw != "" {
+		if value, ok := security.VerifySignedToken(a.cfg.SessionSecret, raw); ok {
+			message = sanitizeStatusMessage(value)
+		}
 	}
+	d := PageData{PageMeta: PageMeta{
+		Title: title, Version: version.Current, CSRF: csrf,
+		Message: message, SpotifyOn: a.spotify != nil,
+	}}
 	if session, ok := currentSession(r); ok {
 		d.User = &UserView{
 			ID: session.User.ID, Email: session.User.Email, Username: session.User.Username,
@@ -862,6 +917,16 @@ func (a *App) data(r *http.Request, title string) PageData {
 		}
 	}
 	return d
+}
+
+// statusQuery creates an integrity-protected flash value for redirects. A
+// plain query parameter would let anyone make the trusted status banner claim
+// that an action succeeded (or inject provider-controlled text into it). The
+// message remains short-lived in the URL, but only values signed with the
+// application session secret are rendered by data.
+func (a *App) statusQuery(message string) string {
+	message = sanitizeStatusMessage(message)
+	return "message=" + url.QueryEscape(security.SignedToken(a.cfg.SessionSecret, message))
 }
 
 // sanitizeStatusMessage keeps redirect banners useful while preventing an
@@ -882,6 +947,39 @@ func sanitizeStatusMessage(value string) string {
 		}
 	}
 	return strings.TrimSpace(string(clean))
+}
+
+// safeActionMessage keeps form validation useful without reflecting storage,
+// provider, or driver errors into a redirect banner. Store errors are normally
+// detailed enough for operators through the structured log, but action
+// responses should only expose the small set of stable validation outcomes a
+// user can correct.
+func safeActionMessage(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "The requested item is no longer available."
+	case errors.Is(err, store.ErrCannotDeleteSelf), errors.Is(err, store.ErrLastAdmin),
+		errors.Is(err, store.ErrManualSyncQueueFull), errors.Is(err, store.ErrDestinationLimit),
+		errors.Is(err, store.ErrArtistResolutionLimit), errors.Is(err, store.ErrInvalidUsername),
+		errors.Is(err, store.ErrUsernameTaken), errors.Is(err, store.ErrInvalidNotificationHoldAction):
+		return err.Error()
+	case errors.Is(err, store.ErrInvalidReleaseTruthProvider), errors.Is(err, store.ErrReleaseTruthProviderUnavailable):
+		return "That provider is not available for this release."
+	case errors.Is(err, notify.ErrUnsupportedTransport):
+		return "This notification transport is not supported."
+	}
+	switch strings.TrimSpace(err.Error()) {
+	case "a valid email address is required", "invalid IANA timezone", "reminder time must use HH:MM",
+		"password must be at least 12 characters", "destination name is required",
+		"destination name must be 80 characters or fewer", "invalid follow notification delivery mode",
+		"select at least one followed artist", "user is required":
+		return strings.TrimSpace(err.Error())
+	default:
+		return fallback
+	}
 }
 
 // pageStoreError keeps database/provider details in structured logs while
@@ -1011,13 +1109,18 @@ func artistsPageURL(r *http.Request, page int) string {
 }
 func (a *App) render(w http.ResponseWriter, name string, data PageData, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Authenticated pages contain household data and must never be reused from
+	// a browser or shared cache after a session changes. Static assets use the
+	// separate immutable handler above.
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Vary", "Cookie")
 	w.WriteHeader(status)
 	if err := a.templates.ExecuteTemplate(w, name+".html", data); err != nil {
 		a.logger.Error("render template", "template", name, "error", err)
 	}
 }
 func (a *App) ready(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.Healthy(r.Context()); err != nil {
+	if err := a.store.Ready(r.Context()); err != nil {
 		var healthErr *store.DatabaseHealthError
 		state := store.DatabaseUnavailable
 		if errors.As(err, &healthErr) && healthErr != nil && healthErr.State != "" {
@@ -1027,7 +1130,7 @@ func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
-	// Readiness is intentionally a cheap unauthenticated orchestration probe.
+	// Readiness is a bounded unauthenticated database/schema/write probe.
 	// Detailed queue, provider, backup, and runner state belongs behind the
 	// authenticated diagnostics/admin pages and must not be exposed through
 	// probe headers.

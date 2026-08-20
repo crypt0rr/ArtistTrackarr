@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -50,5 +49,5 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(redirect, "?") {
 		separator = "&"
 	}
-	http.Redirect(w, r, redirect+separator+"message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, redirect+separator+a.statusQuery(message), http.StatusSeeOther)
 }

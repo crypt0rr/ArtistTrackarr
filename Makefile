@@ -1,7 +1,7 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
-.PHONY: test docker-quality build run fmt-check tooling-check version-check lint vuln coverage quality
+.PHONY: test docker-quality build run fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
 
 test:
 	docker build --target test .
@@ -27,6 +27,7 @@ version-check:
 	fi
 
 tooling-check:
+	@scripts/check-renovate-toolchain.sh
 	@marker=$$(printf '@%s' latest); if git grep -n -F "$$marker" -- .github Dockerfile scripts; then \
 		echo "unpinned tool reference found" >&2; \
 		exit 1; \
@@ -45,7 +46,7 @@ tooling-check:
 	fi
 
 lint:
-	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.0 run ./...
 
 vuln:
 	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
@@ -59,6 +60,9 @@ coverage:
 	fi; \
 	printf 'total coverage: %s%% (minimum: %s%%)\n' "$$coverage" "$(COVERAGE_MIN)"; \
 	awk -v coverage="$$coverage" -v minimum="$(COVERAGE_MIN)" 'BEGIN { exit !(coverage >= minimum) }'
+
+benchmark-notify:
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go test ./internal/notify -run '^$$' -bench '^BenchmarkShoutrrrSendSerialization$$' -benchmem -count=1
 
 quality: fmt-check tooling-check version-check
 	go vet ./...

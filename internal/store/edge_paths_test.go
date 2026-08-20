@@ -538,6 +538,12 @@ func TestStoreFilterAndClassificationHelpers(t *testing.T) {
 			}
 		})
 	}
+	if got := releaseTypeEnabled(NotificationPreferences{Albums: false}, "Album", []string{"Compilation"}); !got {
+		t.Fatal("compilation was incorrectly controlled by the account Albums preference")
+	}
+	if got := releaseTypeEnabled(NotificationPreferences{Albums: false}, "Compilation"); !got {
+		t.Fatal("legacy compilation primary type was incorrectly controlled by the account Albums preference")
+	}
 
 	release := Release{Confidence: "confirmed"}
 	if got := calendarConfidenceLabel(release, true); got != "held for review" {
@@ -600,10 +606,13 @@ func TestHealthyRequiresMigratedSchema(t *testing.T) {
 	if err := s.Healthy(ctx); err != nil {
 		t.Fatalf("healthy migrated store=%v", err)
 	}
-	// A read-only connection can still read the migrated schema, but the
-	// rollback-only write probe must preserve the more actionable state.
+	// A read-only connection can still read the migrated schema, while the
+	// separate write capability probe classifies why it cannot serve writes.
 	readOnly := &Store{DB: s.Reader}
-	err := readOnly.Healthy(ctx)
+	if err := readOnly.Healthy(ctx); err != nil {
+		t.Fatalf("read-only schema health=%v", err)
+	}
+	err := readOnly.Writable(ctx)
 	var healthErr *DatabaseHealthError
 	if !errors.As(err, &healthErr) || healthErr.State != DatabaseReadOnly {
 		t.Fatalf("read-only health error=%v, want read_only", err)
@@ -613,6 +622,35 @@ func TestHealthyRequiresMigratedSchema(t *testing.T) {
 	}
 	if err := s.Healthy(ctx); err == nil {
 		t.Fatal("healthy reported a database without the application schema")
+	}
+}
+
+func TestReadyRequiresWritableDatabase(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	if err := s.Ready(ctx); err != nil {
+		t.Fatalf("writable store readiness=%v", err)
+	}
+	readOnly := &Store{DB: s.Reader}
+	err := readOnly.Ready(ctx)
+	var healthErr *DatabaseHealthError
+	if !errors.As(err, &healthErr) || healthErr.State != DatabaseReadOnly {
+		t.Fatalf("read-only readiness=%v, want read_only", err)
+	}
+}
+
+func TestHealthyReadsThroughReaderWhileWriterTransactionIsOpen(t *testing.T) {
+	s := testStore(t)
+	tx, err := s.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if err := s.Healthy(ctx); err != nil {
+		t.Fatalf("reader-backed health probe blocked by writer transaction: %v", err)
 	}
 }
 

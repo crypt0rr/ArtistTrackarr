@@ -15,7 +15,9 @@
       "matchPackageNames": [
         "go",
         "golang",
-        "actions/setup-go"
+        "docker.io/library/golang",
+        "actions/setup-go",
+        "actions/go-versions"
       ]
     },
     {

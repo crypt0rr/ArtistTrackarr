@@ -34,7 +34,13 @@ func TestFixedWindowLimiterBoundsRequestsAndExpires(t *testing.T) {
 func TestFixedWindowLimiterCapsDistinctKeys(t *testing.T) {
 	limiter := newFixedWindowLimiter(1, time.Minute)
 	limiter.maxEntries = 2
-	if !limiter.Allow("first") || !limiter.Allow("second") || !limiter.Allow("third") {
+	if !limiter.Allow("first") {
+		t.Fatal("limiter rejected the first distinct key")
+	}
+	if !limiter.Allow("second") {
+		t.Fatal("limiter rejected the second distinct key")
+	}
+	if !limiter.Allow("third") {
 		t.Fatal("limiter rejected a request while making room for a bounded key set")
 	}
 	limiter.mu.Lock()

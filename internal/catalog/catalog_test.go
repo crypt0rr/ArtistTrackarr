@@ -1313,6 +1313,61 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 	}
 }
 
+func TestSpotifyArtistReleasesSincePagesPastWatermarkForLaterSingles(t *testing.T) {
+	var albumRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+			return
+		}
+		if request.URL.Path != "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums" {
+			http.NotFound(w, request)
+			return
+		}
+		albumRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		groups := request.URL.Query().Get("include_groups")
+		offset := request.URL.Query().Get("offset")
+		switch {
+		case groups == "appears_on":
+			_, _ = io.WriteString(w, `{"total":0,"items":[]}`)
+		case offset == "0":
+			items := make([]string, 10)
+			for i := range items {
+				items[i] = fmt.Sprintf(`{"id":"old-%d","name":"Old %d","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-06-01","release_date_precision":"day"}`, i, i)
+			}
+			_, _ = fmt.Fprintf(w, `{"total":12,"items":[%s]}`, strings.Join(items, ","))
+		case offset == "10":
+			_, _ = io.WriteString(w, `{"total":12,"items":[
+				{"id":"new-single","name":"New single","album_type":"single","album_group":"single","total_tracks":1,"release_date":"2026-08-10","release_date_precision":"day"},
+				{"id":"new-ep","name":"New EP","album_type":"single","album_group":"single","total_tracks":5,"release_date":"2026-08-11","release_date_precision":"day"}
+			]}`)
+		default:
+			t.Fatalf("unexpected Spotify page groups=%q offset=%q", groups, offset)
+		}
+	}))
+	defer server.Close()
+	spotify := NewSpotify("client-id", "client-secret")
+	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+	spotify.requestInterval = 0
+	releases, err := spotify.ArtistReleasesSince(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF", "2026-07-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if albumRequests.Load() != 3 || len(releases) != 12 {
+		t.Fatalf("requests=%d releases=%d, want two primary pages plus appears_on and 12 releases", albumRequests.Load(), len(releases))
+	}
+	var foundSingle, foundEP bool
+	for _, release := range releases {
+		foundSingle = foundSingle || release.SpotifyID == "new-single"
+		foundEP = foundEP || release.SpotifyID == "new-ep"
+	}
+	if !foundSingle || !foundEP {
+		t.Fatalf("later single/EP was hidden by the release-date watermark: %#v", releases)
+	}
+}
+
 func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testing.T) {
 	var albumRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

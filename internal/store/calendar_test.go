@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -88,6 +89,23 @@ func TestReminderMinutesNormalizesLegacyValues(t *testing.T) {
 		if ok != tc.ok || (ok && got != tc.want) {
 			t.Errorf("reminderMinutes(%q)=(%d,%v), want (%d,%v)", tc.value, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+func TestNormalizeReminderTimeCanonicalizesLegacyInput(t *testing.T) {
+	cases := map[string]string{
+		"09:00":   "09:00",
+		"9:05":    "09:05",
+		" 23:59 ": "23:59",
+	}
+	for value, want := range cases {
+		got, ok := normalizeReminderTime(value)
+		if !ok || got != want {
+			t.Errorf("normalizeReminderTime(%q)=(%q,%v), want (%q,true)", value, got, ok, want)
+		}
+	}
+	if got, ok := normalizeReminderTime("24:00"); ok || got != "" {
+		t.Fatalf("invalid reminder normalized to (%q,%v)", got, ok)
 	}
 }
 
@@ -210,6 +228,57 @@ func TestCalendarReleasesDoesNotNestReaderQueries(t *testing.T) {
 	}
 }
 
+func TestCalendarReleasesConcurrentReadersDoNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	s.Reader.SetMaxIdleConns(1)
+	userID, err := s.CreateUser(ctx, "calendar-concurrent@example.com", "hash", "member", "UTC", "calendar-concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "calendar-concurrent-artist", Name: "Calendar Concurrent Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	releaseDate := time.Now().UTC().AddDate(0, 0, 3).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "calendar-concurrent-release", artist.ID, "Calendar Concurrent Release", "Album", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/calendar-concurrent-release", "musicbrainz", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	from := time.Now().UTC().Format("2006-01-02")
+	to := time.Now().UTC().AddDate(0, 0, 7).Format("2006-01-02")
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var wait sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			items, err := s.CalendarReleases(queryCtx, userID, from, to, 20)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(items) != 1 || len(items[0].FollowedArtists) != 1 {
+				errs <- fmt.Errorf("calendar items=%d followed=%d", len(items), len(items[0].FollowedArtists))
+			}
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent calendar query failed: %v", err)
+	}
+}
+
 func TestCalendarReleasesBatchesLargeAssociationSets(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -247,7 +316,12 @@ func TestCalendarReleasesBatchesLargeAssociationSets(t *testing.T) {
 	}
 	from := time.Now().UTC().Format("2006-01-02")
 	to := time.Now().UTC().AddDate(0, 0, 7).Format("2006-01-02")
-	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// The 501-row association batch is intentionally large and race
+	// instrumentation makes the JSON/date projection substantially slower on
+	// constrained CI runners. Keep a finite bound while avoiding a false
+	// failure that leaves the package's SQLite migrations waiting behind a
+	// cancelled reader.
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	items, err := s.CalendarReleases(queryCtx, userID, from, to, 600)
 	if err != nil {
@@ -275,8 +349,13 @@ func TestCalendarReleasesBatchesLargeAssociationSets(t *testing.T) {
 }
 
 func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	s := testStore(t)
+	// The digest scheduler performs nested calendar and rule reads for each
+	// eligible user. A one-reader pool makes sure the outer user scan is fully
+	// materialized and closed before those nested queries begin.
+	s.Reader.SetMaxOpenConns(1)
 	userID, err := s.CreateUser(ctx, "digest@example.com", "hash", "member", "UTC", "digest-user")
 	if err != nil {
 		t.Fatal(err)
@@ -294,9 +373,6 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddDestination(ctx, userID, "Digest destination", "generic", []byte("encrypted")); err != nil {
-		t.Fatal(err)
-	}
 	now := time.Now().UTC()
 	if now.Hour() < 10 {
 		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
@@ -311,13 +387,51 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 		releaseDate, 3, "https://musicbrainz.org/release-group/digest-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
 		t.Fatal(err)
 	}
+	// A digest must remain visible when no destination exists, but adding a
+	// destination later must not backfill this historical run.
 	queued, err := s.QueueDueReleaseDigests(ctx, now)
-	if err != nil || queued != 1 {
+	if err != nil || queued != 0 {
+		t.Fatalf("orphan digest queued=%d err=%v", queued, err)
+	}
+	var orphanRuns int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&orphanRuns); err != nil {
+		t.Fatal(err)
+	}
+	if orphanRuns != 1 {
+		t.Fatalf("orphan digest runs=%d, want 1 pending run", orphanRuns)
+	}
+	if err := s.AddDestination(ctx, userID, "Digest destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err = s.QueueDueReleaseDigests(ctx, now)
+	if err != nil || queued != 0 {
 		t.Fatalf("queued=%d err=%v", queued, err)
+	}
+	var historicalDeliveries int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_deliveries`).Scan(&historicalDeliveries); err != nil {
+		t.Fatal(err)
+	}
+	if historicalDeliveries != 0 {
+		t.Fatalf("historical digest deliveries=%d, want 0", historicalDeliveries)
+	}
+
+	// A digest created after the destination exists is admitted normally. This
+	// distinguishes future work from replay of the orphaned historical run.
+	futureReleaseDate := now.AddDate(0, 0, 3).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-future-release", artist.ID, "Future Digest Release", "EP", "[]",
+		futureReleaseDate, 3, "https://musicbrainz.org/release-group/digest-future-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
 	}
 	queued, err = s.QueueDueReleaseDigests(ctx, now.Add(time.Hour))
 	if err != nil || queued != 0 {
 		t.Fatalf("duplicate queued=%d err=%v", queued, err)
+	}
+	queued, err = s.QueueDueReleaseDigests(ctx, now.AddDate(0, 0, 2))
+	if err != nil || queued != 1 {
+		t.Fatalf("future queued=%d err=%v", queued, err)
 	}
 	var runs, deliveries int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&runs); err != nil {
@@ -326,10 +440,10 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_deliveries`).Scan(&deliveries); err != nil {
 		t.Fatal(err)
 	}
-	if runs != 1 || deliveries != 1 {
+	if runs != 2 || deliveries != 1 {
 		t.Fatalf("digest runs=%d deliveries=%d", runs, deliveries)
 	}
-	due, err := s.DueDigestDeliveries(ctx, now, 10)
+	due, err := s.DueDigestDeliveries(ctx, now.AddDate(0, 0, 2), 10)
 	if err != nil || len(due) != 1 || due[0].Title == "" || due[0].Body == "" {
 		t.Fatalf("due digest=%#v err=%v", due, err)
 	}
@@ -345,6 +459,86 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 	}
 	if status != "sent" {
 		t.Fatalf("digest run status=%q, want sent", status)
+	}
+}
+
+func TestQueueDueReleaseDigestsUsesCreditedFollowRule(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "digest-credit@example.com", "hash", "member", "UTC", "digest-credit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.UpsertArtist(ctx, Artist{MBID: "digest-credit-primary", Name: "Primary Digest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := s.UpsertArtist(ctx, Artist{MBID: "digest-credit-guest", Name: "Guest Digest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, guest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Digest credit destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-credit-release", primary.ID, "Credited Digest Release", "Album", "[]",
+		"2026-08-21", 3, "https://musicbrainz.org/release-group/digest-credit-release", "musicbrainz", timeText(now), timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_credits
+		(release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,provider_url,confidence,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, releaseID, guest.ID, "musicbrainz", "digest-credit-track", "guest", "Guest track",
+		"Primary Digest Artist feat. Guest Digest Artist", "https://musicbrainz.org/recording/digest-credit-track", "confirmed", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The release is visible through the guest credit, but an explicit off rule
+	// must keep it out of the digest. This catches regressions that consult only
+	// the canonical release artist's (non-followed) rule.
+	off := defaultFollowNotificationRule(userID, guest.ID, now)
+	off.DeliveryMode = FollowDeliveryOff
+	if err := s.UpdateFollowNotificationRule(ctx, userID, guest.ID, off); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.CalendarReleases(ctx, userID, "2026-08-20", "2026-08-27", 20)
+	if err != nil || len(items) != 1 || len(items[0].FollowedAssociations) != 1 || items[0].FollowedAssociations[0].ArtistID != guest.ID || items[0].FollowedAssociations[0].Role != "guest" {
+		t.Fatalf("credited calendar associations=%#v err=%v", items, err)
+	}
+	if queued, err := s.QueueDueReleaseDigests(ctx, now); err != nil || queued != 0 {
+		t.Fatalf("off credited follow queued=%d err=%v", queued, err)
+	}
+
+	// Switching the same follow to digest mode admits the existing release in
+	// the same period and includes the followed association in the body.
+	digest := off
+	digest.DeliveryMode = FollowDeliveryDigest
+	if err := s.UpdateFollowNotificationRule(ctx, userID, guest.ID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := s.QueueDueReleaseDigests(ctx, now.Add(time.Hour)); err != nil || queued != 1 {
+		t.Fatalf("digest credited follow queued=%d err=%v", queued, err)
+	}
+	due, err := s.DueDigestDeliveries(ctx, now.Add(time.Hour), 10)
+	if err != nil || len(due) != 1 || !strings.Contains(due[0].Body, "Guest Digest Artist (guest)") {
+		t.Fatalf("credited digest=%#v err=%v", due, err)
 	}
 }
 
@@ -377,6 +571,7 @@ func TestQueueDueReleaseDigestsWeeklyAndSkipsInvalidSchedules(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	setDestinationCreatedAt(t, s, weeklyUser, now.Add(-time.Hour))
 	queued, err := s.QueueDueReleaseDigests(ctx, now)
 	if err != nil || queued != 1 {
 		t.Fatalf("weekly queued=%d err=%v", queued, err)
@@ -416,5 +611,59 @@ func TestQueueDueReleaseDigestsWeeklyAndSkipsInvalidSchedules(t *testing.T) {
 	queued, err = s.QueueDueReleaseDigests(ctx, now)
 	if err != nil || queued != 0 {
 		t.Fatalf("invalid/future schedules queued=%d err=%v", queued, err)
+	}
+}
+
+func TestQueueDueReleaseDigestsTreatsTimezoneChangesAsOnePeriod(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "digest-timezone@example.com", "hash", "member", "UTC", "digest-timezone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "digest-timezone-artist", Name: "Digest Timezone Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE users SET reminder_time='00:00' WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Timezone destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 21, 1, 0, 0, 0, time.UTC)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-timezone-release", artist.ID, "Timezone Release", "Album", "[]",
+		"2026-08-21", 3, "https://musicbrainz.org/release-group/digest-timezone-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := s.QueueDueReleaseDigests(ctx, now); err != nil || queued != 1 {
+		t.Fatalf("initial digest queued=%d err=%v", queued, err)
+	}
+	// The same instant is still within the original UTC period after changing
+	// to a timezone whose local date is the previous day. It must not create a
+	// second digest for that one logical daily period.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE users SET timezone='America/Los_Angeles' WHERE id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := s.QueueDueReleaseDigests(ctx, now.Add(time.Hour)); err != nil || queued != 0 {
+		t.Fatalf("timezone-change digest queued=%d err=%v", queued, err)
+	}
+	var runs int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("digest runs=%d, want 1", runs)
 	}
 }

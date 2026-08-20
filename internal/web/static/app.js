@@ -103,8 +103,28 @@
     if (!target) return;
     copy.addEventListener("click", async () => {
       const value = "value" in target ? target.value : target.textContent;
-      await navigator.clipboard.writeText(value);
-      copy.textContent = "Copied";
+      let copied = false;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+          copied = true;
+        } else {
+          const textarea = document.createElement("textarea");
+          textarea.value = value;
+          textarea.setAttribute("readonly", "");
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.append(textarea);
+          textarea.select();
+          copied = document.execCommand("copy");
+          textarea.remove();
+        }
+      } catch (_) {
+        copied = false;
+      }
+      const original = copy.textContent;
+      copy.textContent = copied ? "Copied" : "Copy unavailable";
+      window.setTimeout(() => { copy.textContent = original; }, 2000);
     });
   });
 
@@ -265,12 +285,24 @@
       }
     };
 
-    refresh();
-    refreshTimer = window.setInterval(refresh, 30000);
-    countdownTimer = window.setInterval(updateCountdowns, 1000);
-    window.addEventListener("pagehide", () => {
+    const stopLiveRefresh = () => {
       window.clearInterval(refreshTimer);
       window.clearInterval(countdownTimer);
-    }, { once: true });
+      refreshTimer = undefined;
+      countdownTimer = undefined;
+    };
+    const startLiveRefresh = () => {
+      if (document.visibilityState === "hidden" || refreshTimer) return;
+      refresh();
+      refreshTimer = window.setInterval(refresh, 30000);
+      countdownTimer = window.setInterval(updateCountdowns, 1000);
+    };
+    startLiveRefresh();
+    window.addEventListener("pagehide", stopLiveRefresh);
+    window.addEventListener("pageshow", startLiveRefresh);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") stopLiveRefresh();
+      else startLiveRefresh();
+    });
   }
 })();

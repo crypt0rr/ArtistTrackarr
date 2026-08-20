@@ -1216,14 +1216,14 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	// primary catalog, so fetch that group independently instead of letting the
 	// primary watermark hide guest releases.
 	if since == "" {
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation,appears_on", since, false, false, &result, seen); err != nil {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation,appears_on", false, &result, seen); err != nil {
 			return nil, err
 		}
 	} else {
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", since, true, false, &result, seen); err != nil {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", false, &result, seen); err != nil {
 			return nil, err
 		}
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", since, true, true, &result, seen); err != nil {
+		if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", true, &result, seen); err != nil {
 			return nil, err
 		}
 	}
@@ -1234,7 +1234,7 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 // fetchSpotifyReleasePages retrieves one Spotify artist-albums stream. The
 // provider currently permits at most ten items per page; callers must not
 // apply a partial catalog when the generous page safety cap is reached.
-func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includeGroups, since string, stopAtWatermark, featuredOnly bool, result *[]store.Release, seen map[string]int) error {
+func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includeGroups string, featuredOnly bool, result *[]store.Release, seen map[string]int) error {
 	const pageSize = 10
 	const maxPages = 100
 	complete := false
@@ -1248,15 +1248,16 @@ func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includ
 		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
 			return err
 		}
-		oldest := ""
 		for _, item := range page.Items {
-			if item.ReleaseDate != "" && (oldest == "" || item.ReleaseDate < oldest) {
-				oldest = item.ReleaseDate
-			}
 			s.appendSpotifyRelease(result, seen, item, featuredOnly)
 		}
-		if len(page.Items) == 0 || offset+len(page.Items) >= page.Total ||
-			(stopAtWatermark && since != "" && oldest != "" && oldest <= since) {
+		// Always page through the provider-reported catalog. Spotify groups and
+		// sorts album results independently, so a date watermark on the first
+		// page can hide newer singles/EPs or guest appearances on later pages.
+		// The normalized release hash/change check already prevents old rows from
+		// creating duplicate events, while the safety cap prevents an upstream
+		// total from causing an unbounded loop.
+		if len(page.Items) == 0 || offset+len(page.Items) >= page.Total {
 			complete = true
 			break
 		}
@@ -1305,8 +1306,8 @@ func (s *Spotify) appendSpotifyRelease(result *[]store.Release, seen map[string]
 }
 
 // InvalidateArtistReleases drops the cached release pages for one artist.
-// Scheduled polling continues to use the normal cache; explicit manual sync
-// callers use this hook to request fresh Spotify metadata immediately.
+// Explicit manual sync and due scheduled observations use this hook to avoid
+// treating a stale burst cache as a completed provider check.
 func (s *Spotify) InvalidateArtistReleases(artistID string) {
 	if s == nil {
 		return

@@ -34,14 +34,17 @@ type ITunes struct {
 	cacheMu         sync.Mutex
 	searchCache     map[string]itunesSearchCache
 	releaseCache    map[string]itunesReleaseCache
+	artistCache     map[string]itunesArtistCache
 	searchCalls     map[string]*itunesSearchCall
 	releaseCalls    map[string]*itunesReleaseCall
 	artistCalls     map[string]*itunesArtistCall
 	searchTTL       time.Duration
 	emptySearchTTL  time.Duration
 	releaseTTL      time.Duration
+	artistTTL       time.Duration
 	maxSearchCache  int
 	maxReleaseCache int
+	maxArtistCache  int
 }
 
 type ITunesArtist struct {
@@ -113,6 +116,12 @@ type itunesReleaseCache struct {
 	results    []store.Release
 }
 
+type itunesArtistCache struct {
+	observedAt time.Time
+	expiresAt  time.Time
+	artist     ITunesArtist
+}
+
 type itunesSearchCall struct {
 	done    chan struct{}
 	results []ITunesArtist
@@ -167,14 +176,17 @@ func NewITunes(country string) *ITunes {
 		wait:            waitContext,
 		searchCache:     make(map[string]itunesSearchCache),
 		releaseCache:    make(map[string]itunesReleaseCache),
+		artistCache:     make(map[string]itunesArtistCache),
 		searchCalls:     make(map[string]*itunesSearchCall),
 		releaseCalls:    make(map[string]*itunesReleaseCall),
 		artistCalls:     make(map[string]*itunesArtistCall),
 		searchTTL:       10 * time.Minute,
 		emptySearchTTL:  2 * time.Minute,
 		releaseTTL:      24 * time.Hour,
+		artistTTL:       24 * time.Hour,
 		maxSearchCache:  256,
 		maxReleaseCache: 512,
+		maxArtistCache:  512,
 	}
 }
 
@@ -276,6 +288,9 @@ func (i *ITunes) Artist(ctx context.Context, id string) (ITunesArtist, error) {
 	if !validITunesID(id) {
 		return ITunesArtist{}, errors.New("invalid iTunes artist ID")
 	}
+	if cached, ok := i.cachedArtist(id); ok {
+		return cached, nil
+	}
 	i.cacheMu.Lock()
 	if call, ok := i.artistCalls[id]; ok {
 		i.cacheMu.Unlock()
@@ -294,6 +309,9 @@ func (i *ITunes) Artist(ctx context.Context, id string) (ITunesArtist, error) {
 	i.cacheMu.Lock()
 	delete(i.artistCalls, id)
 	call.artist, call.err = artist, err
+	if err == nil {
+		i.cacheArtistLocked(artist)
+	}
 	close(call.done)
 	i.cacheMu.Unlock()
 	return artist, err
@@ -819,6 +837,49 @@ func (i *ITunes) cachedReleases(key string) ([]store.Release, bool) {
 		return nil, false
 	}
 	return cloneITunesReleases(entry.results), true
+}
+
+func (i *ITunes) cachedArtist(id string) (ITunesArtist, bool) {
+	i.cacheMu.Lock()
+	defer i.cacheMu.Unlock()
+	entry, ok := i.artistCache[id]
+	if !ok || (!entry.expiresAt.IsZero() && !time.Now().Before(entry.expiresAt)) {
+		if ok {
+			delete(i.artistCache, id)
+		}
+		return ITunesArtist{}, false
+	}
+	return entry.artist, true
+}
+
+func (i *ITunes) cacheArtistLocked(artist ITunesArtist) {
+	id := strings.TrimSpace(artist.ID)
+	if id == "" {
+		return
+	}
+	if i.artistCache == nil {
+		i.artistCache = make(map[string]itunesArtistCache)
+	}
+	ttl := i.artistTTL
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	now := time.Now()
+	i.artistCache[id] = itunesArtistCache{observedAt: now, expiresAt: now.Add(ttl), artist: artist}
+	maxEntries := i.maxArtistCache
+	if maxEntries <= 0 {
+		maxEntries = 512
+	}
+	for len(i.artistCache) > maxEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for candidate, entry := range i.artistCache {
+			if oldestKey == "" || entry.observedAt.Before(oldest) {
+				oldestKey, oldest = candidate, entry.observedAt
+			}
+		}
+		delete(i.artistCache, oldestKey)
+	}
 }
 
 func (i *ITunes) cacheReleasesLocked(key string, results []store.Release) {

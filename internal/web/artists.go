@@ -49,13 +49,13 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
-		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/artists?message=Synchronization+queued", http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery("Synchronization queued"), http.StatusSeeOther)
 }
 
 func parseFollowArtistID(r *http.Request) (int64, error) {
@@ -102,10 +102,10 @@ func (a *App) updateArtistNotificationRule(w http.ResponseWriter, r *http.Reques
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "The notification rule could not be saved. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?message=Notification+rule+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery("Notification rule updated"), http.StatusSeeOther)
 }
 
 func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.Request) {
@@ -128,11 +128,11 @@ func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.R
 		artistIDs = append(artistIDs, id)
 	}
 	if len(artistIDs) == 0 {
-		http.Redirect(w, r, "/artists?message=Select+at+least+one+artist", http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery("Select at least one artist"), http.StatusSeeOther)
 		return
 	}
 	if len(artistIDs) > 50 {
-		http.Redirect(w, r, "/artists?message=Select+no+more+than+50+artists", http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery("Select no more than 50 artists"), http.StatusSeeOther)
 		return
 	}
 	changed, err := a.store.SetFollowNotificationDeliveryMode(r.Context(), session.User.ID, artistIDs, r.FormValue("delivery_mode"))
@@ -141,10 +141,10 @@ func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.R
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "The notification mode could not be saved. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?message="+url.QueryEscape(fmt.Sprintf("Notification mode updated for %d artists", changed)), http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery(fmt.Sprintf("Notification mode updated for %d artists", changed)), http.StatusSeeOther)
 }
 
 func (a *App) pauseArtistNotifications(w http.ResponseWriter, r *http.Request) {
@@ -164,10 +164,10 @@ func (a *App) pauseArtistNotifications(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Notifications could not be paused. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?message="+url.QueryEscape(fmt.Sprintf("Notifications paused for %d days", days)), http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery(fmt.Sprintf("Notifications paused for %d days", days)), http.StatusSeeOther)
 }
 
 func (a *App) resumeArtistNotifications(w http.ResponseWriter, r *http.Request) {
@@ -182,10 +182,10 @@ func (a *App) resumeArtistNotifications(w http.ResponseWriter, r *http.Request) 
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Notifications could not be resumed. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?message=Notifications+resumed", http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery("Notifications resumed"), http.StatusSeeOther)
 }
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
 	target := "/artists"
@@ -275,7 +275,7 @@ func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		message = "Artist is already queued"
 	}
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -319,7 +319,7 @@ func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
 		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d queued, %d already queued, %d failed", queued, existing, failed)
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func validProviderID(value string) bool {
 	value = strings.TrimSpace(value)
@@ -367,7 +367,7 @@ func (a *App) followSpotify(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		message = "Artist is already queued"
 	}
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -449,7 +449,7 @@ func (a *App) followSpotifyBatch(w http.ResponseWriter, r *http.Request) {
 		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d queued, %d already queued, %d failed", queued, existing, failed)
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) follow(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -483,7 +483,7 @@ func (a *App) follow(w http.ResponseWriter, r *http.Request) {
 	if !added {
 		message = "Artist already followed"
 	}
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -528,7 +528,7 @@ func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
 		a.jobs.Wake()
 	}
 	message := fmt.Sprintf("%d added, %d already followed, %d failed", added, existing, failed)
-	http.Redirect(w, r, "/?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func selectedValues(r *http.Request, name string) ([]string, error) {
 	seen := make(map[string]bool)
@@ -565,7 +565,7 @@ func (a *App) unfollow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "artist could not be removed", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/artists?message=Artist+removed", http.StatusSeeOther)
+	http.Redirect(w, r, "/artists?"+a.statusQuery("Artist removed"), http.StatusSeeOther)
 }
 func (a *App) artistResolution(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -621,7 +621,7 @@ func (a *App) selectArtistResolution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "artist could not be followed", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/?message=Artist+followed", http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery("Artist followed"), http.StatusSeeOther)
 }
 func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -639,14 +639,15 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not cancel this resolution", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/?message=Pending+artist+cancelled", http.StatusSeeOther)
+	http.Redirect(w, r, "/?"+a.statusQuery("Pending artist cancelled"), http.StatusSeeOther)
 }
 func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	filename := "artist-trackarr-watched-artists-" + time.Now().UTC().Format("2006-01-02") + ".csv"
 	payload, err := buildBufferedCSV(func(writer *csv.Writer) error {
 		if err := writer.Write([]string{
-			"artist", "display_name", "musicbrainz_id", "musicbrainz_url", "spotify_id", "spotify_url",
+			"artist", "display_name", "sort_name", "artist_type", "country", "disambiguation",
+			"musicbrainz_id", "musicbrainz_url", "spotify_id", "spotify_url", "spotify_image_url",
 		}); err != nil {
 			return err
 		}
@@ -660,7 +661,9 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 			for _, artist := range artists {
 				musicBrainzURL := "https://musicbrainz.org/artist/" + artist.MBID
 				if err := writer.Write(neutralizeCSVRow([]string{
-					musicBrainzURL, artist.Name, artist.MBID, musicBrainzURL, artist.SpotifyID, artist.SpotifyURL,
+					musicBrainzURL, artist.Name, artist.SortName, artist.Type, artist.Country,
+					artist.Disambiguation, artist.MBID, musicBrainzURL, artist.SpotifyID,
+					artist.SpotifyURL, artist.SpotifyImageURL,
 				})); err != nil {
 					return err
 				}

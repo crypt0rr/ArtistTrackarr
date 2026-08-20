@@ -421,6 +421,16 @@ func normalizedArtistCreditRole(value string) string {
 }
 func normalizedReleaseTitle(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
+	// Apple commonly appends the inferred collection type to its title (for
+	// example, "Comeback - Single"). The type is persisted separately, so
+	// remove only an explicit trailing type suffix before comparing titles
+	// across providers.
+	for _, suffix := range []string{" - single", " - ep", " (single)", " (ep)", " [single]", " [ep]"} {
+		if strings.HasSuffix(value, suffix) && len(value) > len(suffix) {
+			value = strings.TrimSpace(strings.TrimSuffix(value, suffix))
+			break
+		}
+	}
 	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
 		start := strings.LastIndex(value, pair[0])
 		if start < 0 || !strings.HasSuffix(value, pair[1]) {
@@ -748,7 +758,7 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 	if err := json.Unmarshal([]byte(secondary), &secondaryTypes); err != nil {
 		return fmt.Errorf("parse release secondary types: %w", err)
 	}
-	if !releaseTypeEnabled(p, primary) {
+	if !releaseTypeEnabled(p, primary, secondaryTypes) {
 		return nil
 	}
 	var selected *candidate
@@ -831,7 +841,8 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deliveries(event_id,destination_id,status,next_attempt_at)
 		SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
 		LEFT JOIN destination_health dh ON dh.destination_id=d.id
-		WHERE d.user_id=? AND d.enabled=1`, eventID, timeText(now), userID)
+		WHERE d.user_id=? AND d.enabled=1
+		AND d.created_at <= (SELECT created_at FROM notification_events WHERE id=?)`, eventID, timeText(now), userID, eventID)
 	return err
 }
 

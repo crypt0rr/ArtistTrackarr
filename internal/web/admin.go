@@ -31,6 +31,14 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminDeliveryDetail(w, r, false)
+}
+
+func (a *App) adminDigestDeliveryDetail(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminDeliveryDetail(w, r, true)
+}
+
+func (a *App) renderAdminDeliveryDetail(w http.ResponseWriter, r *http.Request, digest bool) {
 	// Notification bodies and provider errors are deliberately only fetched
 	// after this explicit request. Keep the page out of browser/proxy caches
 	// because it contains household-private delivery content.
@@ -40,7 +48,12 @@ func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	detail, err := a.store.AdminDeliveryDetail(r.Context(), id)
+	var detail store.AdminDeliveryHistory
+	if digest {
+		detail, err = a.store.AdminDigestDeliveryDetail(r.Context(), id)
+	} else {
+		detail, err = a.store.AdminDeliveryDetail(r.Context(), id)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
@@ -51,7 +64,7 @@ func (a *App) adminDeliveryDetail(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "admin_delivery", d, http.StatusInternalServerError)
 		return
 	}
-	a.logger.Info("admin delivery details viewed", "delivery_id", id)
+	a.logger.Info("admin delivery details viewed", "delivery_id", id, "delivery_kind", detail.DeliveryKind)
 	d := a.data(r, "Delivery details")
 	d.AdminDelivery = &detail
 	a.render(w, "admin_delivery", d, http.StatusOK)
@@ -320,7 +333,7 @@ func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	payload, err := buildBufferedCSV(func(writer *csv.Writer) error {
-		if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at"}); err != nil {
+		if err := writer.Write([]string{"delivery_id", "user_email", "title", "body", "event_type", "destination", "service", "status", "attempts", "last_error", "created_at", "next_attempt_at", "sent_at", "delivery_kind"}); err != nil {
 			return err
 		}
 		var cursor *store.AdminDeliveryExportCursor
@@ -334,7 +347,7 @@ func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request)
 					strconv.FormatInt(item.DeliveryID, 10), item.UserEmail, item.Title, item.Body,
 					item.EventType, item.Destination, item.Service, item.Status,
 					strconv.Itoa(item.Attempts), item.LastError,
-					item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt),
+					item.CreatedAt.Format(time.RFC3339Nano), formatNullableTime(item.NextAttempt), formatNullableTime(item.SentAt), item.DeliveryKind,
 				}
 				if err := writer.Write(neutralizeCSVRow(row)); err != nil {
 					return err
@@ -440,13 +453,13 @@ func (a *App) adminData(r *http.Request) PageData {
 
 func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(r.FormValue("confirm")) != "cleanup" {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Cleanup was not confirmed; no records were removed."), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Cleanup was not confirmed; no records were removed."), http.StatusSeeOther)
 		return
 	}
 	stats, err := a.store.CleanupRetention(r.Context(), time.Now().UTC())
 	if err != nil {
 		a.logger.Error("retention cleanup failed", "path", r.URL.Path, "error", err)
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape("Retention cleanup could not be completed."), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Retention cleanup could not be completed."), http.StatusSeeOther)
 		return
 	}
 	removed := stats.ApplicationLogs + stats.Sessions + stats.AuthTokens + stats.LoginAttempts + stats.ManualSyncs + stats.ImportJobs
@@ -464,7 +477,27 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	} else {
 		message += " Database file size was not compacted; freelist pages remain reusable and VACUUM is not run automatically."
 	}
-	http.Redirect(w, r, "/admin?message="+url.QueryEscape(message), http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery(message), http.StatusSeeOther)
+}
+
+func (a *App) repairClockSkewedDeliveries(w http.ResponseWriter, r *http.Request) {
+	stats, err := a.store.RepairClockSkewedDeliveries(r.Context(), time.Now().UTC(), 24*time.Hour)
+	if err != nil {
+		a.logger.Error("clock-skewed delivery repair failed", "path", r.URL.Path, "error", err)
+		http.Redirect(w, r, "/admin?"+a.statusQuery("Future deliveries could not be repaired."), http.StatusSeeOther)
+		return
+	}
+	total := stats.Deliveries + stats.DigestDeliveries
+	message := fmt.Sprintf("Requeued %d clock-skewed delivery row%s (%d release, %d digest).", total, pluralSuffix(total), stats.Deliveries, stats.DigestDeliveries)
+	a.logger.Info("clock-skewed deliveries repaired", "deliveries", stats.Deliveries, "digest_deliveries", stats.DigestDeliveries)
+	http.Redirect(w, r, "/admin?"+a.statusQuery(message), http.StatusSeeOther)
+}
+
+func pluralSuffix(value int) string {
+	if value == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string) string {
@@ -593,13 +626,13 @@ func (a *App) queueRetrySync(w http.ResponseWriter, r *http.Request) {
 	}
 	session, _ := currentSession(r)
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "retry", nil); err != nil {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery(safeActionMessage(err, "Retry synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/admin?message=Retry+sync+queued", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("Retry sync queued"), http.StatusSeeOther)
 }
 func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 	if !a.allowProviderAction(w, r) {
@@ -621,13 +654,13 @@ func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err = a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
-		http.Redirect(w, r, "/admin?message="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		http.Redirect(w, r, "/admin?"+a.statusQuery(safeActionMessage(err, "Artist synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/admin?message=Artist+sync+queued", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("Artist sync queued"), http.StatusSeeOther)
 }
 func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
@@ -643,7 +676,7 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, store.ErrCannotDeleteSelf) || errors.Is(err, store.ErrLastAdmin) {
 			d := a.adminData(r)
-			d.Error = err.Error()
+			d.Error = safeActionMessage(err, "The account could not be deleted.")
 			a.render(w, "admin", d, http.StatusBadRequest)
 			return
 		}
@@ -651,7 +684,7 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user could not be deleted", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin?message=User+deleted", http.StatusSeeOther)
+	http.Redirect(w, r, "/admin?"+a.statusQuery("User deleted"), http.StatusSeeOther)
 }
 func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)

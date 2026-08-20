@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -57,11 +56,11 @@ func (a *App) setup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := a.data(r, "Create administrator")
-		d.Error = err.Error()
+		d.Error = safeActionMessage(err, "The administrator account could not be created. Please try again.")
 		a.render(w, "setup", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Administrator+created", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Administrator created"), http.StatusSeeOther)
 }
 func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 	if _, ok := currentSession(r); ok {
@@ -118,7 +117,6 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		for _, key := range keys {
 			_ = a.store.RecordLoginFailure(r.Context(), key)
 		}
-		time.Sleep(250 * time.Millisecond)
 		d := a.data(r, "Sign in")
 		d.Error = "Email or password is incorrect."
 		a.render(w, "login", d, http.StatusUnauthorized)
@@ -146,6 +144,7 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 			_ = a.store.DeleteSession(r.Context(), raw)
 		}
 	}
+	w.Header().Set("Clear-Site-Data", `"cache", "cookies", "storage"`)
 	http.SetCookie(w, &http.Cookie{
 		Name: "artist_session", Path: "/", MaxAge: -1, HttpOnly: true,
 		Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
@@ -185,7 +184,7 @@ func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Account+created", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Account created"), http.StatusSeeOther)
 }
 
 // invitationErrorMessage intentionally keeps token-backed account errors
@@ -224,7 +223,7 @@ func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/login?message=Password+updated", http.StatusSeeOther)
+	http.Redirect(w, r, "/login?"+a.statusQuery("Password updated"), http.StatusSeeOther)
 }
 
 // acquirePasswordSlot bounds the expensive Argon2 work used by login and

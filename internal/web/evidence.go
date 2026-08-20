@@ -170,5 +170,5 @@ func (a *App) evidenceIssueStateAction(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(redirect, "?") {
 		separator = "&"
 	}
-	http.Redirect(w, r, redirect+separator+"message="+url.QueryEscape("Evidence review updated"), http.StatusSeeOther)
+	http.Redirect(w, r, redirect+separator+a.statusQuery("Evidence review updated"), http.StatusSeeOther)
 }

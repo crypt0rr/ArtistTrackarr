@@ -18,8 +18,11 @@ import (
 
 // maxQueuedManualSyncRequests prevents repeated manual-sync actions from
 // starving normal scheduled work. Requests for the same artist are still
-// coalesced by CreateManualSyncRequest before this global cap is checked.
-const maxQueuedManualSyncRequests = 100
+// coalesced by CreateManualSyncRequest before these caps are checked.
+const (
+	maxQueuedManualSyncRequests        = 100
+	maxQueuedManualSyncRequestsPerUser = 25
+)
 
 func (s *Store) InsertApplicationLog(ctx context.Context, entry logging.Entry) error {
 	attrs, err := json.Marshal(entry.Attributes)
@@ -144,6 +147,14 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 		if queued >= maxQueuedManualSyncRequests {
 			return ManualSyncRequest{}, ErrManualSyncQueueFull
 		}
+		var ownerQueued int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests
+			WHERE status='queued' AND requested_by=?`, userID).Scan(&ownerQueued); err != nil {
+			return ManualSyncRequest{}, err
+		}
+		if ownerQueued >= maxQueuedManualSyncRequestsPerUser {
+			return ManualSyncRequest{}, ErrManualSyncQueueFull
+		}
 		now := nowText()
 		res, err := tx.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,artist_id,status,created_at) VALUES(?,?,?,?,?)`, userID, scope, artistID, "queued", now)
 		if err != nil {
@@ -181,9 +192,14 @@ func (s *Store) ClaimManualSyncRequestsWithLease(ctx context.Context, limit int,
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) ([]ManualSyncRequest, error) {
 		now := time.Now().UTC()
 		expires := now.Add(lease)
-		rows, err := tx.QueryContext(ctx, `SELECT id,requested_by,scope,artist_id,created_at FROM manual_sync_requests
-		WHERE status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
-		ORDER BY id LIMIT ?`, timeText(now), limit)
+		rows, err := tx.QueryContext(ctx, `WITH eligible AS (
+			SELECT id,requested_by,scope,artist_id,created_at,
+				ROW_NUMBER() OVER (PARTITION BY requested_by ORDER BY id) AS owner_rank
+			FROM manual_sync_requests
+			WHERE status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
+		)
+		SELECT id,requested_by,scope,artist_id,created_at FROM eligible
+		ORDER BY owner_rank,id LIMIT ?`, timeText(now), limit)
 		if err != nil {
 			return nil, err
 		}
@@ -398,6 +414,13 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		} else {
 			snapshot.DatabaseHealthState = DatabaseUnavailable
 		}
+	} else if healthErr := s.Writable(ctx); healthErr != nil {
+		var classified *DatabaseHealthError
+		if errors.As(healthErr, &classified) && classified != nil && classified.State != "" {
+			snapshot.DatabaseHealthState = classified.State
+		} else {
+			snapshot.DatabaseHealthState = DatabaseWriteFailed
+		}
 	}
 	snapshot.DatabaseHealthy = snapshot.DatabaseHealthState == DatabaseHealthy
 	err := s.readerDB().QueryRowContext(ctx, `SELECT
@@ -416,23 +439,12 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	if err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	var oldestDue sql.NullString
-	if err := s.readerDB().QueryRowContext(ctx, `WITH due AS (
-		SELECT a.id,a.next_check_at AS due_at
-		FROM artists a JOIN follows f ON f.artist_id=a.id
-		WHERE a.next_check_at IS NULL OR a.next_check_at<=?
-		UNION ALL
-		SELECT a.id,a.spotify_next_check_at AS due_at
-		FROM artists a JOIN follows f ON f.artist_id=a.id
-		WHERE a.spotify_id IS NOT NULL AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?)
-	)
-	SELECT COUNT(DISTINCT id),MIN(due_at) FROM due`, timeText(snapshot.CheckedAt), timeText(snapshot.CheckedAt)).
-		Scan(&snapshot.DueSyncArtists, &oldestDue); err != nil {
+	backlog, err := s.DueArtistSyncBacklog(ctx, snapshot.CheckedAt)
+	if err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	if snapshot.OldestDueSyncAt, err = parseStoredNullableTime(oldestDue, "oldest due artist sync"); err != nil {
-		return DiagnosticsSnapshot{}, err
-	}
+	snapshot.DueSyncArtists = backlog.Count
+	snapshot.OldestDueSyncAt = backlog.OldestDueAt
 	var oldest sql.NullString
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT MIN(value) FROM (
 		SELECT next_attempt_at AS value FROM deliveries WHERE status IN ('pending','blocked')
@@ -510,7 +522,10 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	return snapshot, nil
 }
 func (s *Store) MarkAllArtistsDue(ctx context.Context) error {
-	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=? WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, nowText())
+	now := nowText()
+	_, err := s.execWriteContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+		CASE WHEN spotify_id IS NOT NULL THEN ? ELSE spotify_next_check_at END
+		WHERE id IN (SELECT DISTINCT artist_id FROM follows)`, now, now)
 	return err
 }
 func (s *Store) ArtistByID(ctx context.Context, id int64) (Artist, error) {

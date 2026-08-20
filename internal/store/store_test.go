@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +22,13 @@ func testStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func setDestinationCreatedAt(t *testing.T, s *Store, userID int64, at time.Time) {
+	t.Helper()
+	if _, err := s.DB.Exec(`UPDATE destinations SET created_at=? WHERE user_id=?`, timeText(at), userID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStoreUsesWriterAndReadOnlyPool(t *testing.T) {
@@ -363,11 +371,21 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=31`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("calendar feed token migration marker=%d err=%v", migrationsApplied, err)
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=32`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("digest timezone migration marker=%d err=%v", migrationsApplied, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=33`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("artist identity verification migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var identityStatus string
+	if err := db.QueryRow(`SELECT status FROM artist_identity_status WHERE artist_id=?`, artistID).Scan(&identityStatus); err != nil || identityStatus != "verified" {
+		t.Fatalf("legacy artist identity status=%q err=%v, want verified", identityStatus, err)
+	}
 	var importStatus string
 	if err := db.QueryRow(`SELECT status FROM import_jobs WHERE id=(SELECT MIN(id) FROM import_jobs)`).Scan(&importStatus); err != nil || importStatus != "complete" {
 		t.Fatalf("legacy import status=%q err=%v, want complete", importStatus, err)
 	}
-	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id", "calendar_feed_tokens_active"} {
+	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id", "calendar_feed_tokens_active", "release_digest_runs_period_timezone", "artist_identity_status_due"} {
 		var found string
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, indexName).Scan(&found); err != nil {
 			t.Fatalf("migration index %q missing: %v", indexName, err)
@@ -452,6 +470,43 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	}
 }
 
+func TestMigrationRunnerRejectsDisabledForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=OFF;
+		CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := fs.ReadDir(migrations, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		var version int
+		if _, err := fmt.Sscanf(entry.Name(), "%d_", &version); err != nil {
+			t.Fatalf("parse migration %q: %v", entry.Name(), err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)`, version, nowText()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Store{DB: db}
+	if err := s.migrate(ctx); err == nil || !strings.Contains(err.Error(), "foreign-key enforcement") {
+		t.Fatalf("migrate error=%v, want disabled foreign-key failure", err)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatalf("migrate after restoring foreign keys: %v", err)
+	}
+}
+
 func TestFollowNotificationRuleBackfillIsIdempotentAndPreservesCustomRules(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -527,6 +582,17 @@ func TestReleaseRecordsMatchRequiresCompatiblePrecision(t *testing.T) {
 	if releaseRecordsMatch(Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024-06", DatePrecision: 2},
 		Release{Title: "Same Release", PrimaryType: "Album", FirstReleaseDate: "2024-06-15", DatePrecision: 3}) {
 		t.Fatal("month and day precision releases were merged")
+	}
+}
+
+func TestReleaseRecordsMatchNormalizesProviderTypeSuffixAndSmallDateDrift(t *testing.T) {
+	spotify := Release{Title: "Comeback", PrimaryType: "Album", FirstReleaseDate: "2026-07-01", DatePrecision: 3}
+	itunes := Release{Title: "Comeback - Single", PrimaryType: "Single", FirstReleaseDate: "2026-07-03", DatePrecision: 3}
+	if !releaseIdentityMatches(spotify, itunes) {
+		t.Fatal("provider title suffix and small date drift should retain release identity")
+	}
+	if releaseIdentityMatches(spotify, Release{Title: "Comeback - Single", PrimaryType: "Single", FirstReleaseDate: "2026-07-10", DatePrecision: 3}) {
+		t.Fatal("large date drift should not match release identity")
 	}
 }
 
@@ -621,6 +687,71 @@ func TestImportJobCompletionAndInterruptedRecovery(t *testing.T) {
 	}
 	if _, err := s.RecoverInterruptedImportJobs(ctx, now, time.Hour); err != nil {
 		t.Fatalf("repeat recovery=%v", err)
+	}
+}
+
+func TestInterruptedImportRetainsOwnerScopedPayloadForResume(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	ownerID, err := s.CreateUser(ctx, "import-resume@example.com", "hash", "member", "UTC", "import-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := s.CreateUser(ctx, "import-resume-other@example.com", "hash", "member", "UTC", "import-resume-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("artist,display_name,musicbrainz_id,musicbrainz_url,spotify_id,spotify_url\n")
+	job, err := s.CreateImportJobWithPayload(ctx, ownerID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.PayloadSize != len(payload) || job.CanResume {
+		t.Fatalf("new import payload state=%#v", job)
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE import_jobs SET created_at=? WHERE id=?`, timeText(now.Add(-2*time.Hour)), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecoverInterruptedImportJobs(ctx, now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.ImportJob(ctx, ownerID, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != "interrupted" || !loaded.CanResume || loaded.PayloadSize != len(payload) {
+		t.Fatalf("interrupted import resumability=%#v", loaded)
+	}
+	got, err := s.ImportJobPayload(ctx, ownerID, job.ID)
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("retained payload=%q err=%v", got, err)
+	}
+	if _, err := s.ImportJobPayload(ctx, otherID, job.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user payload access err=%v", err)
+	}
+	if err := s.FinishImportJob(ctx, ownerID, job.ID, "complete"); err == nil {
+		t.Fatal("interrupted import unexpectedly completed")
+	}
+	complete, err := s.CreateImportJobWithPayload(ctx, ownerID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishImportJob(ctx, ownerID, complete.ID, "complete"); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := s.ImportJob(ctx, ownerID, complete.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.PayloadSize != 0 || completed.CanResume {
+		t.Fatalf("completed import retained source payload: %#v", completed)
+	}
+	if _, err := s.ImportJobPayload(ctx, ownerID, complete.ID); !errors.Is(err, ErrImportNotResumable) {
+		t.Fatalf("completed import payload err=%v, want ErrImportNotResumable", err)
+	}
+	if _, err := s.CreateImportJobWithPayload(ctx, ownerID, make([]byte, MaxImportPayloadBytes+1)); err == nil {
+		t.Fatal("oversized import payload accepted")
 	}
 }
 
@@ -959,6 +1090,47 @@ func TestReleaseBaselineAndExactlyOnce(t *testing.T) {
 	assertEventCount(t, s, userID, "announcement", 2)
 }
 
+func TestReleaseDiscoveredAfterDowntimeUsesPreviousSuccessfulCheck(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "downtime@example.com", "unused", "member", "UTC", "downtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "downtime-artist", Name: "Downtime", SortName: "Downtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Date(2026, 8, 20, 8, 0, 0, 0, time.UTC)
+	previousCheck := observed.AddDate(0, 0, -30)
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "downtime-baseline", Title: "Baseline", PrimaryType: "Album",
+	}}, previousCheck); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkArtistChecked(ctx, artist.ID, previousCheck, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	artist, err = s.ArtistByID(ctx, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artist.LastCheckedAt == nil || !artist.LastCheckedAt.Equal(previousCheck) {
+		t.Fatalf("last checked=%v, want %v", artist.LastCheckedAt, previousCheck)
+	}
+
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{
+		{MBID: "downtime-baseline", Title: "Baseline", PrimaryType: "Album"},
+		{MBID: "downtime-release", Title: "Released During Outage", PrimaryType: "EP", FirstReleaseDate: "2026-08-10", DatePrecision: 3},
+	}, observed); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+}
+
 func TestSpotifyAdaptivePollingPersistsAndBacksOff(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -1074,6 +1246,7 @@ func TestInitialSyncChoosesNearestUpcomingRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
 	releases := []Release{
 		{MBID: "old", Title: "Last Year", PrimaryType: "Album", FirstReleaseDate: "2025-01-01", DatePrecision: 3, MusicBrainzURL: "https://musicbrainz.test/old"},
 		{MBID: "far", Title: "Far Future", PrimaryType: "Album", FirstReleaseDate: "2027", DatePrecision: 1, MusicBrainzURL: "https://musicbrainz.test/far"},
@@ -1541,6 +1714,7 @@ func TestCreditOwnerAssociationsCreateOneEventAndExposeRelease(t *testing.T) {
 		}
 	}
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
 	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "New shared release", "A body", now); err != nil {
 		t.Fatal(err)
 	}
@@ -1758,6 +1932,136 @@ func TestScheduleArtistCheckDefersDueArtist(t *testing.T) {
 	}
 }
 
+func TestArtistsDueExcludesTerminalIdentityEvenWhenSpotifyCheckIsDue(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "terminal-spotify@example.com", "unused", "member", "UTC", "terminal-spotify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "terminal-spotify-artist", Name: "Terminal Spotify", SpotifyID: "terminal-spotify-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	if err := s.ScheduleArtistIdentityFailure(ctx, artist.ID, 5, now.Add(24*time.Hour), "unresolvable", true); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the Spotify-only side of the due predicate. A missing pair of
+	// parentheses here would admit this terminal identity through the OR arm.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=? WHERE id=?`,
+		timeText(now.Add(time.Hour)), timeText(now), artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	due, err := s.ArtistsDue(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			t.Fatal("terminal identity was admitted through the Spotify due branch")
+		}
+	}
+	diagnostics, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics.DueSyncArtists != 0 || diagnostics.OldestDueSyncAt != nil {
+		t.Fatalf("terminal identity remained in due diagnostics: count=%d oldest=%v", diagnostics.DueSyncArtists, diagnostics.OldestDueSyncAt)
+	}
+}
+
+func TestDueArtistSyncBacklogReportsTotalAndOldest(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "sync-backlog@example.com", "unused", "member", "UTC", "sync-backlog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	oldest := now.Add(-2 * time.Hour)
+	for i := 0; i < 30; i++ {
+		artist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: fmt.Sprintf("sync-backlog-%02d", i), Name: fmt.Sprintf("Sync backlog %02d", i)})
+		if upsertErr != nil {
+			t.Fatal(upsertErr)
+		}
+		if _, followErr := s.Follow(ctx, userID, artist.ID); followErr != nil {
+			t.Fatal(followErr)
+		}
+		dueAt := now.Add(-time.Duration(i+1) * time.Minute)
+		if i == 29 {
+			dueAt = oldest
+		}
+		if _, updateErr := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, timeText(dueAt), artist.ID); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	backlog, err := s.DueArtistSyncBacklog(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog.Count != 30 || backlog.OldestDueAt == nil || !backlog.OldestDueAt.Equal(oldest) {
+		t.Fatalf("backlog=%#v, want 30 artists oldest %v", backlog, oldest)
+	}
+	batch, err := s.ArtistsDue(ctx, now, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 25 {
+		t.Fatalf("bounded batch size=%d, want 25", len(batch))
+	}
+}
+
+func TestArtistsDuePrioritizesTheOldestEffectiveProviderDueTime(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "provider-order@example.com", "unused", "member", "UTC", "provider-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	priority, err := s.UpsertArtist(ctx, Artist{MBID: "provider-order-priority", Name: "Provider order priority", SpotifyID: "provider-order-priority-spotify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, priority.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The normal catalog check is not due, but the Spotify check is the oldest
+	// effective due time. This artist must not be pushed behind a batch cap by
+	// ordering on the future normal check alone.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=? WHERE id=?`,
+		timeText(now.Add(time.Hour)), timeText(now.Add(-2*time.Hour)), priority.ID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		artist, upsertErr := s.UpsertArtist(ctx, Artist{MBID: fmt.Sprintf("provider-order-%02d", i), Name: fmt.Sprintf("Provider order %02d", i)})
+		if upsertErr != nil {
+			t.Fatal(upsertErr)
+		}
+		if _, followErr := s.Follow(ctx, userID, artist.ID); followErr != nil {
+			t.Fatal(followErr)
+		}
+		if _, updateErr := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`,
+			timeText(now.Add(-time.Hour)), artist.ID); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	due, err := s.ArtistsDue(ctx, now, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 25 {
+		t.Fatalf("due batch size=%d, want 25", len(due))
+	}
+	if due[0].ID != priority.ID {
+		t.Fatalf("first due artist=%d, want oldest effective provider due artist %d", due[0].ID, priority.ID)
+	}
+}
+
 func assertReleaseMBIDs(t *testing.T, releases []Release, want []string) {
 	t.Helper()
 	got := make([]string, len(releases))
@@ -1801,6 +2105,7 @@ func TestReleaseDayUsesUserTimezoneAndDeduplicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 30, 7, 1, 0, 0, time.UTC) // 09:01 in Amsterdam.
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
 	releases := []Release{{
 		MBID: "today", Title: "Today", PrimaryType: "Album",
 		FirstReleaseDate: "2026-07-30", DatePrecision: 3,

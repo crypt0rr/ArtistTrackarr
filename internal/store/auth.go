@@ -31,6 +31,18 @@ func validateUsername(value string) (string, error) {
 	}
 	return value, nil
 }
+
+func validateTimezone(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("invalid IANA timezone")
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return "", errors.New("invalid IANA timezone")
+	}
+	return value, nil
+}
+
 func derivedUsername(email string, id int64, taken map[string]struct{}) string {
 	local := email
 	if at := strings.IndexByte(local, '@'); at >= 0 {
@@ -76,8 +88,9 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, errors.New("a valid email address is required")
 	}
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return 0, errors.New("invalid IANA timezone")
+	timezone, err := validateTimezone(timezone)
+	if err != nil {
+		return 0, err
 	}
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int64, error) {
 		candidate := strings.TrimSpace(username)
@@ -122,8 +135,9 @@ func (s *Store) CreateInitialAdmin(ctx context.Context, email, hash, timezone, u
 	if email == "" || !strings.Contains(email, "@") {
 		return 0, errors.New("a valid email address is required")
 	}
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return 0, errors.New("invalid IANA timezone")
+	timezone, err := validateTimezone(timezone)
+	if err != nil {
+		return 0, err
 	}
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int64, error) {
 		var count int
@@ -272,21 +286,31 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 }
 func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) error {
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID)
+		if err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return sql.ErrNoRows
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
 		return err
 	})
 }
 func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, reminder, username string) error {
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return errors.New("invalid IANA timezone")
+	var err error
+	if timezone, err = validateTimezone(timezone); err != nil {
+		return err
 	}
-	if _, err := time.Parse("15:04", reminder); err != nil {
+	canonicalReminder, ok := normalizeReminderTime(reminder)
+	if !ok {
 		return errors.New("reminder time must use HH:MM")
 	}
-	username, err := validateUsername(username)
+	username, err = validateUsername(username)
 	if err != nil {
 		return err
 	}
@@ -298,7 +322,7 @@ func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, remin
 		if taken {
 			return ErrUsernameTaken
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, reminder, userID)
+		_, err = tx.ExecContext(ctx, `UPDATE users SET username=?, timezone=?, reminder_time=? WHERE id=?`, username, timezone, canonicalReminder, userID)
 		return err
 	})
 }
@@ -307,8 +331,9 @@ func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, remin
 // transaction. Validation and uniqueness failures therefore leave the token
 // available for correction and retry.
 func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, timezone string) error {
-	if _, err := time.LoadLocation(timezone); err != nil {
-		return errors.New("invalid IANA timezone")
+	var err error
+	if timezone, err = validateTimezone(timezone); err != nil {
+		return err
 	}
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		var email string

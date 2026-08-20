@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -75,12 +77,17 @@ func parseArtistTrackarrCSV(reader io.Reader) ([]store.ImportInput, error) {
 			return nil, fmt.Errorf("CSV contains more than %d data rows", maxArtistImportRows)
 		}
 		input := store.ImportInput{
-			SourceValue: csvField(record, columns["artist"]),
-			DisplayName: csvField(record, columns["display_name"]),
-			MBID:        strings.ToLower(csvField(record, columns["musicbrainz_id"])),
-			MBURL:       csvField(record, columns["musicbrainz_url"]),
-			SpotifyID:   csvField(record, columns["spotify_id"]),
-			SpotifyURL:  csvField(record, columns["spotify_url"]),
+			SourceValue:     csvField(record, columns["artist"]),
+			DisplayName:     csvField(record, columns["display_name"]),
+			SortName:        csvOptionalField(record, columns, "sort_name"),
+			ArtistType:      csvOptionalField(record, columns, "artist_type"),
+			Country:         csvOptionalField(record, columns, "country"),
+			Disambiguation:  csvOptionalField(record, columns, "disambiguation"),
+			MBID:            strings.ToLower(csvField(record, columns["musicbrainz_id"])),
+			MBURL:           csvField(record, columns["musicbrainz_url"]),
+			SpotifyID:       csvField(record, columns["spotify_id"]),
+			SpotifyURL:      csvField(record, columns["spotify_url"]),
+			SpotifyImageURL: csvOptionalField(record, columns, "spotify_image_url"),
 		}
 		input.Reason = validateArtistImportInput(input)
 		if input.Reason == "" && input.SpotifyID != "" {
@@ -101,9 +108,33 @@ func csvField(record []string, index int) string {
 	return strings.TrimSpace(record[index])
 }
 
+func csvOptionalField(record []string, columns map[string]int, name string) string {
+	index, ok := columns[name]
+	if !ok {
+		return ""
+	}
+	return csvField(record, index)
+}
+
 func validateArtistImportInput(input store.ImportInput) string {
 	if input.DisplayName == "" {
 		return "display name is required"
+	}
+	if utf8.RuneCountInString(input.DisplayName) > 256 {
+		return "display name is too long (maximum 256 characters)"
+	}
+	for _, field := range []struct {
+		label string
+		value string
+	}{
+		{label: "sort name", value: input.SortName},
+		{label: "artist type", value: input.ArtistType},
+		{label: "country", value: input.Country},
+		{label: "disambiguation", value: input.Disambiguation},
+	} {
+		if utf8.RuneCountInString(field.value) > 256 {
+			return field.label + " is too long (maximum 256 characters)"
+		}
 	}
 	if input.SourceValue == "" {
 		return "artist source value is required"
@@ -135,6 +166,9 @@ func validateArtistImportInput(input store.ImportInput) string {
 			return "invalid Spotify artist URL"
 		}
 		input.SpotifyID = spotifyID
+	}
+	if input.SpotifyImageURL != "" && !validSpotifyImageURL(input.SpotifyImageURL) {
+		return "invalid Spotify image URL"
 	}
 	return ""
 }
@@ -189,6 +223,15 @@ func validSpotifyArtistURL(value string) (*url.URL, bool) {
 	return parsed, true
 }
 
+func validSpotifyImageURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme != "https" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	return host == "i.scdn.co" || host == "scdn.co" || strings.HasSuffix(host, ".spotifycdn.com")
+}
+
 func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	if !a.acquireImportSlot(w) {
@@ -225,27 +268,41 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		a.renderImportError(w, r, err.Error())
 		return
 	}
-	job, err := a.store.CreateImportJob(r.Context(), session.User.ID)
+	job, err := a.runArtistImport(r.Context(), session.User.ID, inputs, data)
 	if err != nil {
 		a.logger.Error("create artist import job failed", "user_id", session.User.ID, "error", err)
 		http.Error(w, "could not create import job", http.StatusInternalServerError)
 		return
 	}
+	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
+}
+
+// runArtistImport owns the durable per-row loop shared by fresh and resumed
+// uploads. Every row is independent, so a local write failure leaves the rest
+// of the upload useful while the terminal status tells the user it is
+// incomplete. The original payload is retained only within the store's
+// bounded import-job limit.
+func (a *App) runArtistImport(ctx context.Context, userID int64, inputs []store.ImportInput, payload []byte) (store.ImportJob, error) {
+	job, err := a.store.CreateImportJobWithPayload(ctx, userID, payload)
+	if err != nil {
+		return store.ImportJob{}, err
+	}
 	importStatus := "complete"
 	for _, input := range inputs {
-		if _, saveErr := a.store.SaveImportRow(r.Context(), session.User.ID, job.ID, input); saveErr != nil {
+		if _, saveErr := a.store.SaveImportRow(ctx, userID, job.ID, input); saveErr != nil {
 			importStatus = "failed"
 			a.logger.Error("save artist import row failed", "job_id", job.ID, "error", saveErr)
 			// Keep the row visible even when one local write fails. This is an
 			// invalid result, never a reason to discard the rest of the upload.
 			input.Reason = "could not save this row"
-			_, _ = a.store.SaveImportRow(r.Context(), session.User.ID, job.ID, input)
+			_, _ = a.store.SaveImportRow(ctx, userID, job.ID, input)
 		}
 	}
-	if err := a.store.FinishImportJob(r.Context(), session.User.ID, job.ID, importStatus); err != nil {
+	if err := a.store.FinishImportJob(ctx, userID, job.ID, importStatus); err != nil {
 		a.logger.Error("finish artist import job failed", "job_id", job.ID, "error", err)
 	}
-	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
+	job.Status = importStatus
+	return job, nil
 }
 
 func (a *App) acquireImportSlot(w http.ResponseWriter) bool {
@@ -303,4 +360,74 @@ func (a *App) artistImport(w http.ResponseWriter, r *http.Request) {
 	d := a.data(r, "Artist import results")
 	d.Import = &job
 	a.render(w, "import", d, http.StatusOK)
+}
+
+// resumeArtistImport replays the retained source payload into a fresh job.
+// Replaying is intentionally idempotent: existing follows are reported as
+// already followed, while rows that were never persisted during the original
+// attempt are applied normally. The original interrupted/failed job remains
+// as an audit record.
+func (a *App) resumeArtistImport(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	if !a.acquireImportSlot(w) {
+		return
+	}
+	defer a.releaseImportSlot()
+	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+	if a.importLimiter != nil && !a.importLimiter.Allow(key) {
+		rateLimited(w, 3600, "artist imports are temporarily rate limited; try again later")
+		return
+	}
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	payload, err := a.store.ImportJobPayload(r.Context(), session.User.ID, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if errors.Is(err, store.ErrImportNotResumable) {
+			a.renderImportResumeError(w, r, id, "This import is no longer resumable; upload the CSV again to start a new import.", http.StatusBadRequest)
+			return
+		}
+		a.logger.Error("load artist import payload failed", "job_id", id, "error", err)
+		a.renderImportResumeError(w, r, id, "The saved import could not be resumed.", http.StatusInternalServerError)
+		return
+	}
+	if len(payload) > maxArtistImportBytes {
+		a.renderImportResumeError(w, r, id, "The saved import is larger than the supported upload limit.", http.StatusBadRequest)
+		return
+	}
+	inputs, err := parseArtistTrackarrCSV(strings.NewReader(string(payload)))
+	if err != nil {
+		a.renderImportResumeError(w, r, id, "The saved import is invalid; upload the CSV again to start a new import.", http.StatusBadRequest)
+		return
+	}
+	job, err := a.runArtistImport(r.Context(), session.User.ID, inputs, payload)
+	if err != nil {
+		a.logger.Error("resume artist import failed", "source_job_id", id, "error", err)
+		http.Error(w, "could not resume import", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
+}
+
+func (a *App) renderImportResumeError(w http.ResponseWriter, r *http.Request, id int64, message string, status int) {
+	session, _ := currentSession(r)
+	job, err := a.store.ImportJob(r.Context(), session.User.ID, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "import results are temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	d := a.data(r, "Artist import results")
+	d.Import = &job
+	d.Error = message
+	a.render(w, "import", d, status)
 }

@@ -22,6 +22,17 @@
       <button>Save reminder settings</button>
     </form>
   </section>
+  <section class="panel settings-panel">
+    <p class="eyebrow">Security</p><h2>Change password</h2>
+    <p>Changing your password signs out all active sessions, including this one.</p>
+    <form method="post" action="/settings/password" class="stack compact">
+      {{template "csrf" .}}
+      <label>Current password<input name="current_password" type="password" required autocomplete="current-password"></label>
+      <label>New password<input name="new_password" type="password" minlength="12" required autocomplete="new-password"><small>At least 12 characters.</small></label>
+      <label>Confirm new password<input name="confirm_password" type="password" minlength="12" required autocomplete="new-password"></label>
+      <button>Change password</button>
+    </form>
+  </section>
 </div>
 <section class="panel calendar-feed-panel">
   <div class="section-head"><div><p class="eyebrow">Calendar sync</p><h2>Subscribe to your release calendar</h2><p>Generate a private ICS feed for your calendar app. The feed includes precise releases from the next year and does not require your ArtistTrackarr login.</p></div>{{if .CalendarFeedActive}}<span class="badge sent">Active</span>{{end}}</div>

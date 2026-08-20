@@ -138,6 +138,28 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.verifyForeignKeyEnforcement(ctx); err != nil {
+		return fmt.Errorf("verify foreign-key enforcement after migrations: %w", err)
+	}
+	return nil
+}
+
+// verifyForeignKeyEnforcement is deliberately run after the complete
+// migration sequence, not only after the one migration that temporarily
+// disables SQLite foreign keys. A future migration may use the same rebuild
+// pattern, and startup must fail closed rather than keep serving with cascades
+// and ownership constraints disabled.
+func (s *Store) verifyForeignKeyEnforcement(ctx context.Context) error {
+	if s == nil || s.DB == nil {
+		return errors.New("database handle is unavailable")
+	}
+	var enabled int
+	if err := s.DB.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		return err
+	}
+	if enabled != 1 {
+		return fmt.Errorf("PRAGMA foreign_keys=%d; want 1", enabled)
+	}
 	return nil
 }
 
@@ -504,9 +526,9 @@ func classifyDatabaseHealthError(err error) DatabaseHealthState {
 	return DatabaseWriteFailed
 }
 
-// Healthy proves both that the migrated schema can be read and that the
-// writer can complete a tiny rollback-only write. A read-only or full
-// database must not be reported as ready merely because SELECT succeeds.
+// Healthy proves that the migrated schema can be read. It deliberately uses
+// the reader pool so readiness probes remain responsive while the serialized
+// writer is committing a long transaction.
 func (s *Store) Healthy(ctx context.Context) error {
 	if s == nil || s.readerDB() == nil {
 		return &DatabaseHealthError{State: DatabaseUnavailable, Err: errors.New("database handle is unavailable")}
@@ -517,6 +539,28 @@ func (s *Store) Healthy(ctx context.Context) error {
 	// application schema is absent or corrupt.
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM schema_migrations LIMIT 1`).Scan(&one); err != nil {
 		return &DatabaseHealthError{State: DatabaseUnavailable, Err: err}
+	}
+	return nil
+}
+
+// Ready proves that the application schema is readable and that the writer
+// can complete a tiny rollback-only transaction.  Keeping the two checks in
+// this bounded helper gives unauthenticated readiness probes the same safety
+// classification used by diagnostics without exposing SQLite details.
+func (s *Store) Ready(ctx context.Context) error {
+	if err := s.Healthy(ctx); err != nil {
+		return err
+	}
+	return s.Writable(ctx)
+}
+
+// Writable proves that the writer can complete a tiny rollback-only write.
+// This check is kept separate from Healthy so read-only readiness probes do
+// not queue behind application transactions. Diagnostics uses both checks to
+// distinguish an unavailable schema from a database that cannot accept work.
+func (s *Store) Writable(ctx context.Context) error {
+	if s == nil {
+		return &DatabaseHealthError{State: DatabaseUnavailable, Err: errors.New("database handle is unavailable")}
 	}
 	if s.DB == nil {
 		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: errors.New("writer handle is unavailable")}

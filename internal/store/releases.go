@@ -168,7 +168,18 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 					}
 				}
 				date, full := releaseDate(item.release.FirstReleaseDate)
-				if (!item.isNew && !item.creditNew) || !full || date.Before(dayUTC(observed).AddDate(0, 0, -7)) {
+				// Keep the seven-day discovery window for normal polling, but
+				// widen it to the previous successful catalog check after a
+				// downtime gap. This catches a release first observed after an
+				// outage without turning old back-catalogue imports into alerts.
+				cutoff := dayUTC(observed).AddDate(0, 0, -7)
+				if artist.LastCheckedAt != nil {
+					previousCheck := dayUTC(*artist.LastCheckedAt)
+					if previousCheck.Before(cutoff) {
+						cutoff = previousCheck
+					}
+				}
+				if (!item.isNew && !item.creditNew) || !full || date.Before(cutoff) {
 					continue
 				}
 				title, body := releaseAnnouncementMessage(artist, item.release)
@@ -212,10 +223,18 @@ func matchingReleaseIDTx(
 	if spotifyOnly {
 		sourceClause = "source IN ('spotify','itunes')"
 	}
+	dateClause := "date_precision=? AND first_release_date=?"
+	dateArgs := []any{candidate.DatePrecision, candidate.FirstReleaseDate}
+	if candidate.DatePrecision == 3 {
+		// Regional providers can differ by a few days. Keep the candidate set
+		// narrow by artist/source/precision and a small day-level window before
+		// comparing normalized titles.
+		dateClause = "date_precision=? AND date(first_release_date) BETWEEN date(?, '-3 day') AND date(?, '+3 day')"
+		dateArgs = []any{candidate.DatePrecision, candidate.FirstReleaseDate, candidate.FirstReleaseDate}
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,title,primary_type,first_release_date,date_precision,source
-		FROM release_groups WHERE artist_id=? AND `+sourceClause+`
-		AND date_precision=? AND first_release_date=?`,
-		artistID, candidate.DatePrecision, candidate.FirstReleaseDate)
+		FROM release_groups WHERE artist_id=? AND `+sourceClause+` AND `+dateClause,
+		append([]any{artistID}, dateArgs...)...)
 	if err != nil {
 		return 0, err
 	}
@@ -263,7 +282,19 @@ func releaseIdentityMatches(a, b Release) bool {
 	if length == 0 || len(a.FirstReleaseDate) != length || len(b.FirstReleaseDate) != length {
 		return false
 	}
-	return a.FirstReleaseDate == b.FirstReleaseDate
+	if a.DatePrecision != 3 {
+		return a.FirstReleaseDate == b.FirstReleaseDate
+	}
+	left, leftErr := time.Parse("2006-01-02", a.FirstReleaseDate)
+	right, rightErr := time.Parse("2006-01-02", b.FirstReleaseDate)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	delta := left.Sub(right)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= 3*24*time.Hour
 }
 
 func providerReleaseTypeDerived(release Release) bool {
@@ -273,24 +304,24 @@ func providerReleaseTypeDerived(release Release) bool {
 	}
 	return strings.TrimSpace(release.SpotifyID) != "" || strings.TrimSpace(release.ITunesID) != ""
 }
+
+type releaseDayDue struct {
+	userID, releaseID          int64
+	timezone, reminder         string
+	artist, title, releaseDate string
+	musicBrainzURL             string
+	spotifyURL, itunesURL      sql.NullString
+	artistCreditRole           string
+}
+
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	today := dayUTC(now)
 	from := today.AddDate(0, 0, -1).Format("2006-01-02")
 	to := today.AddDate(0, 0, 1).Format("2006-01-02")
-	type due struct {
-		userID, releaseID          int64
-		timezone, reminder         string
-		artist, title, releaseDate string
-		musicBrainzURL             string
-		spotifyURL, itunesURL      sql.NullString
-		artistCreditRole           string
-		guestCreditCount           int
-	}
-	var candidates []due
+	var candidates []releaseDayDue
 	if err := func() error {
 		rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
-			 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role,
-			 (SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=rg.id AND rc.role='guest')
+			 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role
 			FROM users u JOIN release_groups rg ON 1=1
 			JOIN artists a ON a.id=rg.artist_id
 			WHERE `+followedReleasePredicate("u.id")+` AND rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
@@ -299,10 +330,10 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		}
 		defer func() { _ = rows.Close() }()
 		for rows.Next() {
-			var d due
+			var d releaseDayDue
 			if err := rows.Scan(
 				&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
-				&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole, &d.guestCreditCount,
+				&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole,
 			); err != nil {
 				return err
 			}
@@ -311,6 +342,34 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		return rows.Err()
 	}(); err != nil {
 		return err
+	}
+	// A release can be visible because the member follows a credited artist
+	// rather than the canonical release artist. Resolve those owner-scoped
+	// associations in batches before building the event text so release-day
+	// alerts describe the followed guest/featured artist instead of silently
+	// presenting the canonical artist as the member's own release.
+	type dueKey struct {
+		userID, releaseID int64
+	}
+	associationByCandidate := make(map[dueKey][]FollowedArtistAssociation)
+	releaseIDsByUser := make(map[int64][]int64)
+	seenReleaseByUser := make(map[dueKey]bool)
+	for _, candidate := range candidates {
+		key := dueKey{userID: candidate.userID, releaseID: candidate.releaseID}
+		if seenReleaseByUser[key] {
+			continue
+		}
+		seenReleaseByUser[key] = true
+		releaseIDsByUser[candidate.userID] = append(releaseIDsByUser[candidate.userID], candidate.releaseID)
+	}
+	for userID, releaseIDs := range releaseIDsByUser {
+		associations, err := s.followedReleaseAssociationsBatch(ctx, userID, releaseIDs)
+		if err != nil {
+			return err
+		}
+		for _, releaseID := range releaseIDs {
+			associationByCandidate[dueKey{userID: userID, releaseID: releaseID}] = associations[releaseID]
+		}
 	}
 	for _, d := range candidates {
 		location, err := time.LoadLocation(d.timezone)
@@ -322,13 +381,15 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		if !validReminder || d.releaseDate != localNow.Format("2006-01-02") || localNow.Hour()*60+localNow.Minute() < reminder {
 			continue
 		}
-		body := fmt.Sprintf("%s's %q is out today.", d.artist, d.title)
+		displayArtist, creditRole := releaseDayAssociationDisplay(d, associationByCandidate[dueKey{userID: d.userID, releaseID: d.releaseID}])
+		body := fmt.Sprintf("%s's %q is out today.", displayArtist, d.title)
 		title := "Released today: " + d.title
-		if d.artistCreditRole == "featured" && d.guestCreditCount > 0 {
-			body = fmt.Sprintf("%s is credited on %q, released today.", d.artist, d.title)
+		switch creditRole {
+		case "guest":
+			body = fmt.Sprintf("%s is credited on %q, released today.", displayArtist, d.title)
 			title = "Guest appearance released today: " + d.title
-		} else if d.artistCreditRole == "featured" {
-			body = fmt.Sprintf("%s appears on %q, released today.", d.artist, d.title)
+		case "featured":
+			body = fmt.Sprintf("%s appears on %q, released today.", displayArtist, d.title)
 			title = "Featured appearance released today: " + d.title
 		}
 		if link := firstNonEmpty(d.spotifyURL.String, d.itunesURL.String, d.musicBrainzURL); link != "" {
@@ -340,6 +401,64 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	}
 	return nil
 }
+
+// releaseDayAssociationDisplay picks the strongest followed association for
+// explanatory release-day text. The canonical release artist remains the
+// primary display identity unless the member follows only a guest/featured
+// credit, in which case the alert explicitly describes that appearance.
+func releaseDayAssociationDisplay(d releaseDayDue, associations []FollowedArtistAssociation) (string, string) {
+	role := normalizedCreditRole(d.artistCreditRole)
+	displayArtist := d.artist
+	if len(associations) == 0 {
+		return displayArtist, role
+	}
+	// A primary association is the canonical release identity for this owner.
+	// If there is no primary association, the member follows only a credited
+	// appearance and the strongest non-primary role should be shown instead.
+	var best *FollowedArtistAssociation
+	for index := range associations {
+		association := &associations[index]
+		if normalizedCreditRole(association.Role) == "primary" {
+			return displayArtist, "primary"
+		}
+		if best == nil || creditRolePriority(association.Role) < creditRolePriority(best.Role) {
+			best = association
+		}
+	}
+	if best == nil {
+		return displayArtist, role
+	}
+	if normalizedCreditRole(best.Role) == "guest" || normalizedCreditRole(best.Role) == "featured" {
+		displayArtist = associationDisplayName(best.Label)
+		role = normalizedCreditRole(best.Role)
+	}
+	return displayArtist, role
+}
+
+func creditRolePriority(role string) int {
+	switch normalizedCreditRole(role) {
+	case "primary":
+		return 0
+	case "featured":
+		return 1
+	case "guest":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func associationDisplayName(label string) string {
+	label = strings.TrimSpace(label)
+	for _, role := range []string{"primary", "featured", "guest"} {
+		suffix := " (" + role + ")"
+		if strings.HasSuffix(label, suffix) {
+			return strings.TrimSpace(strings.TrimSuffix(label, suffix))
+		}
+	}
+	return label
+}
+
 func (s *Store) EnqueueEvent(ctx context.Context, userID, releaseID int64, eventType, title, body string, now time.Time) error {
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		return enqueueEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
@@ -407,7 +526,21 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
+func releaseTypeEnabled(p NotificationPreferences, primary string, secondaryTypes ...[]string) bool {
+	// Catalog providers normalize compilations as Album with a Compilation
+	// secondary type. Account preferences do not expose a separate compilation
+	// switch; leave those releases to the per-follow Compilations rule instead
+	// of accidentally treating them as ordinary albums.
+	for _, types := range secondaryTypes {
+		for _, secondary := range types {
+			if strings.EqualFold(strings.TrimSpace(secondary), "compilation") {
+				return true
+			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(primary), "compilation") {
+		return true
+	}
 	switch strings.ToLower(strings.TrimSpace(primary)) {
 	case "album":
 		return p.Albums

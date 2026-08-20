@@ -84,13 +84,13 @@ func (s *Store) followedReleaseArtists(ctx context.Context, userID, releaseID in
 	return names, rows.Err()
 }
 
-// followedReleaseArtistsBatch loads the followed associations for a materialized
-// set of releases. Callers should close any release projection cursor before
-// invoking this helper: each bounded query may acquire a reader connection.
-// Keeping the association lookup batched avoids one nested reader query per
-// release and prevents calendar callers from exhausting the reader pool.
-func (s *Store) followedReleaseArtistsBatch(ctx context.Context, userID int64, releaseIDs []int64) (map[int64][]string, error) {
-	associations := make(map[int64][]string, len(releaseIDs))
+// followedReleaseAssociationsBatch loads the owner-scoped followed artist
+// identities and their credit roles for a materialized set of releases. The
+// IDs are retained alongside display labels so digest delivery can evaluate
+// the correct per-follow rule instead of only the canonical release artist's
+// rule.
+func (s *Store) followedReleaseAssociationsBatch(ctx context.Context, userID int64, releaseIDs []int64) (map[int64][]FollowedArtistAssociation, error) {
+	associations := make(map[int64][]FollowedArtistAssociation, len(releaseIDs))
 	for start := 0; start < len(releaseIDs); start += 500 {
 		end := min(start+500, len(releaseIDs))
 		ids := releaseIDs[start:end]
@@ -101,7 +101,7 @@ func (s *Store) followedReleaseArtistsBatch(ctx context.Context, userID int64, r
 		}
 		args = append(args, userID)
 		if err := func() error {
-			rows, err := s.readerDB().QueryContext(ctx, `SELECT rg.id, `+followedReleaseAssociationLabel+`
+			rows, err := s.readerDB().QueryContext(ctx, `SELECT rg.id,f.artist_id,`+followedReleaseAssociationLabel+`,`+followedReleaseAssociationRole+`
 				FROM follows f
 				JOIN artists a ON a.id=f.artist_id
 				JOIN release_groups rg ON rg.id IN (`+placeholders+`)
@@ -116,11 +116,11 @@ func (s *Store) followedReleaseArtistsBatch(ctx context.Context, userID int64, r
 			defer func() { _ = rows.Close() }()
 			for rows.Next() {
 				var releaseID int64
-				var name string
-				if err := rows.Scan(&releaseID, &name); err != nil {
+				var item FollowedArtistAssociation
+				if err := rows.Scan(&releaseID, &item.ArtistID, &item.Label, &item.Role); err != nil {
 					return err
 				}
-				associations[releaseID] = append(associations[releaseID], name)
+				associations[releaseID] = append(associations[releaseID], item)
 			}
 			return rows.Err()
 		}(); err != nil {

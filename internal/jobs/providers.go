@@ -171,6 +171,11 @@ func (r *Runner) observeSpotify(ctx context.Context, artist store.Artist, now ti
 	}
 
 	var releases []store.Release
+	// The Spotify release cache is intended for short discovery/follow bursts,
+	// not for scheduler decisions. A due scheduled check must reach the
+	// provider so a 24-hour cache cannot be mistaken for an unchanged catalog
+	// when the adaptive interval is shorter than the cache TTL.
+	r.invalidateSpotifyReleaseCache(artist)
 	if incremental, ok := r.spotify.(catalog.SpotifyIncrementalReleaseProvider); ok {
 		releases, err = incremental.ArtistReleasesSince(ctx, artist.SpotifyID, knownDate)
 	} else {

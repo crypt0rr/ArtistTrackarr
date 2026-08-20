@@ -117,6 +117,98 @@ func TestNotificationDeliveryQueriesAndHistory(t *testing.T) {
 	}
 }
 
+func TestAdminDeliveryAuditIncludesDigestDeliveries(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "digest-audit@example.com", "hash", "member", "UTC", "digest-audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Digest destination", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	created := time.Date(2026, time.August, 20, 10, 0, 0, 0, time.UTC)
+	run, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs
+		(user_id,frequency,period_start,title,body,release_count,status,created_at)
+		VALUES(?,?,?,?,?,?,?,?)`, userID, "daily", "2026-08-20", "Daily digest", "Digest body", 2, "pending", timeText(created))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := run.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries
+		(run_id,destination_id,status,attempts,next_attempt_at,last_error)
+		VALUES(?,?,?,?,?,?)`, runID, destinations[0].ID, "failed", 2, timeText(created.Add(time.Hour)), "digest failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := delivery.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "digest-audit-artist", Name: "Digest Audit Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "digest-audit-release", artist.ID, "Normal event", "Album", "[]", "2026-08-20", 3, "https://musicbrainz.test/digest-audit", timeText(created), timeText(created))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := release.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events
+		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`, userID, releaseID, "announcement", "Normal event", "Normal body", timeText(created))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := event.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries
+		(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`, eventID, destinations[0].ID, "sent", 1, timeText(created), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if count, err := s.AdminDeliveryHistoryCount(ctx); err != nil || count != 2 {
+		t.Fatalf("digest audit count=%d err=%v", count, err)
+	}
+	rows, err := s.AdminDeliveryHistory(ctx, 50, 0)
+	if err != nil || len(rows) != 2 || rows[0].DeliveryKind != "digest" || rows[0].EventType != "digest" || rows[0].Body != "Digest body" || rows[1].DeliveryKind != "notification" {
+		t.Fatalf("digest audit rows=%#v err=%v", rows, err)
+	}
+	summary, err := s.AdminDeliveryHistorySummary(ctx, 50, 0)
+	if err != nil || len(summary) != 2 || summary[0].DeliveryKind != "digest" || summary[0].Body != "" || summary[0].LastError != "" {
+		t.Fatalf("digest audit summary=%#v err=%v", summary, err)
+	}
+	detail, err := s.AdminDigestDeliveryDetail(ctx, deliveryID)
+	if err != nil || detail.DeliveryKind != "digest" || detail.Body != "Digest body" || detail.LastError != "digest failed" {
+		t.Fatalf("digest audit detail=%#v err=%v", detail, err)
+	}
+	exported, cursor, err := s.AdminDeliveryHistoryExportPage(ctx, 1, nil)
+	if err != nil || len(exported) != 1 || exported[0].DeliveryKind != "digest" || cursor == nil || cursor.DeliveryKind != "digest" {
+		t.Fatalf("digest audit export first page rows=%#v cursor=%#v err=%v", exported, cursor, err)
+	}
+	exported, cursor, err = s.AdminDeliveryHistoryExportPage(ctx, 1, cursor)
+	if err != nil || len(exported) != 1 || exported[0].DeliveryKind != "notification" || cursor == nil || cursor.DeliveryKind != "notification" {
+		t.Fatalf("digest audit export second page rows=%#v cursor=%#v err=%v", exported, cursor, err)
+	}
+	exported, cursor, err = s.AdminDeliveryHistoryExportPage(ctx, 1, cursor)
+	if err != nil || len(exported) != 0 || cursor != nil {
+		t.Fatalf("digest audit export final page rows=%#v cursor=%#v err=%v", exported, cursor, err)
+	}
+}
+
 func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -268,6 +360,7 @@ func TestUnsupportedDestinationRemainsVisibleAndQueuesBlockedWork(t *testing.T) 
 	}
 
 	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
 	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
 		MBID: "unsupported-destination-release", Title: "Blocked Album", PrimaryType: "Album",
 		FirstReleaseDate: "2026-09-01", DatePrecision: 3,
@@ -396,6 +489,73 @@ func TestPausingDestinationBlocksQueuedNormalAndDigestWork(t *testing.T) {
 	}
 	if normalStatus != "pending" || digestStatus != "pending" {
 		t.Fatalf("replayed work statuses normal=%q digest=%q, want pending", normalStatus, digestStatus)
+	}
+}
+
+func TestDestinationsAddedAfterEventsAreNotBackfilled(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "future-destination@example.com", "hash", "member", "UTC", "future-destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "future-destination-artist", Name: "Future Destination Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "historical-destination-release", Title: "Historical Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-20", DatePrecision: 3,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	var historicalDeliveries int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries`).Scan(&historicalDeliveries); err != nil {
+		t.Fatal(err)
+	}
+	if historicalDeliveries != 0 {
+		t.Fatalf("historical deliveries before destination=%d, want 0", historicalDeliveries)
+	}
+	if err := s.AddDestination(ctx, userID, "Future destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the fixture clock independent of wall time. The first event is at
+	// now, while the second is two hours later; place destination creation
+	// between them so only the second event is admitted.
+	setDestinationCreatedAt(t, s, userID, now.Add(90*time.Minute))
+	// Re-running the idempotent event path must not admit the destination into
+	// an event that predates it.
+	var releaseID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, "historical-destination-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "Historical Release", "body", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries`).Scan(&historicalDeliveries); err != nil {
+		t.Fatal(err)
+	}
+	if historicalDeliveries != 0 {
+		t.Fatalf("historical deliveries after destination=%d, want 0", historicalDeliveries)
+	}
+
+	// A new event created after the destination is configured is admitted.
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "future-destination-release", Title: "Future Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-01", DatePrecision: 3,
+	}}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var totalDeliveries int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries`).Scan(&totalDeliveries); err != nil {
+		t.Fatal(err)
+	}
+	if totalDeliveries != 1 {
+		t.Fatalf("future deliveries=%d, want 1", totalDeliveries)
 	}
 }
 
@@ -558,6 +718,135 @@ func TestDurableDeliveryClaimsRecoverExpiredWork(t *testing.T) {
 	}
 }
 
+func TestRecoverExpiredWorkRequeuesStaleManualSyncWithoutLease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateInitialAdmin(ctx, "stale-manual@example.com", "hash", "UTC", "stale-manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Hour)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO manual_sync_requests(requested_by,scope,status,created_at,started_at) VALUES(?,?,?,?,?)`,
+		userID, "retry", "running", timeText(old), timeText(old)); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := s.RecoverExpiredWork(ctx, now); err != nil || recovered != 1 {
+		t.Fatalf("recovered=%d err=%v, want one stale manual request", recovered, err)
+	}
+	var status string
+	var started sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT status,started_at FROM manual_sync_requests WHERE requested_by=?`, userID).Scan(&status, &started); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || started.Valid {
+		t.Fatalf("stale manual request status=%q started=%v, want queued and NULL", status, started)
+	}
+}
+
+func TestRepairClockSkewedDeliveriesRequeuesOnlyUnclaimedFarFutureRows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "clock-repair@example.com", "hash", "member", "UTC", "clock-repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "clock-repair-artist", Name: "Clock Repair Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Primary", "Secondary", "Active"} {
+		if err := s.AddDestination(ctx, userID, name, "generic", []byte("encrypted")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 3 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "clock-repair-release", artist.ID, "Clock Repair", "Album", "[]", "2026-08-20", 3, "https://musicbrainz.org/release-group/clock-repair", timeText(now), timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := release.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Clock Repair", "body", timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := event.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	farFuture := now.Add(48 * time.Hour)
+	nearFuture := now.Add(2 * time.Hour)
+	activeFuture := now.Add(72 * time.Hour)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[0].ID, "pending", 0, timeText(farFuture), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[1].ID, "pending", 0, timeText(nearFuture), ""); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error,claim_owner,claim_expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+		eventID, destinations[2].ID, "pending", 0, timeText(activeFuture), "", "live-worker", timeText(now.Add(time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeID, err := active.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs(user_id,frequency,period_start,title,body,release_count,status,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		userID, "daily", "2026-08-20", "Digest", "Body", 1, "pending", timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestID, err := digest.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`,
+		digestID, destinations[0].ID, "blocked", timeText(farFuture)); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := s.RepairClockSkewedDeliveries(ctx, now, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Deliveries != 1 || stats.DigestDeliveries != 1 {
+		t.Fatalf("repair stats=%#v, want one normal and one digest row", stats)
+	}
+	var repaired, unchanged, near string
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_attempt_at FROM deliveries WHERE id=(SELECT MIN(id) FROM deliveries)`).Scan(&repaired); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_attempt_at FROM deliveries WHERE destination_id=?`, destinations[1].ID).Scan(&near); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_attempt_at FROM deliveries WHERE id=?`, activeID).Scan(&unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if repaired != timeText(now) || near != timeText(nearFuture) || unchanged != timeText(activeFuture) {
+		t.Fatalf("repaired=%q near=%q active=%q, want now, near unchanged, active unchanged", repaired, near, unchanged)
+	}
+	var digestNext string
+	if err := s.DB.QueryRowContext(ctx, `SELECT next_attempt_at FROM release_digest_deliveries WHERE run_id=?`, digestID).Scan(&digestNext); err != nil {
+		t.Fatal(err)
+	}
+	if digestNext != timeText(now) {
+		t.Fatalf("digest next_attempt_at=%q, want %q", digestNext, timeText(now))
+	}
+}
+
 func TestDeliveryClaimsShareBatchAcrossUsers(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -630,5 +919,114 @@ func TestDeliveryClaimsShareBatchAcrossUsers(t *testing.T) {
 	}
 	if counts[userOne] != maxDeliveryClaimsPerUser || counts[userTwo] != 1 {
 		t.Fatalf("claimed per user=%v, want user one=%d user two=1", counts, maxDeliveryClaimsPerUser)
+	}
+}
+
+func TestReconcileStaleDeliveryAttemptsMarksOnlyExpiredAttempts(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "stale-attempts@example.com", "hash", "member", "UTC", "stale-attempts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "stale-attempts-artist", Name: "Stale Attempts Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Primary", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destination := destinations[0]
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "stale-attempts-release", artist.ID, "Stale Attempts", "Album", "[]", "2026-08-20", 3, "", timeText(now), timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := release.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Stale Attempts", "body", timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := event.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destination.ID, "pending", 0, timeText(now), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := delivery.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleAttempt, err := s.StartDeliveryAttempt(ctx, deliveryID, 0, destination, 1, now.Add(-20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshAttempt, err := s.StartDeliveryAttempt(ctx, deliveryID, 0, destination, 2, now.Add(-2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digest, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs(user_id,frequency,period_start,title,body,release_count,status,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		userID, "daily", "2026-08-20", "Digest", "Body", 1, "pending", timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestID, err := digest.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestDelivery, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`,
+		digestID, destination.ID, "pending", timeText(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestDeliveryID, err := digestDelivery.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestAttempt, err := s.StartDeliveryAttempt(ctx, 0, digestDeliveryID, destination, 1, now.Add(-30*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reconciled, err := s.ReconcileStaleDeliveryAttempts(ctx, now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled != 2 {
+		t.Fatalf("reconciled=%d, want one normal and one digest stale attempt", reconciled)
+	}
+	for _, id := range []int64{staleAttempt, digestAttempt} {
+		var status, finished, abandoned, lastError string
+		if err := s.DB.QueryRowContext(ctx, `SELECT status,finished_at,abandoned_at,last_error FROM delivery_attempts WHERE id=?`, id).
+			Scan(&status, &finished, &abandoned, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if status != "failed" || finished == "" || abandoned == "" || lastError != "worker attempt expired" {
+			t.Fatalf("attempt %d status=%q finished=%q abandoned=%q error=%q, want failed audit", id, status, finished, abandoned, lastError)
+		}
+	}
+	var freshStatus string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM delivery_attempts WHERE id=?`, freshAttempt).Scan(&freshStatus); err != nil {
+		t.Fatal(err)
+	}
+	if freshStatus != "started" {
+		t.Fatalf("fresh attempt status=%q, want started", freshStatus)
 	}
 }

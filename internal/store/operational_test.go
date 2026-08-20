@@ -158,6 +158,35 @@ func TestDiagnosticsCapturesBacklogAges(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsTreatsNullDueTimesAsImmediatelyDue(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "diagnostics-null@example.com", "hash", "member", "UTC", "diagnostics-null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "diagnostics-null-due", Name: "Diagnostics Null Due"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added, err := s.Follow(ctx, userID, artist.ID); err != nil || !added {
+		t.Fatalf("follow diagnostics artist: added=%v err=%v", added, err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET next_check_at=NULL,spotify_next_check_at=NULL WHERE id=?`, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.DueSyncArtists != 1 || snapshot.OldestDueSyncAt == nil {
+		t.Fatalf("due sync diagnostics count=%d oldest=%v", snapshot.DueSyncArtists, snapshot.OldestDueSyncAt)
+	}
+	if snapshot.OldestDueSyncAt.After(snapshot.CheckedAt) || snapshot.CheckedAt.Sub(*snapshot.OldestDueSyncAt) > time.Second {
+		t.Fatalf("null due time=%v, want approximately diagnostic check time %v", snapshot.OldestDueSyncAt, snapshot.CheckedAt)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

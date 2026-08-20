@@ -28,7 +28,7 @@
     <div><strong>{{.Diagnostics.RunningSyncs}}</strong><span>running syncs</span></div>
     <div><strong>{{.Diagnostics.DueSyncArtists}}</strong><span>due artist syncs{{if .Diagnostics.OldestDueSyncAt}} · oldest {{formatProviderTime .Diagnostics.OldestDueSyncAt $.User.Timezone}}{{end}}</span></div>
     <div><strong>{{.Diagnostics.PendingDeliveries}}</strong><span>pending deliveries</span></div>
-    <div><strong>{{.Diagnostics.FutureDeliveries}}</strong><span>future deliveries{{if .Diagnostics.EarliestFutureDelivery}} · earliest {{formatProviderTime .Diagnostics.EarliestFutureDelivery $.User.Timezone}}{{end}}</span></div>
+    <div><strong>{{.Diagnostics.FutureDeliveries}}</strong><span>future deliveries{{if .Diagnostics.EarliestFutureDelivery}} · earliest {{formatProviderTime .Diagnostics.EarliestFutureDelivery $.User.Timezone}}{{end}}</span>{{if .Diagnostics.FutureDeliveries}}<form method="post" action="/admin/deliveries/repair-clock-skew" class="inline-form">{{template "csrf" .}}<button class="secondary" type="submit">Repair future deliveries</button></form><small>Only unclaimed rows more than 24 hours ahead are moved to due now.</small>{{end}}</div>
     <div><strong>{{.Diagnostics.DigestBacklog}}</strong><span>digest backlog</span></div>
     <div><strong>{{.Diagnostics.FailedDeliveries}}</strong><span>failed deliveries</span></div>
     <div><strong>{{.Diagnostics.StaleClaims}}</strong><span>stale work claims</span></div>
@@ -131,7 +131,7 @@
       <thead><tr><th>User</th><th>Notification</th><th>Destination</th><th>Delivery</th><th>Timing</th></tr></thead>
       <tbody>{{range .AdminHistory}}<tr>
         <td><strong>{{.UserEmail}}</strong></td>
-        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small>{{if .DeliveryID}}<a class="admin-detail-link" href="/admin/deliveries/{{.DeliveryID}}">View details</a>{{else}}<small>Content unavailable: no delivery record</small>{{end}}</td>
+        <td><strong>{{.Title}}</strong><small>{{.EventType}}</small>{{if .DeliveryID}}{{if eq .DeliveryKind "digest"}}<a class="admin-detail-link" href="/admin/digest-deliveries/{{.DeliveryID}}">View details</a>{{else}}<a class="admin-detail-link" href="/admin/deliveries/{{.DeliveryID}}">View details</a>{{end}}{{else}}<small>Content unavailable: no delivery record</small>{{end}}</td>
         <td><strong>{{.Destination}}</strong>{{if .Service}}<small>{{.Service}}</small>{{end}}</td>
         <td><span class="badge {{.Status}}">{{.Status}}</span><small>{{.Attempts}} attempts</small>{{if .DeliveryID}}<small>Details require explicit access</small>{{end}}</td>
         <td><small>Created {{formatTime .CreatedAt $.User.Timezone}}</small>{{if .NextAttempt}}<small>Next {{formatTime .NextAttempt $.User.Timezone}}</small>{{end}}{{if .SentAt}}<small>Sent {{formatTime .SentAt $.User.Timezone}}</small>{{end}}</td>

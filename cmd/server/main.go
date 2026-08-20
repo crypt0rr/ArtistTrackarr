@@ -25,6 +25,15 @@ import (
 	appweb "github.com/crypt0rr/artist-tracker/internal/web"
 )
 
+// listenTCP is kept behind a tiny seam so startup bind failures can be tested
+// without starting a process (main exits immediately on configuration/startup
+// failures). Production uses net.Listen unchanged.
+var listenTCP = net.Listen
+
+func bindHTTPListener(address string) (net.Listener, error) {
+	return listenTCP("tcp", address)
+}
+
 // drainStartupResources persists the queued application records before the
 // database is closed. If draining times out, the caller must leave the
 // database open because the sink writer may still be using it.
@@ -156,74 +165,27 @@ func main() {
 	// Bind before announcing readiness. A failed bind is a startup failure,
 	// not a background serve error, and must never make the container appear
 	// healthy while no listener exists.
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	listener, err := bindHTTPListener(cfg.ListenAddr)
 	if err != nil {
 		logger.Error("bind HTTP listener failed", "address", cfg.ListenAddr, "error", err)
 		startupFailure()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go runner.Run(ctx)
-	serverDone := make(chan error, 1)
-	go func() {
-		logger.Info("server listening", "address", listener.Addr().String(), "public_url", cfg.PublicURL.String())
-		serveErr := server.Serve(listener)
-		serverDone <- serveErr
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			logger.Error("http server failed", "error", serveErr)
-			stop()
-		}
-	}()
-	<-ctx.Done()
-	// HTTP and background work have independent budgets. A slow client must
-	// not consume the entire runner shutdown window (and vice versa).
-	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 20*time.Second)
-	if err := server.Shutdown(httpShutdownCtx); err != nil {
-		logger.Error("graceful shutdown failed", "error", err)
-	}
-	serverStopped := false
-	serverFailed := false
-	select {
-	case serveErr := <-serverDone:
-		serverStopped = true
-		serverFailed = serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed)
-	case <-httpShutdownCtx.Done():
-		stdoutLogger.Error("http server did not stop before shutdown deadline")
-	}
-	cancelHTTP()
-	runnerStopped := false
-	runnerShutdownCtx, cancelRunner := context.WithTimeout(context.Background(), 20*time.Second)
-	select {
-	case <-runner.Done():
-		runnerStopped = true
-		cancelRunner()
-	case <-runnerShutdownCtx.Done():
-		cancelRunner()
-	}
-	logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
-	logErr := applicationLogs.Close(logDrainCtx)
-	cancelLogDrain()
-	if logErr != nil || !serverStopped || !runnerStopped {
-		stdoutLogger.Error("background work did not drain before database shutdown",
-			"server_stopped", serverStopped, "runner_stopped", runnerStopped, "log_sink_error", logErr)
-		// Do not close SQLite while a runner or log writer can still use it. The
-		// process is about to exit, so the operating system will reclaim it.
+	databaseClosed, err = runServerLifecycle(ctx, serverLifecycleDeps{
+		server: server, listener: listener, runner: runner, logSink: applicationLogs,
+		database: database, sender: sender, logger: logger, stdoutLog: stdoutLogger,
+		publicURL: cfg.PublicURL.String(),
+	})
+	if err != nil {
+		logger.Error("server lifecycle failed", "error", err)
+		// A false result means the helper intentionally left SQLite open because
+		// active work or the log sink did not drain. Do not let the deferred
+		// cleanup close it underneath that work; process exit will reclaim it.
 		databaseClosed = true
-		return
-	}
-	sender.CloseIdleConnections()
-	if dropped := applicationLogs.Dropped(); dropped > 0 {
-		stdoutLogger.Warn("application log records dropped", "count", dropped)
-	}
-	if sinkErrors := applicationLogs.Errors(); sinkErrors > 0 {
-		stdoutLogger.Warn("application log persistence failed", "count", sinkErrors)
-	}
-	stdoutLogger.Info("server stopped")
-	databaseClosed = true
-	if err := database.Close(); err != nil {
-		stdoutLogger.Error("close database", "error", err)
-	}
-	if serverFailed {
+		// Any lifecycle error is a failed process result, including an incomplete
+		// drain. Supervisors must restart/alert rather than treating a process
+		// that abandoned active work as a clean shutdown.
 		os.Exit(1)
 	}
 }

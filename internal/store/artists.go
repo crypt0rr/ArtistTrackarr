@@ -18,6 +18,24 @@ import (
 // cancels them.
 const maxArtistResolutionsPerUser = 100
 
+// Keep one member's retry/review work from consuming the entire scheduler
+// batch. The runner can still process more than this across household users,
+// while a single noisy import remains bounded and fair.
+const maxArtistResolutionBatchPerUser = 4
+
+// artistSyncAdmissionPredicate is shared by the scheduler and operational
+// diagnostics. Keep the identity terminal-state guard outside the normal and
+// Spotify due branches so an artist cannot bypass it through SQL operator
+// precedence when only its Spotify check is due.
+func artistSyncAdmissionPredicate(alias string) string {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		alias = "a"
+	}
+	return `NOT EXISTS (SELECT 1 FROM artist_identity_status ais
+		WHERE ais.artist_id=` + alias + `.id AND ais.status='unresolvable')`
+}
+
 func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 	now := nowText()
 	_, err := s.execWriteContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
@@ -31,6 +49,14 @@ func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 		a.MBID, a.Name, a.SortName, a.Type, a.Country, a.Disambiguation,
 		nullString(a.SpotifyID), nullString(a.SpotifyURL), nullString(a.SpotifyImageURL), now, now)
 	if err != nil {
+		return Artist{}, err
+	}
+	// Artists admitted from an exact MusicBrainz result are already canonical.
+	// Keep a status row for them so imported identities can be distinguished
+	// without expanding every artist projection with verification columns.
+	if _, err := s.execWriteContext(ctx, `INSERT OR IGNORE INTO artist_identity_status
+		(artist_id,status,attempts,next_check_at,last_error,updated_at)
+		SELECT id,'verified',0,NULL,'',? FROM artists WHERE mbid=?`, now, a.MBID); err != nil {
 		return Artist{}, err
 	}
 	stored, err := s.ArtistByMBID(ctx, a.MBID)
@@ -79,7 +105,9 @@ func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error
 			return false, err
 		}
 		if n > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=? WHERE id=?`, now, artistID); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+				CASE WHEN spotify_id IS NOT NULL AND (spotify_next_check_at IS NULL OR spotify_next_check_at>?)
+				THEN ? ELSE spotify_next_check_at END WHERE id=?`, now, now, now, artistID); err != nil {
 				return false, err
 			}
 		}
@@ -208,9 +236,23 @@ func (s *Store) ArtistResolutions(ctx context.Context, userID int64) ([]ArtistRe
 	return result, rows.Err()
 }
 func (s *Store) DueArtistResolutions(ctx context.Context, now time.Time, limit int) ([]ArtistResolution, error) {
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+artistResolutionColumns+`
-		FROM artist_resolutions WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-		ORDER BY COALESCE(next_attempt_at,'') LIMIT ?`, timeText(now), limit)
+	if limit <= 0 {
+		return nil, nil
+	}
+	perUser := min(maxArtistResolutionBatchPerUser, limit)
+	rows, err := s.readerDB().QueryContext(ctx, `WITH due AS (
+		SELECT `+artistResolutionColumns+`,
+			ROW_NUMBER() OVER (
+				PARTITION BY user_id
+				ORDER BY COALESCE(next_attempt_at,''),created_at,id
+			) AS user_rank
+		FROM artist_resolutions
+		WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+	)
+	SELECT `+artistResolutionColumns+` FROM due
+	WHERE user_rank<=?
+	ORDER BY COALESCE(next_attempt_at,''),created_at,id
+	LIMIT ?`, timeText(now), perUser, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +326,13 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		if artist.LastCheckedAt, err = parseStoredNullableTime(checked, "artist last_checked_at"); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_identity_status
+			(artist_id,status,attempts,next_check_at,last_error,updated_at)
+			VALUES(?, 'verified',0,NULL,'',?)
+			ON CONFLICT(artist_id) DO UPDATE SET status='verified',attempts=0,next_check_at=NULL,last_error='',updated_at=excluded.updated_at`,
+			artist.ID, now); err != nil {
+			return err
+		}
 		if len(artist.Genres) > 0 {
 			if err := replaceArtistGenresExec(ctx, tx, artist.ID, artist.Genres, "musicbrainz"); err != nil {
 				return err
@@ -314,6 +363,13 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		}
 		stored = artist
 		added = followAdded > 0
+		if added {
+			if _, err := tx.ExecContext(ctx, `UPDATE artists SET next_check_at=?,spotify_next_check_at=
+				CASE WHEN spotify_id IS NOT NULL AND (spotify_next_check_at IS NULL OR spotify_next_check_at>?)
+				THEN ? ELSE spotify_next_check_at END WHERE id=?`, now, now, now, artist.ID); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return stored, added, err
@@ -709,9 +765,15 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
 		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at
 		FROM artists a JOIN follows f ON f.artist_id=a.id
-		WHERE (a.next_check_at IS NULL OR a.next_check_at<=?)
-		   OR (a.spotify_id IS NOT NULL AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?))
-		ORDER BY COALESCE(a.next_check_at,a.spotify_next_check_at,'') LIMIT ?`,
+		WHERE `+artistSyncAdmissionPredicate("a")+`
+		  AND ((a.next_check_at IS NULL OR a.next_check_at<=?)
+		   OR (a.spotify_id IS NOT NULL AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?)))
+		ORDER BY CASE
+			WHEN a.next_check_at IS NULL THEN COALESCE(a.spotify_next_check_at,'')
+			WHEN a.spotify_next_check_at IS NULL THEN a.next_check_at
+			WHEN a.next_check_at < a.spotify_next_check_at THEN a.next_check_at
+			ELSE a.spotify_next_check_at
+		END, a.id LIMIT ?`,
 		timeText(now), timeText(now), limit)
 	if err != nil {
 		return nil, err
@@ -735,6 +797,37 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	}
 	return result, rows.Err()
 }
+
+// DueArtistSyncBacklog returns the total number of distinct followed artists
+// whose normal or Spotify schedule is due, along with the oldest due time.
+// The admission predicate intentionally matches ArtistsDue so terminal
+// imported identities are not counted as actionable work.
+func (s *Store) DueArtistSyncBacklog(ctx context.Context, now time.Time) (ArtistSyncBacklog, error) {
+	var backlog ArtistSyncBacklog
+	var oldest sql.NullString
+	err := s.readerDB().QueryRowContext(ctx, `WITH due AS (
+		SELECT a.id,COALESCE(a.next_check_at,?) AS due_at
+		FROM artists a JOIN follows f ON f.artist_id=a.id
+		WHERE `+artistSyncAdmissionPredicate("a")+` AND (a.next_check_at IS NULL OR a.next_check_at<=?)
+		UNION ALL
+		SELECT a.id,COALESCE(a.spotify_next_check_at,?) AS due_at
+		FROM artists a JOIN follows f ON f.artist_id=a.id
+		WHERE `+artistSyncAdmissionPredicate("a")+` AND a.spotify_id IS NOT NULL
+			AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?)
+	)
+	SELECT COUNT(DISTINCT id),MIN(due_at) FROM due`,
+		timeText(now), timeText(now), timeText(now), timeText(now)).
+		Scan(&backlog.Count, &oldest)
+	if err != nil {
+		return ArtistSyncBacklog{}, err
+	}
+	var parseErr error
+	if backlog.OldestDueAt, parseErr = parseStoredNullableTime(oldest, "oldest due artist sync"); parseErr != nil {
+		return ArtistSyncBacklog{}, parseErr
+	}
+	return backlog, nil
+}
+
 func (s *Store) MarkArtistChecked(ctx context.Context, artistID int64, now time.Time, interval time.Duration) error {
 	next := now.Add(interval)
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {

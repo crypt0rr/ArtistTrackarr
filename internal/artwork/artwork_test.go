@@ -113,6 +113,40 @@ func TestCacheRejectsPrivateResolvedArtworkAddressBeforeDial(t *testing.T) {
 	}
 }
 
+func TestArtworkBlocksMappedAndReservedResolvedAddresses(t *testing.T) {
+	tests := []string{
+		"::ffff:127.0.0.1",       // IPv4-mapped loopback
+		"100.64.0.1",             // shared address space
+		"192.0.2.1",              // documentation IPv4
+		"2001:db8::1",            // documentation IPv6
+		"2001:0000:4136:e378::1", // Teredo transition
+		"2002:c000:0201::1",      // 6to4 transition
+		"64:ff9b::c000:0201",     // NAT64 translation prefix
+	}
+	for _, value := range tests {
+		t.Run(value, func(t *testing.T) {
+			var dialCalled atomic.Bool
+			cache, err := NewCache(t.TempDir(),
+				WithHTTPClient(&http.Client{Transport: &http.Transport{}}),
+				WithResolver(func(context.Context, string, string) ([]net.IP, error) {
+					return []net.IP{net.ParseIP(value)}, nil
+				}),
+				WithDialer(func(context.Context, string, string) (net.Conn, error) {
+					dialCalled.Store(true)
+					return nil, errors.New("dial should not be called")
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			asset := cache.Get(context.Background(), testMBID)
+			if asset.Status != "upstream-error" || dialCalled.Load() {
+				t.Fatalf("reserved artwork address %q was dialed or not rejected: status=%q dialed=%v", value, asset.Status, dialCalled.Load())
+			}
+		})
+	}
+}
+
 func TestCacheAcceptsCustomHTTPClient(t *testing.T) {
 	client := &http.Client{Timeout: time.Second}
 	cache, err := NewCache(t.TempDir(), WithHTTPClient(client))
