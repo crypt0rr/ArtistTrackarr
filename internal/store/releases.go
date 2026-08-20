@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -101,25 +102,24 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			spotifyAppearanceBaseline bool
 		}
 		var followers []follower
-		for rows.Next() {
-			var f follower
-			var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
-			if err := rows.Scan(&f.id, &f.timezone, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
-				_ = rows.Close()
-				_ = tx.Rollback()
-				return err
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var f follower
+				var baseline, spotifyBaseline, spotifyAppearanceBaseline sql.NullString
+				if err := rows.Scan(&f.id, &f.timezone, &baseline, &spotifyBaseline, &spotifyAppearanceBaseline); err != nil {
+					return err
+				}
+				f.baseline = baseline.Valid
+				f.spotifyBaseline = spotifyBaseline.Valid
+				f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
+				followers = append(followers, f)
 			}
-			f.baseline = baseline.Valid
-			f.spotifyBaseline = spotifyBaseline.Valid
-			f.spotifyAppearanceBaseline = spotifyAppearanceBaseline.Valid
-			followers = append(followers, f)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			return rows.Err()
+		}(); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		_ = rows.Close()
 		for _, follower := range followers {
 			location := userLocation(follower.timezone)
 			if !follower.baseline {
@@ -199,8 +199,11 @@ func matchingReleaseIDTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, candidate Release, spotifyOnly bool,
 ) (int64, error) {
 	// Provider IDs are the preferred identity. This fallback is deliberately
-	// narrow: only records for the same artist, provider family, type, date,
-	// and precision are candidates before the normalized title comparison.
+	// narrow: only records for the same artist, provider family, date, and
+	// precision are candidates before the normalized title comparison. Spotify
+	// and iTunes derive Album/EP/Single from imperfect provider metadata, so a
+	// title/date match may be promoted across derived types. Exact type matches
+	// are always preferred and an ambiguous result is rejected.
 	if candidate.DatePrecision == 0 || strings.TrimSpace(candidate.FirstReleaseDate) == "" ||
 		strings.TrimSpace(candidate.PrimaryType) == "" {
 		return 0, sql.ErrNoRows
@@ -209,39 +212,48 @@ func matchingReleaseIDTx(
 	if spotifyOnly {
 		sourceClause = "source IN ('spotify','itunes')"
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,title,primary_type,first_release_date,date_precision
+	rows, err := tx.QueryContext(ctx, `SELECT id,title,primary_type,first_release_date,date_precision,source
 		FROM release_groups WHERE artist_id=? AND `+sourceClause+`
-		AND primary_type=? AND date_precision=? AND first_release_date=?`,
-		artistID, candidate.PrimaryType, candidate.DatePrecision, candidate.FirstReleaseDate)
+		AND date_precision=? AND first_release_date=?`,
+		artistID, candidate.DatePrecision, candidate.FirstReleaseDate)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = rows.Close() }()
-	var matches []int64
+	allowDerivedTypeMismatch := spotifyOnly || providerReleaseTypeDerived(candidate)
+	var exactMatches, derivedMatches []int64
 	for rows.Next() {
 		var id int64
-		var title, primaryType, releaseDate string
+		var title, primaryType, releaseDate, source string
 		var precision int
-		if err := rows.Scan(&id, &title, &primaryType, &releaseDate, &precision); err != nil {
+		if err := rows.Scan(&id, &title, &primaryType, &releaseDate, &precision, &source); err != nil {
 			return 0, err
 		}
 		existing := Release{
-			Title: title, PrimaryType: primaryType, FirstReleaseDate: releaseDate, DatePrecision: precision,
+			Title: title, PrimaryType: primaryType, FirstReleaseDate: releaseDate, DatePrecision: precision, Source: source,
 		}
 		if releaseRecordsMatch(existing, candidate) {
-			matches = append(matches, id)
+			exactMatches = append(exactMatches, id)
+		} else if allowDerivedTypeMismatch && releaseIdentityMatches(existing, candidate) {
+			derivedMatches = append(derivedMatches, id)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	if len(matches) != 1 {
+	if len(exactMatches) == 1 {
+		return exactMatches[0], nil
+	}
+	if len(exactMatches) > 1 || len(derivedMatches) != 1 {
 		return 0, sql.ErrNoRows
 	}
-	return matches[0], nil
+	return derivedMatches[0], nil
 }
 func releaseRecordsMatch(a, b Release) bool {
-	if a.PrimaryType != b.PrimaryType || normalizedReleaseTitle(a.Title) != normalizedReleaseTitle(b.Title) {
+	return a.PrimaryType == b.PrimaryType && releaseIdentityMatches(a, b)
+}
+func releaseIdentityMatches(a, b Release) bool {
+	if normalizedReleaseTitle(a.Title) != normalizedReleaseTitle(b.Title) {
 		return false
 	}
 	if a.DatePrecision == 0 || a.DatePrecision != b.DatePrecision {
@@ -253,19 +265,18 @@ func releaseRecordsMatch(a, b Release) bool {
 	}
 	return a.FirstReleaseDate == b.FirstReleaseDate
 }
+
+func providerReleaseTypeDerived(release Release) bool {
+	if strings.EqualFold(strings.TrimSpace(release.Source), "spotify") ||
+		strings.EqualFold(strings.TrimSpace(release.Source), "itunes") {
+		return true
+	}
+	return strings.TrimSpace(release.SpotifyID) != "" || strings.TrimSpace(release.ITunesID) != ""
+}
 func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 	today := dayUTC(now)
 	from := today.AddDate(0, 0, -1).Format("2006-01-02")
 	to := today.AddDate(0, 0, 1).Format("2006-01-02")
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
-		 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role,
-		 (SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=rg.id AND rc.role='guest')
-		FROM users u JOIN release_groups rg ON 1=1
-		JOIN artists a ON a.id=rg.artist_id
-		WHERE `+followedReleasePredicate("u.id")+` AND rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
-	if err != nil {
-		return err
-	}
 	type due struct {
 		userID, releaseID          int64
 		timezone, reminder         string
@@ -276,29 +287,39 @@ func (s *Store) QueueDueReleaseDays(ctx context.Context, now time.Time) error {
 		guestCreditCount           int
 	}
 	var candidates []due
-	for rows.Next() {
-		var d due
-		if err := rows.Scan(
-			&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
-			&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole, &d.guestCreditCount,
-		); err != nil {
-			_ = rows.Close()
+	if err := func() error {
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,rg.id,u.timezone,u.reminder_time,a.name,rg.title,
+			 rg.first_release_date,rg.musicbrainz_url,rg.spotify_url,rg.itunes_url,rg.artist_credit_role,
+			 (SELECT COUNT(*) FROM release_credits rc WHERE rc.release_group_id=rg.id AND rc.role='guest')
+			FROM users u JOIN release_groups rg ON 1=1
+			JOIN artists a ON a.id=rg.artist_id
+			WHERE `+followedReleasePredicate("u.id")+` AND rg.date_precision=3 AND rg.first_release_date BETWEEN ? AND ?`, from, to)
+		if err != nil {
 			return err
 		}
-		candidates = append(candidates, d)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var d due
+			if err := rows.Scan(
+				&d.userID, &d.releaseID, &d.timezone, &d.reminder, &d.artist, &d.title,
+				&d.releaseDate, &d.musicBrainzURL, &d.spotifyURL, &d.itunesURL, &d.artistCreditRole, &d.guestCreditCount,
+			); err != nil {
+				return err
+			}
+			candidates = append(candidates, d)
+		}
+		return rows.Err()
+	}(); err != nil {
 		return err
 	}
-	_ = rows.Close()
 	for _, d := range candidates {
 		location, err := time.LoadLocation(d.timezone)
 		if err != nil {
 			continue
 		}
 		localNow := now.In(location)
-		if d.releaseDate != localNow.Format("2006-01-02") || localNow.Format("15:04") < d.reminder {
+		reminder, validReminder := reminderMinutes(d.reminder)
+		if !validReminder || d.releaseDate != localNow.Format("2006-01-02") || localNow.Hour()*60+localNow.Minute() < reminder {
 			continue
 		}
 		body := fmt.Sprintf("%s's %q is out today.", d.artist, d.title)
@@ -348,27 +369,31 @@ func (s *Store) DashboardReleases(
 	const preferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (SELECT 1 FROM release_groups external_release WHERE external_release.artist_id=rg.artist_id AND external_release.source IN ('spotify','itunes','both'))) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
 		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','itunes','both')
 	))`
-	upcomingRows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-		WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND `+definitelyFuture+`
-		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
-		userID, today, today, today, limit)
+	upcoming, err = func() ([]Release, error) {
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
+			WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND `+definitelyFuture+`
+			ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
+			userID, today, today, today, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return scanReleases(rows)
+	}()
 	if err != nil {
 		return nil, nil, err
 	}
-	upcoming, err = scanReleases(upcomingRows)
-	_ = upcomingRows.Close()
-	if err != nil {
-		return nil, nil, err
-	}
-	recentRows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-		WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
-		ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
-		userID, today, today, today, limit)
-	if err != nil {
-		return nil, nil, err
-	}
-	recent, err = scanReleases(recentRows)
-	_ = recentRows.Close()
+	recent, err = func() ([]Release, error) {
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
+			WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
+			ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
+			userID, today, today, today, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return scanReleases(rows)
+	}()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -396,12 +421,14 @@ func releaseTypeEnabled(p NotificationPreferences, primary string) bool {
 }
 func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (ReleaseDetail, error) {
 	var d ReleaseDetail
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE `+followedReleasePredicate("?")+` AND rg.id=?`, userID, releaseID)
-	if err != nil {
-		return d, err
-	}
-	items, err := scanReleases(rows)
-	_ = rows.Close()
+	items, err := func() ([]Release, error) {
+		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE `+followedReleasePredicate("?")+` AND rg.id=?`, userID, releaseID)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return scanReleases(rows)
+	}()
 	if err != nil {
 		return d, err
 	}
@@ -409,7 +436,7 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 		return d, sql.ErrNoRows
 	}
 	d.Release = items[0]
-	d.Release.FollowedArtists, err = s.followedReleaseArtists(ctx, userID, releaseID)
+	d.FollowedArtists, err = s.followedReleaseArtists(ctx, userID, releaseID)
 	if err != nil {
 		return d, err
 	}
@@ -471,7 +498,7 @@ func (s *Store) ReleaseGroupVisibleByMBID(ctx context.Context, userID int64, mbi
 	var exists int
 	err := s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM release_groups rg
 		WHERE rg.mbid=? AND `+followedReleasePredicate("?")+` LIMIT 1`, mbid, userID).Scan(&exists)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {

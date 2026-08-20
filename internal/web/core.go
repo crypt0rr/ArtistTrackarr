@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"html/template"
 	"log/slog"
 	"math"
@@ -125,6 +126,44 @@ func providerHealthError(p store.ProviderHealth) string {
 		}
 	}
 	return message
+}
+
+func providerStatusLabel(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "healthy":
+		return "Healthy"
+	case "failed":
+		return "Failed"
+	case "degraded":
+		return "Degraded"
+	case "cooldown":
+		return "Cooling down"
+	case "not_configured":
+		return "Not configured"
+	case "standby", "skipped":
+		return "Standby"
+	case "not_found":
+		return "Not found"
+	case "ambiguous":
+		return "Needs review"
+	case "deferred":
+		return "Deferred"
+	default:
+		return "Pending"
+	}
+}
+
+func providerStatusClass(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "healthy":
+		return "sent"
+	case "failed", "degraded", "cooldown":
+		return "failed"
+	case "not_configured":
+		return "pending"
+	default:
+		return "ambiguous"
+	}
 }
 
 func assuranceStatusLabel(status string) string {
@@ -320,18 +359,8 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "pending"
 			}
 		},
-		"providerStatusClass": func(status string) string {
-			switch status {
-			case "healthy":
-				return "sent"
-			case "failed", "cooldown":
-				return "failed"
-			case "not_configured":
-				return "pending"
-			default:
-				return "ambiguous"
-			}
-		},
+		"providerStatusClass": providerStatusClass,
+		"providerStatusLabel": providerStatusLabel,
 		"providerLabel": func(provider string) string {
 			switch strings.ToLower(provider) {
 			case "spotify":
@@ -810,7 +839,7 @@ func (a *App) data(r *http.Request, title string) PageData {
 	csrf, _ := r.Context().Value(csrfKey).(string)
 	d := PageData{
 		Title: title, Version: version.Current, CSRF: csrf,
-		Message: r.URL.Query().Get("message"), SpotifyOn: a.spotify != nil,
+		Message: sanitizeStatusMessage(r.URL.Query().Get("message")), SpotifyOn: a.spotify != nil,
 	}
 	if session, ok := currentSession(r); ok {
 		d.User = &UserView{
@@ -828,6 +857,26 @@ func (a *App) data(r *http.Request, title string) PageData {
 		}
 	}
 	return d
+}
+
+// sanitizeStatusMessage keeps redirect banners useful while preventing an
+// arbitrary query string from becoming an unbounded reflected status block.
+// Templates still escape the result; this additionally removes control
+// characters and caps the amount of text rendered in every page header.
+func sanitizeStatusMessage(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	clean := runes[:0]
+	for _, r := range runes {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		clean = append(clean, r)
+		if len(clean) == 240 {
+			break
+		}
+	}
+	return strings.TrimSpace(string(clean))
 }
 
 // pageStoreError keeps database/provider details in structured logs while
@@ -954,6 +1003,12 @@ func (a *App) render(w http.ResponseWriter, name string, data PageData, status i
 }
 func (a *App) ready(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.Healthy(r.Context()); err != nil {
+		var healthErr *store.DatabaseHealthError
+		state := store.DatabaseUnavailable
+		if errors.As(err, &healthErr) && healthErr != nil && healthErr.State != "" {
+			state = healthErr.State
+		}
+		w.Header().Set("X-ArtistTrackarr-Database", string(state))
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}

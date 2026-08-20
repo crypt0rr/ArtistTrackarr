@@ -16,7 +16,13 @@ import (
 
 func TestFixedWindowLimiterBoundsRequestsAndExpires(t *testing.T) {
 	limiter := newFixedWindowLimiter(2, 20*time.Millisecond)
-	if !limiter.Allow("client") || !limiter.Allow("client") || limiter.Allow("client") {
+	if !limiter.Allow("client") {
+		t.Fatal("fixed-window limiter rejected the first request")
+	}
+	if !limiter.Allow("client") {
+		t.Fatal("fixed-window limiter rejected the second request")
+	}
+	if limiter.Allow("client") {
 		t.Fatal("fixed-window limiter did not reject the third request")
 	}
 	time.Sleep(25 * time.Millisecond)

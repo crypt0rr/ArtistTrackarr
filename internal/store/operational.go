@@ -11,7 +11,14 @@ const (
 	operationalSnapshotRetention = 30 * 24 * time.Hour
 	operationalSnapshotLimit     = 1000
 	operationalQueueWarnAfter    = 15 * time.Minute
-	operationalBackupWarnAfter   = 7 * 24 * time.Hour
+	// A single provider failure can be a normal transient/rate-limit event.
+	// Only the latest failure remaining unresolved for an hour affects the
+	// overall operational status.
+	operationalProviderWarnAfter = time.Hour
+	// Digest work normally runs within the scheduler cadence; fifteen minutes
+	// indicates that the backlog is no longer making useful progress.
+	operationalDigestWarnAfter = 15 * time.Minute
+	operationalBackupWarnAfter = 7 * 24 * time.Hour
 )
 
 // OperationalStatus classifies safe, non-sensitive health signals for an
@@ -31,6 +38,9 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 		status = "degraded"
 		reasons = append(reasons, reason)
 	}
+	addNote := func(note string) {
+		reasons = append(reasons, note)
+	}
 	switch strings.ToLower(strings.TrimSpace(runnerStatus)) {
 	case "stopped":
 		addReason("scheduler stopped")
@@ -44,21 +54,33 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 	if snapshot.PausedDestinations > 0 {
 		addReason("paused destinations")
 	}
-	if snapshot.ProviderFailures > 0 {
+	if snapshot.ProviderFailures > 0 && operationalAgeAtLeast(snapshot.OldestProviderFailureAt, now, operationalProviderWarnAfter) {
 		addReason("provider failures")
 	}
-	if snapshot.DigestBacklog > 0 {
+	if snapshot.DigestBacklog > 0 && operationalAgeAtLeast(snapshot.OldestDigestBacklogAt, now, operationalDigestWarnAfter) {
 		addReason("digest backlog")
 	}
 	if snapshot.OldestQueueAt != nil && now.Sub(snapshot.OldestQueueAt.UTC()) >= operationalQueueWarnAfter {
 		addReason("delivery queue age")
 	}
+	if snapshot.FutureDeliveries > 0 {
+		addReason("clock-skewed future deliveries")
+	}
 	if snapshot.LastBackupAt == nil {
-		addReason("backup not recorded")
+		// Fresh installs have no operator backup marker yet. Keep that state
+		// visible without treating it as a service failure.
+		addNote("backup not yet established")
 	} else if now.Sub(snapshot.LastBackupAt.UTC()) >= operationalBackupWarnAfter {
 		addReason("backup overdue")
 	}
 	return status, reasons
+}
+
+func operationalAgeAtLeast(at *time.Time, now time.Time, threshold time.Duration) bool {
+	if at == nil || threshold <= 0 || now.Before(at.UTC()) {
+		return false
+	}
+	return now.Sub(at.UTC()) >= threshold
 }
 
 // RecordOperationalSnapshot persists one redacted diagnostics point and keeps

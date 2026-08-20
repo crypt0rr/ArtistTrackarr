@@ -36,7 +36,7 @@
         <form method="post" action="/coverage/artists/{{.Artist.ID}}/sync" class="inline">{{template "csrf" $}}<input type="hidden" name="page" value="{{$.CoveragePage}}"><button class="secondary">Sync now</button></form>
       </div>
       <details class="coverage-details"><summary>Provider details</summary><div class="coverage-providers">
-        {{range .ProviderStatuses}}<div class="coverage-provider"><div><strong>{{providerLabel .Provider}}</strong><span class="badge {{providerStatusClass .Status}}">{{.Status}}</span></div><span>{{.ReleaseCount}} releases returned</span>{{if .LastSuccessAt}}<span>Success {{formatProviderTime .LastSuccessAt $.User.Timezone}}</span>{{else if .LastFailureAt}}<span>Failed {{formatProviderTime .LastFailureAt $.User.Timezone}}</span>{{end}}{{if .NextCheckAt}}<span>Next {{formatProviderTime .NextCheckAt $.User.Timezone}}</span>{{end}}{{if .LastError}}<small class="error-text">{{.LastError}}</small>{{end}}</div>{{end}}
+        {{range .ProviderStatuses}}<div class="coverage-provider"><div><strong>{{providerLabel .Provider}}</strong><span class="badge {{providerStatusClass .Status}}">{{providerStatusLabel .Status}}</span></div><span>{{.ReleaseCount}} releases returned</span>{{if .LastSuccessAt}}<span>Success {{formatProviderTime .LastSuccessAt $.User.Timezone}}</span>{{else if .LastFailureAt}}<span>Failed {{formatProviderTime .LastFailureAt $.User.Timezone}}</span>{{end}}{{if .NextCheckAt}}<span>Next {{formatProviderTime .NextCheckAt $.User.Timezone}}</span>{{end}}{{if .LastError}}<small class="error-text">{{.LastError}}</small>{{end}}</div>{{end}}
       </div></details>
     </article>{{end}}
   </div>{{else}}<div class="empty">Follow an artist to see provider coverage here.</div>{{end}}

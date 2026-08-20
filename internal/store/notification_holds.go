@@ -107,19 +107,19 @@ func drainNotificationHoldsTxMode(ctx context.Context, tx *sql.Tx, userID, relea
 		eventType, title, body string
 	}
 	var holds []hold
-	for rows.Next() {
-		var item hold
-		if err := rows.Scan(&item.id, &item.ownerID, &item.eventType, &item.title, &item.body); err != nil {
-			_ = rows.Close()
-			return err
+	if err := func() error {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var item hold
+			if err := rows.Scan(&item.id, &item.ownerID, &item.eventType, &item.title, &item.body); err != nil {
+				return err
+			}
+			holds = append(holds, item)
 		}
-		holds = append(holds, item)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		return rows.Err()
+	}(); err != nil {
 		return err
 	}
-	_ = rows.Close()
 	for _, item := range holds {
 		if err := enqueueHeldEventTxMode(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now, bypassConflictHold); err != nil {
 			return err

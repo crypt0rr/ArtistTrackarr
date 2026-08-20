@@ -86,27 +86,9 @@ func (s *Store) CreateUser(ctx context.Context, email, hash, role, timezone, use
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&id); err != nil {
 				return 0, err
 			}
-			var existing []string
-			rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+			taken, err := usernamesTakenTx(ctx, tx)
 			if err != nil {
 				return 0, err
-			}
-			for rows.Next() {
-				var name string
-				if err := rows.Scan(&name); err != nil {
-					_ = rows.Close()
-					return 0, err
-				}
-				existing = append(existing, name)
-			}
-			if err := rows.Err(); err != nil {
-				_ = rows.Close()
-				return 0, err
-			}
-			_ = rows.Close()
-			taken := make(map[string]struct{}, len(existing))
-			for _, name := range existing {
-				taken[strings.ToLower(name)] = struct{}{}
 			}
 			candidate = derivedUsername(email, id, taken)
 		}
@@ -181,6 +163,26 @@ func usernameTakenTx(ctx context.Context, tx *sql.Tx, username string, exceptID 
 		return false, err
 	}
 	return taken != 0, nil
+}
+
+func usernamesTakenTx(ctx context.Context, tx *sql.Tx) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	taken := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		taken[strings.ToLower(name)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return taken, nil
 }
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
@@ -319,24 +321,10 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM users`).Scan(&nextID); err != nil {
 				return err
 			}
-			taken := make(map[string]struct{})
-			rows, err := tx.QueryContext(ctx, `SELECT username FROM users WHERE username<>''`)
+			taken, err := usernamesTakenTx(ctx, tx)
 			if err != nil {
 				return err
 			}
-			for rows.Next() {
-				var name string
-				if err := rows.Scan(&name); err != nil {
-					_ = rows.Close()
-					return err
-				}
-				taken[strings.ToLower(name)] = struct{}{}
-			}
-			if err := rows.Err(); err != nil {
-				_ = rows.Close()
-				return err
-			}
-			_ = rows.Close()
 			candidate = derivedUsername(email, nextID, taken)
 		}
 		candidate, err := validateUsername(candidate)

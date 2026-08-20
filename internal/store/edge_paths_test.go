@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,30 @@ func TestStoreOpenRejectsMissingParentAndCloseHandlesNilHandles(t *testing.T) {
 	}
 	if err := (&Store{}).Close(); err != nil {
 		t.Fatalf("nil store close error=%v", err)
+	}
+}
+
+func TestStoreOpenEscapesSQLiteURIPathCharacters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "artist ? # ü.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open path with URI-significant characters: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database was not created at the requested path: %v", err)
+	}
+
+	dsn := sqliteDSN("relative/artist ? # ü.db", false)
+	for _, escaped := range []string{"%3F", "%23", "%20", "%C3%BC"} {
+		if !strings.Contains(dsn, escaped) {
+			t.Fatalf("sqlite DSN %q does not escape %s", dsn, escaped)
+		}
+	}
+	if strings.Contains(dsn, "? #") || strings.Contains(dsn, "# ü") {
+		t.Fatalf("sqlite DSN left path delimiters unescaped: %q", dsn)
 	}
 }
 
@@ -84,6 +109,43 @@ func TestArtistProviderStatusValidationAndRetention(t *testing.T) {
 	}
 	if coverage, err := s.FollowedArtistCoveragePage(ctx, 1, 1000, -10); err != nil || len(coverage) != 0 {
 		t.Fatalf("empty bounded coverage=%#v err=%v", coverage, err)
+	}
+}
+
+func TestStandbyProviderStatusPreservesFailureEvidence(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "provider-standby", Name: "Provider Standby"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failureAt := time.Date(2026, time.August, 18, 10, 0, 0, 0, time.UTC)
+	nextCheck := failureAt.Add(time.Hour)
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "failed",
+		LastAttemptAt: &failureAt, LastFailureAt: &failureAt, NextCheckAt: &nextCheck,
+		ReleaseCount: 7, LastError: "provider unavailable", UpdatedAt: failureAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "standby", UpdatedAt: failureAt.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastFailure, lastError, storedNext string
+	var releaseCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT status,last_failure_at,last_error,next_check_at
+		FROM artist_provider_status WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).
+		Scan(&status, &lastFailure, &lastError, &storedNext); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT release_count FROM artist_provider_status
+		WHERE artist_id=? AND provider='musicbrainz'`, artist.ID).Scan(&releaseCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != "standby" || lastFailure == "" || lastError != "provider unavailable" || storedNext == "" || releaseCount != 7 {
+		t.Fatalf("standby state lost failure evidence status=%q failure=%q error=%q next=%q releases=%d", status, lastFailure, lastError, storedNext, releaseCount)
 	}
 }
 
@@ -537,6 +599,14 @@ func TestHealthyRequiresMigratedSchema(t *testing.T) {
 	s := testStore(t)
 	if err := s.Healthy(ctx); err != nil {
 		t.Fatalf("healthy migrated store=%v", err)
+	}
+	// A read-only connection can still read the migrated schema, but the
+	// rollback-only write probe must classify it as a write failure.
+	readOnly := &Store{DB: s.Reader}
+	err := readOnly.Healthy(ctx)
+	var healthErr *DatabaseHealthError
+	if !errors.As(err, &healthErr) || healthErr.State != DatabaseWriteFailed {
+		t.Fatalf("read-only health error=%v, want write_failed", err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `DROP TABLE schema_migrations`); err != nil {
 		t.Fatal(err)

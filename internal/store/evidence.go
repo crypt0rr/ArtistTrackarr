@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -203,7 +204,7 @@ func evidenceIssueFingerprint(issueType string, evidence []ReleaseEvidence) stri
 		_, _ = hash.Write([]byte{0})
 		_, _ = hash.Write([]byte(item.FirstReleaseDate))
 		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write([]byte(fmt.Sprint(item.DatePrecision)))
+		_, _ = hash.Write([]byte(strconv.Itoa(item.DatePrecision)))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }
@@ -288,33 +289,37 @@ func upsertEvidenceIssuesTx(ctx context.Context, tx *sql.Tx, releaseID int64, is
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,issue_type,fingerprint FROM release_evidence_issues
-		WHERE release_group_id=? AND status='open'`, releaseID)
-	if err != nil {
-		return err
-	}
 	type existingIssue struct {
 		id  int64
 		key string
 	}
-	var stale []existingIssue
-	for rows.Next() {
-		var item existingIssue
-		var issueType, fingerprint string
-		if err := rows.Scan(&item.id, &issueType, &fingerprint); err != nil {
-			_ = rows.Close()
-			return err
+	stale, err := func() ([]existingIssue, error) {
+		rows, err := tx.QueryContext(ctx, `SELECT id,issue_type,fingerprint FROM release_evidence_issues
+			WHERE release_group_id=? AND status='open'`, releaseID)
+		if err != nil {
+			return nil, err
 		}
-		item.key = issueType + "\x00" + fingerprint
-		if _, ok := current[item.key]; !ok {
-			stale = append(stale, item)
+		defer func() { _ = rows.Close() }()
+		var stale []existingIssue
+		for rows.Next() {
+			var item existingIssue
+			var issueType, fingerprint string
+			if err := rows.Scan(&item.id, &issueType, &fingerprint); err != nil {
+				return nil, err
+			}
+			item.key = issueType + "\x00" + fingerprint
+			if _, ok := current[item.key]; !ok {
+				stale = append(stale, item)
+			}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return stale, nil
+	}()
+	if err != nil {
 		return err
 	}
-	_ = rows.Close()
 	for _, item := range stale {
 		if _, err := tx.ExecContext(ctx, `UPDATE release_evidence_issues SET status='resolved',resolved_at=? WHERE id=?`, timeText(observed), item.id); err != nil {
 			return err

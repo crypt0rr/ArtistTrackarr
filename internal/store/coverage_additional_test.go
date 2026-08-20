@@ -1050,6 +1050,13 @@ func TestITunesFallbackMigrationFaultRollsBackBeforeMarkerAndCanRerun(t *testing
 	if err := (&Store{DB: db}).migrateITunesFallback(ctx); err != nil {
 		t.Fatalf("rerun migration failed: %v", err)
 	}
+	var foreignKeys int
+	if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatal(err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign key enforcement=%d after successful migration, want enabled", foreignKeys)
+	}
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=8`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("rerun marker count=%d err=%v", count, err)
 	}

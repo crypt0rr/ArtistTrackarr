@@ -198,19 +198,15 @@ func (s *Store) FollowNotificationRules(ctx context.Context, userID int64, artis
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = followRows.Close() }()
 	for followRows.Next() {
 		var artistID int64
 		if err := followRows.Scan(&artistID); err != nil {
-			_ = followRows.Close()
 			return nil, err
 		}
 		result[artistID] = defaultFollowNotificationRule(userID, artistID, now)
 	}
 	if err := followRows.Err(); err != nil {
-		_ = followRows.Close()
-		return nil, err
-	}
-	if err := followRows.Close(); err != nil {
 		return nil, err
 	}
 	rows, err := s.readerDB().QueryContext(ctx, query, args...)

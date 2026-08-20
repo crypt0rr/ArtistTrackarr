@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -25,7 +26,7 @@ func (c ResolutionCandidate) Artist() Artist {
 	}
 }
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	dsn := sqliteDSN(path, false)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -48,7 +49,7 @@ func Open(path string) (*Store, error) {
 	// Open the reader pool only after migrations have completed. The read-only
 	// URI prevents accidental writes from production query paths and keeps the
 	// writer connection available for migrations and transactions.
-	reader, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	reader, err := sql.Open("sqlite", sqliteDSN(path, true))
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -62,6 +63,21 @@ func Open(path string) (*Store, error) {
 	}
 	s.Reader = reader
 	return s, nil
+}
+
+// sqliteDSN builds a file URI without allowing filesystem characters such as
+// '?' and '#' to become URI query/fragment delimiters. Keep path separators
+// unescaped so SQLite preserves absolute and relative path semantics while
+// escaping every other path component character.
+func sqliteDSN(path string, readOnly bool) string {
+	escapedPath := strings.ReplaceAll(url.PathEscape(filepath.ToSlash(path)), "%2F", "/")
+	query := url.Values{}
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "busy_timeout(5000)")
+	if readOnly {
+		query.Set("mode", "ro")
+	}
+	return "file:" + escapedPath + "?" + query.Encode()
 }
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations
@@ -165,37 +181,39 @@ func (s *Store) migrateOperationalTimestamps(ctx context.Context) error {
 	}
 	for _, item := range columns {
 		query := fmt.Sprintf("SELECT rowid,%s FROM %s WHERE %s IS NOT NULL AND %s<>''", item.column, item.table, item.column, item.column)
-		rows, queryErr := tx.QueryContext(ctx, query)
-		if queryErr != nil {
-			return rollback(fmt.Errorf("read %s.%s: %w", item.table, item.column, queryErr))
-		}
 		type update struct {
 			id   int64
 			text string
 		}
 		var updates []update
-		for rows.Next() {
-			var id int64
-			var raw string
-			if scanErr := rows.Scan(&id, &raw); scanErr != nil {
-				_ = rows.Close()
-				return rollback(fmt.Errorf("scan %s.%s: %w", item.table, item.column, scanErr))
+		if err := func() error {
+			rows, queryErr := tx.QueryContext(ctx, query)
+			if queryErr != nil {
+				return fmt.Errorf("read %s.%s: %w", item.table, item.column, queryErr)
 			}
-			parsed, parseErr := parseTime(raw)
-			if parseErr != nil {
-				_ = rows.Close()
-				return rollback(fmt.Errorf("invalid timestamp in %s.%s row %d: %w", item.table, item.column, id, parseErr))
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var id int64
+				var raw string
+				if scanErr := rows.Scan(&id, &raw); scanErr != nil {
+					return fmt.Errorf("scan %s.%s: %w", item.table, item.column, scanErr)
+				}
+				parsed, parseErr := parseTime(raw)
+				if parseErr != nil {
+					return fmt.Errorf("invalid timestamp in %s.%s row %d: %w", item.table, item.column, id, parseErr)
+				}
+				canonical := timeText(parsed)
+				if raw != canonical {
+					updates = append(updates, update{id: id, text: canonical})
+				}
 			}
-			canonical := timeText(parsed)
-			if raw != canonical {
-				updates = append(updates, update{id: id, text: canonical})
+			if rowsErr := rows.Err(); rowsErr != nil {
+				return fmt.Errorf("read %s.%s: %w", item.table, item.column, rowsErr)
 			}
+			return nil
+		}(); err != nil {
+			return rollback(err)
 		}
-		if rowsErr := rows.Err(); rowsErr != nil {
-			_ = rows.Close()
-			return rollback(fmt.Errorf("read %s.%s: %w", item.table, item.column, rowsErr))
-		}
-		_ = rows.Close()
 		for _, change := range updates {
 			statement := fmt.Sprintf("UPDATE %s SET %s=? WHERE rowid=?", item.table, item.column)
 			if _, updateErr := tx.ExecContext(ctx, statement, change.text, change.id); updateErr != nil {
@@ -222,28 +240,28 @@ func (s *Store) migrateUsernames(ctx context.Context, body []byte) error {
 	if _, err = tx.ExecContext(ctx, string(body)); err != nil {
 		return rollback(err)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,email FROM users ORDER BY id`)
-	if err != nil {
-		return rollback(err)
-	}
 	type legacyUser struct {
 		id    int64
 		email string
 	}
 	var users []legacyUser
-	for rows.Next() {
-		var user legacyUser
-		if err := rows.Scan(&user.id, &user.email); err != nil {
-			_ = rows.Close()
-			return rollback(err)
+	if err := func() error {
+		rows, err := tx.QueryContext(ctx, `SELECT id,email FROM users ORDER BY id`)
+		if err != nil {
+			return err
 		}
-		users = append(users, user)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var user legacyUser
+			if err := rows.Scan(&user.id, &user.email); err != nil {
+				return err
+			}
+			users = append(users, user)
+		}
+		return rows.Err()
+	}(); err != nil {
 		return rollback(err)
 	}
-	_ = rows.Close()
 	taken := make(map[string]struct{}, len(users))
 	for _, user := range users {
 		name := derivedUsername(user.email, user.id, taken)
@@ -268,20 +286,48 @@ var migrationFaultHook func(string) error
 // place, so the tables are copied while foreign-key enforcement is temporarily
 // disabled during application startup. The dependent tables keep their
 // release_groups foreign-key name and continue to point at the replacement.
-func (s *Store) migrateITunesFallback(ctx context.Context) error {
-	if _, err := s.DB.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+func (s *Store) migrateITunesFallback(ctx context.Context) (err error) {
+	if _, err = s.DB.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
 		return err
 	}
-	defer func() { _, _ = s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`) }()
-	tx, err := s.DB.BeginTx(ctx, nil)
+	// foreign_keys cannot be toggled while a transaction is active. Restore
+	// it after commit/rollback and verify the connection really enforces it;
+	// silently leaving this pragma disabled would undermine every FK cascade.
+	defer func() {
+		restoreErr := func() error {
+			if _, restoreErr := s.DB.ExecContext(ctx, `PRAGMA foreign_keys=ON`); restoreErr != nil {
+				return fmt.Errorf("restore foreign-key enforcement: %w", restoreErr)
+			}
+			var enabled int
+			if queryErr := s.DB.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); queryErr != nil {
+				return fmt.Errorf("verify foreign-key enforcement: %w", queryErr)
+			}
+			if enabled != 1 {
+				return errors.New("verify foreign-key enforcement: pragma remains disabled")
+			}
+			return nil
+		}()
+		if restoreErr == nil {
+			return
+		}
+		if err == nil {
+			err = restoreErr
+			return
+		}
+		err = fmt.Errorf("%w (also: %w)", err, restoreErr)
+	}()
+
+	var tx *sql.Tx
+	tx, err = s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if err := s.migrateITunesFallbackTx(ctx, tx); err != nil {
+	if err = s.migrateITunesFallbackTx(ctx, tx); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 func (s *Store) migrateITunesFallbackTx(ctx context.Context, tx *sql.Tx) error {
@@ -394,12 +440,68 @@ func (s *Store) Close() error {
 	})
 	return s.closeErr
 }
+
+// DatabaseHealthState identifies the failure class of a readiness check
+// without exposing driver details to unauthenticated callers.
+type DatabaseHealthState string
+
+const (
+	DatabaseHealthy     DatabaseHealthState = "healthy"
+	DatabaseUnavailable DatabaseHealthState = "unavailable"
+	DatabaseWriteFailed DatabaseHealthState = "write_failed"
+)
+
+// DatabaseHealthError wraps a readiness failure with a safe classification.
+// The underlying error is retained for structured server logs and tests, but
+// is never written to the unauthenticated response body.
+type DatabaseHealthError struct {
+	State DatabaseHealthState
+	Err   error
+}
+
+func (e *DatabaseHealthError) Error() string {
+	if e == nil || e.Err == nil {
+		return string(DatabaseUnavailable)
+	}
+	return string(e.State) + ": " + e.Err.Error()
+}
+
+func (e *DatabaseHealthError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// Healthy proves both that the migrated schema can be read and that the
+// writer can complete a tiny rollback-only write. A read-only or full
+// database must not be reported as ready merely because SELECT succeeds.
 func (s *Store) Healthy(ctx context.Context) error {
+	if s == nil || s.readerDB() == nil {
+		return &DatabaseHealthError{State: DatabaseUnavailable, Err: errors.New("database handle is unavailable")}
+	}
 	var one int
 	// Keep readiness bounded while still proving that migrations completed. A
 	// bare SELECT 1 would report an arbitrary SQLite file as ready even when the
 	// application schema is absent or corrupt.
-	return s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM schema_migrations LIMIT 1`).Scan(&one)
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT 1 FROM schema_migrations LIMIT 1`).Scan(&one); err != nil {
+		return &DatabaseHealthError{State: DatabaseUnavailable, Err: err}
+	}
+	if s.DB == nil {
+		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: errors.New("writer handle is unavailable")}
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`, nowText(), "INFO", "health probe", "[]"); err != nil {
+		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+	}
+	if err := tx.Rollback(); err != nil {
+		return &DatabaseHealthError{State: DatabaseWriteFailed, Err: err}
+	}
+	return nil
 }
 func changedOrNotFound(result sql.Result, err error) error {
 	if err != nil {
@@ -467,17 +569,6 @@ func parseTime(v string) (time.Time, error) {
 		return parsed, nil
 	}
 	return time.ParseInLocation("2006-01-02 15:04:05", v, time.UTC)
-}
-
-func parseNullableTime(v string) *time.Time {
-	if strings.TrimSpace(v) == "" {
-		return nil
-	}
-	t, err := parseTime(v)
-	if err != nil {
-		return nil
-	}
-	return &t
 }
 
 func nullableID(id int64) any {

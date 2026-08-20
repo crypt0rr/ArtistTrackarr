@@ -28,6 +28,10 @@ deployment:
 4. Open `http://localhost:8080/setup`, enter `SETUP_TOKEN`, and create the
    first administrator with a unique username.
 
+Password changes use the administrator's one-hour reset-link flow in the
+household administration page. Consuming a reset link revokes the account's
+existing sessions; email remains the recovery and login identity.
+
 Application data remains on the existing Compose volume mapping so upgrades do
 not move user data. Docker Compose names the container `artist-trackarr` for
 predictable logs and administration commands. Use the backup helper below to
@@ -45,11 +49,12 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.46.6`; local and published images use the
-same source-controlled semantic version. Operational
-timestamps are stored
-in UTC and rendered in the configured system timezone; existing databases are
-normalized automatically during the v0.20.0 migration.
+footer. The current release is `v0.48.0`; local and published images use the
+same source-controlled semantic version. Operational timestamps are stored in
+UTC and rendered in the signed-in administrator's configured timezone in the
+web UI and downloaded assurance report; machine-readable JSON and CSV exports
+remain RFC3339 UTC. Existing databases are normalized automatically during the
+v0.20.0 migration.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
@@ -150,6 +155,15 @@ runner, and backup state remains available only through authenticated admin
 diagnostics. A provider cooldown or overdue backup does not cause a restart
 loop.
 
+Operational health treats a missing backup marker on a fresh installation as an
+informational “backup not yet established” note rather than a service failure.
+Transient provider failures are shown in diagnostics but affect the overall
+status only when the latest failure remains unresolved for at least one hour;
+digest backlog affects the status after fifteen minutes. These thresholds keep
+the readiness/administration signal actionable without hiding persistent
+failures, and the diagnostics page still shows the underlying counters and
+oldest timestamps.
+
 The v0.46.0 approval catch-up release ensures an explicit provider or evidence
 approval creates one owner-scoped inbox event and delivery when no earlier
 notification hold existed. It preserves discarded holds, waits for all blocking
@@ -164,6 +178,31 @@ also offers a paginated, CSV-safe delivery-audit export before any future
 history policy is considered. The export contains notification text and should
 be handled as confidential household data; a complete encrypted database
 backup remains the authoritative recovery archive.
+
+The v0.47.0 reliability release keeps fresh-install backup state informational
+until a backup is established, applies age thresholds to provider failures and
+digest backlog, exposes the true due-artist backlog and oldest due time, and
+sends Telegram notifications through the bounded, sender-owned HTTP client
+instead of Shoutrrr's process-global JSON client. Startup failures drain
+persisted application logs before closing SQLite, and database paths are
+escaped as SQLite file URIs so unusual filenames remain unambiguous. Admin
+diagnostics now distinguish database file size from reusable SQLite freelist
+space; retention cleanup is bounded and does not run an automatic `VACUUM`, so
+operators can compact a backup or maintenance window deliberately. Member-owned
+work is bounded at 25 notification destinations and 100 active provider
+identifications per account. CSV imports report `processing`, `complete`,
+`failed`, or `interrupted` state; hourly maintenance marks stale uploads as
+interrupted instead of presenting a partial upload as complete. Diagnostics
+also flag pending delivery retries parked more than 24 hours into the future,
+which is a useful clock-skew or bad-schedule signal rather than a delivery
+failure by itself.
+
+The v0.48.0 catalog release uses one Album/EP/Single heuristic for Spotify and
+Apple/iTunes observations. Explicit standalone title labels take precedence,
+then one track is a Single, two through six tracks are an EP, and seven or
+more tracks are an Album; compilations remain Albums. A unique normalized
+title/date match can merge provider records even when those derived types
+differ, while ambiguous matches are kept separate for review.
 
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
@@ -208,10 +247,11 @@ delivers notifications every ten seconds, and runs transient-state maintenance
 hourly. Hourly maintenance also bounds the artwork cache to 1 GiB or 25,000
 files, removing stale and oldest entries first. Notification delivery is
 scheduled through a bounded four-worker queue, while the Shoutrrr 0.8
-compatibility adapter serializes the underlying HTTP client send and restores
-the process default after each operation. SQLite keeps one serialized writer
-and a small read-only pool so dashboard queries do not queue behind provider
-work.
+compatibility adapter serializes only transports that still require its
+process-global client and restores the process default after each operation;
+Telegram uses the sender-owned bounded Bot API client directly. SQLite keeps
+one serialized writer and a small read-only pool so dashboard queries do not
+queue behind provider work.
 
 Delivery assurance records every normal and digest attempt, keeps a durable
 health state for each destination, and pauses destinations after five
@@ -246,7 +286,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.46.6` publishes `0.46.6`, `0.46`, and `latest`.
+- Pushing a tag such as `v0.48.0` publishes `0.48.0`, `0.48`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -257,10 +297,15 @@ The module targets Go 1.26; CI and the Docker build use the pinned patched Go
 1.26.6 toolchain so local builds and release images share the same supported
 language/runtime line.
 
+`make lint` runs the pinned `golangci-lint` v2.12.2 configuration. The focused
+quality gate covers unchecked errors, Go vet, static analysis, ineffective
+assignments, unused code, row and SQL resource handling, HTTP body closure,
+wrapped errors, and nil-error paths.
+
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.6 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.48.0 docker compose up -d
 ```
 
 ## Configuration
@@ -269,7 +314,7 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.46.6 docker compose up 
 | --- | --- | --- | --- |
 | `PUBLIC_URL` | yes | `http://localhost:8080` | External base URL; use HTTPS behind a reverse proxy. |
 | `ARTIST_TRACKARR_BIND` | no | `127.0.0.1` | Host address for the Compose port; expose wider only behind a trusted TLS proxy/firewall. |
-| `SETUP_TOKEN` | first run | — | Protects initial administrator creation. |
+| `SETUP_TOKEN` | first run | — | Protects initial administrator creation; must be at least 32 characters. |
 | `APP_ENCRYPTION_KEY` | yes | — | Encrypts notification credentials at rest. |
 | `SESSION_SECRET` | yes | — | Adds server-side protection to session cookies. |
 | `MUSICBRAINZ_CONTACT` | yes | — | Single-line contact included in the required MusicBrainz User-Agent; values over 200 characters are rejected. |
@@ -301,8 +346,8 @@ Set `SPOTIFY_MARKET` to the country whose catalogue should be checked, for
 example `NL`. Existing followed artists are silently baselined the first time
 Spotify release polling runs after an upgrade, preventing back-catalogue
 notification floods. New releases observed after that baseline can notify
-independently of MusicBrainz. Albums, EPs, singles, and compilations are all eligible release
-types; multi-track Spotify releases with at least four tracks are treated as
+independently of MusicBrainz. Albums, EPs, singles, and compilations are all
+eligible release types; two through six track Spotify releases are treated as
 EPs. Spotify also requests the `appears_on` relationship, so a followed artist
 is notified when they are featured on another artist's album, EP, single, or
 compilation. Existing follows receive a one-time appearance baseline during
@@ -332,7 +377,7 @@ also means selecting an artist directly from a recent search does not trigger a
 second lookup request. Batch follow actions use Spotify's multiple-artist
 endpoint when available. Artists are assigned stable polling offsets so a large
 watch list is spread across the day instead of queried in one burst.
-Apple/iTunes release observations are best-effort and are matched by canonical artist name. Collections are classified as Album, EP, or Single using track-count/title heuristics. Apple artwork URLs are accepted only from Apple hosts, loaded directly with attribution, and never downloaded or retained as image bytes. Existing artwork gaps are backfilled one artist at a time using the same conservative limiter. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
+Apple/iTunes release observations are best-effort and are matched by canonical artist name. Spotify and Apple/iTunes use the same release-type heuristic: an explicit standalone “Single” or “EP” title wins, followed by one track as Single, two through six tracks as EP, and seven or more tracks as Album; compilations remain Albums. Word-boundary matching avoids treating titles such as “episode”, “epic”, or “epilogue” as EPs. When provider-derived types disagree, a unique normalized title/date match is preferred over creating a duplicate. Apple artwork URLs are accepted only from Apple hosts, loaded directly with attribution, and never downloaded or retained as image bytes. Existing artwork gaps are backfilled one artist at a time using the same conservative limiter. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
 
 iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `ITUNES_MARKET` (default `US`) independently of Spotify, and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.
 

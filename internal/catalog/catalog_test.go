@@ -355,6 +355,48 @@ func TestSpotifyReleaseTypeClassification(t *testing.T) {
 	}
 }
 
+func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
+	for _, tracks := range []int{2, 4, 5, 6} {
+		for _, provider := range []string{"spotify", "itunes"} {
+			t.Run(fmt.Sprintf("%s-%d-tracks", provider, tracks), func(t *testing.T) {
+				var got string
+				if provider == "spotify" {
+					got, _, _ = spotifyReleaseType("single", "single", "", tracks)
+				} else {
+					got = iTunesReleaseType("", tracks)
+				}
+				if got != "EP" {
+					t.Fatalf("%s %d-track release=%q, want EP", provider, tracks, got)
+				}
+			})
+		}
+	}
+	for _, test := range []struct {
+		title, want string
+	}{
+		{title: "episode", want: "Album"},
+		{title: "epic", want: "Album"},
+		{title: "epilogue", want: "Album"},
+		{title: "EP", want: "EP"},
+	} {
+		for _, provider := range []string{"spotify", "itunes"} {
+			t.Run(provider+"-"+test.title, func(t *testing.T) {
+				var got string
+				var ok bool
+				if provider == "spotify" {
+					got, _, ok = spotifyReleaseType("album", "", test.title, 0)
+				} else {
+					got = iTunesReleaseType(test.title, 0)
+					ok = got != ""
+				}
+				if !ok || got != test.want {
+					t.Fatalf("%s %q=(%q,%v), want (%q,true)", provider, test.title, got, ok, test.want)
+				}
+			})
+		}
+	}
+}
+
 func TestSpotifyReleaseImageSelectionAndTrustedHosts(t *testing.T) {
 	if got := spotifyReleaseImage(nil); got != "" {
 		t.Fatalf("empty release image=%q", got)
@@ -484,6 +526,82 @@ func TestITunesRejectsAmbiguousExactArtistNames(t *testing.T) {
 	var ambiguous *ITunesAmbiguousArtistError
 	if !errors.As(err, &ambiguous) || len(ambiguous.IDs) != 2 {
 		t.Fatalf("ambiguous error=%v (%T), want two exact matches", err, err)
+	}
+}
+
+func TestITunesArtistLookupCoalescesConcurrentCalls(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/lookup" || request.URL.Query().Get("entity") != "musicArtist" {
+			t.Fatalf("unexpected iTunes request: %s", request.URL.String())
+		}
+		if requests.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example"}]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+
+	type result struct {
+		artist ITunesArtist
+		err    error
+	}
+	leader := make(chan result, 1)
+	go func() {
+		artist, err := itunes.Artist(context.Background(), "123")
+		leader <- result{artist: artist, err: err}
+	}()
+	<-started
+	follower := make(chan result, 1)
+	go func() {
+		artist, err := itunes.Artist(context.Background(), "123")
+		follower <- result{artist: artist, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		itunes.cacheMu.Lock()
+		coalesced := len(itunes.artistCalls) == 1
+		itunes.cacheMu.Unlock()
+		if coalesced {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	for _, ch := range []chan result{leader, follower} {
+		select {
+		case got := <-ch:
+			if got.err != nil || got.artist.ID != "123" {
+				t.Fatalf("coalesced lookup result=%#v", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("coalesced iTunes lookup did not finish")
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("iTunes artist requests=%d, want 1", requests.Load())
+	}
+}
+
+func TestITunesNotFoundIsTypedNegativeLookup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/search" {
+			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"resultCount":0,"results":[]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	_, err := itunes.ArtistReleases(context.Background(), "Missing Artist")
+	var notFound *ITunesArtistNotFoundError
+	if !errors.As(err, &notFound) || notFound.Name != "Missing Artist" {
+		t.Fatalf("not-found error=%v (%T), want typed negative lookup", err, err)
 	}
 }
 
@@ -783,8 +901,12 @@ func TestSpotifyCoalescedLookupsHonorResultsAndCancellation(t *testing.T) {
 		t.Fatalf("coalesced search results=%#v err=%v", results, err)
 	}
 
-	cancelledSearch := &spotifySearchCall{done: make(chan struct{})}
+	cancelledSearch := &spotifySearchCall{done: make(chan struct{}), err: context.Canceled}
+	close(cancelledSearch.done)
 	spotify.searchCalls[normalizeSpotifySearchQuery("cancelled")] = cancelledSearch
+	if _, err := spotify.SearchArtists(context.Background(), "cancelled"); !errors.Is(err, ErrCoalescedRequestCanceled) {
+		t.Fatalf("leader cancellation leaked to follower: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := spotify.SearchArtists(ctx, "cancelled"); !errors.Is(err, context.Canceled) {
@@ -804,7 +926,12 @@ func TestSpotifyCoalescedLookupsHonorResultsAndCancellation(t *testing.T) {
 	}
 
 	cancelledArtistID := "artist-cancelled"
-	spotify.artistCalls[cancelledArtistID] = &spotifyArtistCall{done: make(chan struct{})}
+	cancelledArtist := &spotifyArtistCall{done: make(chan struct{}), err: context.Canceled}
+	close(cancelledArtist.done)
+	spotify.artistCalls[cancelledArtistID] = cancelledArtist
+	if _, err := spotify.Artist(context.Background(), cancelledArtistID); !errors.Is(err, ErrCoalescedRequestCanceled) {
+		t.Fatalf("leader artist cancellation leaked to follower: %v", err)
+	}
 	ctx, cancel = context.WithCancel(context.Background())
 	cancel()
 	if _, err := spotify.Artist(ctx, cancelledArtistID); !errors.Is(err, context.Canceled) {

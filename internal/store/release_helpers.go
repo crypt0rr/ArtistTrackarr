@@ -86,7 +86,7 @@ func saveSpotifyReleaseTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
 ) (syncedRelease, error) {
 	if strings.TrimSpace(release.SpotifyID) == "" {
-		return syncedRelease{}, errors.New("Spotify release ID is required")
+		return syncedRelease{}, errors.New("spotify release ID is required")
 	}
 	var releaseID int64
 	existed := true
@@ -505,10 +505,6 @@ func releaseByIDTx(ctx context.Context, tx *sql.Tx, releaseID int64) (Release, e
 	return scanReleaseWithExtra(tx.QueryRowContext(ctx,
 		`SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id WHERE rg.id=?`, releaseID))
 }
-func selectInitialRelease(items []syncedRelease, observed time.Time) (syncedRelease, string, bool) {
-	return selectInitialReleaseInLocation(items, observed, time.UTC)
-}
-
 func selectInitialReleaseInLocation(items []syncedRelease, observed time.Time, location *time.Location) (syncedRelease, string, bool) {
 	var zero syncedRelease
 	today := dayInLocation(observed, location)
@@ -547,10 +543,6 @@ func selectInitialReleaseInLocation(items []syncedRelease, observed time.Time, l
 	}
 	return latest, "announcement", true
 }
-func initialReleaseMessage(artist Artist, release Release, eventType string, observed time.Time) (string, string) {
-	return initialReleaseMessageInLocation(artist, release, eventType, observed, time.UTC)
-}
-
 func initialReleaseMessageInLocation(artist Artist, release Release, eventType string, observed time.Time, location *time.Location) (string, string) {
 	today := dayInLocation(observed, location)
 	start, _ := comparableReleaseDate(release.FirstReleaseDate)
@@ -718,33 +710,33 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 	if err != nil {
 		return fmt.Errorf("load notification rules for release: %w", err)
 	}
-	for rows.Next() {
-		var albums, eps, singles, announcements, releaseDay, holdConflicts int
-		var artistID int64
-		var role, mode string
-		var includePrimary, includeFeatured int
-		var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
-		var paused, updated sql.NullString
-		if err := rows.Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts, &artistID,
-			&primary, &secondary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
-			&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("scan notification rule for release: %w", err)
+	if err := func() error {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var albums, eps, singles, announcements, releaseDay, holdConflicts int
+			var artistID int64
+			var role, mode string
+			var includePrimary, includeFeatured int
+			var ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay int
+			var paused, updated sql.NullString
+			if err := rows.Scan(&albums, &eps, &singles, &announcements, &releaseDay, &holdConflicts, &artistID,
+				&primary, &secondary, &role, &mode, &includePrimary, &includeFeatured, &ruleAlbums, &ruleEPs, &ruleSingles,
+				&compilations, &ruleAnnouncements, &ruleReleaseDay, &paused, &updated); err != nil {
+				return fmt.Errorf("scan notification rule for release: %w", err)
+			}
+			p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
+			p.HoldConflictingNotifications = holdConflicts != 0
+			rule, err := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, artistID)
+			if err != nil {
+				return err
+			}
+			candidates = append(candidates, candidate{rule: rule, role: role})
 		}
-		p.Albums, p.EPs, p.Singles, p.Announcements, p.ReleaseDay = albums != 0, eps != 0, singles != 0, announcements != 0, releaseDay != 0
-		p.HoldConflictingNotifications = holdConflicts != 0
-		rule, err := followRuleFromColumns(mode, includePrimary, includeFeatured, ruleAlbums, ruleEPs, ruleSingles, compilations, ruleAnnouncements, ruleReleaseDay, paused.String, updated.String, userID, artistID)
-		if err != nil {
-			_ = rows.Close()
-			return err
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("scan notification rules for release: %w", err)
 		}
-		candidates = append(candidates, candidate{rule: rule, role: role})
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("scan notification rules for release: %w", err)
-	}
-	if err := rows.Close(); err != nil {
+		return nil
+	}(); err != nil {
 		return err
 	}
 	if len(candidates) == 0 {

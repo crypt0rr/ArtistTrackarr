@@ -134,7 +134,7 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 		var existing int64
 		if err := tx.QueryRowContext(ctx, q, args...).Scan(&existing); err == nil {
 			return ManualSyncRequest{ID: existing, Scope: scope, Status: "queued"}, nil
-		} else if err != sql.ErrNoRows {
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return ManualSyncRequest{}, err
 		}
 		var queued int
@@ -189,33 +189,32 @@ func (s *Store) ClaimManualSyncRequestsWithLease(ctx context.Context, limit int,
 		}
 		var ids []int64
 		var out []ManualSyncRequest
-		for rows.Next() {
-			var r ManualSyncRequest
-			var aid sql.NullInt64
-			var ts string
-			if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
-				_ = rows.Close()
-				return nil, err
+		if err := func() error {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var r ManualSyncRequest
+				var aid sql.NullInt64
+				var ts string
+				if err := rows.Scan(&r.ID, &r.RequestedBy, &r.Scope, &aid, &ts); err != nil {
+					return err
+				}
+				if aid.Valid {
+					v := aid.Int64
+					r.ArtistID = &v
+				}
+				r.Status = "running"
+				created, parseErr := parseStoredTime(ts, "manual sync created_at")
+				if parseErr != nil {
+					return parseErr
+				}
+				r.CreatedAt = created
+				out = append(out, r)
+				ids = append(ids, r.ID)
 			}
-			if aid.Valid {
-				v := aid.Int64
-				r.ArtistID = &v
-			}
-			r.Status = "running"
-			created, parseErr := parseStoredTime(ts, "manual sync created_at")
-			if parseErr != nil {
-				_ = rows.Close()
-				return nil, parseErr
-			}
-			r.CreatedAt = created
-			out = append(out, r)
-			ids = append(ids, r.ID)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-		_ = rows.Close()
 		nowTextValue := timeText(now)
 		for _, id := range ids {
 			if _, err := tx.ExecContext(ctx, `UPDATE manual_sync_requests SET status='running',started_at=?,lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1 WHERE id=? AND (status='queued' OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?))`, nowTextValue, owner, timeText(expires), id, nowTextValue); err != nil {
@@ -408,6 +407,23 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		return DiagnosticsSnapshot{}, err
 	}
 	snapshot.DatabaseHealthy = true
+	var oldestDue sql.NullString
+	if err := s.readerDB().QueryRowContext(ctx, `WITH due AS (
+		SELECT a.id,a.next_check_at AS due_at
+		FROM artists a JOIN follows f ON f.artist_id=a.id
+		WHERE a.next_check_at IS NULL OR a.next_check_at<=?
+		UNION ALL
+		SELECT a.id,a.spotify_next_check_at AS due_at
+		FROM artists a JOIN follows f ON f.artist_id=a.id
+		WHERE a.spotify_id IS NOT NULL AND (a.spotify_next_check_at IS NULL OR a.spotify_next_check_at<=?)
+	)
+	SELECT COUNT(DISTINCT id),MIN(due_at) FROM due`, timeText(snapshot.CheckedAt), timeText(snapshot.CheckedAt)).
+		Scan(&snapshot.DueSyncArtists, &oldestDue); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.OldestDueSyncAt, err = parseStoredNullableTime(oldestDue, "oldest due artist sync"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
 	var oldest sql.NullString
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT MIN(value) FROM (
 		SELECT next_attempt_at AS value FROM deliveries WHERE status IN ('pending','blocked')
@@ -415,6 +431,20 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		return DiagnosticsSnapshot{}, err
 	}
 	if snapshot.OldestQueueAt, err = parseStoredNullableTime(oldest, "oldest queued delivery"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	var earliestFuture sql.NullString
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(value) FROM (
+		SELECT next_attempt_at AS value FROM deliveries
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?
+		UNION ALL
+		SELECT next_attempt_at FROM release_digest_deliveries
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?)`,
+		timeText(snapshot.CheckedAt.Add(24*time.Hour)), timeText(snapshot.CheckedAt.Add(24*time.Hour))).
+		Scan(&snapshot.FutureDeliveries, &earliestFuture); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.EarliestFutureDelivery, err = parseStoredNullableTime(earliestFuture, "earliest future delivery"); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT
@@ -427,14 +457,33 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		Scan(&snapshot.StaleClaims, &snapshot.PausedDestinations, &snapshot.ProviderFailures, &snapshot.DigestBacklog); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	var pageCount, pageSize int64
+	var oldestProviderFailure, oldestDigestBacklog sql.NullString
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT
+		(SELECT MIN(last_failure_at) FROM provider_health
+		 WHERE last_failure_at IS NOT NULL AND (last_success_at IS NULL OR last_failure_at>last_success_at)),
+		(SELECT MIN(r.created_at) FROM release_digest_deliveries dd
+		 JOIN release_digest_runs r ON r.id=dd.run_id
+		 WHERE dd.status IN ('pending','blocked'))`).Scan(&oldestProviderFailure, &oldestDigestBacklog); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.OldestProviderFailureAt, err = parseStoredNullableTime(oldestProviderFailure, "oldest provider failure"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	if snapshot.OldestDigestBacklogAt, err = parseStoredNullableTime(oldestDigestBacklog, "oldest digest backlog"); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	var pageCount, pageSize, freePages int64
 	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
 	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
+	if err := s.readerDB().QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
 	snapshot.DatabaseBytes = pageCount * pageSize
+	snapshot.DatabaseFreeBytes = freePages * pageSize
 	snapshot.LastBackupAt, _ = s.operationalMarker(backupMarkerFile)
 	snapshot.LastRestoreAt, snapshot.LastRestoreResult = s.operationalMarker(restoreMarkerFile)
 	health, err := s.ProviderHealth(ctx)

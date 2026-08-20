@@ -150,11 +150,16 @@ func validMBID(value string) bool {
 			}
 			continue
 		}
-		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F')) {
+		if !isHexDigit(character) {
 			return false
 		}
 	}
 	return true
+}
+
+func isHexDigit(character rune) bool {
+	return (character >= '0' && character <= '9') ||
+		(character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F')
 }
 
 func validMusicBrainzArtistURL(value string) (*url.URL, bool) {
@@ -226,14 +231,19 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create import job", http.StatusInternalServerError)
 		return
 	}
+	importStatus := "complete"
 	for _, input := range inputs {
 		if _, saveErr := a.store.SaveImportRow(r.Context(), session.User.ID, job.ID, input); saveErr != nil {
+			importStatus = "failed"
 			a.logger.Error("save artist import row failed", "job_id", job.ID, "error", saveErr)
 			// Keep the row visible even when one local write fails. This is an
 			// invalid result, never a reason to discard the rest of the upload.
 			input.Reason = "could not save this row"
 			_, _ = a.store.SaveImportRow(r.Context(), session.User.ID, job.ID, input)
 		}
+	}
+	if err := a.store.FinishImportJob(r.Context(), session.User.ID, job.ID, importStatus); err != nil {
+		a.logger.Error("finish artist import job failed", "job_id", job.ID, "error", err)
 	}
 	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
 }

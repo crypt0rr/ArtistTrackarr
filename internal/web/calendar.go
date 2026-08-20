@@ -26,7 +26,10 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fromTime := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, location)
-	toTime := fromTime.AddDate(0, 1, 0).Add(-24 * time.Hour)
+	// Build the last calendar day by date rather than subtracting 24 hours
+	// from the next month. The latter can land on the wrong local date around
+	// DST transitions.
+	toTime := time.Date(month.Year(), month.Month()+1, 1, 0, 0, 0, 0, location).AddDate(0, 0, -1)
 	from := fromTime.Format("2006-01-02")
 	to := toTime.Format("2006-01-02")
 	releases, err := a.store.CalendarReleases(r.Context(), session.User.ID, from, to, 300)
@@ -72,32 +75,32 @@ func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
 	}
 	publicURL := a.cfg.PublicURL
 	var builder strings.Builder
-	builder.WriteString("BEGIN:VCALENDAR\r\n")
-	builder.WriteString("VERSION:2.0\r\n")
-	builder.WriteString("PRODID:-//ArtistTrackarr//Release Calendar//EN\r\n")
-	builder.WriteString("METHOD:PUBLISH\r\n")
-	builder.WriteString("CALSCALE:GREGORIAN\r\n")
-	builder.WriteString("X-WR-CALNAME:ArtistTrackarr releases\r\n")
-	builder.WriteString("X-WR-TIMEZONE:" + icsEscape(location.String()) + "\r\n")
+	writeICSLine(&builder, "BEGIN:VCALENDAR")
+	writeICSLine(&builder, "VERSION:2.0")
+	writeICSLine(&builder, "PRODID:-//ArtistTrackarr//Release Calendar//EN")
+	writeICSLine(&builder, "METHOD:PUBLISH")
+	writeICSLine(&builder, "CALSCALE:GREGORIAN")
+	writeICSLine(&builder, "X-WR-CALNAME:ArtistTrackarr releases")
+	writeICSLine(&builder, "X-WR-TIMEZONE:"+icsEscape(location.String()))
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 	for _, release := range releases {
-		builder.WriteString("BEGIN:VEVENT\r\n")
-		builder.WriteString("UID:release-" + strconv.FormatInt(release.ID, 10) + "@artisttrackarr\r\n")
-		builder.WriteString("DTSTAMP:" + stamp + "\r\n")
-		builder.WriteString("DTSTART;VALUE=DATE:" + strings.ReplaceAll(release.CalendarDate, "-", "") + "\r\n")
-		builder.WriteString("SUMMARY:" + icsEscape(release.Title+" — "+release.ArtistName) + "\r\n")
+		writeICSLine(&builder, "BEGIN:VEVENT")
+		writeICSLine(&builder, "UID:release-"+strconv.FormatInt(release.ID, 10)+"@artisttrackarr")
+		writeICSLine(&builder, "DTSTAMP:"+stamp)
+		writeICSLine(&builder, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(release.CalendarDate, "-", ""))
+		writeICSLine(&builder, "SUMMARY:"+icsEscape(release.Title+" — "+release.ArtistName))
 		description := fmt.Sprintf("%s · %s · %s", release.PrimaryType, release.Source, calendarReleaseStatus(release))
 		if link := releaseExternalLink(release); link != "" {
 			description += "\n" + link
 		}
-		builder.WriteString("DESCRIPTION:" + icsEscape(description) + "\r\n")
+		writeICSLine(&builder, "DESCRIPTION:"+icsEscape(description))
 		if publicURL != nil {
 			link := publicURL.ResolveReference(&url.URL{Path: "/releases/" + strconv.FormatInt(release.ID, 10)}).String()
-			builder.WriteString("URL:" + icsEscape(link) + "\r\n")
+			writeICSLine(&builder, "URL:"+icsEscapeURI(link))
 		}
-		builder.WriteString("END:VEVENT\r\n")
+		writeICSLine(&builder, "END:VEVENT")
 	}
-	builder.WriteString("END:VCALENDAR\r\n")
+	writeICSLine(&builder, "END:VCALENDAR")
 	w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="artisttrackarr-releases.ics"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -112,6 +115,33 @@ func icsEscape(value string) string {
 	value = strings.ReplaceAll(value, "\r", "\\n")
 	value = strings.ReplaceAll(value, "\n", "\\n")
 	return value
+}
+
+// icsEscapeURI keeps URI punctuation intact for the URL property while
+// removing physical line breaks that could inject another calendar property.
+func icsEscapeURI(value string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(value)
+}
+
+// writeICSLine applies RFC 5545 line folding at 75 octets. It avoids cutting
+// through a UTF-8 continuation byte and prefixes each continuation line with
+// the required single space.
+func writeICSLine(builder *strings.Builder, line string) {
+	data := []byte(line)
+	for len(data) > 75 {
+		cut := 75
+		for cut > 0 && cut < len(data) && data[cut]&0xc0 == 0x80 {
+			cut--
+		}
+		if cut == 0 {
+			cut = 75
+		}
+		builder.Write(data[:cut])
+		builder.WriteString("\r\n ")
+		data = data[cut:]
+	}
+	builder.Write(data)
+	builder.WriteString("\r\n")
 }
 
 func releaseExternalLink(release store.CalendarRelease) string {

@@ -65,6 +65,38 @@ func TestProviderHealthPresentationHelpers(t *testing.T) {
 	}
 }
 
+func TestSanitizeStatusMessageBoundsAndRemovesControls(t *testing.T) {
+	got := sanitizeStatusMessage("  hello\nworld\t" + strings.Repeat("x", 300) + "  ")
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Fatalf("status message retained control characters: %q", got)
+	}
+	if len([]rune(got)) != 240 {
+		t.Fatalf("status message rune length=%d, want 240", len([]rune(got)))
+	}
+}
+
+func TestProviderStatusPresentationLabelsNegativeAndStandbyResults(t *testing.T) {
+	cases := map[string]string{
+		"healthy":        "Healthy",
+		"degraded":       "Degraded",
+		"standby":        "Standby",
+		"not_found":      "Not found",
+		"ambiguous":      "Needs review",
+		"not_configured": "Not configured",
+	}
+	for status, want := range cases {
+		if got := providerStatusLabel(status); got != want {
+			t.Fatalf("providerStatusLabel(%q)=%q, want %q", status, got, want)
+		}
+	}
+	if got := providerStatusClass("not_found"); got != "ambiguous" {
+		t.Fatalf("negative status class=%q, want ambiguous", got)
+	}
+	if got := providerStatusClass("standby"); got != "ambiguous" {
+		t.Fatalf("standby status class=%q, want ambiguous", got)
+	}
+}
+
 func TestProviderHealthPresentationUsesConfiguredCadence(t *testing.T) {
 	old := time.Now().UTC().Add(-5 * time.Hour)
 	cfg := config.Config{PollInterval: time.Hour, SpotifyPollInterval: 2 * time.Hour}
@@ -267,7 +299,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 	providerTime := now.Add(-time.Hour)
 	resolution := &store.ArtistResolution{ID: 1, UserID: user.ID, Provider: "spotify", ProviderID: "spotify-template", DisplayName: artist.Name, ProviderURL: "https://open.spotify.com/artist/template", Status: "review", Candidates: []store.ResolutionCandidate{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}}}
 	data := PageData{
-		Title: "Template smoke", Version: "0.46.6", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true, Query: "template",
+		Title: "Template smoke", Version: "0.48.0", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true, Query: "template",
 		Artists: []store.Artist{artist}, Results: []catalog.ArtistResult{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}},
 		SpotifyResults: []catalog.SpotifyArtist{{ID: "spotify-template", Name: artist.Name, URL: "https://open.spotify.com/artist/template"}},
 		ITunesResults:  []catalog.ITunesArtist{{ID: "123", Name: artist.Name, URL: "https://music.apple.com/us/artist/template/123"}}, UpcomingReleases: []store.Release{release}, RecentReleases: []store.Release{release},

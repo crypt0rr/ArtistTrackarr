@@ -40,9 +40,10 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 	}
 	redirect := localReturnPath(r.FormValue("return"), "/", "/")
 	message := "Notification released"
-	if action == "discard" {
+	switch action {
+	case "discard":
 		message = "Notification discarded"
-	} else if action == "restore" {
+	case "restore":
 		message = "Notification restored"
 	}
 	separator := "?"

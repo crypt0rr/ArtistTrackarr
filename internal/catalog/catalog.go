@@ -134,6 +134,25 @@ type CatalogLimitError struct {
 	Pages    int
 }
 
+// ErrCoalescedRequestCanceled is returned to a still-live waiter when the
+// request that originally owned an in-flight coalesced call was canceled.
+// Returning the leader's context error would make an unrelated follower look
+// canceled and can cause provider fallback to be skipped incorrectly.
+var ErrCoalescedRequestCanceled = errors.New("coalesced provider request was canceled")
+
+func coalescedRequestError(ctx context.Context, leaderErr error) error {
+	if leaderErr == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if errors.Is(leaderErr, context.Canceled) || errors.Is(leaderErr, context.DeadlineExceeded) {
+		return ErrCoalescedRequestCanceled
+	}
+	return leaderErr
+}
+
 func (e *CatalogLimitError) Error() string {
 	return fmt.Sprintf("%s catalog exceeded the %d-page safety limit", e.Provider, e.Pages)
 }
@@ -843,7 +862,7 @@ func (s *Spotify) SearchArtists(ctx context.Context, query string) ([]SpotifyArt
 		s.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return cloneSpotifyArtists(call.results), call.err
+			return cloneSpotifyArtists(call.results), coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -917,7 +936,7 @@ func (s *Spotify) Artist(ctx context.Context, id string) (SpotifyArtist, error) 
 		s.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return call.artist, call.err
+			return call.artist, coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return SpotifyArtist{}, ctx.Err()
 		}
@@ -1165,11 +1184,15 @@ func SpotifyID(value string) (string, bool) {
 		return "", false
 	}
 	for _, r := range value {
-		if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+		if !asciiAlphaNumeric(r) {
 			return "", false
 		}
 	}
 	return value, true
+}
+
+func asciiAlphaNumeric(r rune) bool {
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
 }
 
 func (s *Spotify) ArtistReleases(ctx context.Context, artistID string) ([]store.Release, error) {
@@ -1471,20 +1494,7 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 func spotifyReleaseType(albumType, albumGroup, title string, totalTracks int) (string, []string, bool) {
-	kind := strings.ToLower(strings.TrimSpace(albumType))
-	group := strings.ToLower(strings.TrimSpace(albumGroup))
-	switch {
-	case kind == "album" && group == "compilation", kind == "compilation":
-		return "Album", []string{"Compilation"}, true
-	case kind == "album":
-		return "Album", nil, true
-	case kind == "single" && (totalTracks >= 4 || strings.Contains(strings.ToLower(title), " ep")):
-		return "EP", nil, true
-	case kind == "single":
-		return "Single", nil, true
-	default:
-		return "", nil, false
-	}
+	return classifyReleaseType(albumType, albumGroup, title, totalTracks)
 }
 
 func spotifyDatePrecision(precision, value string) int {

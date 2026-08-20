@@ -351,6 +351,8 @@ var (
 	ErrCannotDeleteSelf              = errors.New("you cannot delete your own account")
 	ErrLastAdmin                     = errors.New("the last administrator cannot be deleted")
 	ErrManualSyncQueueFull           = errors.New("manual synchronization queue is full; try again later")
+	ErrDestinationLimit              = errors.New("notification destination limit reached; remove an existing destination before adding another")
+	ErrArtistResolutionLimit         = errors.New("artist identification limit reached; review or cancel an existing item before adding another")
 	ErrSetupCompleted                = errors.New("setup has already completed")
 	ErrInvalidUsername               = errors.New("username must be 3-32 characters using letters, numbers, dots, underscores, or hyphens")
 	ErrUsernameTaken                 = errors.New("that username is already in use")
@@ -661,26 +663,45 @@ type AssuranceSummary struct {
 // support view. It intentionally excludes provider error text, credentials,
 // notification bodies, and destination URLs.
 type DiagnosticsSnapshot struct {
-	CheckedAt          time.Time
-	DatabaseHealthy    bool
-	SchemaVersion      int
-	FollowedArtists    int
-	Releases           int
-	QueuedSyncs        int
-	RunningSyncs       int
-	PendingDeliveries  int
-	FailedDeliveries   int
-	RecentLogEntries   int
-	OldestQueueAt      *time.Time
-	StaleClaims        int
-	PausedDestinations int
-	ProviderFailures   int
-	DigestBacklog      int
-	DatabaseBytes      int64
-	LastBackupAt       *time.Time
-	LastRestoreAt      *time.Time
-	LastRestoreResult  string
-	Providers          []DiagnosticsProvider
+	CheckedAt       time.Time
+	DatabaseHealthy bool
+	SchemaVersion   int
+	FollowedArtists int
+	Releases        int
+	QueuedSyncs     int
+	RunningSyncs    int
+	// DueSyncArtists is the total number of distinct followed artists whose
+	// normal or Spotify schedule is due. It is intentionally separate from
+	// the runner's per-tick batch size, which is capped for fairness.
+	DueSyncArtists    int
+	OldestDueSyncAt   *time.Time
+	PendingDeliveries int
+	FailedDeliveries  int
+	RecentLogEntries  int
+	OldestQueueAt     *time.Time
+	// FutureDeliveries flags pending work parked far beyond the normal retry
+	// horizon. This is a safe clock-skew signal; it does not alter admission.
+	FutureDeliveries       int
+	EarliestFutureDelivery *time.Time
+	StaleClaims            int
+	PausedDestinations     int
+	ProviderFailures       int
+	// These live-derived timestamps let operational health distinguish a
+	// transient provider/digest condition from one that has persisted beyond
+	// its documented warning threshold. They are not persisted in the bounded
+	// hourly snapshot table.
+	OldestProviderFailureAt *time.Time
+	DigestBacklog           int
+	OldestDigestBacklogAt   *time.Time
+	DatabaseBytes           int64
+	// DatabaseFreeBytes is the SQLite freelist space that can be reused by
+	// future writes. It is intentionally separate from DatabaseBytes because
+	// deleting rows does not necessarily shrink the database file.
+	DatabaseFreeBytes int64
+	LastBackupAt      *time.Time
+	LastRestoreAt     *time.Time
+	LastRestoreResult string
+	Providers         []DiagnosticsProvider
 }
 
 // OperationalSnapshot is a bounded, redacted history of the administrator

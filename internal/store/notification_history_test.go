@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -503,10 +504,131 @@ func TestDurableDeliveryClaimsRecoverExpiredWork(t *testing.T) {
 	if err != nil || len(claimedDigest) != 1 {
 		t.Fatalf("reclaimed digest delivery=%#v err=%v", claimedDigest, err)
 	}
+	if err := s.FinalizeDeliverySent(ctx, claimedNormal[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE id=?`, claimedNormal[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("active normal claim status=%q, want pending", status)
+	}
+	if err := s.FinalizeDigestDeliverySent(ctx, claimedDigest[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE id=?`, claimedDigest[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("active digest claim status=%q, want pending", status)
+	}
 	if err := s.MarkDeliverySentOwned(ctx, claimedNormal[0].ID, "worker-two", now); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("lost normal delivery claim error=%v, want sql.ErrNoRows", err)
 	}
 	if err := s.MarkDigestDeliveryFailedOwned(ctx, claimedDigest[0].ID, 1, "temporary", "worker-two", now); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("lost digest delivery claim error=%v, want sql.ErrNoRows", err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET claim_expires_at=? WHERE id=?`, timeText(now.Add(-time.Second)), claimedNormal[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE release_digest_deliveries SET claim_expires_at=? WHERE id=?`, timeText(now.Add(-time.Second)), claimedDigest[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := s.RecoverExpiredWork(ctx, now); err != nil || recovered != 2 {
+		t.Fatalf("recovered after active claim=%d err=%v, want two", recovered, err)
+	}
+	if err := s.FinalizeDeliverySent(ctx, claimedNormal[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinalizeDigestDeliverySent(ctx, claimedDigest[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE id=?`, claimedNormal[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "sent" {
+		t.Fatalf("finalized normal status=%q, want sent", status)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM release_digest_deliveries WHERE id=?`, claimedDigest[0].ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "sent" {
+		t.Fatalf("finalized digest status=%q, want sent", status)
+	}
+}
+
+func TestDeliveryClaimsShareBatchAcrossUsers(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userOne, err := s.CreateInitialAdmin(ctx, "fair-one@example.com", "hash", "UTC", "fair-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userTwo, err := s.CreateUser(ctx, "fair-two@example.com", "hash", "member", "UTC", "fair-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "fair-artist", Name: "Fair Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userOne, "One", "generic", []byte("encrypted-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userTwo, "Two", "generic", []byte("encrypted-two")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userOne)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("user one destinations=%#v err=%v", destinations, err)
+	}
+	destinationOne := destinations[0]
+	destinations, err = s.Destinations(ctx, userTwo)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("user two destinations=%#v err=%v", destinations, err)
+	}
+	destinationTwo := destinations[0]
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 7; i++ {
+		owner, destination := userOne, destinationOne
+		if i == 6 {
+			owner, destination = userTwo, destinationTwo
+		}
+		release, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`, fmt.Sprintf("fair-release-%d", i), artist.ID, fmt.Sprintf("Fair Release %d", i), "Album", "[]", "2026-08-13", 3, "", timeText(now), timeText(now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseID, err := release.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		event, err := s.DB.ExecContext(ctx, `INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`, owner, releaseID, "announcement", "Fair release", "body", timeText(now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventID, err := event.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`, eventID, destination.ID, "pending", 0, timeText(now.Add(-time.Minute)), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed, err := s.ClaimDueDeliveries(ctx, now, 25, "fair-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 6 {
+		t.Fatalf("claimed=%d, want five from user one plus one from user two", len(claimed))
+	}
+	counts := map[int64]int{}
+	for _, delivery := range claimed {
+		counts[delivery.Destination.UserID]++
+	}
+	if counts[userOne] != maxDeliveryClaimsPerUser || counts[userTwo] != 1 {
+		t.Fatalf("claimed per user=%v, want user one=%d user two=1", counts, maxDeliveryClaimsPerUser)
 	}
 }

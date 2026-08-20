@@ -584,6 +584,11 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 			"login_attempts", maintenance.LoginAttempts, "manual_syncs", maintenance.ManualSyncs,
 			"import_jobs", maintenance.ImportJobs)
 	}
+	if recovered, err := r.store.RecoverInterruptedImportJobs(ctx, now, time.Hour); err != nil {
+		r.logger.Warn("interrupted import recovery failed", "error", err)
+	} else if recovered > 0 {
+		r.logger.Info("interrupted imports recovered", "jobs", recovered)
+	}
 	if err := r.store.Optimize(ctx); err != nil {
 		r.logger.Debug("SQLite query optimization failed", "error", err)
 	}
@@ -1313,13 +1318,24 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 	}
 	if err == nil {
 		if markErr := r.store.MarkDigestDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
-			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
-			}
 			if errors.Is(markErr, sql.ErrNoRows) {
 				r.logger.Warn("notification delivery claim lost after send",
 					"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-				return deliveryResult{failed: true}
+				if attemptID > 0 {
+					if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+						return deliveryResult{sent: true, err: finishErr}
+					}
+				}
+				if finalizeErr := r.store.FinalizeDigestDeliverySent(ctx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
+					r.logger.Warn("notification delivery post-send finalization failed",
+						"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
+						"error", notify.RedactError(finalizeErr))
+					return deliveryResult{sent: true, err: finalizeErr}
+				}
+				return deliveryResult{sent: true}
+			}
+			if attemptID > 0 {
+				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
 			return deliveryResult{failed: true, err: markErr}
 		}
@@ -1378,13 +1394,24 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 	}
 	if err == nil {
 		if markErr := r.store.MarkDeliverySentOwned(ctx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
-			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
-			}
 			if errors.Is(markErr, sql.ErrNoRows) {
 				r.logger.Warn("notification delivery claim lost after send",
 					"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-				return deliveryResult{failed: true}
+				if attemptID > 0 {
+					if finishErr := r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+						return deliveryResult{sent: true, err: finishErr}
+					}
+				}
+				if finalizeErr := r.store.FinalizeDeliverySent(ctx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
+					r.logger.Warn("notification delivery post-send finalization failed",
+						"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
+						"error", notify.RedactError(finalizeErr))
+					return deliveryResult{sent: true, err: finalizeErr}
+				}
+				return deliveryResult{sent: true}
+			}
+			if attemptID > 0 {
+				_ = r.store.FinishDeliveryAttempt(ctx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
 			}
 			return deliveryResult{failed: true, err: markErr}
 		}

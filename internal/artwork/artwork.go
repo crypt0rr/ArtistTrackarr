@@ -527,14 +527,17 @@ func validateArtworkTarget(target *url.URL, allowLoopback bool) error {
 		return errors.New("artwork upstream URL is invalid")
 	}
 	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(target.Hostname()), "."))
-	if target.Scheme != "https" && !(allowLoopback && target.Scheme == "http" && isLoopbackHost(host)) {
+	allowLoopbackHTTP := allowLoopback && target.Scheme == "http" && isLoopbackHost(host)
+	if target.Scheme != "https" && !allowLoopbackHTTP {
 		return errors.New("artwork upstream must use HTTPS")
 	}
 	if !allowedArtworkHost(host, allowLoopback) {
 		return errors.New("artwork upstream host is not approved")
 	}
-	if port := target.Port(); port != "" && !(allowLoopback && isLoopbackHost(host) && port != "443") && port != "443" {
-		return errors.New("artwork upstream port is not approved")
+	if port := target.Port(); port != "" && port != "443" {
+		if !allowLoopback || !isLoopbackHost(host) {
+			return errors.New("artwork upstream port is not approved")
+		}
 	}
 	return nil
 }

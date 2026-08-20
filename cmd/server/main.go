@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,21 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/store"
 	appweb "github.com/crypt0rr/artist-tracker/internal/web"
 )
+
+// drainStartupResources persists the queued application records before the
+// database is closed. If draining times out, the caller must leave the
+// database open because the sink writer may still be using it.
+func drainStartupResources(sink *logging.AsyncSink, database *store.Store) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sink.Close(ctx); err != nil {
+		return fmt.Errorf("drain application log sink: %w", err)
+	}
+	if err := database.Close(); err != nil {
+		return fmt.Errorf("close database: %w", err)
+	}
+	return nil
+}
 
 func main() {
 	stdoutLogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -60,20 +76,29 @@ func main() {
 		return database.InsertApplicationLog(context.Background(), entry)
 	})
 	logHandler.SetSink(applicationLogs.Enqueue)
+	startupFailure := func() {
+		if err := drainStartupResources(applicationLogs, database); err != nil {
+			// The sink may still be using SQLite when its drain timed out. Do not
+			// close the database in that case; process exit will reclaim it safely.
+			stdoutLogger.Error("startup cleanup incomplete", "error", err)
+		}
+		databaseClosed = true
+		os.Exit(1)
+	}
 
 	cipher, err := security.NewCipher(cfg.EncryptionKey)
 	if err != nil {
 		logger.Error("create credential cipher", "error", err)
-		os.Exit(1)
+		startupFailure()
 	}
 	if err := database.ValidateDestinationCiphertexts(context.Background(), cipher.Decrypt); err != nil {
 		logger.Error("validate encrypted notification destinations", "error", err)
-		os.Exit(1)
+		startupFailure()
 	}
 	artworkCache, err := artwork.NewCache(filepath.Join(filepath.Dir(cfg.DatabasePath), "covers"))
 	if err != nil {
 		logger.Error("initialize artwork cache", "error", err)
-		os.Exit(1)
+		startupFailure()
 	}
 	musicBrainz := catalog.NewMusicBrainz(cfg.MusicBrainzContact)
 	spotify := catalog.NewSpotify(cfg.SpotifyClientID, cfg.SpotifySecret, cfg.SpotifyMarket)
@@ -101,7 +126,7 @@ func main() {
 	} else if !errors.Is(healthErr, sql.ErrNoRows) {
 		logger.Warn("restore iTunes provider cooldown failed", "error", healthErr)
 	}
-	sender := notify.ShoutrrrSender{AllowPrivateTargets: cfg.AllowPrivateNotificationTargets}
+	sender := notify.NewShoutrrrSender(cfg.AllowPrivateNotificationTargets, notify.DefaultSendTimeout)
 	var runnerOptions []jobs.Option
 	if spotify != nil {
 		runnerOptions = append(runnerOptions, jobs.WithSpotify(spotify))
@@ -115,7 +140,7 @@ func main() {
 	app, err := appweb.New(cfg, database, musicBrainz, spotifyProvider, sender, cipher, artworkCache, runner, logger, itunes)
 	if err != nil {
 		logger.Error("initialize web application", "error", err)
-		os.Exit(1)
+		startupFailure()
 	}
 
 	server := &http.Server{
@@ -134,18 +159,7 @@ func main() {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		logger.Error("bind HTTP listener failed", "address", cfg.ListenAddr, "error", err)
-		logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
-		logErr := applicationLogs.Close(logDrainCtx)
-		cancelLogDrain()
-		if logErr != nil {
-			// The process is terminating, but do not close SQLite while the
-			// asynchronous sink may still be writing to it.
-			databaseClosed = true
-			os.Exit(1)
-		}
-		_ = database.Close()
-		databaseClosed = true
-		os.Exit(1)
+		startupFailure()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -197,6 +211,7 @@ func main() {
 		databaseClosed = true
 		return
 	}
+	sender.CloseIdleConnections()
 	if dropped := applicationLogs.Dropped(); dropped > 0 {
 		stdoutLogger.Warn("application log records dropped", "count", dropped)
 	}

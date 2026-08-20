@@ -90,10 +90,11 @@ func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 	if a.jobs != nil {
 		runner = a.jobs.Status()
 	}
+	session, _ := currentSession(r)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `inline; filename="artisttrackarr-diagnostics.txt"`)
-	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner)); err != nil {
+	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner, session.User.Timezone)); err != nil {
 		a.logger.Debug("system diagnostics response interrupted", "error", err)
 	}
 }
@@ -138,24 +139,31 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 			Healthy:       snapshot.DatabaseHealthy,
 			Schema:        snapshot.SchemaVersion,
 			SizeBytes:     snapshot.DatabaseBytes,
+			FreeBytes:     snapshot.DatabaseFreeBytes,
 			LastBackupAt:  snapshot.LastBackupAt,
 			LastRestoreAt: snapshot.LastRestoreAt,
 			RestoreResult: snapshot.LastRestoreResult,
 		},
 		Inventory: diagnosticsJSONInventory{
-			FollowedArtists:  snapshot.FollowedArtists,
-			Releases:         snapshot.Releases,
-			RecentLogEntries: snapshot.RecentLogEntries,
-			ProviderFailures: snapshot.ProviderFailures,
+			FollowedArtists:         snapshot.FollowedArtists,
+			Releases:                snapshot.Releases,
+			RecentLogEntries:        snapshot.RecentLogEntries,
+			ProviderFailures:        snapshot.ProviderFailures,
+			OldestProviderFailureAt: snapshot.OldestProviderFailureAt,
 		},
 		Queue: diagnosticsJSONQueue{
-			QueuedSyncs:       snapshot.QueuedSyncs,
-			RunningSyncs:      snapshot.RunningSyncs,
-			PendingDeliveries: snapshot.PendingDeliveries,
-			FailedDeliveries:  snapshot.FailedDeliveries,
-			DigestBacklog:     snapshot.DigestBacklog,
-			OldestQueueAt:     snapshot.OldestQueueAt,
-			StaleClaims:       snapshot.StaleClaims,
+			QueuedSyncs:            snapshot.QueuedSyncs,
+			RunningSyncs:           snapshot.RunningSyncs,
+			DueSyncArtists:         snapshot.DueSyncArtists,
+			OldestDueSyncAt:        snapshot.OldestDueSyncAt,
+			PendingDeliveries:      snapshot.PendingDeliveries,
+			FailedDeliveries:       snapshot.FailedDeliveries,
+			DigestBacklog:          snapshot.DigestBacklog,
+			OldestDigestBacklogAt:  snapshot.OldestDigestBacklogAt,
+			OldestQueueAt:          snapshot.OldestQueueAt,
+			FutureDeliveries:       snapshot.FutureDeliveries,
+			EarliestFutureDelivery: snapshot.EarliestFutureDelivery,
+			StaleClaims:            snapshot.StaleClaims,
 		},
 		Destinations: diagnosticsJSONDestinations{
 			Paused: snapshot.PausedDestinations,
@@ -228,26 +236,33 @@ type diagnosticsJSONDatabase struct {
 	Healthy       bool       `json:"healthy"`
 	Schema        int        `json:"schema"`
 	SizeBytes     int64      `json:"size_bytes"`
+	FreeBytes     int64      `json:"free_bytes"`
 	LastBackupAt  *time.Time `json:"last_backup_at,omitempty"`
 	LastRestoreAt *time.Time `json:"last_restore_at,omitempty"`
 	RestoreResult string     `json:"restore_result,omitempty"`
 }
 
 type diagnosticsJSONQueue struct {
-	QueuedSyncs       int        `json:"queued_syncs"`
-	RunningSyncs      int        `json:"running_syncs"`
-	PendingDeliveries int        `json:"pending_deliveries"`
-	FailedDeliveries  int        `json:"failed_deliveries"`
-	DigestBacklog     int        `json:"digest_backlog"`
-	OldestQueueAt     *time.Time `json:"oldest_queue_at,omitempty"`
-	StaleClaims       int        `json:"stale_claims"`
+	QueuedSyncs            int        `json:"queued_syncs"`
+	RunningSyncs           int        `json:"running_syncs"`
+	DueSyncArtists         int        `json:"due_sync_artists"`
+	OldestDueSyncAt        *time.Time `json:"oldest_due_sync_at,omitempty"`
+	PendingDeliveries      int        `json:"pending_deliveries"`
+	FailedDeliveries       int        `json:"failed_deliveries"`
+	DigestBacklog          int        `json:"digest_backlog"`
+	OldestDigestBacklogAt  *time.Time `json:"oldest_digest_backlog_at,omitempty"`
+	OldestQueueAt          *time.Time `json:"oldest_queue_at,omitempty"`
+	FutureDeliveries       int        `json:"future_deliveries"`
+	EarliestFutureDelivery *time.Time `json:"earliest_future_delivery,omitempty"`
+	StaleClaims            int        `json:"stale_claims"`
 }
 
 type diagnosticsJSONInventory struct {
-	FollowedArtists  int `json:"followed_artists"`
-	Releases         int `json:"releases"`
-	RecentLogEntries int `json:"recent_log_entries"`
-	ProviderFailures int `json:"provider_failures"`
+	FollowedArtists         int        `json:"followed_artists"`
+	Releases                int        `json:"releases"`
+	RecentLogEntries        int        `json:"recent_log_entries"`
+	ProviderFailures        int        `json:"provider_failures"`
+	OldestProviderFailureAt *time.Time `json:"oldest_provider_failure_at,omitempty"`
 }
 
 type diagnosticsJSONDestinations struct {
@@ -397,7 +412,11 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.OperationalStatus, d.OperationalReasons = store.OperationalStatus(d.Diagnostics, runnerState, time.Now().UTC())
 	d.OperationalSnapshots, err = a.store.OperationalSnapshots(r.Context(), 24)
 	failed = a.pageStoreError(r, &d, "Household administration", "operational snapshot history", err) || failed
-	d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus)
+	if d.User != nil {
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, d.User.Timezone)
+	} else {
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, "UTC")
+	}
 	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
 	d.ManualSyncs, err = a.store.ManualSyncRequests(r.Context(), 20)
@@ -436,7 +455,7 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?message="+url.QueryEscape(fmt.Sprintf("Retention cleanup removed %d transient records; notification and delivery history was preserved.", removed)), http.StatusSeeOther)
 }
 
-func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus) string {
+func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string) string {
 	var report strings.Builder
 	runnerState := "stopped"
 	if runner.Running {
@@ -444,7 +463,11 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	}
 	status, reasons := store.OperationalStatus(snapshot, runnerState, snapshot.CheckedAt)
 	report.WriteString("ArtistTrackarr release assurance report\n")
-	fmt.Fprintf(&report, "Generated: %s\n", snapshot.CheckedAt.Format(time.RFC3339))
+	if strings.TrimSpace(timezone) == "" {
+		timezone = "UTC"
+	}
+	fmt.Fprintf(&report, "Timezone: %s\n", timezone)
+	fmt.Fprintf(&report, "Generated: %s\n", providerHealthTime(snapshot.CheckedAt, timezone))
 	fmt.Fprintf(&report, "Operational status: %s\n", store.DiagnosticStatusLabel(status))
 	if len(reasons) > 0 {
 		fmt.Fprintf(&report, "Operational reasons: %s\n", strings.Join(reasons, ", "))
@@ -454,30 +477,44 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)
 	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)
 	fmt.Fprintf(&report, "Running syncs: %d\n", snapshot.RunningSyncs)
+	fmt.Fprintf(&report, "Due artist syncs: %d\n", snapshot.DueSyncArtists)
+	if snapshot.OldestDueSyncAt != nil {
+		fmt.Fprintf(&report, "Oldest due artist sync: %s\n", providerHealthTime(snapshot.OldestDueSyncAt, timezone))
+	}
 	fmt.Fprintf(&report, "Pending deliveries: %d\n", snapshot.PendingDeliveries)
+	fmt.Fprintf(&report, "Clock-skewed future deliveries: %d\n", snapshot.FutureDeliveries)
+	if snapshot.EarliestFutureDelivery != nil {
+		fmt.Fprintf(&report, "Earliest clock-skewed delivery: %s\n", providerHealthTime(snapshot.EarliestFutureDelivery, timezone))
+	}
 	fmt.Fprintf(&report, "Digest backlog: %d\n", snapshot.DigestBacklog)
 	fmt.Fprintf(&report, "Failed deliveries: %d\n", snapshot.FailedDeliveries)
 	fmt.Fprintf(&report, "Stale work claims: %d\n", snapshot.StaleClaims)
 	fmt.Fprintf(&report, "Paused destinations: %d\n", snapshot.PausedDestinations)
 	fmt.Fprintf(&report, "Provider failures: %d\n", snapshot.ProviderFailures)
-	fmt.Fprintf(&report, "Database size: %d bytes\n", snapshot.DatabaseBytes)
+	if snapshot.OldestProviderFailureAt != nil {
+		fmt.Fprintf(&report, "Oldest provider failure: %s\n", providerHealthTime(snapshot.OldestProviderFailureAt, timezone))
+	}
+	if snapshot.OldestDigestBacklogAt != nil {
+		fmt.Fprintf(&report, "Oldest digest backlog: %s\n", providerHealthTime(snapshot.OldestDigestBacklogAt, timezone))
+	}
+	fmt.Fprintf(&report, "Database size: %d bytes; reusable space: %d bytes\n", snapshot.DatabaseBytes, snapshot.DatabaseFreeBytes)
 	if snapshot.OldestQueueAt != nil {
-		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", snapshot.OldestQueueAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", providerHealthTime(snapshot.OldestQueueAt, timezone))
 	}
 	if snapshot.LastBackupAt != nil {
-		fmt.Fprintf(&report, "Last backup: %s\n", snapshot.LastBackupAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Last backup: %s\n", providerHealthTime(snapshot.LastBackupAt, timezone))
 	} else {
-		fmt.Fprintln(&report, "Last backup: not recorded")
+		fmt.Fprintln(&report, "Last backup: not yet established")
 	}
 	if snapshot.LastRestoreAt != nil {
-		fmt.Fprintf(&report, "Last restore rehearsal: %s (%s)\n", snapshot.LastRestoreAt.Format(time.RFC3339), snapshot.LastRestoreResult)
+		fmt.Fprintf(&report, "Last restore rehearsal: %s (%s)\n", providerHealthTime(snapshot.LastRestoreAt, timezone), snapshot.LastRestoreResult)
 	} else {
 		fmt.Fprintln(&report, "Last restore rehearsal: not recorded")
 	}
 	fmt.Fprintf(&report, "Application events (24h): %d\n", snapshot.RecentLogEntries)
 	fmt.Fprintf(&report, "Scheduler: %s\n", diagnosticHealthLabel(runner.Running))
 	if runner.LastActivityAt != nil {
-		fmt.Fprintf(&report, "Scheduler last activity: %s\n", runner.LastActivityAt.Format(time.RFC3339))
+		fmt.Fprintf(&report, "Scheduler last activity: %s\n", providerHealthTime(runner.LastActivityAt, timezone))
 	}
 	fmt.Fprintf(&report, "Scheduler wakes: %d; overlaps: %d; recovered panics: %d\n",
 		runner.Metrics.WakeSignals, runner.Metrics.TaskOverlaps, runner.Metrics.TaskPanics)
@@ -497,7 +534,7 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	for _, provider := range snapshot.Providers {
 		fmt.Fprintf(&report, "- %s: %s", provider.Provider, provider.Status)
 		if provider.NextCheckAt != nil {
-			fmt.Fprintf(&report, "; next check %s", provider.NextCheckAt.Format(time.RFC3339))
+			fmt.Fprintf(&report, "; next check %s", providerHealthTime(provider.NextCheckAt, timezone))
 		}
 		report.WriteByte('\n')
 	}

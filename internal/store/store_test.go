@@ -263,6 +263,9 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 		t.Fatal(err)
 	}
 	userID, _ := userResult.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO import_jobs(user_id,created_at) VALUES(?,?)`, userID, nowText()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`INSERT INTO application_logs(created_at,level,message,attributes_json) VALUES(?,?,?,?)`,
 		"2026-08-04T10:00:00+02:00", "INFO", "legacy timestamp", "[]"); err != nil {
 		t.Fatal(err)
@@ -353,6 +356,13 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=29`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
 		t.Fatalf("hot path indexes migration marker=%d err=%v", migrationsApplied, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=30`).Scan(&migrationsApplied); err != nil || migrationsApplied != 1 {
+		t.Fatalf("import job status migration marker=%d err=%v", migrationsApplied, err)
+	}
+	var importStatus string
+	if err := db.QueryRow(`SELECT status FROM import_jobs WHERE id=(SELECT MIN(id) FROM import_jobs)`).Scan(&importStatus); err != nil || importStatus != "complete" {
+		t.Fatalf("legacy import status=%q err=%v, want complete", importStatus, err)
 	}
 	for _, indexName := range []string{"idx_provider_observations_release_observed", "idx_follows_artist_user", "idx_import_rows_job_id", "release_credits_release_artist", "release_credits_artist_release", "destinations_user_enabled", "deliveries_status_due_destination", "release_digest_deliveries_status_due_destination", "destinations_transport_status", "manual_sync_leases", "deliveries_claim_expiry", "release_digest_deliveries_claim_expiry", "delivery_attempts_started", "artist_provider_identities_provider_id", "release_groups_precision_date", "notification_events_created_id", "deliveries_event_id"} {
 		var found string
@@ -528,6 +538,9 @@ func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if job.Status != "processing" {
+		t.Fatalf("new import status=%q, want processing", job.Status)
+	}
 	mbid := "11111111-1111-4111-8111-111111111111"
 	row, err := s.SaveImportRow(ctx, userID, job.ID, ImportInput{
 		SourceValue: "https://musicbrainz.org/artist/" + mbid,
@@ -559,6 +572,48 @@ func TestImportRowsAreOwnerScopedAndScheduleNewFollows(t *testing.T) {
 	var next sql.NullString
 	if err := s.DB.QueryRow(`SELECT next_check_at FROM artists WHERE mbid=?`, mbid).Scan(&next); err != nil || !next.Valid {
 		t.Fatalf("imported artist was not scheduled: %q err=%v", next.String, err)
+	}
+}
+
+func TestImportJobCompletionAndInterruptedRecovery(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "import-status@example.com", "hash", "member", "UTC", "import-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishImportJob(ctx, userID, job.ID, "complete"); err != nil {
+		t.Fatalf("finish import=%v", err)
+	}
+	loaded, err := s.ImportJob(ctx, userID, job.ID)
+	if err != nil || loaded.Status != "complete" || loaded.FinishedAt == nil {
+		t.Fatalf("completed import=%#v err=%v", loaded, err)
+	}
+	if err := s.FinishImportJob(ctx, userID, job.ID, "complete"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("repeat completion err=%v, want sql.ErrNoRows", err)
+	}
+	interrupted, err := s.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE import_jobs SET created_at=? WHERE id=?`, timeText(now.Add(-2*time.Hour)), interrupted.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := s.RecoverInterruptedImportJobs(ctx, now, time.Hour)
+	if err != nil || recovered != 1 {
+		t.Fatalf("recovered=%d err=%v, want 1", recovered, err)
+	}
+	loaded, err = s.ImportJob(ctx, userID, interrupted.ID)
+	if err != nil || loaded.Status != "interrupted" || loaded.FinishedAt == nil {
+		t.Fatalf("interrupted import=%#v err=%v", loaded, err)
+	}
+	if _, err := s.RecoverInterruptedImportJobs(ctx, now, time.Hour); err != nil {
+		t.Fatalf("repeat recovery=%v", err)
 	}
 }
 
@@ -939,6 +994,35 @@ func TestSpotifyAdaptivePollingPersistsAndBacksOff(t *testing.T) {
 	state, err = s.SpotifyPollingState(ctx, artist.ID)
 	if err != nil || state.UnchangedChecks != 0 {
 		t.Fatalf("change did not reset state=%#v err=%v", state, err)
+	}
+}
+
+func TestSpotifyPollingStatePreservesLookupAndTimestampErrors(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+
+	if _, err := s.SpotifyPollingState(ctx, 999999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing artist error=%v, want sql.ErrNoRows", err)
+	}
+
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "polling-state-errors", Name: "Polling State Errors"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`, 3, "not-a-timestamp", artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SpotifyPollingState(ctx, artist.ID); err == nil || !strings.Contains(err.Error(), "spotify_last_change_at") {
+		t.Fatalf("malformed timestamp error=%v, want field context", err)
+	}
+
+	valid := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE artists SET spotify_unchanged_checks=?,spotify_last_change_at=? WHERE id=?`, 4, timeText(valid), artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.SpotifyPollingState(ctx, artist.ID)
+	if err != nil || state.UnchangedChecks != 4 || state.LastChangeAt == nil || !state.LastChangeAt.Equal(valid) {
+		t.Fatalf("valid state=%#v err=%v", state, err)
 	}
 }
 
@@ -1525,6 +1609,55 @@ func TestSpotifyReleaseIsPromotedToMusicBrainzWithoutDuplicate(t *testing.T) {
 	assertEventCount(t, s, userID, "announcement", 1)
 }
 
+func TestProviderDerivedTypeMismatchStillMergesByTitleAndDate(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "derived-type@example.com", "unused", "member", "UTC", "derived-type")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "derived-type-artist", Name: "Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 8, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "itunes", Releases: []Release{{
+			MBID: "itunes:derived-type-release", ITunesID: "derived-type-release", Title: "Shared Release",
+			PrimaryType: "EP", FirstReleaseDate: "2026-08-21", DatePrecision: 3,
+			ITunesURL: "https://music.apple.com/us/album/shared-release/derived-type-release", Source: "itunes",
+		}},
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{
+		Provider: "spotify", Releases: []Release{{
+			MBID: "spotify:derived-type-release", SpotifyID: "derived-type-release", Title: "Shared Release",
+			PrimaryType: "Album", FirstReleaseDate: "2026-08-21", DatePrecision: 3,
+			SpotifyURL: "https://open.spotify.com/album/derived-type-release", Source: "spotify",
+		}},
+	}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("release rows=%d, want one cross-provider match", count)
+	}
+	var source, primaryType string
+	if err := s.DB.QueryRowContext(ctx, `SELECT source,primary_type FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&source, &primaryType); err != nil {
+		t.Fatal(err)
+	}
+	if source != "both" || primaryType != "EP" {
+		t.Fatalf("merged source/type=%q/%q, want both/EP (canonical first provider)", source, primaryType)
+	}
+}
+
 func TestSpotifyEditionsCollapseIntoOneRelease(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
@@ -2081,6 +2214,229 @@ func TestAdminUsersAndDeleteUser(t *testing.T) {
 	}
 	if err := s.DeleteUser(ctx, adminID, 99999); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing user delete error=%v", err)
+	}
+}
+
+func TestDeleteUserCascadesEveryOwnerScopedTable(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	adminID, err := s.CreateUser(ctx, "cascade-admin@example.com", "unused", "admin", "UTC", "cascade-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberID, err := s.CreateUser(ctx, "cascade-member@example.com", "unused", "member", "UTC", "cascade-member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "cascade-artist", Name: "Cascade Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, memberID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, memberID, "Cascade destination", "ntfy", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuthToken(ctx, "reset", "cascade-member@example.com", &memberID, adminID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.CreateImportJob(ctx, memberID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveImportRow(ctx, memberID, job.ID, ImportInput{DisplayName: "Cascade Artist", SourceValue: artist.MBID, MBID: artist.MBID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateArtistResolution(ctx, memberID, "spotify", "cascade-spotify", "Cascade Artist", "https://open.spotify.com/artist/cascade-spotify", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateManualSyncRequest(ctx, memberID, "artist", &artist.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	observed := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	if err := s.ApplyReleaseSync(ctx, artist, []Release{{
+		MBID: "cascade-release", SpotifyID: "cascade-release", Title: "Cascade Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-08-25", DatePrecision: 3,
+	}}, observed); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID, eventID, destinationID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, "cascade-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM notification_events WHERE user_id=? AND release_group_id=?`, memberID, releaseID).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM destinations WHERE user_id=?`, memberID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReleaseInboxState(ctx, memberID, releaseID, "read", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?)`, releaseID, "title_conflict", "warning", "cascade", "cascade", "open", timeText(observed), timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	var issueID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_evidence_issues WHERE release_group_id=?`, releaseID).Scan(&issueID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_reviews(user_id,issue_id,state,updated_at) VALUES(?,?,?,?)`, memberID, issueID, "confirmed", timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO notification_holds
+		(user_id,release_group_id,event_type,title,body,planned_at,status,created_at)
+		VALUES(?,?,?,?,?,?,?,?)`, memberID, releaseID, "announcement", "cascade", "cascade", timeText(observed), "held", timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_truth_decisions
+		(release_group_id,state,selected_provider,selected_provider_id,decided_by_user_id,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?)`, releaseID, "confirmed", "spotify", "cascade-release", memberID, timeText(observed), timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs
+		(user_id,frequency,period_start,title,body,release_count,status,created_at)
+		VALUES(?,?,?,?,?,?,?,?)`, memberID, "daily", "2026-08-20", "cascade", "cascade", 1, "pending", timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	var runID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_digest_runs WHERE user_id=?`, memberID).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM destinations WHERE id=?`, destinationID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`, runID, destinationID, "pending", timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO follow_credit_baselines(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`, memberID, artist.ID, "spotify", "featured", timeText(observed)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUser(ctx, adminID, memberID); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.DB.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			t.Fatal(err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range tables {
+		columns, err := s.DB.QueryContext(ctx, `PRAGMA table_info("`+strings.ReplaceAll(table, `"`, `""`)+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = columns.Close() }()
+		hasUserID := false
+		for columns.Next() {
+			var cid int
+			var name, columnType string
+			var notNull, primaryKey int
+			var defaultValue sql.NullString
+			if err := columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				t.Fatal(err)
+			}
+			if name == "user_id" {
+				hasUserID = true
+			}
+		}
+		if err := columns.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if !hasUserID {
+			continue
+		}
+		var count int
+		if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" WHERE user_id=?`, memberID).Scan(&count); err != nil {
+			t.Fatalf("owner table %s query failed: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("owner table %s retained %d rows for deleted user", table, count)
+		}
+	}
+	var decidedBy sql.NullInt64
+	if err := s.DB.QueryRowContext(ctx, `SELECT decided_by_user_id FROM release_truth_decisions WHERE release_group_id=?`, releaseID).Scan(&decidedBy); err != nil {
+		t.Fatal(err)
+	}
+	if decidedBy.Valid {
+		t.Fatalf("SET NULL truth decision retained deleted user %d", decidedBy.Int64)
+	}
+	var artistCount, releaseCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM artists WHERE id=?`, artist.ID).Scan(&artistCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE id=?`, releaseID).Scan(&releaseCount); err != nil {
+		t.Fatal(err)
+	}
+	if artistCount != 1 || releaseCount != 1 {
+		t.Fatalf("shared artist/release counts=%d/%d, want 1/1", artistCount, releaseCount)
+	}
+	foreignKeys, err := s.DB.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = foreignKeys.Close() }()
+	if foreignKeys.Next() {
+		var tableName string
+		if err := foreignKeys.Scan(&tableName, new(int64), new(string), new(int)); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("foreign key violation after user deletion in %s", tableName)
+	}
+	if err := foreignKeys.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every direct users foreign key must cascade, except intentionally nullable
+	// audit attribution fields. This catches future owner tables that would
+	// otherwise retain household data after account deletion.
+	for _, table := range tables {
+		foreignKeys, err := s.DB.QueryContext(ctx, `PRAGMA foreign_key_list("`+strings.ReplaceAll(table, `"`, `""`)+`")`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = foreignKeys.Close() }()
+		for foreignKeys.Next() {
+			var id, sequence int
+			var referenced, from, to, onUpdate, onDelete, match string
+			if err := foreignKeys.Scan(&id, &sequence, &referenced, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+				t.Fatal(err)
+			}
+			if referenced != "users" {
+				continue
+			}
+			switch from {
+			case "created_by", "decided_by_user_id":
+				if onDelete != "SET NULL" {
+					t.Fatalf("%s.%s users FK action=%q, want SET NULL", table, from, onDelete)
+				}
+			default:
+				if onDelete != "CASCADE" {
+					t.Fatalf("%s.%s users FK action=%q, want CASCADE", table, from, onDelete)
+				}
+			}
+		}
+		if err := foreignKeys.Err(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

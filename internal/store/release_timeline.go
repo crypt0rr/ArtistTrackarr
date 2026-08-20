@@ -231,7 +231,8 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 			return nil, parseErr
 		}
 		summary := notificationEventTypeLabel(eventType) + " held: " + strings.TrimSpace(reason)
-		if status == "released" {
+		switch status {
+		case "released":
 			summary = notificationEventTypeLabel(eventType) + " hold released"
 			if strings.TrimSpace(releasedAt) != "" {
 				released, releaseErr := parseStoredTime(releasedAt, "release timeline hold released_at")
@@ -240,7 +241,7 @@ func (s *Store) ReleaseTimeline(ctx context.Context, userID, releaseID int64) ([
 				}
 				when = released
 			}
-		} else if status == "discarded" {
+		case "discarded":
 			summary = notificationEventTypeLabel(eventType) + " hold discarded"
 		}
 		appendEntry(ReleaseTimelineEntry{

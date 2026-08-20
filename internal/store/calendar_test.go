@@ -6,7 +6,48 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+func TestReminderMinutesNormalizesLegacyValues(t *testing.T) {
+	cases := []struct {
+		value string
+		want  int
+		ok    bool
+	}{
+		{value: "09:00", want: 9 * 60, ok: true},
+		{value: "9:05", want: 9*60 + 5, ok: true},
+		{value: " 23:59 ", want: 23*60 + 59, ok: true},
+		{value: "24:00", ok: false},
+		{value: "not-a-time", ok: false},
+	}
+	for _, tc := range cases {
+		got, ok := reminderMinutes(tc.value)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("reminderMinutes(%q)=(%d,%v), want (%d,%v)", tc.value, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestBuildDigestBodyIsBoundedAndValidUTF8(t *testing.T) {
+	releases := make([]CalendarRelease, 0, 100)
+	for i := 0; i < 100; i++ {
+		releases = append(releases, CalendarRelease{Release: Release{
+			Title: strings.Repeat("é", 120), PrimaryType: "Album", FirstReleaseDate: "2026-08-21", DatePrecision: 3,
+			ArtistName: "Digest Artist",
+		}, CalendarDate: "2026-08-21"})
+	}
+	body := buildDigestBody(releases, "daily")
+	if len([]byte(body)) > 3500 {
+		t.Fatalf("digest body bytes=%d, want <=3500", len([]byte(body)))
+	}
+	if !utf8.ValidString(body) {
+		t.Fatal("digest body is not valid UTF-8")
+	}
+	if !strings.Contains(body, "additional releases omitted") {
+		t.Fatalf("bounded digest did not explain truncation: %q", body)
+	}
+}
 
 func TestCalendarReleasesAreOwnerScopedAndExposeHoldState(t *testing.T) {
 	ctx := context.Background()

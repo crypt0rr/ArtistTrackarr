@@ -81,11 +81,16 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		d := a.data(r, "Settings")
 		d.Error = notify.RedactError(err)
-		if a.loadSettingsData(r, &d) {
-			a.render(w, "settings", d, http.StatusInternalServerError)
-		} else {
-			a.render(w, "settings", d, http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if !errors.Is(err, store.ErrDestinationLimit) && a.loadSettingsData(r, &d) {
+			status = http.StatusInternalServerError
+		} else if errors.Is(err, store.ErrDestinationLimit) {
+			// This is a user-actionable admission limit, not a database failure;
+			// keep the settings page and explain how to recover.
+			d.Error = err.Error()
+			_ = a.loadSettingsData(r, &d)
 		}
+		a.render(w, "settings", d, status)
 		return
 	}
 	http.Redirect(w, r, "/settings?message=Destination+added", http.StatusSeeOther)

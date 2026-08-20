@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -188,6 +189,36 @@ func TestLatestSpotifyReleaseDateAndArtistResolutionLifecycle(t *testing.T) {
 	completed, added, err := s.CompleteArtistResolution(ctx, ArtistResolution{ID: 0, UserID: userID}, Artist{})
 	if !errors.Is(err, sql.ErrNoRows) || completed.ID != 0 || added {
 		t.Fatalf("missing resolution completion=%#v added=%v err=%v", completed, added, err)
+	}
+}
+
+func TestMemberOwnedDestinationsAndResolutionsAreBounded(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "bounded-work@example.com", "hash", "member", "UTC", "bounded-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxDestinationsPerUser; i++ {
+		if err := s.AddDestination(ctx, userID, fmt.Sprintf("Destination %d", i), "ntfy", []byte("encrypted")); err != nil {
+			t.Fatalf("destination %d: %v", i, err)
+		}
+	}
+	if err := s.AddDestination(ctx, userID, "one too many", "ntfy", []byte("encrypted")); !errors.Is(err, ErrDestinationLimit) {
+		t.Fatalf("destination limit error=%v, want ErrDestinationLimit", err)
+	}
+
+	for i := 0; i < maxArtistResolutionsPerUser; i++ {
+		if _, created, err := s.CreateArtistResolution(ctx, userID, "spotify", fmt.Sprintf("bounded-%d", i), "Bounded Artist", "https://open.spotify.com/artist/bounded", ""); err != nil || !created {
+			t.Fatalf("resolution %d created=%v err=%v", i, created, err)
+		}
+	}
+	duplicate, created, err := s.CreateArtistResolution(ctx, userID, "spotify", "bounded-0", "Bounded Artist", "https://open.spotify.com/artist/bounded", "")
+	if err != nil || created || duplicate.ID == 0 {
+		t.Fatalf("duplicate resolution=%#v created=%v err=%v", duplicate, created, err)
+	}
+	if _, created, err := s.CreateArtistResolution(ctx, userID, "spotify", "bounded-extra", "Bounded Artist", "https://open.spotify.com/artist/bounded", ""); !errors.Is(err, ErrArtistResolutionLimit) || created {
+		t.Fatalf("resolution limit created=%v err=%v, want ErrArtistResolutionLimit", created, err)
 	}
 }
 

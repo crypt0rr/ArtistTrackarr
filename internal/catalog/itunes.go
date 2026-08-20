@@ -36,6 +36,7 @@ type ITunes struct {
 	releaseCache    map[string]itunesReleaseCache
 	searchCalls     map[string]*itunesSearchCall
 	releaseCalls    map[string]*itunesReleaseCall
+	artistCalls     map[string]*itunesArtistCall
 	searchTTL       time.Duration
 	emptySearchTTL  time.Duration
 	releaseTTL      time.Duration
@@ -78,6 +79,28 @@ func (e *ITunesAPIError) Error() string {
 	return fmt.Sprintf("%s returned %s", e.Operation, e.StatusText)
 }
 
+// ITunesArtistNotFoundError indicates that the iTunes API was reachable but
+// did not contain an exact artist identity. This is a negative catalog result,
+// not a provider outage, so callers may safely continue with their fallback
+// source without marking iTunes degraded.
+type ITunesArtistNotFoundError struct {
+	Name string
+	ID   string
+}
+
+func (e *ITunesArtistNotFoundError) Error() string {
+	if e == nil {
+		return "iTunes artist was not found"
+	}
+	if strings.TrimSpace(e.ID) != "" {
+		return fmt.Sprintf("iTunes artist %q was not found", e.ID)
+	}
+	if strings.TrimSpace(e.Name) != "" {
+		return fmt.Sprintf("iTunes artist %q was not found", e.Name)
+	}
+	return "iTunes artist was not found"
+}
+
 type itunesSearchCache struct {
 	observedAt time.Time
 	expiresAt  time.Time
@@ -100,6 +123,12 @@ type itunesReleaseCall struct {
 	done    chan struct{}
 	results []store.Release
 	err     error
+}
+
+type itunesArtistCall struct {
+	done   chan struct{}
+	artist ITunesArtist
+	err    error
 }
 
 type itunesResult struct {
@@ -140,6 +169,7 @@ func NewITunes(country string) *ITunes {
 		releaseCache:    make(map[string]itunesReleaseCache),
 		searchCalls:     make(map[string]*itunesSearchCall),
 		releaseCalls:    make(map[string]*itunesReleaseCall),
+		artistCalls:     make(map[string]*itunesArtistCall),
 		searchTTL:       10 * time.Minute,
 		emptySearchTTL:  2 * time.Minute,
 		releaseTTL:      24 * time.Hour,
@@ -188,7 +218,7 @@ func (i *ITunes) SearchArtists(ctx context.Context, query string) ([]ITunesArtis
 		i.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return cloneITunesArtists(call.results), call.err
+			return cloneITunesArtists(call.results), coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -246,6 +276,30 @@ func (i *ITunes) Artist(ctx context.Context, id string) (ITunesArtist, error) {
 	if !validITunesID(id) {
 		return ITunesArtist{}, errors.New("invalid iTunes artist ID")
 	}
+	i.cacheMu.Lock()
+	if call, ok := i.artistCalls[id]; ok {
+		i.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return call.artist, coalescedRequestError(ctx, call.err)
+		case <-ctx.Done():
+			return ITunesArtist{}, ctx.Err()
+		}
+	}
+	call := &itunesArtistCall{done: make(chan struct{})}
+	i.artistCalls[id] = call
+	i.cacheMu.Unlock()
+
+	artist, err := i.artistByID(ctx, id)
+	i.cacheMu.Lock()
+	delete(i.artistCalls, id)
+	call.artist, call.err = artist, err
+	close(call.done)
+	i.cacheMu.Unlock()
+	return artist, err
+}
+
+func (i *ITunes) artistByID(ctx context.Context, id string) (ITunesArtist, error) {
 	endpoint := i.baseURL + "/lookup?id=" + url.QueryEscape(id) +
 		"&country=" + url.QueryEscape(i.country) + "&entity=musicArtist&limit=1"
 	var response itunesResponse
@@ -261,7 +315,7 @@ func (i *ITunes) Artist(ctx context.Context, id string) (ITunesArtist, error) {
 			return ITunesArtist{ID: id, Name: strings.TrimSpace(item.ArtistName), URL: artistURL}, nil
 		}
 	}
-	return ITunesArtist{}, errors.New("iTunes artist was not found")
+	return ITunesArtist{}, &ITunesArtistNotFoundError{ID: id}
 }
 
 func (i *ITunes) ArtistReleases(ctx context.Context, artistName string) ([]store.Release, error) {
@@ -333,7 +387,7 @@ func (i *ITunes) resolveExactArtist(ctx context.Context, artistName string) (ITu
 		matches = append(matches, artist)
 	}
 	if len(matches) == 0 {
-		return ITunesArtist{}, fmt.Errorf("iTunes artist %q was not found", artistName)
+		return ITunesArtist{}, &ITunesArtistNotFoundError{Name: artistName}
 	}
 	if len(matches) > 1 {
 		ids := make([]string, 0, len(matches))
@@ -367,7 +421,7 @@ func (i *ITunes) artistReleasesCached(ctx context.Context, key, artistName, arti
 		i.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return cloneITunesReleases(call.results), call.err
+			return cloneITunesReleases(call.results), coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -687,25 +741,11 @@ func iTunesDate(value string) (string, int) {
 }
 
 func iTunesReleaseType(title string, trackCount int) string {
-	lower := strings.ToLower(strings.TrimSpace(title))
-	if trackCount == 1 || containsReleaseWord(lower, "single") {
-		return "Single"
+	primaryType, _, ok := classifyReleaseType("album", "", title, trackCount)
+	if !ok {
+		return "Album"
 	}
-	if (trackCount >= 2 && trackCount <= 6) || containsReleaseWord(lower, "ep") {
-		return "EP"
-	}
-	return "Album"
-}
-
-func containsReleaseWord(title, word string) bool {
-	for _, part := range strings.FieldsFunc(title, func(r rune) bool {
-		return r < 'a' || r > 'z'
-	}) {
-		if part == word {
-			return true
-		}
-	}
-	return false
+	return primaryType
 }
 
 func validITunesID(value string) bool {

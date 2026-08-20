@@ -104,7 +104,7 @@ func (l *ListenBrainz) Popularity(ctx context.Context, mbids []string) (map[stri
 		l.cacheMu.Unlock()
 		select {
 		case <-call.done:
-			return mergeListenBrainzStats(result, call.stats), call.err
+			return mergeListenBrainzStats(result, call.stats), coalescedRequestError(ctx, call.err)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

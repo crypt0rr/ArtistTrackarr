@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"time"
 )
@@ -11,7 +12,9 @@ import (
 type ImportJob struct {
 	ID              int64
 	UserID          int64
+	Status          string
 	CreatedAt       time.Time
+	FinishedAt      *time.Time
 	Rows            []ImportRow
 	Added           int
 	AlreadyFollowed int
@@ -44,7 +47,7 @@ type ImportInput struct {
 
 func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, error) {
 	now := nowText()
-	result, err := s.execWriteContext(ctx, `INSERT INTO import_jobs(user_id,created_at) VALUES(?,?)`, userID, now)
+	result, err := s.execWriteContext(ctx, `INSERT INTO import_jobs(user_id,created_at,status) VALUES(?,?,?)`, userID, now, "processing")
 	if err != nil {
 		return ImportJob{}, err
 	}
@@ -56,7 +59,37 @@ func (s *Store) CreateImportJob(ctx context.Context, userID int64) (ImportJob, e
 	if err != nil {
 		return ImportJob{}, err
 	}
-	return ImportJob{ID: id, UserID: userID, CreatedAt: created}, nil
+	return ImportJob{ID: id, UserID: userID, Status: "processing", CreatedAt: created}, nil
+}
+
+// FinishImportJob records the terminal state of an upload. It is deliberately
+// owner-scoped and idempotent: a retry after a completed request cannot change
+// the result, while a failed request can still be marked explicitly.
+func (s *Store) FinishImportJob(ctx context.Context, userID, jobID int64, status string) error {
+	if status != "complete" && status != "failed" {
+		return errors.New("invalid import job status")
+	}
+	result, err := s.execWriteContext(ctx, `UPDATE import_jobs SET status=?,finished_at=?
+		WHERE id=? AND user_id=? AND status='processing'`, status, nowText(), jobID, userID)
+	if err != nil {
+		return err
+	}
+	return changedOrNotFound(result, nil)
+}
+
+// RecoverInterruptedImportJobs marks uploads that were left processing after
+// a request or process interruption. A generous stale window avoids racing a
+// large, legitimate upload while ensuring an interrupted job is visible.
+func (s *Store) RecoverInterruptedImportJobs(ctx context.Context, now time.Time, staleAfter time.Duration) (int64, error) {
+	if staleAfter <= 0 {
+		staleAfter = time.Hour
+	}
+	result, err := s.execWriteContext(ctx, `UPDATE import_jobs SET status='interrupted',finished_at=?
+		WHERE status='processing' AND created_at<=?`, timeText(now), timeText(now.Add(-staleAfter)))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // SaveImportRow persists one row and, for valid input, creates or reuses the
@@ -140,13 +173,17 @@ func insertImportRowTx(ctx context.Context, tx *sql.Tx, row ImportRow) error {
 func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, error) {
 	var job ImportJob
 	var created string
-	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,created_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
-		Scan(&job.ID, &job.UserID, &created)
+	var finished sql.NullString
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,status,created_at,finished_at FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
+		Scan(&job.ID, &job.UserID, &job.Status, &created, &finished)
 	if err != nil {
 		return ImportJob{}, err
 	}
 	job.CreatedAt, err = parseStoredTime(created, "import job created_at")
 	if err != nil {
+		return ImportJob{}, err
+	}
+	if job.FinishedAt, err = parseStoredNullableTime(finished, "import job finished_at"); err != nil {
 		return ImportJob{}, err
 	}
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,job_id,source_value,display_name,status,artist_id,reason

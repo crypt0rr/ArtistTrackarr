@@ -17,6 +17,7 @@ const artistProviderStatusColumns = `artist_id,provider,status,last_attempt_at,l
 // batch; in that case the previously observed count is retained.
 func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistProviderStatus) error {
 	provider := strings.ToLower(strings.TrimSpace(status.Provider))
+	status.Status = strings.ToLower(strings.TrimSpace(status.Status))
 	if status.ArtistID < 1 || (provider != "spotify" && provider != "itunes" && provider != "musicbrainz") {
 		return errors.New("invalid artist provider status")
 	}
@@ -29,6 +30,31 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 	updated := status.UpdatedAt
 	if updated.IsZero() {
 		updated = time.Now().UTC()
+	}
+	// A standby/skipped result means this provider was deliberately not
+	// contacted because an earlier provider supplied a usable catalog (or its
+	// check was deferred). It must update the current per-artist state without
+	// erasing the last meaningful failure, success, error, or retry deadline.
+	// In particular, replacing a previous failure with an empty status would
+	// make the Trust Center lose the evidence needed to explain recovery.
+	if status.Status == "standby" || status.Status == "skipped" {
+		_, err := s.execWriteContext(ctx, `INSERT INTO artist_provider_status
+			(artist_id,provider,status,last_attempt_at,last_success_at,last_failure_at,next_check_at,
+			 release_count,last_error,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(artist_id,provider) DO UPDATE SET
+			 status=excluded.status,
+			 last_attempt_at=COALESCE(excluded.last_attempt_at,artist_provider_status.last_attempt_at),
+			 last_success_at=COALESCE(excluded.last_success_at,artist_provider_status.last_success_at),
+			 last_failure_at=COALESCE(excluded.last_failure_at,artist_provider_status.last_failure_at),
+			 next_check_at=COALESCE(excluded.next_check_at,artist_provider_status.next_check_at),
+			release_count=artist_provider_status.release_count,
+			 last_error=CASE WHEN excluded.last_error<>'' THEN excluded.last_error ELSE artist_provider_status.last_error END,
+			 updated_at=excluded.updated_at`,
+			status.ArtistID, provider, status.Status, nullableTime(status.LastAttemptAt),
+			nullableTime(status.LastSuccessAt), nullableTime(status.LastFailureAt), nullableTime(status.NextCheckAt),
+			status.ReleaseCount, status.LastError, timeText(updated))
+		return err
 	}
 	_, err := s.execWriteContext(ctx, `INSERT INTO artist_provider_status
 		(artist_id,provider,status,last_attempt_at,last_success_at,last_failure_at,next_check_at,
@@ -288,7 +314,7 @@ func coverageAssurance(item ArtistCoverage, now time.Time) (string, string, stri
 		}
 	}
 	for _, status := range item.ProviderStatuses {
-		if status.Status == "failed" || status.Status == "cooldown" {
+		if status.Status == "failed" || status.Status == "cooldown" || status.Status == "degraded" {
 			return "degraded", "A provider is unavailable or rate-limited; fallback data may still be available.", provider
 		}
 	}
@@ -329,24 +355,24 @@ func (s *Store) artistProviderStatuses(ctx context.Context, ids []int64) (map[in
 		for _, id := range ids[start:end] {
 			args = append(args, id)
 		}
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+artistProviderStatusColumns+`
-			FROM artist_provider_status WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,provider`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			status, err := scanArtistProviderStatus(rows)
+		if err := func() error {
+			rows, err := s.readerDB().QueryContext(ctx, `SELECT `+artistProviderStatusColumns+`
+				FROM artist_provider_status WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,provider`, args...)
 			if err != nil {
-				_ = rows.Close()
-				return nil, err
+				return err
 			}
-			result[status.ArtistID] = append(result[status.ArtistID], status)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				status, err := scanArtistProviderStatus(rows)
+				if err != nil {
+					return err
+				}
+				result[status.ArtistID] = append(result[status.ArtistID], status)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-		_ = rows.Close()
 	}
 	return result, nil
 }
@@ -361,51 +387,50 @@ func (s *Store) coverageReleaseStats(ctx context.Context, ids []int64) (map[int6
 			args = append(args, id)
 		}
 		queryArgs := append(append([]any(nil), args...), args...)
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT followed_artist_id,COUNT(*),
-			SUM(CASE WHEN provider_count>=2 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN provider_count=1 THEN 1 ELSE 0 END),
-			SUM(CASE WHEN provider_count=1 AND itunes_provider=1 THEN 1 ELSE 0 END),MAX(last_observed_at)
-			FROM (
-				SELECT rg.id,rg.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
-					MAX(po.observed_at) AS last_observed_at,
-					MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
-				FROM release_groups rg LEFT JOIN provider_observations po ON po.release_group_id=rg.id
-				WHERE rg.artist_id IN (`+placeholders+`)
-				GROUP BY rg.id,rg.artist_id
-				UNION
-				SELECT rg.id,rc.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
-					MAX(po.observed_at) AS last_observed_at,
-					MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
-				FROM release_groups rg JOIN release_credits rc ON rc.release_group_id=rg.id
-				LEFT JOIN provider_observations po ON po.release_group_id=rg.id
-				WHERE rc.artist_id IN (`+placeholders+`)
-				GROUP BY rg.id,rc.artist_id
-			) grouped GROUP BY followed_artist_id`, queryArgs...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var artistID int64
-			var count, confirmed, singleSource, fallback int
-			var observed sql.NullString
-			if err := rows.Scan(&artistID, &count, &confirmed, &singleSource, &fallback, &observed); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			stats := coverageReleaseStats{ReleaseCount: count, ConfirmedReleases: confirmed,
-				SingleSourceReleases: singleSource, FallbackReleases: fallback}
-			stats.LastObservedAt, err = parseNullableStatusTime(observed, "coverage last_observed_at")
+		if err := func() error {
+			rows, err := s.readerDB().QueryContext(ctx, `SELECT followed_artist_id,COUNT(*),
+				SUM(CASE WHEN provider_count>=2 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN provider_count=1 THEN 1 ELSE 0 END),
+				SUM(CASE WHEN provider_count=1 AND itunes_provider=1 THEN 1 ELSE 0 END),MAX(last_observed_at)
+				FROM (
+					SELECT rg.id,rg.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
+						MAX(po.observed_at) AS last_observed_at,
+						MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
+					FROM release_groups rg LEFT JOIN provider_observations po ON po.release_group_id=rg.id
+					WHERE rg.artist_id IN (`+placeholders+`)
+					GROUP BY rg.id,rg.artist_id
+					UNION
+					SELECT rg.id,rc.artist_id AS followed_artist_id,COUNT(DISTINCT po.provider) AS provider_count,
+						MAX(po.observed_at) AS last_observed_at,
+						MAX(CASE WHEN po.provider='itunes' THEN 1 ELSE 0 END) AS itunes_provider
+					FROM release_groups rg JOIN release_credits rc ON rc.release_group_id=rg.id
+					LEFT JOIN provider_observations po ON po.release_group_id=rg.id
+					WHERE rc.artist_id IN (`+placeholders+`)
+					GROUP BY rg.id,rc.artist_id
+				) grouped GROUP BY followed_artist_id`, queryArgs...)
 			if err != nil {
-				_ = rows.Close()
-				return nil, err
+				return err
 			}
-			result[artistID] = stats
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var artistID int64
+				var count, confirmed, singleSource, fallback int
+				var observed sql.NullString
+				if err := rows.Scan(&artistID, &count, &confirmed, &singleSource, &fallback, &observed); err != nil {
+					return err
+				}
+				stats := coverageReleaseStats{ReleaseCount: count, ConfirmedReleases: confirmed,
+					SingleSourceReleases: singleSource, FallbackReleases: fallback}
+				stats.LastObservedAt, err = parseNullableStatusTime(observed, "coverage last_observed_at")
+				if err != nil {
+					return err
+				}
+				result[artistID] = stats
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
-		_ = rows.Close()
 	}
 	return result, nil
 }
@@ -438,7 +463,7 @@ func coverageStatus(item ArtistCoverage) string {
 		}
 	}
 	for _, status := range item.ProviderStatuses {
-		if status.Status == "failed" || status.Status == "cooldown" {
+		if status.Status == "failed" || status.Status == "cooldown" || status.Status == "degraded" {
 			return "attention"
 		}
 	}

@@ -12,6 +12,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Unresolved provider identities are member-owned work. Keep the active set
+// bounded so a repeated search/import cannot create an unbounded retry and
+// review queue. Existing rows remain available until the member resolves or
+// cancels them.
+const maxArtistResolutionsPerUser = 100
+
 func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 	now := nowText()
 	_, err := s.execWriteContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
@@ -113,20 +119,41 @@ func (s *Store) CreateArtistResolution(ctx context.Context, userID int64, provid
 	if providerID == "" || name == "" || providerURL == "" {
 		return ArtistResolution{}, false, errors.New(provider + " artist identity is incomplete")
 	}
-	now := nowText()
-	result, err := s.execWriteContext(ctx, `INSERT OR IGNORE INTO artist_resolutions
-		(user_id,provider,provider_id,display_name,provider_url,image_url,status,next_attempt_at,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,'pending',?,?,?)`,
-		userID, provider, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now)
-	if err != nil {
-		return ArtistResolution{}, false, err
+	type resolutionInsertResult struct {
+		resolution ArtistResolution
+		created    bool
 	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return ArtistResolution{}, false, err
-	}
-	resolution, err := s.artistResolutionByProvider(ctx, userID, provider, providerID)
-	return resolution, changed > 0, err
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (resolutionInsertResult, error) {
+		// Duplicate selections must remain idempotent even when the active queue
+		// has reached its cap; return the existing row rather than rejecting it.
+		resolution, err := scanArtistResolution(tx.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+			FROM artist_resolutions WHERE user_id=? AND provider=? AND provider_id=?`, userID, provider, providerID))
+		if err == nil {
+			return resolutionInsertResult{resolution: resolution}, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return resolutionInsertResult{}, err
+		}
+		var active int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM artist_resolutions
+			WHERE user_id=? AND status IN ('pending','review')`, userID).Scan(&active); err != nil {
+			return resolutionInsertResult{}, err
+		}
+		if active >= maxArtistResolutionsPerUser {
+			return resolutionInsertResult{}, ErrArtistResolutionLimit
+		}
+		now := nowText()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO artist_resolutions
+			(user_id,provider,provider_id,display_name,provider_url,image_url,status,next_attempt_at,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,'pending',?,?,?)`,
+			userID, provider, providerID, name, providerURL, strings.TrimSpace(imageURL), now, now, now); err != nil {
+			return resolutionInsertResult{}, err
+		}
+		resolution, err = scanArtistResolution(tx.QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
+			FROM artist_resolutions WHERE user_id=? AND provider=? AND provider_id=?`, userID, provider, providerID))
+		return resolutionInsertResult{resolution: resolution, created: true}, err
+	})
+	return result.resolution, result.created, err
 }
 
 func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution, error) {
@@ -158,10 +185,6 @@ func scanArtistResolution(row interface{ Scan(...any) error }) (ArtistResolution
 		return ArtistResolution{}, err
 	}
 	return resolution, nil
-}
-func (s *Store) artistResolutionByProvider(ctx context.Context, userID int64, provider, providerID string) (ArtistResolution, error) {
-	return scanArtistResolution(s.readerDB().QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
-		FROM artist_resolutions WHERE user_id=? AND provider=? AND provider_id=?`, userID, provider, providerID))
 }
 func (s *Store) ArtistResolution(ctx context.Context, userID, resolutionID int64) (ArtistResolution, error) {
 	return scanArtistResolution(s.readerDB().QueryRowContext(ctx, `SELECT `+artistResolutionColumns+`
@@ -503,52 +526,50 @@ func (s *Store) enrichArtistMetadata(ctx context.Context, artists []Artist) erro
 			args[index] = ids[index]
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,genre FROM artist_genres WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,weight DESC,genre`, args...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var artistID int64
-			var genre string
-			if err := rows.Scan(&artistID, &genre); err != nil {
-				_ = rows.Close()
+		if err := func() error {
+			rows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,genre FROM artist_genres WHERE artist_id IN (`+placeholders+`) ORDER BY artist_id,weight DESC,genre`, args...)
+			if err != nil {
 				return err
 			}
-			genresByArtist[artistID] = append(genresByArtist[artistID], genre)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var artistID int64
+				var genre string
+				if err := rows.Scan(&artistID, &genre); err != nil {
+					return err
+				}
+				genresByArtist[artistID] = append(genresByArtist[artistID], genre)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return err
 		}
-		_ = rows.Close()
 
-		statsRows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
-		if err != nil {
-			return err
-		}
-		for statsRows.Next() {
-			var stats ListenBrainzStats
-			var checked, next sql.NullString
-			if err := statsRows.Scan(&stats.ArtistID, &stats.TotalListenCount, &stats.TotalUserCount, &checked, &next, &stats.LastError); err != nil {
-				_ = statsRows.Close()
+		if err := func() error {
+			statsRows, err := s.readerDB().QueryContext(ctx, `SELECT artist_id,total_listen_count,total_user_count,checked_at,next_check_at,last_error FROM artist_listenbrainz_stats WHERE artist_id IN (`+placeholders+`)`, args...)
+			if err != nil {
 				return err
 			}
-			var parseErr error
-			if stats.CheckedAt, parseErr = parseStoredNullableTime(checked, "ListenBrainz checked_at"); parseErr != nil {
-				_ = statsRows.Close()
-				return parseErr
+			defer func() { _ = statsRows.Close() }()
+			for statsRows.Next() {
+				var stats ListenBrainzStats
+				var checked, next sql.NullString
+				if err := statsRows.Scan(&stats.ArtistID, &stats.TotalListenCount, &stats.TotalUserCount, &checked, &next, &stats.LastError); err != nil {
+					return err
+				}
+				var parseErr error
+				if stats.CheckedAt, parseErr = parseStoredNullableTime(checked, "ListenBrainz checked_at"); parseErr != nil {
+					return parseErr
+				}
+				if stats.NextCheckAt, parseErr = parseStoredNullableTime(next, "ListenBrainz next_check_at"); parseErr != nil {
+					return parseErr
+				}
+				statsByArtist[stats.ArtistID] = stats
 			}
-			if stats.NextCheckAt, parseErr = parseStoredNullableTime(next, "ListenBrainz next_check_at"); parseErr != nil {
-				_ = statsRows.Close()
-				return parseErr
-			}
-			statsByArtist[stats.ArtistID] = stats
-		}
-		if err := statsRows.Err(); err != nil {
-			_ = statsRows.Close()
+			return statsRows.Err()
+		}(); err != nil {
 			return err
 		}
-		_ = statsRows.Close()
 	}
 	for index := range artists {
 		artists[index].Genres = genresByArtist[artists[index].ID]
@@ -757,10 +778,16 @@ func (s *Store) SpotifyPollingState(ctx context.Context, artistID int64) (Spotif
 	var last sql.NullString
 	err := s.readerDB().QueryRowContext(ctx, `SELECT spotify_unchanged_checks,spotify_last_change_at FROM artists WHERE id=?`, artistID).
 		Scan(&state.UnchangedChecks, &last)
+	if err != nil {
+		// Preserve lookup failures, especially sql.ErrNoRows. Parsing the
+		// nullable timestamp before checking the scan result would overwrite a
+		// missing/corrupt artist error with nil and reset adaptive polling.
+		return SpotifyPollingState{}, err
+	}
 	if state.LastChangeAt, err = parseStoredNullableTime(last, "artist spotify_last_change_at"); err != nil {
 		return state, err
 	}
-	return state, err
+	return state, nil
 }
 func (s *Store) MarkSpotifyCheckedAdaptive(ctx context.Context, artistID int64, now time.Time, interval time.Duration, changed, upcoming bool) error {
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
@@ -859,29 +886,33 @@ func (s *Store) ApplyITunesArtworkBackfill(ctx context.Context, artistID int64, 
 	}
 	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (struct{ checked, updated int }, error) {
 		var counts struct{ checked, updated int }
-		rows, err := tx.QueryContext(ctx, `SELECT id,itunes_id FROM release_groups
-		WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`, artistID)
-		if err != nil {
-			return counts, err
-		}
 		type candidate struct {
 			id       int64
 			itunesID string
 		}
-		var candidates []candidate
-		for rows.Next() {
-			var item candidate
-			if err := rows.Scan(&item.id, &item.itunesID); err != nil {
-				_ = rows.Close()
-				return counts, err
+		candidates, err := func() ([]candidate, error) {
+			rows, err := tx.QueryContext(ctx, `SELECT id,itunes_id FROM release_groups
+			WHERE artist_id=? AND itunes_id IS NOT NULL AND itunes_id<>'' AND itunes_artwork_url=''`, artistID)
+			if err != nil {
+				return nil, err
 			}
-			candidates = append(candidates, item)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+			defer func() { _ = rows.Close() }()
+			var candidates []candidate
+			for rows.Next() {
+				var item candidate
+				if err := rows.Scan(&item.id, &item.itunesID); err != nil {
+					return nil, err
+				}
+				candidates = append(candidates, item)
+			}
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			return candidates, nil
+		}()
+		if err != nil {
 			return counts, err
 		}
-		_ = rows.Close()
 		checkedAt := timeText(observed)
 		negativeNext := timeText(observed.Add(30 * 24 * time.Hour))
 		for _, item := range candidates {

@@ -146,7 +146,10 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 			_ = a.store.DeleteSession(r.Context(), raw)
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: "artist_session", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{
+		Name: "artist_session", Path: "/", MaxAge: -1, HttpOnly: true,
+		Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 func (a *App) tokenForm(kind string) http.HandlerFunc {

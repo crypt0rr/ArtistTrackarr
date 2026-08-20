@@ -724,12 +724,13 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	body, _ = io.ReadAll(response.Body)
 	_ = response.Body.Close()
 	ics := string(body)
+	unfolded := strings.ReplaceAll(ics, "\r\n ", "")
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/calendar; charset=utf-8" ||
 		response.Header.Get("Content-Disposition") != `attachment; filename="artisttrackarr-releases.ics"` ||
 		response.Header.Get("Cache-Control") != "no-store" ||
-		!strings.Contains(ics, "BEGIN:VCALENDAR") || !strings.Contains(ics, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
-		!strings.Contains(ics, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
-		!strings.Contains(ics, "https://music.apple.com/us/album/calendar-web-release") {
+		!strings.Contains(unfolded, "BEGIN:VCALENDAR") || !strings.Contains(unfolded, "SUMMARY:Calendar Web Release — Calendar Web Artist") ||
+		!strings.Contains(unfolded, "DTSTART;VALUE=DATE:"+strings.ReplaceAll(releaseDate, "-", "")) ||
+		!strings.Contains(unfolded, "https://music.apple.com/us/album/calendar-web-release") {
 		t.Fatalf("calendar ICS status/headers/body=%d %q %v", response.StatusCode, response.Header, body)
 	}
 }

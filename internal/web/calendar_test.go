@@ -23,6 +23,24 @@ func TestICSEscapeEscapesCalendarControlCharacters(t *testing.T) {
 	}
 }
 
+func TestICSLineFoldingAndURIEscaping(t *testing.T) {
+	var builder strings.Builder
+	writeICSLine(&builder, "SUMMARY:"+strings.Repeat("é", 80))
+	lines := strings.Split(strings.TrimSuffix(builder.String(), "\r\n"), "\r\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[1], " ") {
+		t.Fatalf("folded lines=%q", lines)
+	}
+	for _, line := range lines {
+		if len([]byte(line)) > 75 {
+			t.Fatalf("line length=%d exceeds 75 octets: %q", len([]byte(line)), line)
+		}
+	}
+	uri := icsEscapeURI("https://example.test/a,b?x=1\nINJECT")
+	if uri != "https://example.test/a,b?x=1INJECT" {
+		t.Fatalf("URI escape=%q", uri)
+	}
+}
+
 func TestReleaseExternalLinkPrefersProviderLinks(t *testing.T) {
 	if got := releaseExternalLink(store.CalendarRelease{Release: store.Release{SpotifyURL: "https://open.spotify.com/album/1", ITunesURL: "https://music.apple.com/album/1", MusicBrainzURL: "https://musicbrainz.org/release-group/1"}}); got != "https://open.spotify.com/album/1" {
 		t.Fatalf("Spotify link preference = %q", got)

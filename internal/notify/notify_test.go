@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -70,6 +71,19 @@ func TestValidateOutboundTargetTreatsProviderIdentifiersAsNonHosts(t *testing.T)
 			t.Fatalf("provider URL %q was treated as a network target: %v", value, err)
 		}
 	}
+}
+
+func TestNewShoutrrrSenderReusesTransportAcrossSends(t *testing.T) {
+	sender := NewShoutrrrSender(true, time.Second)
+	first := sender.httpClient()
+	second := sender.httpClient()
+	if first == second {
+		t.Fatal("sender returned the same client object for separate sends")
+	}
+	if first.Transport == nil || second.Transport == nil || first.Transport != second.Transport {
+		t.Fatalf("sender did not reuse its transport: first=%T second=%T", first.Transport, second.Transport)
+	}
+	sender.CloseIdleConnections()
 }
 
 func TestShoutrrrSenderValidationAndSendGuards(t *testing.T) {
@@ -216,6 +230,35 @@ func TestTelegramUsesScopedClientAndRestoresGlobals(t *testing.T) {
 	}
 }
 
+func TestTelegramDirectClientBuildsBoundedPayload(t *testing.T) {
+	var got telegramSendPayload
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
+		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+			Request:    req,
+		}, nil
+	})}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second}
+	serviceURL := "telegram://12345:mock-token@telegram?chats=-100123&preview=No&notification=No&parsemode=HTML"
+	if err := sender.Send(context.Background(), serviceURL, "A <release>", "Body & details"); err != nil {
+		t.Fatalf("Telegram send failed: %v", err)
+	}
+	if got.ChatID != "-100123" || got.ParseMode != "HTML" || !got.DisablePreview || !got.DisableNotification {
+		t.Fatalf("payload=%#v", got)
+	}
+	if got.Text != "<b>A &lt;release&gt;</b>\nBody & details" {
+		t.Fatalf("payload text=%q", got.Text)
+	}
+}
+
 func TestBuildURLRejectsIncompleteInput(t *testing.T) {
 	for _, input := range []DestinationInput{
 		{Service: "ntfy"},
@@ -281,6 +324,16 @@ func TestRedactErrorRemovesDestinationCredentials(t *testing.T) {
 	}
 }
 
+func TestRedactErrorRemovesBearerTokens(t *testing.T) {
+	message := RedactError(errors.New(`request failed: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9; bearer abc.def-123`))
+	if strings.Contains(message, "eyJhbGci") || strings.Contains(message, "abc.def-123") {
+		t.Fatalf("bearer token leaked in redacted error: %q", message)
+	}
+	if !strings.Contains(message, "Bearer [redacted]") {
+		t.Fatalf("redacted bearer error lost context: %q", message)
+	}
+}
+
 func TestValidateOutboundTargetRejectsPrivateAndLoopbackTargets(t *testing.T) {
 	for _, value := range []string{
 		"generic+http://127.0.0.1/hook",
@@ -330,7 +383,7 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 	if got := outboundHost(nil); got != "" {
 		t.Fatalf("outboundHost(nil)=%q", got)
 	}
-	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "224.0.0.1"} {
+	for _, value := range []string{"192.0.2.1", "198.18.0.1", "203.0.113.1", "2001:db8::1", "2002:c000:0201::1", "64:ff9b::c000:0201", "64:ff9b:1::1", "224.0.0.1"} {
 		ip := net.ParseIP(value)
 		if ip == nil || !isBlockedIP(ip, false) {
 			t.Fatalf("reserved address %s was not blocked", value)
@@ -341,13 +394,13 @@ func TestOutboundTargetResolutionAndHostClassification(t *testing.T) {
 	}
 }
 
-func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
-	ConfigureHTTPClient(time.Second, false)
+func TestSenderHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
+	client := newHTTPClient(time.Second, false, nil, nil)
 	redirect, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/hook", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := http.DefaultClient.CheckRedirect(redirect, nil); err == nil {
+	if err := client.CheckRedirect(redirect, nil); err == nil {
 		t.Fatal("private redirect was accepted by the notification client")
 	}
 
@@ -356,8 +409,8 @@ func TestConfigureHTTPClientBoundsSendsAndRevalidatesRedirects(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
-	ConfigureHTTPClient(10*time.Millisecond, true)
-	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 10 * time.Millisecond}
+	sender := NewShoutrrrSender(true, 10*time.Millisecond)
+	defer sender.CloseIdleConnections()
 	before := http.DefaultClient
 	if err := sender.Send(context.Background(), "generic+"+server.URL+"/slow", "title", "body"); err == nil {
 		t.Fatal("slow notification was not bounded by the client timeout")
@@ -405,7 +458,11 @@ func TestHTTPClientUsesResolverSeamForRedirectAndDial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "local or private") {
+	response, err := client.Do(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
+	if err == nil || !strings.Contains(err.Error(), "local or private") {
 		t.Fatalf("blocked resolved address error=%v", err)
 	}
 	if dialCalled {

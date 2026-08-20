@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const calendarPreferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (
@@ -124,8 +126,8 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			continue
 		}
 		localNow := now.In(location)
-		if reminder, parseErr := time.Parse("15:04", user.Reminder); parseErr != nil ||
-			localNow.Hour()*60+localNow.Minute() < reminder.Hour()*60+reminder.Minute() {
+		if reminder, ok := reminderMinutes(user.Reminder); !ok ||
+			localNow.Hour()*60+localNow.Minute() < reminder {
 			continue
 		}
 
@@ -203,8 +205,7 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			if deliveryCount == 0 {
 				// No admitted destination is not a successful send. Keep the run
 				// pending so it remains visible for an explicit replay/recovery action.
-				_, err = tx.ExecContext(ctx, `UPDATE release_digest_runs SET status='pending' WHERE id=?`, runID)
-				return err
+				return nil
 			}
 			return nil
 		})
@@ -218,10 +219,29 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 	return queued, nil
 }
 
+// reminderMinutes accepts the persisted HH:MM form and harmless legacy
+// values such as H:MM, normalizing both before local-time comparisons. New
+// profile writes remain strict; this keeps older rows from being skipped just
+// because their hour was not zero-padded.
+func reminderMinutes(value string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, errHour := strconv.Atoi(strings.TrimSpace(parts[0]))
+	minute, errMinute := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errHour != nil || errMinute != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
 func buildDigestBody(releases []CalendarRelease, frequency string) string {
+	const maxDigestBodyBytes = 3500
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Your %s ArtistTrackarr release digest:\n", frequency)
 	for _, item := range releases {
+		var entry strings.Builder
 		status := calendarConfidenceLabel(item.Release, item.Held)
 		artistName := item.ArtistName
 		association := ""
@@ -229,19 +249,43 @@ func buildDigestBody(releases []CalendarRelease, frequency string) string {
 			association = "; followed association(s): " + strings.Join(item.FollowedArtists, ", ")
 		}
 		if item.ArtistCreditRole == "featured" && item.GuestCreditCount > 0 {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Guest appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; Guest appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else if item.ArtistCreditRole == "featured" {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; Featured appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; Featured appearance; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		} else {
-			fmt.Fprintf(&builder, "- %s — %s — %s (%s; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
+			fmt.Fprintf(&entry, "- %s — %s — %s (%s; %s%s)", item.CalendarDate, artistName, item.Title, item.PrimaryType, status, association)
 		}
 		if link := releaseExternalURL(item.Release); link != "" {
-			builder.WriteString("\n  ")
-			builder.WriteString(link)
+			entry.WriteString("\n  ")
+			entry.WriteString(link)
+		}
+		entryText := entry.String()
+		if builder.Len()+1+len(entryText) > maxDigestBodyBytes {
+			marker := "\n… additional releases omitted"
+			if builder.Len()+len(marker) > maxDigestBodyBytes {
+				return strings.TrimSpace(truncateUTF8(builder.String(), maxDigestBodyBytes))
+			}
+			builder.WriteString(marker)
+			break
 		}
 		builder.WriteByte('\n')
+		builder.WriteString(entryText)
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+func truncateUTF8(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	data := []byte(value[:limit])
+	for len(data) > 0 && !utf8.Valid(data) {
+		data = data[:len(data)-1]
+	}
+	return string(data)
 }
 
 func calendarConfidenceLabel(release Release, held bool) string {

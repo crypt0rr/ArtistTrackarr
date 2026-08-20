@@ -91,7 +91,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	// A Spotify artist with a known release date is intentionally deferred
 	// until its adaptive cadence says it is due. This prevents fallback sources
 	// from turning an enrichment-only check into a high-volume poll.
-	allowITunes := !result.spotifySucceeded && !(spotifyPrimary && !spotifyWasDue)
+	allowITunes := !result.spotifySucceeded && (!spotifyPrimary || spotifyWasDue)
 	itunes, err := r.observeITunes(ctx, artist, now, allowITunes)
 	if err != nil {
 		return result, err
@@ -110,7 +110,7 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 		result.providerErrors = append(result.providerErrors, itunes.err)
 	}
 
-	allowMusicBrainz := !result.spotifySucceeded && !result.itunesSucceeded && !(spotifyPrimary && !spotifyWasDue)
+	allowMusicBrainz := !result.spotifySucceeded && !result.itunesSucceeded && (!spotifyPrimary || spotifyWasDue)
 	if allowMusicBrainz {
 		musicBrainz, err := r.observeMusicBrainz(ctx, artist, now)
 		if err != nil {
@@ -126,6 +126,14 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 		if musicBrainz.err != nil {
 			result.providerErrors = append(result.providerErrors, musicBrainz.err)
 		}
+	} else {
+		// MusicBrainz was intentionally not contacted because an earlier
+		// provider supplied the release catalog (or Spotify's adaptive check
+		// was deferred). Keep that distinction visible per artist without
+		// overwriting a previous failure or cooldown record.
+		r.recordProviderStatus(ctx, artist.ID, providerObservation{
+			provider: "musicbrainz", status: "standby",
+		}, now)
 	}
 
 	return result, nil
@@ -224,7 +232,7 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 		if r.itunes == nil {
 			observation.status = "not_configured"
 		} else {
-			observation.status = "deferred"
+			observation.status = "standby"
 		}
 		return observation, nil
 	}
@@ -261,6 +269,27 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 		observation.status = "healthy"
 		observation.nextCheckAt = timePtr(now.Add(r.interval))
 		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
+		return observation, nil
+	}
+
+	// A reachable iTunes API can legitimately have no exact identity for a
+	// canonical artist. Treat that negative result as a healthy lookup so the
+	// fallback chain continues without turning Trust Center/provider health
+	// into a false outage signal.
+	var notFound *catalog.ITunesArtistNotFoundError
+	var ambiguous *catalog.ITunesAmbiguousArtistError
+	if errors.As(err, &notFound) || errors.As(err, &ambiguous) {
+		observation.healthy = true
+		observation.empty = true
+		observation.status = "not_found"
+		if ambiguous != nil {
+			observation.status = "ambiguous"
+		}
+		observation.lastError = sanitizedProviderError(err)
+		observation.nextCheckAt = timePtr(now.Add(r.interval))
+		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
+		r.logger.Debug("iTunes artist lookup returned no usable identity", "artist_id", artist.ID,
+			"status", observation.status)
 		return observation, nil
 	}
 

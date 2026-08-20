@@ -1,4 +1,8 @@
 {{template "head" .}}
+{{if not .Resolution}}
+<section class="page-head"><p class="eyebrow">Artist identification</p><h1>Resolution unavailable</h1><p>We could not load this artist identification request. Please return to the dashboard and try again.</p></section>
+<section class="panel"><div class="actions"><a class="button secondary" href="/">Back to dashboard</a></div></section>
+{{else}}
 <section class="page-head"><p class="eyebrow">Artist identification</p><h1>Confirm {{.Resolution.DisplayName}}</h1>
   <p>The {{resolutionProviderLabel .Resolution.Provider}} artist must be matched to one MusicBrainz identity before release tracking begins.</p>
 </section>
@@ -24,4 +28,5 @@
 </section>
 {{end}}
 <form method="post" action="/artist-resolutions/{{.Resolution.ID}}/cancel" class="actions">{{template "csrf" .}}<a class="button secondary" href="/">Back</a><button class="danger link">Cancel pending artist</button></form>
+{{end}}
 {{template "foot" .}}

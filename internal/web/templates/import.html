@@ -1,6 +1,7 @@
 {{template "head" .}}
 {{with .Import}}
-<section class="page-head split-head"><div><p class="eyebrow">Watchlist restore</p><h1>Import results</h1><p>Each row was processed independently; no provider calls were made during the upload.</p></div><a class="button secondary" href="/artists">Back to Artists</a></section>
+<section class="page-head split-head"><div><p class="eyebrow">Watchlist restore</p><h1>Import results</h1><p>Each row was processed independently; no provider calls were made during the upload.</p></div><div class="actions"><span class="badge {{.Status}}">{{.Status}}</span><a class="button secondary" href="/artists">Back to Artists</a></div></section>
+{{if eq .Status "interrupted"}}<div class="notice">This import was interrupted before all rows were processed. The rows shown here are durable, but the upload is incomplete; upload the original CSV again to retry the missing rows.</div>{{else if eq .Status "failed"}}<div class="notice">Some rows could not be persisted, so this upload is incomplete. Review the row details and upload the original CSV again if needed.</div>{{end}}
 <section class="stats">
   <article><strong>{{.Added}}</strong><span>added</span></article>
   <article><strong>{{.AlreadyFollowed}}</strong><span>already followed</span></article>

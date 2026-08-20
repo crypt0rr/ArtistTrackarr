@@ -100,32 +100,30 @@ func (s *Store) followedReleaseArtistsBatch(ctx context.Context, userID int64, r
 			args = append(args, releaseID)
 		}
 		args = append(args, userID)
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT rg.id, `+followedReleaseAssociationLabel+`
-			FROM follows f
-			JOIN artists a ON a.id=f.artist_id
-			JOIN release_groups rg ON rg.id IN (`+placeholders+`)
-			WHERE f.user_id=? AND (f.artist_id=rg.artist_id OR EXISTS (
-				SELECT 1 FROM release_credits rc
-				WHERE rc.release_group_id=rg.id AND rc.artist_id=f.artist_id
-			))
-			ORDER BY rg.id,lower(a.name),f.artist_id`, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var releaseID int64
-			var name string
-			if err := rows.Scan(&releaseID, &name); err != nil {
-				_ = rows.Close()
-				return nil, err
+		if err := func() error {
+			rows, err := s.readerDB().QueryContext(ctx, `SELECT rg.id, `+followedReleaseAssociationLabel+`
+				FROM follows f
+				JOIN artists a ON a.id=f.artist_id
+				JOIN release_groups rg ON rg.id IN (`+placeholders+`)
+				WHERE f.user_id=? AND (f.artist_id=rg.artist_id OR EXISTS (
+					SELECT 1 FROM release_credits rc
+					WHERE rc.release_group_id=rg.id AND rc.artist_id=f.artist_id
+				))
+				ORDER BY rg.id,lower(a.name),f.artist_id`, args...)
+			if err != nil {
+				return err
 			}
-			associations[releaseID] = append(associations[releaseID], name)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var releaseID int64
+				var name string
+				if err := rows.Scan(&releaseID, &name); err != nil {
+					return err
+				}
+				associations[releaseID] = append(associations[releaseID], name)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return nil, err
 		}
 	}
