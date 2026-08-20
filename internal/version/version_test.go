@@ -9,8 +9,8 @@ import (
 )
 
 func TestCurrentReleaseVersion(t *testing.T) {
-	if Current != "0.48.1" {
-		t.Fatalf("Current=%q, want the source-controlled release version 0.48.1", Current)
+	if Current != "0.48.2" {
+		t.Fatalf("Current=%q, want the source-controlled release version 0.48.2", Current)
 	}
 }
 

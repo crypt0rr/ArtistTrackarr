@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/containrrr/shoutrrr"
 	"github.com/containrrr/shoutrrr/pkg/types"
@@ -25,6 +26,59 @@ import (
 type NotificationSender interface {
 	Validate(string) error
 	Send(context.Context, string, string, string) error
+}
+
+// MessageLimitError identifies a payload that cannot be delivered safely by
+// the selected transport.  Delivery workers persist this error and apply the
+// normal retry policy, while the explicit message avoids silently dropping
+// content inside a provider library.
+type MessageLimitError struct {
+	Service string
+	Limit   int
+	Length  int
+	Unit    string
+}
+
+func (e *MessageLimitError) Error() string {
+	if e == nil {
+		return "notification message exceeds transport limit"
+	}
+	return fmt.Sprintf("%s notification message exceeds the %d %s transport limit (got %d)", e.Service, e.Limit, e.Unit, e.Length)
+}
+
+const (
+	telegramMessageLimit   = 4096 // Telegram counts Unicode characters.
+	discordMessageLimit    = 6000 // Shoutrrr chunks Discord messages up to this total.
+	notificationTitleLimit = 1024
+	// Generic webhooks and ntfy do not expose one portable server-side limit.
+	// Keep payloads bounded so a provider-controlled title/body cannot consume
+	// unbounded memory or request bandwidth. This is above every application-
+	// generated digest and release message.
+	genericMessageLimitBytes = 64 << 10
+)
+
+func validateNotificationMessage(serviceURL, title, body string) error {
+	scheme := strings.ToLower(parsedScheme(serviceURL))
+	if length := utf8.RuneCountInString(title); length > notificationTitleLimit {
+		return &MessageLimitError{Service: strings.ToUpper(scheme), Limit: notificationTitleLimit, Length: length, Unit: "title characters"}
+	}
+	switch scheme {
+	case "telegram":
+		// The final Telegram representation is assembled in sendTelegram after
+		// its parse-mode options are read, so it is checked there.
+		return nil
+	case "discord":
+		length := utf8.RuneCountInString(title) + utf8.RuneCountInString(body)
+		if length > discordMessageLimit {
+			return &MessageLimitError{Service: "Discord", Limit: discordMessageLimit, Length: length, Unit: "characters"}
+		}
+	case "ntfy", "generic+http", "generic+https":
+		length := len([]byte(body))
+		if length > genericMessageLimitBytes {
+			return &MessageLimitError{Service: strings.ToUpper(scheme), Limit: genericMessageLimitBytes, Length: length, Unit: "bytes"}
+		}
+	}
+	return nil
 }
 
 // ErrUnsupportedTransport is returned before Shoutrrr is allowed to create a
@@ -322,6 +376,9 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := ValidateTransportPolicy(serviceURL); err != nil {
 		return err
 	}
+	if err := validateNotificationMessage(serviceURL, title, body); err != nil {
+		return err
+	}
 	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
 	defer cancel()
 	if err := validateOutboundTargetWithLookup(sendCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP); err != nil {
@@ -404,8 +461,6 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	return nil
 }
 
-const telegramMessageLimit = 4096
-
 type telegramSendPayload struct {
 	Text                string `json:"text"`
 	ChatID              string `json:"chat_id"`
@@ -433,9 +488,6 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
 	if err != nil || parsed == nil || !strings.EqualFold(parsed.Scheme, "telegram") {
 		return ErrUnsupportedTransport
-	}
-	if len(body) > telegramMessageLimit {
-		return errors.New("telegram message exceeds the max length")
 	}
 	if parsed.User == nil {
 		return errors.New("telegram bot token is invalid")
@@ -494,6 +546,9 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 		case "HTML":
 			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), message)
 		}
+	}
+	if length := utf8.RuneCountInString(message); length > telegramMessageLimit {
+		return &MessageLimitError{Service: "Telegram", Limit: telegramMessageLimit, Length: length, Unit: "characters"}
 	}
 	preview := !telegramOptionDisabled(query.Get("preview"))
 	notification := !telegramOptionDisabled(query.Get("notification"))

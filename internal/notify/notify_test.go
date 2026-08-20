@@ -104,6 +104,67 @@ func TestShoutrrrSenderValidationAndSendGuards(t *testing.T) {
 	}
 }
 
+func TestNotificationMessageLimitsRejectLossyPayloadsBeforeNetwork(t *testing.T) {
+	sender := ShoutrrrSender{AllowPrivateTargets: true}
+	tests := []struct {
+		name      string
+		service   string
+		title     string
+		body      string
+		wantSvc   string
+		wantLimit int
+	}{
+		{
+			name:      "telegram counts rendered unicode title",
+			service:   "telegram://12345:mock-token@telegram?chats=-100123",
+			title:     "Titel",
+			body:      strings.Repeat("é", telegramMessageLimit),
+			wantSvc:   "Telegram",
+			wantLimit: telegramMessageLimit,
+		},
+		{
+			name:      "discord rejects beyond total chunk budget",
+			service:   "discord://token@123456",
+			body:      strings.Repeat("x", discordMessageLimit+1),
+			wantSvc:   "Discord",
+			wantLimit: discordMessageLimit,
+		},
+		{
+			name:      "generic webhook is bounded",
+			service:   "generic+https://hooks.example/releases",
+			body:      strings.Repeat("x", genericMessageLimitBytes+1),
+			wantSvc:   "GENERIC+HTTPS",
+			wantLimit: genericMessageLimitBytes,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := sender.Send(context.Background(), test.service, test.title, test.body)
+			var limitErr *MessageLimitError
+			if !errors.As(err, &limitErr) {
+				t.Fatalf("Send error=%v, want MessageLimitError", err)
+			}
+			if limitErr.Service != test.wantSvc || limitErr.Limit != test.wantLimit {
+				t.Fatalf("limit error=%#v, want service=%q limit=%d", limitErr, test.wantSvc, test.wantLimit)
+			}
+		})
+	}
+}
+
+func TestNotificationMessageLimitsAllowNormalPayloads(t *testing.T) {
+	for _, test := range []struct {
+		service string
+		body    string
+	}{
+		{service: "discord://token@123456", body: strings.Repeat("é", discordMessageLimit)},
+		{service: "generic+https://hooks.example/releases", body: strings.Repeat("x", genericMessageLimitBytes)},
+	} {
+		if err := validateNotificationMessage(test.service, "", test.body); err != nil {
+			t.Fatalf("validateNotificationMessage(%q)=%v for payload at limit", test.service, err)
+		}
+	}
+}
+
 func TestShoutrrrSenderSendsGenericWebhookAndReportsUpstreamErrors(t *testing.T) {
 	requests := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
