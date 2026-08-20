@@ -175,12 +175,33 @@ func (a *App) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			digest := security.Digest(chi.URLParam(r, "token"))
+			a.logger.Warn("invitation acceptance failed", "page", "Accept invitation", "route", "/invite/{token}",
+				"token_fingerprint", fmt.Sprintf("%x", digest[:6]), "error", err)
+		}
 		d := a.data(r, "Accept invitation")
-		d.Error, d.Token, d.TokenKind = "Invitation is invalid, expired, or already used: "+err.Error(), chi.URLParam(r, "token"), "invite"
+		d.Error, d.Token, d.TokenKind = invitationErrorMessage(err), chi.URLParam(r, "token"), "invite"
 		a.render(w, "token", d, http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/login?message=Account+created", http.StatusSeeOther)
+}
+
+// invitationErrorMessage intentionally keeps token-backed account errors
+// generic. Validation errors are actionable without exposing database details;
+// the full cause is retained in the structured server log above.
+func invitationErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, store.ErrInvalidUsername):
+		return "Invitation is invalid, expired, or already used. Choose a username with 3–32 letters, numbers, dots, underscores, or hyphens."
+	case errors.Is(err, store.ErrUsernameTaken):
+		return "Invitation is invalid, expired, or already used. That username is already in use; choose another."
+	case strings.Contains(strings.ToLower(err.Error()), "invalid iana timezone"):
+		return "Invitation is invalid, expired, or already used. Choose a valid IANA timezone."
+	default:
+		return "Invitation is invalid, expired, or already used. Check your details and try again."
+	}
 }
 func (a *App) acceptReset(w http.ResponseWriter, r *http.Request) {
 	_, release, ok := a.acquirePasswordSlot(w, r, a.tokenLimiter, 300, "too many password reset attempts; try again later")

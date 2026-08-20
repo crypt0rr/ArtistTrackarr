@@ -35,9 +35,12 @@ func TestICSLineFoldingAndURIEscaping(t *testing.T) {
 			t.Fatalf("line length=%d exceeds 75 octets: %q", len([]byte(line)), line)
 		}
 	}
-	uri := icsEscapeURI("https://example.test/a,b?x=1\nINJECT")
-	if uri != "https://example.test/a,b?x=1INJECT" {
+	uri := icsEscapeURI("https://example.test/a b?x=hello world&name=é#frag ment\nINJECT")
+	if uri != "https://example.test/a%20b?x=hello%20world&name=%C3%A9#frag%20mentINJECT" {
 		t.Fatalf("URI escape=%q", uri)
+	}
+	if malformed := icsEscapeURI("https://example.test/a?x=bad%zz"); malformed != "https://example.test/a?x=bad%25zz" {
+		t.Fatalf("malformed URI escape=%q", malformed)
 	}
 }
 

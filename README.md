@@ -49,7 +49,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.48.0`; local and published images use the
+footer. The current release is `v0.48.1`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -204,6 +204,11 @@ more tracks are an Album; compilations remain Albums. A unique normalized
 title/date match can merge provider records even when those derived types
 differ, while ambiguous matches are kept separate for review.
 
+The v0.48.1 consistency patch keeps invitation failures generic while retaining
+actionable username and timezone guidance, and emits RFC 5545-safe calendar
+`URL:` properties by normalizing whitespace, Unicode query values, and malformed
+percent escapes.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -286,7 +291,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.48.0` publishes `0.48.0`, `0.48`, and `latest`.
+- Pushing a tag such as `v0.48.1` publishes `0.48.1`, `0.48`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -309,7 +314,7 @@ spurious SQLite disk-full failures.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.48.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.48.1 docker compose up -d
 ```
 
 ## Configuration

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -117,10 +118,58 @@ func icsEscape(value string) string {
 	return value
 }
 
-// icsEscapeURI keeps URI punctuation intact for the URL property while
-// removing physical line breaks that could inject another calendar property.
+// icsEscapeURI returns a URI-safe value for the RFC 5545 URL property. URI
+// punctuation remains intact, while whitespace, non-ASCII query bytes, and
+// malformed percent escapes are normalized. Control characters are removed
+// before parsing so a provider-controlled value can never inject another
+// calendar property.
 func icsEscapeURI(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "").Replace(value)
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return escapeURIQuery(value)
+	}
+	parsed.RawQuery = escapeURIQuery(parsed.RawQuery)
+	return parsed.String()
+}
+
+// escapeURIQuery escapes bytes that cannot appear literally in a URI query,
+// preserving delimiters such as '&' and '='. Existing valid percent escapes
+// are retained; malformed '%' bytes become %25 instead of producing an
+// invalid or ambiguous URL property.
+func escapeURIQuery(value string) string {
+	var builder strings.Builder
+	for index := 0; index < len(value); {
+		character := value[index]
+		if character == '%' && index+2 < len(value) && isHexByte(value[index+1]) && isHexByte(value[index+2]) {
+			builder.WriteString(value[index : index+3])
+			index += 3
+			continue
+		}
+		if character >= 0x21 && character <= 0x7e && character != '%' {
+			builder.WriteByte(character)
+			index++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(value[index:])
+		if size == 0 {
+			size = 1
+		}
+		for offset := 0; offset < size && index+offset < len(value); offset++ {
+			fmt.Fprintf(&builder, "%%%02X", value[index+offset])
+		}
+		index += size
+	}
+	return builder.String()
+}
+
+func isHexByte(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F')
 }
 
 // writeICSLine applies RFC 5545 line folding at 75 octets. It avoids cutting
