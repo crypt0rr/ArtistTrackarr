@@ -19,6 +19,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 func TestProviderHealthPresentationHelpers(t *testing.T) {
@@ -337,7 +338,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 	resolution := &store.ArtistResolution{ID: 1, UserID: user.ID, Provider: "spotify", ProviderID: "spotify-template", DisplayName: artist.Name, ProviderURL: "https://open.spotify.com/artist/template", Status: "review", Candidates: []store.ResolutionCandidate{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}}}
 	data := PageData{
 		PageMeta: PageMeta{
-			Title: "Template smoke", Version: "0.54.15", User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true,
+			Title: "Template smoke", Version: version.Current, User: &UserView{ID: user.ID, Email: user.Email, Username: user.Username, Role: user.Role, Timezone: user.Timezone, ReminderTime: user.ReminderTime}, CSRF: "csrf", SetupNeeded: true,
 		},
 		PageDiscovery: PageDiscovery{
 			Query: "template", Artists: []store.Artist{artist}, Results: []catalog.ArtistResult{{MBID: artist.MBID, Name: artist.Name, Type: artist.Type, Country: artist.Country, Aliases: []string{"Template"}}},

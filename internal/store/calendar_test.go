@@ -403,6 +403,11 @@ func TestQueueDueReleaseDigestsDeduplicatesPeriod(t *testing.T) {
 	if err := s.AddDestination(ctx, userID, "Digest destination", "generic", []byte("encrypted")); err != nil {
 		t.Fatal(err)
 	}
+	// Keep the destination newer than the orphaned run. The production query
+	// intentionally admits only destinations that existed when a digest was
+	// created; using the wall clock here made this fixture depend on when the
+	// test happened to run relative to its logical test time.
+	setDestinationCreatedAt(t, s, userID, now.Add(time.Hour))
 	queued, err = s.QueueDueReleaseDigests(ctx, now)
 	if err != nil || queued != 0 {
 		t.Fatalf("queued=%d err=%v", queued, err)
@@ -647,6 +652,10 @@ func TestQueueDueReleaseDigestsTreatsTimezoneChangesAsOnePeriod(t *testing.T) {
 		"2026-08-21", 3, "https://musicbrainz.org/release-group/digest-timezone-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
 		t.Fatal(err)
 	}
+	// The fixed test clock must also control destination age. Otherwise a
+	// destination created after this historical instant is excluded, making
+	// the expected initial digest depend on the host wall clock.
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
 	if queued, err := s.QueueDueReleaseDigests(ctx, now); err != nil || queued != 1 {
 		t.Fatalf("initial digest queued=%d err=%v", queued, err)
 	}

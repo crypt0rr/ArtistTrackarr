@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
+	"github.com/crypt0rr/artist-tracker/internal/version"
 )
 
 func TestAdminDiagnosticsJSONAndRetentionExport(t *testing.T) {
@@ -62,7 +63,7 @@ func TestAdminDiagnosticsJSONAndRetentionExport(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["version"] != "0.54.15" || payload["operational_status"] == nil || payload["database"] == nil || payload["retention"] == nil || payload["runner"] == nil {
+	if payload["version"] != version.Current || payload["operational_status"] == nil || payload["database"] == nil || payload["retention"] == nil || payload["runner"] == nil {
 		t.Fatalf("unexpected diagnostics payload=%#v", payload)
 	}
 	jsonBody, _ := json.Marshal(payload)
