@@ -916,6 +916,71 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	}
 }
 
+func TestCalendarMonthGridReportsTruncationInsteadOfDroppingReleasesSilently(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		releases   int
+		wantShown  int
+		wantNotice bool
+	}{
+		{name: "at the limit", releases: calendarMonthLimit, wantShown: calendarMonthLimit, wantNotice: false},
+		{name: "over the limit", releases: calendarMonthLimit + 1, wantShown: calendarMonthLimit, wantNotice: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+			user, err := database.UserByEmail(context.Background(), "member@example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			artist, err := database.UpsertArtist(context.Background(), store.Artist{
+				MBID: "77777777-7777-4777-8777-777777777777", Name: "Busy Calendar Artist", SortName: "Busy Calendar Artist",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Follow(context.Background(), user.ID, artist.ID); err != nil {
+				t.Fatal(err)
+			}
+			// A fixed future month keeps the grid bounds away from "today" and
+			// from a month boundary, so the row count is the only variable.
+			month := time.Now().UTC().AddDate(0, 2, 0).Format("2006-01")
+			releases := make([]store.Release, 0, test.releases)
+			for i := range test.releases {
+				id := fmt.Sprintf("busy-%03d", i)
+				releases = append(releases, store.Release{
+					MBID: "itunes:" + id, ITunesID: id,
+					Title: "Busy Release " + id, PrimaryType: "Album",
+					// Spread across days 01-28 so every date is valid in any month.
+					FirstReleaseDate: fmt.Sprintf("%s-%02d", month, i%28+1), DatePrecision: 3,
+					ITunesURL: "https://music.apple.com/us/album/" + id,
+				})
+			}
+			if err := database.ApplyReleaseBatches(context.Background(), artist, []store.ReleaseBatch{{
+				Provider: "itunes", Releases: releases,
+			}}, time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			response, err := client.Get(server.URL + "/calendar?month=" + month)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			page := string(body)
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("calendar status=%d body=%q", response.StatusCode, page)
+			}
+			if shown := strings.Count(page, `class="calendar-release"`); shown != test.wantShown {
+				t.Fatalf("rendered releases=%d, want %d", shown, test.wantShown)
+			}
+			gotNotice := strings.Contains(page, "This month has more than")
+			if gotNotice != test.wantNotice {
+				t.Fatalf("truncation notice=%t, want %t", gotNotice, test.wantNotice)
+			}
+		})
+	}
+}
+
 func TestSearchFallsBackToMusicBrainz(t *testing.T) {
 	tests := []struct {
 		name    string

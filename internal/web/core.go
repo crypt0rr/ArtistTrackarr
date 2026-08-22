@@ -81,11 +81,14 @@ func displayLocation(timezones ...string) *time.Location {
 	return location
 }
 
+// formatTime renders a stored UTC instant in the reader's timezone. The zone
+// abbreviation is included so a member can tell which zone a timestamp is in,
+// matching providerHealthTime; stored timestamps and scheduling stay in UTC.
 func formatTime(value time.Time, timezones ...string) string {
 	if len(timezones) == 0 {
-		return value.Format("2006-01-02 15:04")
+		return value.Format("2006-01-02 15:04 MST")
 	}
-	return value.In(displayLocation(timezones...)).Format("2006-01-02 15:04")
+	return value.In(displayLocation(timezones...)).Format("2006-01-02 15:04 MST")
 }
 
 func providerHealthTime(value any, timezones ...string) string {

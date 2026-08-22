@@ -73,6 +73,7 @@ type PageRelease struct {
 	CalendarPrevMonth        string
 	CalendarNextMonth        string
 	CalendarICSURL           string
+	CalendarNotice           string
 	CalendarFeedURL          string
 	CalendarFeedCreatedAt    *time.Time
 	CalendarFeedExpiresAt    *time.Time

@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.54.16`; local and published images use the
+footer. The current release is `v0.54.17`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -288,6 +288,18 @@ visible through a followed guest or featured artist: the event title and body
 identify the credited appearance while preserving one owner-scoped event and
 delivery for the shared release.
 
+The v0.54.17 patch restores MusicBrainz guest-credit discovery, which had never
+returned a result: the recording search response was decoded with browse-style
+field names, so every credit was discarded before it could be projected onto a
+release group. The search is deliberately bounded to one page, matching the
+Apple/iTunes credit search, because credit discovery runs for every artist on
+every scheduled check and MusicBrainz permits one request a second. A release
+group discovered this way carries no upstream release date, so it is recorded
+with an unknown date precision rather than a guessed date. The same patch makes
+the calendar month grid say when a month holds more dated releases than the grid
+shows, instead of dropping the remainder silently, and adds the timezone
+abbreviation to rendered timestamps so a displayed time is unambiguous.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -378,7 +390,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.54.16` publishes `0.54.16`, `0.54`, and `latest`.
+- Pushing a tag such as `v0.54.17` publishes `0.54.17`, `0.54`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -402,7 +414,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.54.16 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.54.17 docker compose up -d
 ```
 
 ## Configuration
