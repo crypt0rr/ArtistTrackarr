@@ -22,6 +22,10 @@ import (
 )
 
 type Runner struct {
+	// genreBackfillEmpty records artists MusicBrainz reports no genres for, so
+	// the backfill lookup is not repeated on every scheduled sync.
+	genreBackfillEmpty        map[int64]time.Time
+	genreBackfillMu           sync.Mutex
 	store                     *store.Store
 	catalog                   catalog.CatalogProvider
 	spotify                   catalog.SpotifyReleaseProvider
@@ -1005,6 +1009,35 @@ func (r *Runner) SyncArtistNow(ctx context.Context, artist store.Artist) error {
 	return err
 }
 
+// genreBackfillRetryAfter bounds how often an artist with no MusicBrainz genres
+// is asked again. Genre data changes rarely, so a long interval removes the
+// per-sync cost while still picking up newly curated genres.
+const genreBackfillRetryAfter = 7 * 24 * time.Hour
+
+// shouldBackfillGenres reports whether the genre lookup is worth an upstream
+// request for this artist right now.
+func (r *Runner) shouldBackfillGenres(ctx context.Context, artist store.Artist, now time.Time) bool {
+	genres, err := r.store.ArtistGenres(ctx, artist.ID)
+	if err != nil || len(genres) > 0 {
+		return false
+	}
+	r.genreBackfillMu.Lock()
+	defer r.genreBackfillMu.Unlock()
+	last, ok := r.genreBackfillEmpty[artist.ID]
+	return !ok || !now.Before(last.Add(genreBackfillRetryAfter))
+}
+
+// noteGenreBackfillEmpty records that MusicBrainz has no genres for an artist so
+// the lookup is not repeated on the next tick.
+func (r *Runner) noteGenreBackfillEmpty(artistID int64, now time.Time) {
+	r.genreBackfillMu.Lock()
+	defer r.genreBackfillMu.Unlock()
+	if r.genreBackfillEmpty == nil {
+		r.genreBackfillEmpty = make(map[int64]time.Time)
+	}
+	r.genreBackfillEmpty[artistID] = now
+}
+
 type spotifyReleaseCacheInvalidator interface {
 	InvalidateArtistReleases(string)
 }
@@ -1022,6 +1055,10 @@ func (r *Runner) invalidateSpotifyReleaseCache(artist store.Artist) {
 // MusicBrainz artist. Real iTunes clients use the optional canonical-aware
 // interface; small test providers and legacy implementations retain the
 // existing name-based interface for compatibility.
+type itunesReleaseCacheInvalidator interface {
+	InvalidateArtistReleases(canonicalID, providerID string)
+}
+
 func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artist) ([]store.Release, error) {
 	if r.itunes == nil {
 		return nil, errors.New("iTunes is not configured")
@@ -1044,6 +1081,16 @@ func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artis
 	providerID := ""
 	if found {
 		providerID = identity.ProviderID
+	}
+	// A runner-driven fetch is a scheduled or manual sync, and both must reach
+	// the provider. The 24-hour release cache serves short discovery and follow
+	// bursts; replaying it here would let a poll interval shorter than the cache
+	// TTL mistake a stale response for an unchanged catalog, and a non-empty
+	// replay would also suppress the MusicBrainz fallback and record provider
+	// health for a request that was never made. Spotify is invalidated for the
+	// same reason in observeSpotify.
+	if invalidator, ok := r.itunes.(itunesReleaseCacheInvalidator); ok {
+		invalidator.InvalidateArtistReleases(artist.MBID, providerID)
 	}
 	releases, resolvedID, resolvedURL, err := canonical.ArtistReleasesForCanonical(
 		ctx, artist.MBID, artist.Name, providerID,
@@ -1136,10 +1183,19 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		artist.Name, artist.SortName, artist.Type = canonical.Name, canonical.SortName, canonical.Type
 		artist.Country, artist.Disambiguation, artist.Genres = canonical.Country, canonical.Disambiguation, canonical.Genres
 	}
-	if genres, genreErr := r.store.ArtistGenres(ctx, artist.ID); genreErr == nil && len(genres) == 0 {
-		if metadata, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID); resolveErr == nil && len(metadata.Genres) > 0 {
-			if saveErr := r.store.SaveArtistGenres(ctx, artist.ID, metadata.Genres); saveErr != nil {
-				r.logger.Debug("artist genre metadata save failed", "artist_id", artist.ID, "error", saveErr)
+	// Backfill genres for an artist that has none, but do not retry forever.
+	// Plenty of artists genuinely carry no MusicBrainz genres, and without this
+	// guard every one of them costs an extra lookup on every scheduled sync,
+	// against the process-wide one-request-per-second limiter, with no cooldown
+	// check and no attempt counter.
+	if r.shouldBackfillGenres(ctx, artist, now) {
+		if metadata, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID); resolveErr == nil {
+			if len(metadata.Genres) > 0 {
+				if saveErr := r.store.SaveArtistGenres(ctx, artist.ID, metadata.Genres); saveErr != nil {
+					r.logger.Debug("artist genre metadata save failed", "artist_id", artist.ID, "error", saveErr)
+				}
+			} else {
+				r.noteGenreBackfillEmpty(artist.ID, now)
 			}
 		}
 	}
@@ -1225,6 +1281,19 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	}
 	if strategy.spotifySuppressed {
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); err != nil {
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
+		}
+		return outcome, nil
+	}
+	if spotifyWasDue && r.spotify == nil {
+		// The artist carries a Spotify ID but this deployment has no Spotify
+		// credentials, so the check was never attempted and neither the success
+		// nor the failure branch below fires. Without advancing the watermark
+		// the artist stays permanently due: ArtistsDue matches on
+		// spotify_next_check_at and orders by it, so a stale value sorts to the
+		// front of every batch forever and starves every other followed artist.
+		// A Spotify ID reaches such a deployment through a CSV round trip.
+		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(r.spotifyInterval)); err != nil {
 			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 		return outcome, nil

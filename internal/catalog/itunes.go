@@ -475,6 +475,20 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 			return nil, err
 		}
 		collectionCount := 0
+		// A lookup by artist ID returns that artist's own row alongside the
+		// collections. If Apple's name for the looked-up ID is not the artist
+		// that was asked for, the persisted identity is stale or mis-mapped:
+		// surface that for review instead of silently importing another
+		// artist's discography, and instead of silently dropping every row.
+		for _, item := range response.Results {
+			if item.WrapperType != "artist" {
+				continue
+			}
+			owner := strings.TrimSpace(item.ArtistName)
+			if owner != "" && !strings.EqualFold(owner, artistName) {
+				return nil, &ITunesAmbiguousArtistError{Name: artistName, IDs: []string{artistID}}
+			}
+		}
 		for _, item := range response.Results {
 			// Lookup responses may include the artist object alongside the
 			// collection rows. Count only collections when deciding whether a
@@ -488,7 +502,18 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 				strings.TrimSpace(item.ReleaseDate) == "" {
 				continue
 			}
-			if item.CollectionArtistName != "" && !strings.EqualFold(strings.TrimSpace(item.CollectionArtistName), artistName) {
+			// Apple sends collectionArtistName only on wrapperType "track" rows
+			// for compilations, never on the "collection" rows kept here, so
+			// keying the guard off it left it dead: the value was always empty
+			// and the != "" test skipped the comparison entirely. artistName is
+			// the field collection rows actually carry, and exact-name-modulo-
+			// case is already how resolveExactArtist establishes an iTunes
+			// identity, so the same standard applies here.
+			owner := strings.TrimSpace(item.ArtistName)
+			if owner == "" {
+				owner = strings.TrimSpace(item.CollectionArtistName)
+			}
+			if owner != "" && !strings.EqualFold(owner, artistName) {
 				continue
 			}
 			id := strconv.FormatInt(item.CollectionID, 10)
@@ -823,6 +848,32 @@ func (i *ITunes) cacheSearchLocked(key string, results []ITunesArtist) {
 			}
 		}
 		delete(i.searchCache, oldestKey)
+	}
+}
+
+// InvalidateArtistReleases drops cached release pages for one artist so a due
+// scheduled check reaches the provider. The release cache exists for short
+// discovery and follow bursts; at a poll interval shorter than the cache TTL a
+// scheduled check would otherwise replay a stale response, and because a
+// non-empty replay counts as a successful observation it also suppresses the
+// MusicBrainz fallback and records provider health for a request that was never
+// made. Both the canonical and the name-based key forms are covered.
+func (i *ITunes) InvalidateArtistReleases(canonicalID, providerID string) {
+	if i == nil {
+		return
+	}
+	canonicalID = strings.TrimSpace(canonicalID)
+	providerID = strings.TrimSpace(providerID)
+	i.cacheMu.Lock()
+	defer i.cacheMu.Unlock()
+	for key := range i.releaseCache {
+		if canonicalID != "" && strings.HasPrefix(key, "canonical:"+canonicalID+"\x00") {
+			delete(i.releaseCache, key)
+			continue
+		}
+		if providerID != "" && (key == "name:"+providerID || strings.HasSuffix(key, "\x00"+providerID)) {
+			delete(i.releaseCache, key)
+		}
 	}
 }
 

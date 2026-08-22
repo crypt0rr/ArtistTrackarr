@@ -36,6 +36,14 @@ func artistSyncAdmissionPredicate(alias string) string {
 		WHERE ais.artist_id=` + alias + `.id AND ais.status='unresolvable')`
 }
 
+// UpsertArtist writes the household-shared artist row for one MusicBrainz ID.
+// A stored Spotify identity is never replaced: the interactive follow path
+// re-runs a Spotify name search on every follow and Enrich takes the first
+// exact-name match, which is frequently a different band for a homonym. Letting
+// that guess win would repoint every other member's release feed, artwork, and
+// genres for an artist they already follow. A missing identity is still filled
+// in, and the URL and image are only taken from an incoming record that agrees
+// with the identity being kept. The CSV import path was hardened the same way.
 func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 	now := nowText()
 	_, err := s.execWriteContext(ctx, `INSERT INTO artists(mbid,name,sort_name,artist_type,country,disambiguation,
@@ -43,9 +51,12 @@ func (s *Store) UpsertArtist(ctx context.Context, a Artist) (Artist, error) {
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
 		artist_type=excluded.artist_type,country=excluded.country,disambiguation=excluded.disambiguation,
-		spotify_id=COALESCE(excluded.spotify_id,artists.spotify_id),
-		spotify_url=COALESCE(excluded.spotify_url,artists.spotify_url),
-		spotify_image_url=COALESCE(excluded.spotify_image_url,artists.spotify_image_url),updated_at=excluded.updated_at`,
+		spotify_id=COALESCE(artists.spotify_id,excluded.spotify_id),
+		spotify_url=CASE WHEN artists.spotify_id IS NULL OR artists.spotify_id=excluded.spotify_id
+			THEN COALESCE(excluded.spotify_url,artists.spotify_url) ELSE artists.spotify_url END,
+		spotify_image_url=CASE WHEN artists.spotify_id IS NULL OR artists.spotify_id=excluded.spotify_id
+			THEN COALESCE(excluded.spotify_image_url,artists.spotify_image_url) ELSE artists.spotify_image_url END,
+		updated_at=excluded.updated_at`,
 		a.MBID, a.Name, a.SortName, a.Type, a.Country, a.Disambiguation,
 		nullString(a.SpotifyID), nullString(a.SpotifyURL), nullString(a.SpotifyImageURL), now, now)
 	if err != nil {
@@ -306,9 +317,12 @@ func (s *Store) CompleteArtistResolution(ctx context.Context, resolution ArtistR
 		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(mbid) DO UPDATE SET name=excluded.name,sort_name=excluded.sort_name,
 		artist_type=excluded.artist_type,country=excluded.country,disambiguation=excluded.disambiguation,
-		spotify_id=COALESCE(excluded.spotify_id,artists.spotify_id),
-		spotify_url=COALESCE(excluded.spotify_url,artists.spotify_url),
-		spotify_image_url=COALESCE(excluded.spotify_image_url,artists.spotify_image_url),updated_at=excluded.updated_at`,
+		spotify_id=COALESCE(artists.spotify_id,excluded.spotify_id),
+		spotify_url=CASE WHEN artists.spotify_id IS NULL OR artists.spotify_id=excluded.spotify_id
+			THEN COALESCE(excluded.spotify_url,artists.spotify_url) ELSE artists.spotify_url END,
+		spotify_image_url=CASE WHEN artists.spotify_id IS NULL OR artists.spotify_id=excluded.spotify_id
+			THEN COALESCE(excluded.spotify_image_url,artists.spotify_image_url) ELSE artists.spotify_image_url END,
+		updated_at=excluded.updated_at`,
 			artist.MBID, artist.Name, artist.SortName, artist.Type, artist.Country, artist.Disambiguation,
 			nullString(artist.SpotifyID), nullString(artist.SpotifyURL), nullString(artist.SpotifyImageURL), now, now)
 		if err != nil {
@@ -763,7 +777,7 @@ func (s *Store) IsFollowing(ctx context.Context, userID, artistID int64) (bool, 
 }
 func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Artist, error) {
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,
-		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at
+		a.spotify_id,a.spotify_url,a.spotify_image_url,a.spotify_next_check_at,a.last_checked_at
 		FROM artists a JOIN follows f ON f.artist_id=a.id
 		WHERE `+artistSyncAdmissionPredicate("a")+`
 		  AND ((a.next_check_at IS NULL OR a.next_check_at<=?)
@@ -782,15 +796,22 @@ func (s *Store) ArtistsDue(ctx context.Context, now time.Time, limit int) ([]Art
 	var result []Artist
 	for rows.Next() {
 		var a Artist
-		var spotifyID, spotifyURL, spotifyImage, spotifyNext sql.NullString
+		var spotifyID, spotifyURL, spotifyImage, spotifyNext, lastChecked sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.MBID, &a.Name, &a.SortName, &a.Type, &a.Country, &a.Disambiguation,
-			&spotifyID, &spotifyURL, &spotifyImage, &spotifyNext,
+			&spotifyID, &spotifyURL, &spotifyImage, &spotifyNext, &lastChecked,
 		); err != nil {
 			return nil, err
 		}
 		a.SpotifyID, a.SpotifyURL, a.SpotifyImageURL = spotifyID.String, spotifyURL.String, spotifyImage.String
 		if a.SpotifyNextCheckAt, err = parseStoredNullableTime(spotifyNext, "artist spotify_next_check_at"); err != nil {
+			return nil, err
+		}
+		// The scheduled sync path widens the announcement cutoff to the previous
+		// successful check after a downtime gap. Without this column that
+		// widening is unreachable, so releases published during an outage longer
+		// than the seven-day window are observed and then silently suppressed.
+		if a.LastCheckedAt, err = parseStoredNullableTime(lastChecked, "artist last_checked_at"); err != nil {
 			return nil, err
 		}
 		result = append(result, a)

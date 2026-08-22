@@ -116,7 +116,10 @@ func (a *App) calendarFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if a.logger != nil {
-			a.logger.Error("calendar feed token lookup failed", "path", r.URL.Path, "error", err)
+			// Never log the request path here: this route is
+			// /calendar/feed/{token} and the path carries the raw year-long
+			// feed credential. The route is enough to locate the failure.
+			a.logger.Error("calendar feed token lookup failed", "route", "/calendar/feed/{token}", "error", err)
 		}
 		http.Error(w, "calendar feed unavailable", http.StatusInternalServerError)
 		return
@@ -147,7 +150,10 @@ func (a *App) writeCalendarICS(w http.ResponseWriter, r *http.Request, user stor
 	releases, err := a.calendarExportReleases(r, user.ID, from, to)
 	if err != nil {
 		if a.logger != nil {
-			a.logger.Error("calendar export failed", "operation", "calendar releases", "path", r.URL.Path, "error", err)
+			// writeCalendarICS serves both /calendar.ics and the tokenized feed
+			// route, so the path can carry the raw feed credential. Identify the
+			// owner instead, which is more useful for diagnosis anyway.
+			a.logger.Error("calendar export failed", "operation", "calendar releases", "user_id", user.ID, "error", err)
 		}
 		if errors.Is(err, errCalendarExportTooLarge) {
 			http.Error(w, "calendar export is too large; narrow the date range", http.StatusUnprocessableEntity)

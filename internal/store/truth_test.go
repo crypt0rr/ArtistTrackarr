@@ -282,3 +282,79 @@ func TestConflictingNotificationCanBeHeldAndReleased(t *testing.T) {
 		t.Fatalf("hold status=%q, want released", holds[0].Status)
 	}
 }
+
+func TestReleaseTruthDecisionBelongsToTheMemberWhoRecordedIt(t *testing.T) {
+	// release_truth_decisions is one shared row per release with no user
+	// dimension, and following a release is enough to reach the write paths -
+	// a single guest credit qualifies. Without an ownership guard a second
+	// member could silently revert the first member's review and replace its
+	// stated reason, which then renders on every member's release page.
+	ctx := context.Background()
+	s := testStore(t)
+	owner, err := s.CreateUser(ctx, "truth-owner@example.com", "hash", "member", "UTC", "truth-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateUser(ctx, "truth-other@example.com", "hash", "member", "UTC", "truth-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := s.CreateUser(ctx, "truth-admin@example.com", "hash", "admin", "UTC", "truth-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "truth-artist", Name: "Truth Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{owner, other, admin} {
+		if _, err := s.Follow(ctx, id, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "truth-release", artist.ID, "Truth Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/truth-release", "musicbrainz",
+		timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, "truth-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReleaseTruthDecision(ctx, owner, releaseID, "musicbrainz", "owner reviewed this"); err != nil {
+		t.Fatal(err)
+	}
+	// A second member may not overwrite it.
+	err = s.SetReleaseTruthDecision(ctx, other, releaseID, "musicbrainz", "hijacked reason")
+	if !errors.Is(err, ErrReleaseTruthDecidedByAnotherMember) {
+		t.Fatalf("overwrite by another member err=%v, want ErrReleaseTruthDecidedByAnotherMember", err)
+	}
+	// Nor delete it.
+	err = s.ClearReleaseTruthDecision(ctx, other, releaseID)
+	if !errors.Is(err, ErrReleaseTruthDecidedByAnotherMember) {
+		t.Fatalf("clear by another member err=%v, want ErrReleaseTruthDecidedByAnotherMember", err)
+	}
+	var reason string
+	if err := s.DB.QueryRowContext(ctx, `SELECT reason FROM release_truth_decisions WHERE release_group_id=?`, releaseID).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "owner reviewed this" {
+		t.Fatalf("reason=%q, want the original owner's reason", reason)
+	}
+	// The member who recorded it may still change it.
+	if err := s.SetReleaseTruthDecision(ctx, owner, releaseID, "musicbrainz", "owner updated this"); err != nil {
+		t.Fatalf("owner could not update their own decision: %v", err)
+	}
+	// A household administrator can override.
+	if err := s.ClearReleaseTruthDecision(ctx, admin, releaseID); err != nil {
+		t.Fatalf("admin could not override: %v", err)
+	}
+	// With no decision present, any follower may record one.
+	if err := s.SetReleaseTruthDecision(ctx, other, releaseID, "musicbrainz", "now unowned"); err != nil {
+		t.Fatalf("a cleared decision was not writable by another member: %v", err)
+	}
+}

@@ -1,11 +1,17 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
 	"time"
@@ -151,5 +157,38 @@ func TestCalendarFallsBackForInvalidInputsAndMarksToday(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(page, "Today") ||
 		!strings.Contains(page, "Today Release") || !strings.Contains(page, "Release calendar") {
 		t.Fatalf("calendar fallback status/body=%d %q", response.StatusCode, page)
+	}
+}
+
+func TestCalendarFeedFailureDoesNotLogTheRawToken(t *testing.T) {
+	// /calendar/feed/{token} carries a year-long unauthenticated read
+	// credential in its path, and "path" is not a sensitive key, so logging
+	// r.URL.Path would put the token into stdout, the persisted
+	// application_logs table, and the admin diagnostics panel.
+	database, err := store.Open(filepath.Join(t.TempDir(), "feed-logging.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A closed database makes the token lookup fail rather than simply miss,
+	// which is the branch that logs.
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	app := &App{store: database, logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	const token = "feedtoken0123456789abcdef0123456789abcd"
+	router := chi.NewRouter()
+	router.Get("/calendar/feed/{token}", app.calendarFeed)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/calendar/feed/"+token, nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", response.Code)
+	}
+	written := logs.String()
+	if strings.Contains(written, token) {
+		t.Fatalf("raw feed token reached the log: %s", written)
+	}
+	if !strings.Contains(written, "calendar feed token lookup failed") {
+		t.Fatalf("the failure was not logged at all: %s", written)
 	}
 }

@@ -111,13 +111,22 @@ type digestUser struct {
 // and local period. It deliberately reuses the normal destination encryption
 // and retry path, while keeping aggregate content separate from per-release
 // notification event uniqueness.
+//
+// A member is included when the account-level digest is on, or when any follow
+// is set to "Digest only". The account digest defaults to off, so without the
+// second condition a digest-only follow produced a notification event with no
+// delivery rows and no digest run: the alert went nowhere, and because
+// notification_events is unique per (user, release, event type) it could never
+// be re-queued by enabling the digest or reverting the follow later.
 func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int, error) {
 	var users []digestUser
 	if err := func() error {
 		rows, err := s.readerDB().QueryContext(ctx, `SELECT u.id,u.timezone,u.reminder_time,
 			p.release_digest_frequency,p.albums,p.eps,p.singles
 			FROM users u JOIN notification_preferences p ON p.user_id=u.id
-			WHERE p.release_digest_enabled=1`)
+			WHERE p.release_digest_enabled=1
+			   OR EXISTS (SELECT 1 FROM follow_notification_rules r
+				WHERE r.user_id=u.id AND lower(trim(COALESCE(r.delivery_mode,'')))='digest')`)
 		if err != nil {
 			return err
 		}

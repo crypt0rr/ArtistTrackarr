@@ -51,18 +51,29 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
-	if err := h.next.Handle(ctx, record); err != nil {
+	// Redact before the record reaches the downstream handler. The downstream
+	// handler is what writes to stdout, so redacting afterwards would hide a
+	// credential from the operator's own diagnostics while still shipping it to
+	// whatever collects container logs.
+	attrs := make([]slog.Attr, 0, record.NumAttrs())
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs = append(attrs, redactAttr(attr))
+		return true
+	})
+	safe := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
+	safe.AddAttrs(attrs...)
+	if err := h.next.Handle(ctx, safe); err != nil {
 		return err
 	}
 	if record.Level >= slog.LevelInfo {
-		fields := make([]Field, 0, len(h.attrs)+record.NumAttrs())
+		fields := make([]Field, 0, len(h.attrs)+len(attrs))
+		// h.attrs were redacted when the child handler was built.
 		for _, attr := range h.attrs {
 			appendField(&fields, attr)
 		}
-		record.Attrs(func(attr slog.Attr) bool {
+		for _, attr := range attrs {
 			appendField(&fields, attr)
-			return true
-		})
+		}
 		entry := Entry{
 			Time:       record.Time,
 			Level:      record.Level.String(),
@@ -84,7 +95,13 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	child := &Handler{next: h.next.WithAttrs(attrs), buffer: h.buffer, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...), sink: h.sink}
+	// Persistent attributes reach every later record, so redact them once here
+	// rather than on each Handle call.
+	redacted := make([]slog.Attr, 0, len(attrs))
+	for _, attr := range attrs {
+		redacted = append(redacted, redactAttr(attr))
+	}
+	child := &Handler{next: h.next.WithAttrs(redacted), buffer: h.buffer, attrs: append(append([]slog.Attr{}, h.attrs...), redacted...), sink: h.sink}
 	return child
 }
 
@@ -105,10 +122,34 @@ func (h *Handler) Snapshot() []Entry {
 	return h.buffer.snapshot()
 }
 
+// Redacted is the placeholder substituted for a sensitive attribute value. The
+// key is preserved so an operator can still see that a field was present.
+const Redacted = "[redacted]"
+
+// redactAttr replaces sensitive values, recursing into groups. This is the one
+// place redaction happens, so the downstream handler, the in-memory buffer, and
+// the persisted sink cannot disagree about what is safe to record.
+func redactAttr(attr slog.Attr) slog.Attr {
+	attr.Value = attr.Value.Resolve()
+	if attr.Value.Kind() == slog.KindGroup {
+		group := attr.Value.Group()
+		nested := make([]slog.Attr, 0, len(group))
+		for _, item := range group {
+			nested = append(nested, redactAttr(item))
+		}
+		return slog.Attr{Key: attr.Key, Value: slog.GroupValue(nested...)}
+	}
+	if sensitiveKey(strings.TrimSpace(attr.Key)) {
+		return slog.Attr{Key: attr.Key, Value: slog.StringValue(Redacted)}
+	}
+	return attr
+}
+
+// appendField formats an already-redacted attribute for the in-memory entry.
 func appendField(fields *[]Field, attr slog.Attr) {
 	attr.Value = attr.Value.Resolve()
 	key := strings.TrimSpace(attr.Key)
-	if key == "" || sensitiveKey(key) {
+	if key == "" {
 		return
 	}
 	*fields = append(*fields, Field{Key: key, Value: fmt.Sprint(attr.Value)})

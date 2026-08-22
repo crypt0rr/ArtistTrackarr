@@ -85,6 +85,15 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	keys := loginThrottleKeys(clientIP, email)
+	// Only the peer-scoped key refuses a request outright. The account-scoped
+	// key counts failures from every source, which is what stops an attacker who
+	// can rotate the apparent client address, but refusing on it would let
+	// anyone who knows a member's email keep that account locked out from every
+	// device and network - and on the documented single-admin deployment there
+	// is no in-app recovery, because the reset link is minted from /admin/reset
+	// by that same admin. A correct password is therefore still checked and
+	// still signs in; a wrong one simply records another failure. Attempt volume
+	// stays bounded by the per-peer limiter acquired above.
 	for _, key := range keys {
 		allowed, err := a.store.LoginAllowed(r.Context(), key)
 		if err != nil {
@@ -92,7 +101,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "could not sign in", http.StatusInternalServerError)
 			return
 		}
-		if !allowed {
+		if !allowed && key != accountThrottleKey(email) {
 			d := a.data(r, "Sign in")
 			d.Error = "Too many attempts. Try again in 15 minutes."
 			a.render(w, "login", d, http.StatusTooManyRequests)
@@ -277,9 +286,16 @@ func (a *App) clientIP(r *http.Request) string {
 // loginThrottleKeys applies both the peer identity and an account identity.
 // The peer key protects a single source while the account key keeps failures
 // throttled when an attacker rotates addresses through a trusted proxy.
+// accountThrottleKey is the source-independent failure counter for one account.
+// It is deliberately counted but never used to refuse a request on its own; see
+// the comment in login.
+func accountThrottleKey(email string) string {
+	return "account:" + strings.ToLower(strings.TrimSpace(email))
+}
+
 func loginThrottleKeys(clientIP, email string) []string {
 	email = strings.ToLower(strings.TrimSpace(email))
-	return []string{clientIP + "|" + email, "account:" + email}
+	return []string{clientIP + "|" + email, accountThrottleKey(email)}
 }
 
 func (a *App) trustedProxy(ip net.IP) bool {

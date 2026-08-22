@@ -1,9 +1,11 @@
 package logging
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -19,10 +21,46 @@ func TestHandlerKeepsBoundedRedactedSnapshot(t *testing.T) {
 		t.Fatalf("unexpected snapshot: %#v", entries)
 	}
 	if len(entries[1].Attributes) != 0 {
-		t.Fatalf("sensitive attributes were retained: %#v", entries[1].Attributes)
+		t.Fatalf("unexpected attributes on an attribute-free record: %#v", entries[1].Attributes)
 	}
-	if len(entries[0].Attributes) != 0 {
-		t.Fatalf("unexpected second attributes: %#v", entries[0].Attributes)
+	// The key survives so an operator can see a field was present; the value
+	// does not.
+	if len(entries[0].Attributes) != 1 || entries[0].Attributes[0].Key != "destination_url" ||
+		entries[0].Attributes[0].Value != Redacted {
+		t.Fatalf("sensitive attribute was not redacted: %#v", entries[0].Attributes)
+	}
+}
+
+func TestHandlerRedactsBeforeTheDownstreamHandler(t *testing.T) {
+	// The downstream handler is what writes to stdout. Assert on the bytes it
+	// actually receives, not on Snapshot(): redaction that only shapes the
+	// in-memory view hides a credential from the operator while still shipping
+	// it to whatever collects container logs.
+	var out bytes.Buffer
+	h := NewHandler(slog.NewJSONHandler(&out, &slog.HandlerOptions{Level: slog.LevelInfo}), 8)
+	logger := slog.New(h.WithAttrs([]slog.Attr{slog.String("session_token", "persistent-attr-secret")}))
+	logger.Info("delivery attempted",
+		"destination_url", "https://hooks.example.test/T000/B000/xoxb-real-credential",
+		"password", "hunter2",
+		"api_secret", "sk-live-abcdef",
+		"nested", slog.GroupValue(slog.String("bearer_token", "grouped-secret"), slog.String("artist_id", "42")),
+		"artist_id", 42,
+	)
+	written := out.String()
+	for _, leaked := range []string{
+		"xoxb-real-credential", "hunter2", "sk-live-abcdef",
+		"grouped-secret", "persistent-attr-secret",
+	} {
+		if strings.Contains(written, leaked) {
+			t.Fatalf("credential %q reached the downstream handler: %s", leaked, written)
+		}
+	}
+	// Non-sensitive attributes and the message must survive intact.
+	if !strings.Contains(written, `"artist_id":42`) || !strings.Contains(written, "delivery attempted") {
+		t.Fatalf("redaction damaged safe output: %s", written)
+	}
+	if !strings.Contains(written, Redacted) {
+		t.Fatalf("no redaction placeholder in output: %s", written)
 	}
 }
 

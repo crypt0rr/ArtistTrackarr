@@ -14,6 +14,13 @@ var (
 	// ErrReleaseTruthProviderUnavailable means the provider is valid but has no
 	// persisted observation for this release.
 	ErrReleaseTruthProviderUnavailable = errors.New("release truth provider is unavailable")
+
+	// ErrReleaseTruthDecidedByAnotherMember reports an attempt to overwrite or
+	// clear a decision another household member recorded. The decision is one
+	// shared row per release, so without this guard any member who follows the
+	// release - which a single guest credit is enough for - could silently
+	// revert another member's review and replace its stated reason.
+	ErrReleaseTruthDecidedByAnotherMember = errors.New("release truth decision belongs to another household member")
 )
 
 // SetReleaseTruthDecision records a household-scoped, reversible source choice
@@ -49,6 +56,13 @@ func (s *Store) SetReleaseTruthDecision(ctx context.Context, userID, releaseID i
 		if !providerID.Valid || strings.TrimSpace(providerID.String) == "" {
 			return ErrReleaseTruthProviderUnavailable
 		}
+		// The decision is one shared row per release. Only the member who
+		// recorded it, or a household administrator, may change it; otherwise a
+		// second member silently reverts the first member's review and replaces
+		// its stated reason, which then renders on every member's release page.
+		if err := releaseTruthDecisionWritableTx(ctx, tx, userID, releaseID); err != nil {
+			return err
+		}
 		now := nowText()
 		_, err = tx.ExecContext(ctx, `INSERT INTO release_truth_decisions
 		(release_group_id,state,selected_provider,selected_provider_id,reason,decided_by_user_id,created_at,updated_at)
@@ -81,6 +95,9 @@ func (s *Store) ClearReleaseTruthDecision(ctx context.Context, userID, releaseID
 			if errors.Is(err, sql.ErrNoRows) {
 				return sql.ErrNoRows
 			}
+			return err
+		}
+		if err := releaseTruthDecisionWritableTx(ctx, tx, userID, releaseID); err != nil {
 			return err
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM release_truth_decisions WHERE release_group_id=?`, releaseID)
@@ -126,4 +143,34 @@ func releaseTruthState(explicitState, source string, sourceCount int, sources []
 
 func parseTruthUpdatedAt(value sql.NullString) (*time.Time, error) {
 	return parseStoredNullableTime(value, "release truth updated_at")
+}
+
+// releaseTruthDecisionWritableTx reports whether userID may change the shared
+// truth decision for releaseID. An absent decision is writable by any follower;
+// an existing one belongs to the member who recorded it, and a household
+// administrator can always override.
+func releaseTruthDecisionWritableTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64) error {
+	var decidedBy sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT decided_by_user_id FROM release_truth_decisions
+		WHERE release_group_id=?`, releaseID).Scan(&decidedBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !decidedBy.Valid || decidedBy.Int64 == userID {
+		return nil
+	}
+	var role string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(role,'') FROM users WHERE id=?`, userID).Scan(&role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrReleaseTruthDecidedByAnotherMember
+		}
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(role), "admin") {
+		return nil
+	}
+	return ErrReleaseTruthDecidedByAnotherMember
 }

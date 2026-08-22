@@ -635,6 +635,60 @@ func TestLoginThrottleRendersRetryResponseAfterRepeatedFailures(t *testing.T) {
 	}
 }
 
+func TestAccountThrottleAloneDoesNotLockTheOwnerOut(t *testing.T) {
+	// The account-scoped counter is source-independent, so refusing on it let
+	// anyone who knows a member's email keep that account locked out from every
+	// device and network. It must still count failures - that is what stops an
+	// attacker who can rotate the apparent client address - but it must not
+	// refuse a request before the password is even checked.
+	database, server, client := authenticatedTestServer(t, &searchCatalog{}, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/")
+	response := postForm(t, client, server.URL+"/logout", url.Values{"_csrf": {csrf}})
+	_ = response.Body.Close()
+
+	// Saturate only the account key, as a remote party who knows the email can.
+	for range 6 {
+		if err := database.RecordLoginFailure(context.Background(), "account:member@example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allowed, err := database.LoginAllowed(context.Background(), "account:member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed {
+		t.Fatal("account key was not blocked by the seeded failures")
+	}
+
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
+		"_csrf": {csrf}, "email": {"member@example.com"}, "password": {"wrong password"},
+	})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	// 401 means the credentials were actually evaluated; 429 would mean the
+	// owner is locked out by a counter a stranger can drive.
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("account-only throttle status/body=%d %q, want 401", response.StatusCode, body)
+	}
+
+	// The peer-scoped key must still refuse outright.
+	for range 6 {
+		if err := database.RecordLoginFailure(context.Background(), "127.0.0.1|member@example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	csrf = getCSRF(t, client, server.URL+"/login")
+	response = postForm(t, client, server.URL+"/login", url.Values{
+		"_csrf": {csrf}, "email": {"member@example.com"}, "password": {"wrong password"},
+	})
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(body), "Too many attempts") {
+		t.Fatalf("peer throttle status/body=%d %q, want 429", response.StatusCode, body)
+	}
+}
+
 func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
 	var logs bytes.Buffer
 	app := &App{
