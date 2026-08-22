@@ -185,8 +185,9 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		// A recording search returns a search document: "count" for the total and
 		// a "releases" array whose entries embed "release-group". The embedded
-		// group carries no first-release-date, which is what upstream sends.
-		_, _ = io.WriteString(w, `{"count":1,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
+		// group carries no first-release-date; each release carries its own
+		// "date". Two releases share one group here, so the earliest wins.
+		_, _ = io.WriteString(w, `{"count":1,"recordings":[{"id":"`+recordingID+`","title":"Collab track","first-release-date":"2020-01-01","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","date":"2026-11-04","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}},{"id":"66666666-6666-4666-8666-666666666666","title":"Collab album","date":"2026-09-01","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
 	}))
 	defer server.Close()
 	mb := NewMusicBrainz("test@example.com")
@@ -195,10 +196,11 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 	if err != nil || len(credits) != 1 || credits[0].MBID != groupID || credits[0].ArtistCreditRole != "featured" || len(credits[0].Credits) != 1 {
 		t.Fatalf("credits=%#v err=%v", credits, err)
 	}
-	// A search document has no release date for the group, so the projection
-	// must record an unknown precision instead of inventing one.
-	if credits[0].FirstReleaseDate != "" || credits[0].DatePrecision != 0 {
-		t.Fatalf("date=%q precision=%d, want empty/0", credits[0].FirstReleaseDate, credits[0].DatePrecision)
+	// The group's date comes from the earliest of its releases, at that date's
+	// own precision. An undated projection would be invisible to notifications,
+	// the calendar, the ICS feed, and the inbox.
+	if credits[0].FirstReleaseDate != "2026-09-01" || credits[0].DatePrecision != 3 {
+		t.Fatalf("date=%q precision=%d, want 2026-09-01/3", credits[0].FirstReleaseDate, credits[0].DatePrecision)
 	}
 	credit := credits[0].Credits[0]
 	if credit.Role != "guest" || credit.ProviderID != recordingID || credit.TrackTitle != "Collab track" {
@@ -224,6 +226,58 @@ func TestMusicBrainzRejectsMalformedReleaseGroupID(t *testing.T) {
 	}
 }
 
+func TestMusicBrainzReleaseCreditsProjectDatesAtTheirRealPrecision(t *testing.T) {
+	const artistID = "11111111-1111-4111-8111-111111111111"
+	const yearGroup = "22222222-2222-4222-8222-222222222222"
+	const undatedGroup = "33333333-3333-4333-8333-333333333333"
+	const knownGroup = "44444444-4444-4444-8444-444444444444"
+	const recordingID = "55555555-5555-4555-8555-555555555555"
+	credit := func(id string) string {
+		return `{"name":"Fridayy","artist":{"id":"` + artistID + `","name":"Fridayy"}},{"name":"Other","artist":{"id":"` + id + `","name":"Other"}}`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/ws/2/recording" {
+			http.NotFound(w, request)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Upstream mixes precisions and omits dates entirely on some releases.
+		_, _ = io.WriteString(w, `{"count":3,"recordings":[
+			{"id":"`+recordingID+`","title":"Year only","artist-credit":[`+credit("66666666-6666-4666-8666-666666666666")+`],
+			 "releases":[{"id":"77777777-7777-4777-8777-777777777777","date":"1990","release-group":{"id":"`+yearGroup+`","title":"Year album","primary-type":"Album"}}]},
+			{"id":"88888888-8888-4888-8888-888888888888","title":"No date","artist-credit":[`+credit("99999999-9999-4999-8999-999999999999")+`],
+			 "releases":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","release-group":{"id":"`+undatedGroup+`","title":"Undated album","primary-type":"Album"}}]},
+			{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","title":"Known","artist-credit":[`+credit("cccccccc-cccc-4ccc-8ccc-cccccccccccc")+`],
+			 "releases":[{"id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","release-group":{"id":"`+knownGroup+`","title":"Known album","primary-type":"Album"}}]}
+		]}`)
+	}))
+	defer server.Close()
+	mb := NewMusicBrainz("test@example.com")
+	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
+	// The third group is already known with real browse metadata, so its credit
+	// must attach even though the search document gives it no date.
+	known := []store.Release{{MBID: knownGroup, Title: "Known album", PrimaryType: "Album", FirstReleaseDate: "2024-05-06", DatePrecision: 3}}
+	credits, err := mb.ArtistReleaseCredits(context.Background(), artistID, known)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	byID := make(map[string]store.Release, len(credits))
+	for _, release := range credits {
+		byID[release.MBID] = release
+	}
+	if _, ok := byID[undatedGroup]; ok {
+		t.Fatalf("undated group was projected: %#v", byID[undatedGroup])
+	}
+	year, ok := byID[yearGroup]
+	if !ok || year.FirstReleaseDate != "1990" || year.DatePrecision != 1 {
+		t.Fatalf("year group=%#v ok=%t, want 1990 at precision 1", year, ok)
+	}
+	stored, ok := byID[knownGroup]
+	if !ok || stored.FirstReleaseDate != "2024-05-06" || stored.DatePrecision != 3 || len(stored.Credits) != 1 {
+		t.Fatalf("known group=%#v ok=%t, want its browse date and one credit", stored, ok)
+	}
+}
+
 func TestMusicBrainzReleaseCreditsStopAtOneBoundedPage(t *testing.T) {
 	const artistID = "11111111-1111-4111-8111-111111111111"
 	const groupID = "22222222-2222-4222-8222-222222222222"
@@ -244,7 +298,7 @@ func TestMusicBrainzReleaseCreditsStopAtOneBoundedPage(t *testing.T) {
 		// request per second limiter, so it must take what one page gives and
 		// stop rather than walking the whole catalogue or reporting a limit
 		// error that would cool the provider down.
-		_, _ = io.WriteString(w, `{"count":9001,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
+		_, _ = io.WriteString(w, `{"count":9001,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","date":"2026-09-01","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
 	}))
 	defer server.Close()
 	mb := NewMusicBrainz("test@example.com")
