@@ -676,3 +676,65 @@ func TestQueueDueReleaseDigestsTreatsTimezoneChangesAsOnePeriod(t *testing.T) {
 		t.Fatalf("digest runs=%d, want 1", runs)
 	}
 }
+
+func TestDigestOnlyFollowGetsADigestRunWithTheAccountDigestOff(t *testing.T) {
+	// release_digest_enabled defaults to 0. A follow set to "Digest only" then
+	// produced a notification event with no delivery rows and no digest run:
+	// the alert went nowhere, and because notification_events is unique per
+	// (user, release, event type) it could never be re-queued afterwards.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	userID, err := s.CreateUser(ctx, "digest-only@example.com", "hash", "member", "UTC", "digest-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "digest-only-artist", Name: "Digest Only Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Account digest deliberately left off, which is the shipped default.
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: false, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule.DeliveryMode = FollowDeliveryDigest
+	if err := s.UpdateFollowNotificationRule(ctx, userID, artist.ID, rule); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	releaseDate := now.AddDate(0, 0, 1).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "digest-only-release", artist.ID, "Digest Only Release", "EP", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/digest-only-release", "musicbrainz",
+		timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	var runs int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("digest runs=%d for a digest-only follow with the account digest off, want 1", runs)
+	}
+}

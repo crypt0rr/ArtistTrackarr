@@ -39,6 +39,8 @@ func (a *App) releaseTruthAction(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 		case errors.Is(operationErr, store.ErrInvalidReleaseTruthProvider), errors.Is(operationErr, store.ErrReleaseTruthProviderUnavailable):
 			http.Error(w, "that provider is not available for this release", http.StatusBadRequest)
+		case errors.Is(operationErr, store.ErrReleaseTruthDecidedByAnotherMember):
+			http.Error(w, "another household member recorded this release source decision; ask them or an administrator to change it", http.StatusForbidden)
 		default:
 			a.logger.Error("release truth decision failed", "path", r.URL.Path, "user_id", session.User.ID,
 				"release_id", id, "error", operationErr)

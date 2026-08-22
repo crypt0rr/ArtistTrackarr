@@ -57,12 +57,20 @@ func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType
 // secondary types, so compilations have their own filter and must not be
 // accidentally controlled by the Albums checkbox.
 func (r FollowNotificationRule) AllowsRelease(primaryType string, secondaryTypes []string, creditRole, eventType string, now time.Time) bool {
-	if strings.EqualFold(strings.TrimSpace(creditRole), "featured") {
+	// "featured" and "guest" are both appearance credits: release_credits.role
+	// is CHECK(role IN ('primary','featured','guest')) and both iTunes and
+	// MusicBrainz emit "guest". The README states that follow rules including
+	// featured appearances also include guest credits, so both must be gated by
+	// IncludeFeatured. Gating "guest" by IncludePrimary inverts that.
+	switch strings.ToLower(strings.TrimSpace(creditRole)) {
+	case "featured", "guest":
 		if !r.IncludeFeatured {
 			return false
 		}
-	} else if !r.IncludePrimary {
-		return false
+	default:
+		if !r.IncludePrimary {
+			return false
+		}
 	}
 	compilation := strings.EqualFold(strings.TrimSpace(primaryType), "compilation")
 	if !compilation {

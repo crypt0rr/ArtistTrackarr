@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.54.18`; local and published images use the
+footer. The current release is `v0.55.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -313,6 +313,43 @@ rather than stored undated, matching the Apple/iTunes credit path, while a
 credit on a release group already known from the release-group browse keeps
 that catalogue date.
 
+The v0.55.0 release closes a full review backlog. Three faults were reachable
+through ordinary documented use. Compose declared the optional Spotify secret
+unconditionally, so the documented quick start could not produce a running
+container without Spotify credentials; an absent optional secret file now means
+"not configured" while the three required secrets still fail closed. Application
+logs were written before redaction ran, so every value the redactor hides from
+the diagnostics panel was still printed in full to standard output and shipped
+to whatever collects container logs; redaction now happens once, before the
+record reaches the log handler, and covers persistent and grouped attributes.
+An artist carrying a Spotify ID on a deployment without Spotify credentials was
+never rescheduled and held a due slot forever, starving every other followed
+artist.
+
+Alongside those: the calendar feed token no longer reaches any log through the
+request path; a release truth decision now belongs to the member who recorded
+it, with administrator override; following an artist can no longer repoint the
+household-shared Spotify identity, artwork, or genres another member already
+relies on; guest credits follow the featured-appearance switch as documented
+rather than the primary one; a follow set to "Digest only" now receives a digest
+run even when the account digest is off, instead of recording an event that is
+delivered nowhere and can never be re-queued; and a known email address can no
+longer keep an account locked out, because the account-wide failure counter
+still counts every attempt but no longer refuses one before the password is
+checked.
+
+Three provider integrations were reading fields their upstream never sends. The
+MusicBrainz artist search decoded a genres key that only the lookup endpoint
+returns, which also made every genre-less artist cost an extra lookup on every
+scheduled sync; the iTunes wrong-artist guard compared a field Apple sends only
+on track rows, so a stale provider identity is now surfaced for review instead
+of importing another artist's discography; and the iTunes release cache is now
+invalidated before a due check, so a scheduled poll reaches the provider rather
+than replaying a day-old response, suppressing the MusicBrainz fallback, and
+recording health for a request that never happened. Their fixtures previously
+repeated the same wrong field names, so the tests validated each struct against
+itself; they now use real payload shapes.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -403,7 +440,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.54.18` publishes `0.54.18`, `0.54`, and `latest`.
+- Pushing a tag such as `v0.55.0` publishes `0.55.0`, `0.55`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -427,7 +464,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.54.18 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.55.0 docker compose up -d
 ```
 
 ## Configuration

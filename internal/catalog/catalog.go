@@ -262,7 +262,10 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 	if limit < 1 || limit > 25 {
 		limit = 10
 	}
-	endpoint := m.baseURL + "/ws/2/artist?fmt=json&inc=genres&limit=" +
+	// A search request is a Lucene query, not a lookup: it ignores inc= and its
+	// artist objects carry "tags", never "genres". Genres are read from
+	// ResolveArtist, which uses the lookup endpoint where inc=genres applies.
+	endpoint := m.baseURL + "/ws/2/artist?fmt=json&limit=" +
 		fmt.Sprint(limit) + "&query=" + url.QueryEscape(query)
 	var response struct {
 		Artists []struct {
@@ -276,10 +279,6 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 			Aliases        []struct {
 				Name string `json:"name"`
 			} `json:"aliases"`
-			Genres []struct {
-				Name  string `json:"name"`
-				Count int    `json:"count"`
-			} `json:"genres"`
 		} `json:"artists"`
 	}
 	if err := m.getJSON(ctx, endpoint, &response); err != nil {
@@ -297,14 +296,8 @@ func (m *MusicBrainz) SearchArtists(ctx context.Context, query string, limit int
 			}
 			a.Aliases = append(a.Aliases, alias.Name)
 		}
-		for _, genre := range item.Genres {
-			if strings.TrimSpace(genre.Name) != "" {
-				a.Genres = append(a.Genres, genre.Name)
-			}
-			if len(a.Genres) >= 10 {
-				break
-			}
-		}
+		// Genres are intentionally left empty here: the search document does not
+		// carry them. ResolveArtist fills them in from the lookup endpoint.
 		result = append(result, a)
 	}
 	return result, nil

@@ -350,3 +350,42 @@ func TestLoadTrimsTrustProxy(t *testing.T) {
 		t.Fatalf("Load() trust proxy=%v networks=%v err=%v", cfg.TrustProxy, cfg.TrustedProxyNetworks, err)
 	}
 }
+
+func TestOptionalSpotifySecretFileMayBeAbsentButRequiredSecretsMayNot(t *testing.T) {
+	// compose.yaml always declares the Spotify Docker secret, so a deployment
+	// with no Spotify credentials has SPOTIFY_CLIENT_SECRET_FILE pointing at a
+	// file Compose never created. That must mean "not configured", not a fatal
+	// startup error, because the README documents Spotify as optional.
+	missing := filepath.Join(t.TempDir(), "never-created")
+	t.Setenv("SPOTIFY_CLIENT_SECRET_FILE", missing)
+	t.Setenv("SPOTIFY_CLIENT_SECRET", "")
+	value, err := optionalSecret("SPOTIFY_CLIENT_SECRET")
+	if err != nil || value != "" {
+		t.Fatalf("absent optional secret file: value=%q err=%v, want empty and no error", value, err)
+	}
+	// A required secret must still fail closed on the same input.
+	t.Setenv("SETUP_TOKEN_FILE", missing)
+	if _, err := secret("SETUP_TOKEN"); err == nil {
+		t.Fatal("a missing required secret file was accepted")
+	}
+	// A present optional secret is still read.
+	present := filepath.Join(t.TempDir(), "spotify-secret")
+	if err := os.WriteFile(present, []byte("  real-secret  "), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTIFY_CLIENT_SECRET_FILE", present)
+	value, err = optionalSecret("SPOTIFY_CLIENT_SECRET")
+	if err != nil || value != "real-secret" {
+		t.Fatalf("present optional secret: value=%q err=%v", value, err)
+	}
+	// A file that exists but cannot be read stays fatal: that is a real
+	// misconfiguration, not an absent optional credential.
+	unreadable := filepath.Join(t.TempDir(), "unreadable")
+	if err := os.WriteFile(unreadable, []byte("secret"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPOTIFY_CLIENT_SECRET_FILE", unreadable)
+	if _, err := optionalSecret("SPOTIFY_CLIENT_SECRET"); err == nil && os.Geteuid() != 0 {
+		t.Fatal("an unreadable optional secret file was accepted")
+	}
+}

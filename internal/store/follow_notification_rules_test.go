@@ -538,3 +538,41 @@ func compilationProviderRelease(provider, suffix, date string) Release {
 	}
 	return release
 }
+
+func TestAllowsReleaseTreatsGuestCreditsAsAppearances(t *testing.T) {
+	// release_credits.role is CHECK(role IN ('primary','featured','guest')) and
+	// both iTunes and MusicBrainz emit "guest". The README states that follow
+	// rules including featured appearances also include guest credits, so
+	// "guest" must follow IncludeFeatured. Gating it by IncludePrimary inverted
+	// that: unchecking "Featured & guest appearances" still delivered every
+	// guest credit, and unchecking Primary silently dropped them all.
+	base := FollowNotificationRule{
+		Albums: true, EPs: true, Singles: true, Compilations: true,
+		Announcements: true, ReleaseDay: true, DeliveryMode: FollowDeliveryImmediate,
+	}
+	now := time.Now().UTC()
+	for _, test := range []struct {
+		name            string
+		role            string
+		includePrimary  bool
+		includeFeatured bool
+		want            bool
+	}{
+		{name: "guest with appearances on", role: "guest", includePrimary: false, includeFeatured: true, want: true},
+		{name: "guest with appearances off", role: "guest", includePrimary: true, includeFeatured: false, want: false},
+		{name: "featured with appearances on", role: "featured", includePrimary: false, includeFeatured: true, want: true},
+		{name: "featured with appearances off", role: "featured", includePrimary: true, includeFeatured: false, want: false},
+		{name: "primary with primary on", role: "primary", includePrimary: true, includeFeatured: false, want: true},
+		{name: "primary with primary off", role: "primary", includePrimary: false, includeFeatured: true, want: false},
+		{name: "unknown role follows primary", role: "", includePrimary: true, includeFeatured: false, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rule := base
+			rule.IncludePrimary, rule.IncludeFeatured = test.includePrimary, test.includeFeatured
+			if got := rule.AllowsRelease("Album", nil, test.role, "announcement", now); got != test.want {
+				t.Fatalf("AllowsRelease(role=%q, primary=%t, featured=%t)=%t, want %t",
+					test.role, test.includePrimary, test.includeFeatured, got, test.want)
+			}
+		})
+	}
+}

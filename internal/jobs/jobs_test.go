@@ -1115,6 +1115,108 @@ func TestImportedFollowSyncCreatesRuleReleaseAndOnboardingEvent(t *testing.T) {
 	}
 }
 
+func TestGenreBackfillDoesNotRepeatForAnArtistWithNoGenres(t *testing.T) {
+	// Plenty of artists genuinely have no MusicBrainz genres. Without a guard,
+	// each one costs an extra ResolveArtist lookup on every scheduled sync,
+	// forever, against the process-wide one-request-per-second limiter.
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "genres@example.com", "unused", "member", "UTC", "genres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "genreless-artist", Name: "Genreless Artist", SortName: "Genreless Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider := &countingResolveCatalog{perArtistCatalog: perArtistCatalog{releases: map[string][]store.Release{
+		"genreless-artist": {{MBID: "genreless-release", Title: "Release", PrimaryType: "Album",
+			FirstReleaseDate: "2026-08-18", DatePrecision: 3}},
+	}}}
+	runner := testRunner(database, provider)
+	for range 3 {
+		stored, err := database.ArtistByID(ctx, artist.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runner.SyncArtistNow(ctx, stored); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := provider.resolves.Load(); got != 1 {
+		t.Fatalf("ResolveArtist called %d times across three syncs, want 1", got)
+	}
+}
+
+func TestSpotifyIDArtistIsRescheduledWhenSpotifyIsNotConfigured(t *testing.T) {
+	// A deployment with no Spotify credentials can still hold artists carrying a
+	// Spotify ID, because a CSV round trip writes and reads spotify_id back. The
+	// Spotify check is never attempted there, so if the watermark is not
+	// advanced the artist stays permanently due: ArtistsDue matches on
+	// spotify_next_check_at and orders by it, so 25 such artists occupy the
+	// whole batch forever and nothing else ever syncs.
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "no-spotify@example.com", "unused", "member", "UTC", "no-spotify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "no-spotify-artist", Name: "No Spotify Artist", SortName: "No Spotify Artist",
+		SpotifyID: "spotify-id-from-a-csv-round-trip",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.ArtistByID(ctx, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SpotifyID == "" {
+		t.Fatal("artist did not retain a Spotify ID")
+	}
+	provider := &perArtistCatalog{releases: map[string][]store.Release{
+		"no-spotify-artist": {{MBID: "no-spotify-release", Title: "Release", PrimaryType: "Album",
+			FirstReleaseDate: "2026-08-18", DatePrecision: 3}},
+	}}
+	// testRunner passes nil for the Spotify provider.
+	runner := testRunner(database, provider)
+	if runner.spotify != nil {
+		t.Fatal("test runner unexpectedly has a Spotify provider")
+	}
+	if err := runner.SyncArtistNow(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	after, err := database.ArtistByID(ctx, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SpotifyNextCheckAt == nil {
+		t.Fatal("spotify_next_check_at was never set, so the artist stays permanently due")
+	}
+	if !after.SpotifyNextCheckAt.After(time.Now().UTC()) {
+		t.Fatalf("spotify_next_check_at=%s is not in the future; the artist is still due", after.SpotifyNextCheckAt)
+	}
+	// The artist must not come straight back to the front of the due batch.
+	due, err := database.ArtistsDue(ctx, time.Now().UTC(), 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			t.Fatal("artist is still due immediately after a successful sync")
+		}
+	}
+}
+
 func TestImportedIdentityVerificationPersistsCanonicalMetadata(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
@@ -2289,4 +2391,16 @@ func TestRunnerMaintenanceAndDeliveryHandleClosedStore(t *testing.T) {
 	_ = database.Close()
 	runner.runMaintenance(context.Background())
 	runner.runDeliveryCadence(context.Background())
+}
+
+// countingResolveCatalog counts ResolveArtist calls and always reports an
+// artist with no genres.
+type countingResolveCatalog struct {
+	perArtistCatalog
+	resolves atomic.Int32
+}
+
+func (c *countingResolveCatalog) ResolveArtist(ctx context.Context, mbid string) (catalog.ArtistResult, error) {
+	c.resolves.Add(1)
+	return catalog.ArtistResult{MBID: mbid, Name: "Genreless Artist", SortName: "Genreless Artist"}, nil
 }

@@ -95,12 +95,14 @@ func TestMusicBrainzSearchValidationAndResponseErrors(t *testing.T) {
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(`{"artists":[{"id":"6e335887-60ba-38f0-95af-fae7774336bf","name":"Example","aliases":[{"name":"one"},{"name":"two"},{"name":"three"},{"name":"four"}],"genres":[{"name":"pop"},{"name":"rock"},{"name":"jazz"},{"name":"metal"},{"name":"folk"},{"name":"soul"},{"name":"rap"},{"name":"blues"},{"name":"house"},{"name":"techno"},{"name":"noise"}]}]}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"artists":[{"id":"6e335887-60ba-38f0-95af-fae7774336bf","name":"Example","aliases":[{"name":"one"},{"name":"two"},{"name":"three"},{"name":"four"}],"tags":[{"count":1,"name":"pop"},{"count":1,"name":"rock"}]}]}`)),
 			Header:     make(http.Header),
 		}, nil
 	})}
 	results, err := mb.SearchArtists(context.Background(), "example", 25)
-	if err != nil || len(results) != 1 || len(results[0].Aliases) != 3 || len(results[0].Genres) != 10 || requests.Load() != 1 {
+	// A search document carries "tags", never "genres", so genres stay empty
+	// here and are filled in from the lookup endpoint by ResolveArtist.
+	if err != nil || len(results) != 1 || len(results[0].Aliases) != 3 || len(results[0].Genres) != 0 || requests.Load() != 1 {
 		t.Fatalf("results=%#v requests=%d err=%v", results, requests.Load(), err)
 	}
 
@@ -539,10 +541,10 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 			}
 			_, _ = io.WriteString(w, `{"results":[
 				{"wrapperType":"artist","artistId":123,"artistName":"Example"},
-				{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"One","collectionArtistName":"Example","trackCount":1,"releaseDate":"2026-01-02T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/one","artworkUrl100":"http://is1-ssl.mzstatic.com/image/thumb/Features/100x100bb.jpg"},
-				{"wrapperType":"collection","collectionType":"Album","collectionId":2,"collectionName":"Short EP","collectionArtistName":"Example","trackCount":4,"releaseDate":"2025-02-01T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/ep"},
-				{"wrapperType":"collection","collectionType":"Album","collectionId":3,"collectionName":"Long","collectionArtistName":"Example","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"},
-				{"wrapperType":"collection","collectionType":"Album","collectionId":4,"collectionName":"Other Artist","collectionArtistName":"Other","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"}
+				{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"One","artistName":"Example","trackCount":1,"releaseDate":"2026-01-02T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/one","artworkUrl100":"http://is1-ssl.mzstatic.com/image/thumb/Features/100x100bb.jpg"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":2,"collectionName":"Short EP","artistName":"Example","trackCount":4,"releaseDate":"2025-02-01T00:00:00Z","collectionViewUrl":"https://music.apple.com/nl/album/ep"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":3,"collectionName":"Long","artistName":"Example","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":4,"collectionName":"Other Artist","artistName":"Other","trackCount":10,"releaseDate":"2024-01-01T00:00:00Z"}
 			]}`)
 			return
 		}
@@ -680,7 +682,7 @@ func TestITunesCanonicalReleaseCacheIncludesCanonicalAndProviderIDs(t *testing.T
 			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/artist/example"}]}`)
 		case "/lookup":
 			lookups.Add(1)
-			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"Example Album","collectionArtistName":"Example","trackCount":10,"releaseDate":"2026-01-02T00:00:00Z"}]}`)
+			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"collection","collectionType":"Album","collectionId":1,"collectionName":"Example Album","artistName":"Example","trackCount":10,"releaseDate":"2026-01-02T00:00:00Z"}]}`)
 		default:
 			http.NotFound(w, request)
 		}
@@ -1593,4 +1595,65 @@ func TestExtractMBIDRejectsSpoofedHosts(t *testing.T) {
 			t.Fatalf("extractMBID accepted untrusted URL %q as %q", value, got)
 		}
 	}
+}
+
+func TestITunesAlbumLookupRejectsAnotherArtistsCollections(t *testing.T) {
+	// Apple sends collectionArtistName only on wrapperType "track" rows, never
+	// on the "collection" rows this path keeps, so a guard keyed off it never
+	// ran and a stale or mis-mapped provider ID admitted a whole wrong artist's
+	// discography. Fixtures below use the real payload shape: collection rows
+	// carry artistName and no collectionArtistName.
+	t.Run("mis-mapped identity is surfaced, not silently imported", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if request.URL.Path != "/lookup" {
+				http.NotFound(w, request)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"resultCount":2,"results":[
+				{"wrapperType":"artist","artistType":"Artist","artistId":42,"artistName":"Someone Else"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":900,"collectionName":"Wrong Album","artistName":"Someone Else","releaseDate":"2026-09-01T00:00:00Z","trackCount":10}
+			]}`)
+		}))
+		defer server.Close()
+		itunes := NewITunes("US")
+		itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+		releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
+			"11111111-1111-4111-8111-111111111111", "Expected Artist", "42")
+		var ambiguous *ITunesAmbiguousArtistError
+		if !errors.As(err, &ambiguous) {
+			t.Fatalf("err=%v releases=%#v, want ITunesAmbiguousArtistError", err, releases)
+		}
+		if len(releases) != 0 {
+			t.Fatalf("another artist's releases were admitted: %#v", releases)
+		}
+	})
+
+	t.Run("the expected artist's own collections are admitted", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if request.URL.Path != "/lookup" {
+				http.NotFound(w, request)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			// Casing differs, which resolveExactArtist already treats as the
+			// same identity, plus one foreign row that must be dropped.
+			_, _ = io.WriteString(w, `{"resultCount":3,"results":[
+				{"wrapperType":"artist","artistType":"Artist","artistId":42,"artistName":"expected artist"},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":901,"collectionName":"Real Album","artistName":"Expected Artist","releaseDate":"2026-09-01T00:00:00Z","trackCount":10},
+				{"wrapperType":"collection","collectionType":"Album","collectionId":902,"collectionName":"Foreign Album","artistName":"Someone Else","releaseDate":"2026-09-02T00:00:00Z","trackCount":10}
+			]}`)
+		}))
+		defer server.Close()
+		itunes := NewITunes("US")
+		itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+		releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
+			"11111111-1111-4111-8111-111111111111", "Expected Artist", "42")
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if len(releases) != 1 || releases[0].Title != "Real Album" {
+			t.Fatalf("releases=%#v, want only Real Album", releases)
+		}
+	})
 }

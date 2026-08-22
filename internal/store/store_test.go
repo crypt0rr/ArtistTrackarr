@@ -2906,3 +2906,68 @@ func assertEventCount(t *testing.T, s *Store, userID int64, eventType string, wa
 		t.Fatalf("%s events = %d, want %d", eventType, got, want)
 	}
 }
+
+func TestUpsertArtistNeverRepointsAStoredSpotifyIdentity(t *testing.T) {
+	// The interactive follow path re-runs a Spotify name search on every follow
+	// and takes the first exact-name match, which is frequently a different band
+	// for a homonym. A second member following an artist must not repoint the
+	// first member's release feed, artwork, or genres.
+	ctx := context.Background()
+	database := testStore(t)
+	const mbid = "shared-artist-mbid"
+	first, err := database.UpsertArtist(ctx, Artist{
+		MBID: mbid, Name: "Shared Artist", SortName: "Shared Artist",
+		SpotifyID: "correct-spotify-id", SpotifyURL: "https://open.spotify.com/artist/correct",
+		SpotifyImageURL: "https://i.scdn.co/image/correct",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SpotifyID != "correct-spotify-id" {
+		t.Fatalf("initial identity=%q", first.SpotifyID)
+	}
+	// A second follow arrives carrying a wrong-band guess.
+	second, err := database.UpsertArtist(ctx, Artist{
+		MBID: mbid, Name: "Shared Artist", SortName: "Shared Artist",
+		SpotifyID: "wrong-homonym-id", SpotifyURL: "https://open.spotify.com/artist/wrong",
+		SpotifyImageURL: "https://i.scdn.co/image/wrong",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.SpotifyID != "correct-spotify-id" {
+		t.Fatalf("stored Spotify identity was repointed to %q", second.SpotifyID)
+	}
+	if second.SpotifyURL != "https://open.spotify.com/artist/correct" ||
+		second.SpotifyImageURL != "https://i.scdn.co/image/correct" {
+		t.Fatalf("URL/image followed the guess: url=%q image=%q", second.SpotifyURL, second.SpotifyImageURL)
+	}
+
+	// A genuinely missing identity is still filled in.
+	const blankMBID = "no-identity-mbid"
+	if _, err := database.UpsertArtist(ctx, Artist{MBID: blankMBID, Name: "Blank", SortName: "Blank"}); err != nil {
+		t.Fatal(err)
+	}
+	filled, err := database.UpsertArtist(ctx, Artist{
+		MBID: blankMBID, Name: "Blank", SortName: "Blank",
+		SpotifyID: "discovered-id", SpotifyURL: "https://open.spotify.com/artist/discovered",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.SpotifyID != "discovered-id" || filled.SpotifyURL != "https://open.spotify.com/artist/discovered" {
+		t.Fatalf("missing identity was not filled in: %#v", filled)
+	}
+
+	// Artwork for the identity that is being kept is still backfilled.
+	backfilled, err := database.UpsertArtist(ctx, Artist{
+		MBID: blankMBID, Name: "Blank", SortName: "Blank",
+		SpotifyID: "discovered-id", SpotifyImageURL: "https://i.scdn.co/image/discovered",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backfilled.SpotifyImageURL != "https://i.scdn.co/image/discovered" {
+		t.Fatalf("artwork for the kept identity was not backfilled: %#v", backfilled)
+	}
+}

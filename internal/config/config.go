@@ -61,7 +61,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	spotifySecret, err := secret("SPOTIFY_CLIENT_SECRET")
+	// Spotify is optional, and compose.yaml always declares the secret even when
+	// no credentials are supplied, so an absent secret file means "not
+	// configured" rather than a fatal misconfiguration. A file that exists but
+	// cannot be read is still fatal, and pairing SPOTIFY_CLIENT_ID with a
+	// missing secret is caught by the paired-configuration check below.
+	spotifySecret, err := optionalSecret("SPOTIFY_CLIENT_SECRET")
 	if err != nil {
 		return Config{}, err
 	}
@@ -244,6 +249,18 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// optionalSecret reads a secret whose absence is a supported configuration. A
+// missing *_FILE target yields an empty value; every other read failure, such as
+// a permission error on a file that does exist, is still reported.
+func optionalSecret(name string) (string, error) {
+	if path := strings.TrimSpace(os.Getenv(name + "_FILE")); path != "" {
+		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+			return strings.TrimSpace(os.Getenv(name)), nil
+		}
+	}
+	return secret(name)
 }
 
 func secret(name string) (string, error) {
