@@ -462,6 +462,13 @@ type musicBrainzReleaseGroup struct {
 	FirstReleaseDate string   `json:"first-release-date"`
 }
 
+// musicBrainzCreditGroup pairs an embedded release group with the earliest
+// release date observed for it in one recording search result.
+type musicBrainzCreditGroup struct {
+	group musicBrainzReleaseGroup
+	date  string
+}
+
 // ArtistReleaseCredits performs one bounded recording search to find MusicBrainz
 // recordings where an artist appears alongside another artist, and projects them
 // onto their containing release groups. Only recordings with an explicit
@@ -510,6 +517,7 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 					} `json:"artist"`
 				} `json:"artist-credit"`
 				Releases []struct {
+					Date         string                   `json:"date"`
 					ReleaseGroup *musicBrainzReleaseGroup `json:"release-group"`
 				} `json:"releases"`
 			} `json:"recordings"`
@@ -536,18 +544,32 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 			if !credited {
 				continue
 			}
-			// A search result embeds the release group inside each release. The
-			// search document omits first-release-date there, so a group that is
-			// not already known is stored with an unknown date precision rather
-			// than a guessed date.
-			groups := make([]musicBrainzReleaseGroup, 0, len(recording.Releases))
+			// A search result embeds the release group inside each release, and
+			// that embedded group carries no first-release-date - only each
+			// release carries a date. A release group's first release date is by
+			// definition the earliest of its releases, so collect the earliest
+			// date seen per group. ISO-8601 dates order correctly as strings,
+			// and a less precise value sorts before a more precise one inside
+			// the same year, which keeps the imprecise-but-true answer.
+			groups := make([]musicBrainzCreditGroup, 0, len(recording.Releases))
+			position := make(map[string]int, len(recording.Releases))
 			for _, release := range recording.Releases {
 				if release.ReleaseGroup == nil {
 					continue
 				}
-				groups = append(groups, *release.ReleaseGroup)
+				groupID := strings.TrimSpace(release.ReleaseGroup.ID)
+				date := strings.TrimSpace(release.Date)
+				if at, ok := position[groupID]; ok {
+					if date != "" && (groups[at].date == "" || date < groups[at].date) {
+						groups[at].date = date
+					}
+					continue
+				}
+				position[groupID] = len(groups)
+				groups = append(groups, musicBrainzCreditGroup{group: *release.ReleaseGroup, date: date})
 			}
-			for _, group := range groups {
+			for _, candidate := range groups {
+				group := candidate.group
 				groupID := strings.TrimSpace(group.ID)
 				if !validMBID(groupID) || seen[groupID+"\x00"+recording.ID] {
 					continue
@@ -558,11 +580,23 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 					if strings.TrimSpace(group.PrimaryType) == "" || strings.TrimSpace(group.Title) == "" {
 						continue
 					}
-					precision := releaseDatePrecision(group.FirstReleaseDate)
+					// Prefer the group's own first-release-date when a payload
+					// supplies one; otherwise use the earliest release date.
+					// A group with no usable date at all is skipped rather than
+					// stored undated: an undated release cannot be announced,
+					// cannot reach the calendar or the ICS feed, and would sit
+					// permanently unmatched against the dated provider copy.
+					date := strings.TrimSpace(group.FirstReleaseDate)
+					if date == "" {
+						date = candidate.date
+					}
+					if date == "" {
+						continue
+					}
 					release = store.Release{
 						MBID: groupID, Title: strings.TrimSpace(group.Title), PrimaryType: strings.TrimSpace(group.PrimaryType),
-						SecondaryTypes: append([]string(nil), group.SecondaryTypes...), FirstReleaseDate: strings.TrimSpace(group.FirstReleaseDate),
-						DatePrecision: precision, MusicBrainzURL: "https://musicbrainz.org/release-group/" + groupID,
+						SecondaryTypes: append([]string(nil), group.SecondaryTypes...), FirstReleaseDate: date,
+						DatePrecision: releaseDatePrecision(date), MusicBrainzURL: "https://musicbrainz.org/release-group/" + groupID,
 					}
 				}
 				release.ArtistCreditRole = "featured"
