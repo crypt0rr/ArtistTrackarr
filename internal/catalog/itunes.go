@@ -462,19 +462,23 @@ func (i *ITunes) artistReleasesCached(ctx context.Context, key, artistName, arti
 }
 
 func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID string) ([]store.Release, error) {
-	const pageSize = 200
-	const maxPages = 100
+	// Apple's lookup endpoint ignores offset: every request returns the same
+	// first page. Paging it meant that any artist with a full page of
+	// collections never satisfied the short-page terminator, so the loop ran its
+	// whole cap, burned that many upstream requests, and then threw the results
+	// away with a CatalogLimitError - which cooled the provider down on every
+	// sync of a prolific artist. One request is therefore the whole budget, and
+	// lookupPageSize is the documented maximum the endpoint honours.
+	const lookupPageSize = 200
 	result := make([]store.Release, 0)
 	seen := make(map[string]bool)
-	for page := 0; page < maxPages; page++ {
-		offset := page * pageSize
+	{
 		endpoint := i.baseURL + "/lookup?id=" + url.QueryEscape(artistID) +
-			"&country=" + url.QueryEscape(i.country) + "&entity=album&limit=" + strconv.Itoa(pageSize) + "&offset=" + strconv.Itoa(offset)
+			"&country=" + url.QueryEscape(i.country) + "&entity=album&limit=" + strconv.Itoa(lookupPageSize)
 		var response itunesResponse
 		if err := i.getJSON(ctx, "iTunes artist albums", endpoint, &response); err != nil {
 			return nil, err
 		}
-		collectionCount := 0
 		// A lookup by artist ID returns that artist's own row alongside the
 		// collections. If Apple's name for the looked-up ID is not the artist
 		// that was asked for, the persisted identity is stale or mis-mapped:
@@ -490,13 +494,6 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 			}
 		}
 		for _, item := range response.Results {
-			// Lookup responses may include the artist object alongside the
-			// collection rows. Count only collections when deciding whether a
-			// full page was returned; otherwise a page of 199 albums plus the
-			// artist row would cause an unnecessary extra request.
-			if item.WrapperType == "collection" {
-				collectionCount++
-			}
 			if item.WrapperType != "collection" || item.CollectionType != "Album" ||
 				item.CollectionID <= 0 || strings.TrimSpace(item.CollectionName) == "" ||
 				strings.TrimSpace(item.ReleaseDate) == "" {
@@ -542,11 +539,11 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 				Source:           "itunes",
 			})
 		}
-		if collectionCount < pageSize {
-			return result, nil
-		}
 	}
-	return nil, &CatalogLimitError{Provider: "iTunes", Pages: maxPages}
+	// The endpoint cannot return more than one page, so a full page is the
+	// natural bound rather than an error: returning what was found keeps a
+	// prolific artist's catalogue usable instead of discarding it.
+	return result, nil
 }
 
 // ArtistReleaseCredits performs one bounded song search to find iTunes tracks

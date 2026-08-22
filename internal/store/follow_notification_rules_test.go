@@ -576,3 +576,51 @@ func TestAllowsReleaseTreatsGuestCreditsAsAppearances(t *testing.T) {
 		})
 	}
 }
+
+func TestPausedFollowDefersDeliveryInsteadOfDiscardingIt(t *testing.T) {
+	// Pausing suppressed the delivery entirely. Because notification_events is
+	// unique per (user, release, event type) and the release is no longer newly
+	// observed once the pause expires, the alert was lost permanently rather
+	// than deferred, which is not what "Pause for 7 days" implies.
+	now := time.Now().UTC()
+	resume := now.Add(48 * time.Hour)
+	past := now.Add(-time.Hour)
+
+	immediate := FollowNotificationRule{DeliveryMode: FollowDeliveryImmediate, PausedUntil: &resume}
+	at, deferred := immediate.pausedDeliveryResumesAt(now)
+	if !deferred || !at.Equal(resume) {
+		t.Fatalf("paused immediate follow: at=%s deferred=%t, want deferral to %s", at, deferred, resume)
+	}
+	// While paused it must not also be queued for immediate delivery.
+	if immediate.queuesImmediate(now) {
+		t.Fatal("a paused follow reported immediate delivery")
+	}
+
+	inherit := FollowNotificationRule{DeliveryMode: FollowDeliveryInherit, PausedUntil: &resume}
+	if _, deferred := inherit.pausedDeliveryResumesAt(now); !deferred {
+		t.Fatal("paused inherit follow was not deferred")
+	}
+
+	// An expired pause is not a deferral, and delivery resumes normally.
+	expired := FollowNotificationRule{DeliveryMode: FollowDeliveryImmediate, PausedUntil: &past}
+	if _, deferred := expired.pausedDeliveryResumesAt(now); deferred {
+		t.Fatal("an expired pause still deferred delivery")
+	}
+	if !expired.queuesImmediate(now) {
+		t.Fatal("an expired pause did not resume immediate delivery")
+	}
+
+	// A follow with no pause is unaffected.
+	if _, deferred := (FollowNotificationRule{DeliveryMode: FollowDeliveryImmediate}).pausedDeliveryResumesAt(now); deferred {
+		t.Fatal("an unpaused follow was treated as deferred")
+	}
+
+	// Digest-only and off keep their own semantics while paused: there is no
+	// immediate delivery to defer.
+	for _, mode := range []string{FollowDeliveryDigest, FollowDeliveryOff} {
+		rule := FollowNotificationRule{DeliveryMode: mode, PausedUntil: &resume}
+		if _, deferred := rule.pausedDeliveryResumesAt(now); deferred {
+			t.Fatalf("paused %q follow was converted into a deferred immediate delivery", mode)
+		}
+	}
+}

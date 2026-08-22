@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.55.0`; local and published images use the
+footer. The current release is `v0.56.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -350,6 +350,28 @@ recording health for a request that never happened. Their fixtures previously
 repeated the same wrong field names, so the tests validated each struct against
 itself; they now use real payload shapes.
 
+The v0.56.0 release closes the second review batch. Apple's lookup endpoint
+ignores the paging offset, so an artist with a full page of albums never
+satisfied the short-page terminator: the catalog fetch issued a hundred
+identical requests and then discarded the result, cooling the provider down on
+every sync. It now issues one bounded request and keeps what it returns.
+Pausing a follow defers its notifications to the moment the pause expires
+instead of discarding them permanently, and the release digest filters while
+paging so an eligible release is no longer lost behind a page of ineligible
+ones. Retention keeps interrupted and failed imports that still carry a
+resumable payload. The shutdown stage budgets now sum to less than the
+container stop grace period, so a slow shutdown is no longer killed part-way
+through the log drain.
+
+Smaller corrections in the same release: the calendar truncation notice no
+longer points at an export that cannot cover the month being viewed; the
+unauthenticated calendar feed route is throttled by caller rather than by the
+token the caller supplies; MusicBrainz aliases are used instead of being
+fetched and discarded; Spotify artist artwork uses a rendition suitable for
+display rather than the smallest thumbnail; and eighteen test assertions no
+longer call the testing package's fatal helpers from inside HTTP handler
+goroutines, where they terminate the handler instead of reporting the failure.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -440,7 +462,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.55.0` publishes `0.55.0`, `0.55`, and `latest`.
+- Pushing a tag such as `v0.56.0` publishes `0.56.0`, `0.56`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -464,7 +486,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.55.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.56.0 docker compose up -d
 ```
 
 ## Configuration

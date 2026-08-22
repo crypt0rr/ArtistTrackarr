@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -190,5 +191,50 @@ func TestCalendarFeedFailureDoesNotLogTheRawToken(t *testing.T) {
 	}
 	if !strings.Contains(written, "calendar feed token lookup failed") {
 		t.Fatalf("the failure was not logged at all: %s", written)
+	}
+}
+
+func TestCalendarFeedThrottlesByCallerNotByToken(t *testing.T) {
+	// Keying the limiter on the path token gave every distinct value its own
+	// bucket, so a caller varying the token was never throttled on the only
+	// route reachable without a session.
+	database, err := store.Open(filepath.Join(t.TempDir(), "feed-throttle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	app := &App{
+		store:               database,
+		logger:              slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		calendarFeedLimiter: newFixedWindowLimiter(3, time.Minute),
+	}
+	router := chi.NewRouter()
+	router.Get("/calendar/feed/{token}", app.calendarFeed)
+	statuses := make([]int, 0, 5)
+	for attempt := range 5 {
+		response := httptest.NewRecorder()
+		// A different token every time, as an enumerating caller would send.
+		request := httptest.NewRequest(http.MethodGet,
+			fmt.Sprintf("/calendar/feed/token-%d-aaaaaaaaaaaaaaaaaaaaaaaaaaaa", attempt), nil)
+		request.RemoteAddr = "198.51.100.7:44444"
+		router.ServeHTTP(response, request)
+		statuses = append(statuses, response.Code)
+	}
+	throttled := 0
+	for _, status := range statuses {
+		if status == http.StatusTooManyRequests {
+			throttled++
+		}
+	}
+	if throttled == 0 {
+		t.Fatalf("varying the token defeated the limiter entirely: statuses=%v", statuses)
+	}
+	// A different caller must not inherit that budget.
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/calendar/feed/token-other-aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	request.RemoteAddr = "203.0.113.9:44444"
+	router.ServeHTTP(response, request)
+	if response.Code == http.StatusTooManyRequests {
+		t.Fatal("an unrelated caller was throttled by another caller's budget")
 	}
 }

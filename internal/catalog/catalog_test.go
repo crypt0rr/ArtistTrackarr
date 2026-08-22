@@ -144,7 +144,8 @@ func TestMusicBrainzResolveArtistAndReleasePagination(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":"`+mbid+`","name":"Resolved","sort-name":"Resolved","type":"Person","country":"NL","disambiguation":"singer","genres":[{"name":"pop"},{"name":""}]}`)
 		case "/ws/2/release-group":
 			if request.URL.Query().Get("artist") != mbid || request.URL.Query().Get("type") != "album|ep|single" {
-				t.Fatalf("unexpected release-group query: %s", request.URL.RawQuery)
+				t.Errorf("unexpected release-group query: %s", request.URL.RawQuery)
+				return
 			}
 			_, _ = io.WriteString(w, `{"release-group-count":2,"release-groups":[{"id":"`+firstRelease+`","title":"One","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2026"},{"id":"`+secondRelease+`","title":"Two","primary-type":"EP","first-release-date":"2026-08"}]}`)
 		default:
@@ -525,7 +526,8 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 		if request.URL.Path == "/search" {
 			searchRequests.Add(1)
 			if request.URL.Query().Get("country") != "NL" || request.URL.Query().Get("entity") != "musicArtist" {
-				t.Fatalf("unexpected iTunes search query: %s", request.URL.RawQuery)
+				t.Errorf("unexpected iTunes search query: %s", request.URL.RawQuery)
+				return
 			}
 			_, _ = io.WriteString(w, `{"results":[{"wrapperType":"artist","artistId":123,"artistName":"Example","artistViewUrl":"https://music.apple.com/nl/artist/example"}]}`)
 			return
@@ -537,7 +539,8 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 			}
 			releaseRequests.Add(1)
 			if request.URL.Query().Get("entity") != "album" {
-				t.Fatalf("unexpected iTunes lookup query: %s", request.URL.RawQuery)
+				t.Errorf("unexpected iTunes lookup query: %s", request.URL.RawQuery)
+				return
 			}
 			_, _ = io.WriteString(w, `{"results":[
 				{"wrapperType":"artist","artistId":123,"artistName":"Example"},
@@ -580,7 +583,8 @@ func TestITunesSearchAndReleaseNormalization(t *testing.T) {
 func TestITunesRejectsAmbiguousExactArtistNames(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/search" {
-			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+			t.Errorf("unexpected iTunes request %s", request.URL.Path)
+			return
 		}
 		_, _ = io.WriteString(w, `{"results":[
 			{"wrapperType":"artist","artistId":101,"artistName":"Example"},
@@ -603,7 +607,8 @@ func TestITunesArtistLookupCoalescesConcurrentCalls(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/lookup" || request.URL.Query().Get("entity") != "musicArtist" {
-			t.Fatalf("unexpected iTunes request: %s", request.URL.String())
+			t.Errorf("unexpected iTunes request: %s", request.URL.String())
+			return
 		}
 		if requests.Add(1) == 1 {
 			close(started)
@@ -659,7 +664,8 @@ func TestITunesArtistLookupCoalescesConcurrentCalls(t *testing.T) {
 func TestITunesNotFoundIsTypedNegativeLookup(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/search" {
-			t.Fatalf("unexpected iTunes request %s", request.URL.Path)
+			t.Errorf("unexpected iTunes request %s", request.URL.Path)
+			return
 		}
 		_, _ = io.WriteString(w, `{"resultCount":0,"results":[]}`)
 	}))
@@ -883,7 +889,8 @@ func TestSpotifyArtistSearchUsesCurrentResultLimit(t *testing.T) {
 		case "/api/token":
 			tokenRequests.Add(1)
 			if request.Method != http.MethodPost {
-				t.Fatalf("token method=%s", request.Method)
+				t.Errorf("token method=%s", request.Method)
+				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
@@ -891,13 +898,14 @@ func TestSpotifyArtistSearchUsesCurrentResultLimit(t *testing.T) {
 			searchRequests.Add(1)
 			if request.URL.Query().Get("type") != "artist" || request.URL.Query().Get("limit") != "10" ||
 				request.Header.Get("Authorization") != "Bearer test-token" {
-				t.Fatalf("unexpected Spotify search request: %s headers=%v", request.URL, request.Header)
+				t.Errorf("unexpected Spotify search request: %s headers=%v", request.URL, request.Header)
+				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"artists":{"items":[{
 				"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"Example",
 				"external_urls":{"spotify":"https://open.spotify.com/artist/0OdUWJ0sBjDrqHygGUXeCF"},
-				"images":[{"url":"https://i.scdn.co/large"},{"url":"https://i.scdn.co/small"}]
+				"images":[{"url":"https://i.scdn.co/large","width":640},{"url":"https://i.scdn.co/medium","width":320},{"url":"https://i.scdn.co/small","width":160}]
 			}]}}`)
 		default:
 			http.NotFound(w, request)
@@ -907,8 +915,11 @@ func TestSpotifyArtistSearchUsesCurrentResultLimit(t *testing.T) {
 	spotify := NewSpotify("client-id", "client-secret")
 	spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
 	results, err := spotify.SearchArtists(context.Background(), "Example")
+	// Spotify orders artist images widest first. Taking the last entry always
+	// selected the smallest, typically a 64px thumbnail; the narrowest rendition
+	// still at or above the display threshold is the right choice.
 	if err != nil || len(results) != 1 || results[0].ID != "0OdUWJ0sBjDrqHygGUXeCF" ||
-		results[0].ImageURL != "https://i.scdn.co/small" {
+		results[0].ImageURL != "https://i.scdn.co/medium" {
 		t.Fatalf("Spotify results=%#v err=%v", results, err)
 	}
 	if tokenRequests.Load() != 1 || searchRequests.Load() != 1 {
@@ -1076,7 +1087,8 @@ func TestSpotifyBatchArtistLookupUsesOneRequest(t *testing.T) {
 		case "/v1/artists":
 			batchRequests.Add(1)
 			if request.URL.Query().Get("ids") != "0OdUWJ0sBjDrqHygGUXeCF,1OdUWJ0sBjDrqHygGUXeCG" {
-				t.Fatalf("unexpected batch IDs: %q", request.URL.Query().Get("ids"))
+				t.Errorf("unexpected batch IDs: %q", request.URL.Query().Get("ids"))
+				return
 			}
 			_, _ = io.WriteString(w, `{"artists":[{"id":"0OdUWJ0sBjDrqHygGUXeCF","name":"First"},{"id":"1OdUWJ0sBjDrqHygGUXeCG","name":"Second"}]}`)
 		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF", "/v1/artists/1OdUWJ0sBjDrqHygGUXeCG":
@@ -1274,11 +1286,13 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 			if request.URL.Query().Get("limit") != "10" || request.URL.Query().Get("market") != "NL" ||
 				request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" ||
 				request.Header.Get("Authorization") != "Bearer test-token" {
-				t.Fatalf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
+				t.Errorf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
+				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if request.URL.Query().Get("offset") != "0" {
-				t.Fatalf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
+				t.Errorf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
+				return
 			}
 			_, _ = io.WriteString(w, `{"items":[
 					{"id":"album-id","name":"Album","album_type":"album","album_group":"album","total_tracks":10,
@@ -1351,7 +1365,8 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		groups := request.URL.Query().Get("include_groups")
 		if groups != "album,single,compilation" && groups != "appears_on" {
-			t.Fatalf("unexpected incremental include_groups=%q", groups)
+			t.Errorf("unexpected incremental include_groups=%q", groups)
+			return
 		}
 		if groups == "appears_on" {
 			_, _ = io.WriteString(w, `{"total":1,"items":[{"id":"guest","name":"Guest","album_type":"album","album_group":"appears_on","total_tracks":10,"release_date":"2026-08-02","release_date_precision":"day"}]}`)
@@ -1362,7 +1377,8 @@ func TestSpotifyArtistReleasesSinceStopsAtLocalHistoryBoundary(t *testing.T) {
 			return
 		}
 		if request.URL.Query().Get("offset") != "10" {
-			t.Fatalf("unexpected offset: %s", request.URL.Query().Get("offset"))
+			t.Errorf("unexpected offset: %s", request.URL.Query().Get("offset"))
+			return
 		}
 		_, _ = io.WriteString(w, `{"total":2,"items":[{"id":"old","name":"Old","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-06-01","release_date_precision":"day"}]}`)
 	}))
@@ -1412,7 +1428,8 @@ func TestSpotifyArtistReleasesSincePagesPastWatermarkForLaterSingles(t *testing.
 				{"id":"new-ep","name":"New EP","album_type":"single","album_group":"single","total_tracks":5,"release_date":"2026-08-11","release_date_precision":"day"}
 			]}`)
 		default:
-			t.Fatalf("unexpected Spotify page groups=%q offset=%q", groups, offset)
+			t.Errorf("unexpected Spotify page groups=%q offset=%q", groups, offset)
+			return
 		}
 	}))
 	defer server.Close()
@@ -1448,12 +1465,14 @@ func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testi
 			return
 		}
 		if request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" {
-			t.Fatalf("unexpected include_groups=%q", request.URL.Query().Get("include_groups"))
+			t.Errorf("unexpected include_groups=%q", request.URL.Query().Get("include_groups"))
+			return
 		}
 		albumRequests.Add(1)
 		offset := 0
 		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
-			t.Fatalf("invalid offset: %v", err)
+			t.Errorf("invalid offset: %v", err)
+			return
 		}
 		count := 10
 		if offset == 20 {
@@ -1516,7 +1535,8 @@ func TestSpotifyArtistReleasesFailsAtCatalogPageSafetyCap(t *testing.T) {
 		albumRequests.Add(1)
 		offset := 0
 		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
-			t.Fatalf("invalid offset: %v", err)
+			t.Errorf("invalid offset: %v", err)
+			return
 		}
 		items := make([]string, 10)
 		for index := range items {
@@ -1656,4 +1676,77 @@ func TestITunesAlbumLookupRejectsAnotherArtistsCollections(t *testing.T) {
 			t.Fatalf("releases=%#v, want only Real Album", releases)
 		}
 	})
+}
+
+func TestITunesAlbumLookupIssuesOneRequestBecauseOffsetIsIgnored(t *testing.T) {
+	// Apple's lookup endpoint ignores offset and returns the same first page for
+	// every request. Paging it meant a full page never satisfied the short-page
+	// terminator, so the loop ran its whole cap, burned that many upstream
+	// requests, and then discarded the catalogue with a CatalogLimitError that
+	// cooled the provider down on every sync.
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/lookup" {
+			http.NotFound(w, request)
+			return
+		}
+		requests.Add(1)
+		if offset := request.URL.Query().Get("offset"); offset != "" {
+			t.Errorf("lookup was paged with offset=%q, which Apple ignores", offset)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// A deliberately full page: 200 collections, the case that used to loop.
+		rows := make([]string, 0, 201)
+		rows = append(rows, `{"wrapperType":"artist","artistType":"Artist","artistId":42,"artistName":"Prolific Artist"}`)
+		for id := 1; id <= 200; id++ {
+			rows = append(rows, fmt.Sprintf(
+				`{"wrapperType":"collection","collectionType":"Album","collectionId":%d,"collectionName":"Album %d","artistName":"Prolific Artist","releaseDate":"2026-09-01T00:00:00Z","trackCount":10}`,
+				1000+id, id))
+		}
+		_, _ = io.WriteString(w, `{"resultCount":201,"results":[`+strings.Join(rows, ",")+`]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
+		"11111111-1111-4111-8111-111111111111", "Prolific Artist", "42")
+	if err != nil {
+		t.Fatalf("a full page was reported as an error instead of a bound: %v", err)
+	}
+	if len(releases) != 200 {
+		t.Fatalf("releases=%d, want the full page of 200", len(releases))
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests=%d, want exactly 1", got)
+	}
+}
+
+func TestPreferredSpotifyImagePicksADisplayableRendition(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		images []spotifyImage
+		want   string
+	}{
+		{name: "narrowest at or above the threshold", want: "m", images: []spotifyImage{
+			{URL: "l", Width: 640}, {URL: "m", Width: 320}, {URL: "s", Width: 160},
+		}},
+		{name: "exactly at the threshold qualifies", want: "t", images: []spotifyImage{
+			{URL: "l", Width: 640}, {URL: "t", Width: spotifyMinImageWidth},
+		}},
+		{name: "all below the threshold falls back to the widest", want: "l", images: []spotifyImage{
+			{URL: "s", Width: 64}, {URL: "l", Width: 160},
+		}},
+		{name: "no widths keeps the first, which Spotify orders widest first", want: "l",
+			images: []spotifyImage{{URL: "l"}, {URL: "s"}}},
+		{name: "blank URLs are skipped", want: "m", images: []spotifyImage{
+			{URL: "", Width: 640}, {URL: "m", Width: 320},
+		}},
+		{name: "no images yields no URL", want: "", images: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := preferredSpotifyImage(test.images); got != test.want {
+				t.Fatalf("preferredSpotifyImage=%q, want %q", got, test.want)
+			}
+		})
+	}
 }

@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,5 +172,25 @@ func TestRunServerLifecycleReturnsServeFailureAfterDraining(t *testing.T) {
 	}
 	if err := database.DB.Ping(); err == nil {
 		t.Fatal("database remained usable after serve failure cleanup")
+	}
+}
+
+func TestShutdownBudgetFitsTheContainerGracePeriod(t *testing.T) {
+	// The shutdown stages run in sequence, so their sum is the worst case. If it
+	// exceeds the container stop grace period the process is SIGKILLed part-way
+	// through the log drain and the SQLite close that follows, which is the
+	// unsafe shutdown these budgets exist to prevent.
+	if shutdownBudget > shutdownGracePeriod {
+		t.Fatalf("shutdown budget %s exceeds the container grace period %s", shutdownBudget, shutdownGracePeriod)
+	}
+	// The grace period constant must keep matching compose.yaml, or this check
+	// silently stops meaning anything.
+	compose, err := os.ReadFile(filepath.Join("..", "..", "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("stop_grace_period: %ds", int(shutdownGracePeriod.Seconds()))
+	if !strings.Contains(string(compose), want) {
+		t.Fatalf("compose.yaml does not declare %q", want)
 	}
 }

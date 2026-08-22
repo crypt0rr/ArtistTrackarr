@@ -112,6 +112,24 @@ func (r FollowNotificationRule) AllowsRelease(primaryType string, secondaryTypes
 	}
 }
 
+// pausedDeliveryResumesAt reports when a paused follow's notifications become
+// deliverable. Pausing is a deferral, not a discard: suppressing the delivery
+// outright lost the alert permanently, because notification_events is unique
+// per (user, release, event type) and the release is no longer newly observed
+// once the pause expires. Only immediate delivery is deferred; a follow that is
+// digest-only or switched off keeps that behaviour while paused.
+func (r FollowNotificationRule) pausedDeliveryResumesAt(now time.Time) (time.Time, bool) {
+	if r.PausedUntil == nil || !now.Before(*r.PausedUntil) {
+		return time.Time{}, false
+	}
+	switch normalizeFollowDeliveryMode(r.DeliveryMode) {
+	case FollowDeliveryInherit, FollowDeliveryImmediate:
+		return *r.PausedUntil, true
+	default:
+		return time.Time{}, false
+	}
+}
+
 func (r FollowNotificationRule) queuesImmediate(now time.Time) bool {
 	mode := r.effectiveDeliveryMode(now)
 	return mode == FollowDeliveryInherit || mode == FollowDeliveryImmediate

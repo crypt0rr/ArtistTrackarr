@@ -37,6 +37,20 @@ type serverLifecycleDeps struct {
 // and database shutdown order. It returns whether the database was closed
 // safely; callers must leave it open when a worker or log sink misses its
 // deadline so no connection can be closed underneath active work.
+// Shutdown stage budgets. They run in sequence, so shutdownBudget is the
+// worst-case time between SIGTERM and a clean exit. It must not exceed
+// shutdownGracePeriod, which mirrors stop_grace_period in compose.yaml;
+// TestShutdownBudgetFitsTheContainerGracePeriod enforces that.
+const (
+	httpShutdownBudget   = 15 * time.Second
+	serverStopBudget     = 15 * time.Second
+	runnerShutdownBudget = 20 * time.Second
+	logDrainBudget       = 5 * time.Second
+
+	shutdownBudget      = httpShutdownBudget + serverStopBudget + runnerShutdownBudget + logDrainBudget
+	shutdownGracePeriod = 60 * time.Second
+)
+
 func runServerLifecycle(parent context.Context, deps serverLifecycleDeps) (bool, error) {
 	if parent == nil {
 		parent = context.Background()
@@ -77,8 +91,13 @@ func runServerLifecycle(parent context.Context, deps serverLifecycleDeps) (bool,
 
 	// HTTP shutdown and background work have independent budgets. A slow
 	// client must not consume the entire runner shutdown window (and vice
-	// versa).
-	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 20*time.Second)
+	// versa). The stages run in sequence, so their sum is the worst-case
+	// shutdown: it must stay inside the container stop grace period, or the
+	// process is SIGKILLed part-way through the log drain and the SQLite close
+	// that follows it - exactly the unsafe shutdown these budgets exist to
+	// prevent. shutdownBudget documents that relationship; compose.yaml sets
+	// stop_grace_period to shutdownGracePeriod.
+	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), httpShutdownBudget)
 	shutdownErr := deps.server.Shutdown(httpShutdownCtx)
 	cancelHTTP()
 	if shutdownErr != nil {
@@ -92,13 +111,13 @@ func runServerLifecycle(parent context.Context, deps serverLifecycleDeps) (bool,
 				serveErr = err
 			}
 			serverStopped = true
-		case <-time.After(20 * time.Second):
+		case <-time.After(serverStopBudget):
 			deps.stdoutLog.Error("http server did not stop before shutdown deadline")
 		}
 	}
 
 	runnerStopped := false
-	runnerShutdownCtx, cancelRunner := context.WithTimeout(context.Background(), 20*time.Second)
+	runnerShutdownCtx, cancelRunner := context.WithTimeout(context.Background(), runnerShutdownBudget)
 	select {
 	case <-deps.runner.Done():
 		runnerStopped = true
@@ -107,7 +126,7 @@ func runServerLifecycle(parent context.Context, deps serverLifecycleDeps) (bool,
 	}
 	cancelRunner()
 
-	logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	logDrainCtx, cancelLogDrain := context.WithTimeout(context.Background(), logDrainBudget)
 	logErr := deps.logSink.Close(logDrainCtx)
 	cancelLogDrain()
 	if logErr != nil {

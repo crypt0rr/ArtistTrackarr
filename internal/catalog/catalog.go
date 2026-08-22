@@ -333,6 +333,16 @@ func (m *MusicBrainz) ResolveArtist(ctx context.Context, mbid string) (ArtistRes
 		MBID: item.ID, Name: item.Name, SortName: item.SortName, Type: item.Type,
 		Country: item.Country, Disambiguation: item.Disambiguation,
 	}
+	// inc=aliases is requested, so assign what comes back rather than paying for
+	// the payload and discarding it. The cap matches SearchArtists.
+	for _, alias := range item.Aliases {
+		if len(result.Aliases) == 3 {
+			break
+		}
+		if strings.TrimSpace(alias.Name) != "" {
+			result.Aliases = append(result.Aliases, alias.Name)
+		}
+	}
 	for _, genre := range item.Genres {
 		if strings.TrimSpace(genre.Name) != "" && len(result.Genres) < 10 {
 			result.Genres = append(result.Genres, genre.Name)
@@ -938,10 +948,8 @@ func (s *Spotify) searchArtists(ctx context.Context, query string) ([]SpotifyArt
 				ID           string            `json:"id"`
 				Name         string            `json:"name"`
 				ExternalURLs map[string]string `json:"external_urls"`
-				Images       []struct {
-					URL string `json:"url"`
-				} `json:"images"`
-				Genres []string `json:"genres"`
+				Images       []spotifyImage    `json:"images"`
+				Genres       []string          `json:"genres"`
 			} `json:"items"`
 		} `json:"artists"`
 	}
@@ -952,7 +960,7 @@ func (s *Spotify) searchArtists(ctx context.Context, query string) ([]SpotifyArt
 	for _, item := range response.Artists.Items {
 		a := SpotifyArtist{ID: item.ID, Name: item.Name, URL: item.ExternalURLs["spotify"], Genres: append([]string(nil), item.Genres...)}
 		if len(item.Images) > 0 {
-			a.ImageURL = item.Images[len(item.Images)-1].URL
+			a.ImageURL = preferredSpotifyImage(item.Images)
 		}
 		result = append(result, a)
 	}
@@ -1068,20 +1076,59 @@ func (s *Spotify) Artists(ctx context.Context, ids []string) ([]SpotifyArtist, e
 	return result, nil
 }
 
+// spotifyImage is one artist artwork rendition.
+type spotifyImage struct {
+	URL   string `json:"url"`
+	Width int    `json:"width"`
+}
+
+// spotifyMinImageWidth is the smallest artist rendition worth displaying. It
+// matches the threshold already used when choosing release artwork.
+const spotifyMinImageWidth = 250
+
+// preferredSpotifyImage picks a rendition suitable for display. Spotify orders
+// artist images widest first, so taking the last entry always selected the
+// smallest, typically a 64px thumbnail. Prefer the narrowest rendition that is
+// still at least spotifyMinImageWidth, and fall back to the widest available
+// when none qualify.
+func preferredSpotifyImage(images []spotifyImage) string {
+	best := ""
+	bestWidth := 0
+	widest := ""
+	widestWidth := -1
+	for _, image := range images {
+		url := strings.TrimSpace(image.URL)
+		if url == "" {
+			continue
+		}
+		if image.Width > widestWidth {
+			widest, widestWidth = url, image.Width
+		}
+		if image.Width < spotifyMinImageWidth {
+			continue
+		}
+		if best == "" || image.Width < bestWidth {
+			best, bestWidth = url, image.Width
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return widest
+}
+
 type spotifyArtistPayload struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	ExternalURLs map[string]string `json:"external_urls"`
-	Images       []struct {
-		URL string `json:"url"`
-	} `json:"images"`
-	Genres []string `json:"genres"`
+	Images       []spotifyImage    `json:"images"`
+	Genres       []string          `json:"genres"`
 }
 
 func (p spotifyArtistPayload) artist() SpotifyArtist {
 	artist := SpotifyArtist{ID: p.ID, Name: p.Name, URL: p.ExternalURLs["spotify"], Genres: append([]string(nil), p.Genres...)}
 	if len(p.Images) > 0 {
-		artist.ImageURL = p.Images[len(p.Images)-1].URL
+		artist.ImageURL = preferredSpotifyImage(p.Images)
 	}
 	return artist
 }
