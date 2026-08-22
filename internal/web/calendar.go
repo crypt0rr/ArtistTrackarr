@@ -51,9 +51,20 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 	pageFailed := a.pageStoreError(r, &d, "Release calendar", "calendar releases", err)
 	if len(releases) > calendarMonthLimit {
 		releases = releases[:calendarMonthLimit]
-		d.CalendarNotice = fmt.Sprintf(
-			"This month has more than %d dated releases. Showing the first %d — subscribe to the calendar feed or download the ICS file for the complete list.",
-			calendarMonthLimit, calendarMonthLimit)
+		// The ICS export is fixed to today through one year ahead, so it cannot
+		// stand in for a month it does not cover. Only offer it when this month
+		// actually falls inside that window; otherwise say plainly that the rest
+		// of the month is not shown rather than sending the member to an export
+		// that would come back without those releases.
+		if toTime.Before(now) {
+			d.CalendarNotice = fmt.Sprintf(
+				"This month has more than %d dated releases and only the first %d are shown. The calendar feed and ICS export cover upcoming releases only, so they do not include this month.",
+				calendarMonthLimit, calendarMonthLimit)
+		} else {
+			d.CalendarNotice = fmt.Sprintf(
+				"This month has more than %d dated releases and only the first %d are shown. Subscribe to the calendar feed or download the ICS file, which cover the next year of releases.",
+				calendarMonthLimit, calendarMonthLimit)
+		}
 	}
 	d.CalendarMonth = fromTime.Format("January 2006")
 	d.CalendarPrevMonth = fromTime.AddDate(0, -1, 0).Format("2006-01")
@@ -105,7 +116,12 @@ func (a *App) calendarICS(w http.ResponseWriter, r *http.Request) {
 // credentials intentionally look identical to a missing feed.
 func (a *App) calendarFeed(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimSpace(chi.URLParam(r, "token"))
-	if a.calendarFeedLimiter != nil && !a.calendarFeedLimiter.Allow(raw) {
+	// Throttle by caller, not by the value the caller supplies. Keying on the
+	// token gave every distinct value its own bucket, so varying it defeated the
+	// limiter entirely - and this is the only route reachable without a session,
+	// where each request costs a database lookup. Feed tokens carry 256 bits of
+	// entropy, so this is about request volume rather than guessing.
+	if a.calendarFeedLimiter != nil && !a.calendarFeedLimiter.Allow(a.clientIP(r)) {
 		rateLimited(w, 60, "calendar feed requests are temporarily rate limited; try again later")
 		return
 	}

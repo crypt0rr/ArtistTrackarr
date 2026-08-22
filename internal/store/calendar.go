@@ -107,6 +107,15 @@ type digestUser struct {
 	Singles   bool
 }
 
+// Digest assembly bounds. Rows are scanned in pages and filtered by the
+// member's preferences and per-follow rules as they are read, so an eligible
+// release is not lost behind a page full of ineligible ones.
+const (
+	digestScanPageSize = 200
+	digestMaxScanRows  = 1000
+	digestMaxItems     = 50
+)
+
 // QueueDueReleaseDigests creates at most one aggregate digest run per user
 // and local period. It deliberately reuses the normal destination encryption
 // and retry path, while keeping aggregate content separate from per-release
@@ -181,16 +190,31 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		periodKey := periodStart.Format("2006-01-02")
 		from := localNow.Format("2006-01-02")
 		to := windowEnd.AddDate(0, 0, -1).Format("2006-01-02")
-		items, err := s.CalendarReleases(ctx, user.ID, from, to, 50)
-		if err != nil {
-			return queued, err
-		}
 		rules, err := s.FollowNotificationRules(ctx, user.ID, nil)
 		if err != nil {
 			return queued, err
 		}
+		// Scan in pages and filter as we go. Fetching a single fixed page and
+		// only then applying the member's type preferences and per-follow digest
+		// rules meant a busy window could fill that page with ineligible rows and
+		// produce a short or empty digest while eligible releases sat just past
+		// the cap. Both bounds stay modest so digest generation remains cheap.
+		var items []CalendarRelease
+		for offset := 0; offset < digestMaxScanRows; offset += digestScanPageSize {
+			page, pageErr := s.CalendarReleasesPage(ctx, user.ID, from, to, digestScanPageSize, offset)
+			if pageErr != nil {
+				return queued, pageErr
+			}
+			items = append(items, page...)
+			if len(page) < digestScanPageSize {
+				break
+			}
+		}
 		var releases []CalendarRelease
 		for _, item := range items {
+			if len(releases) >= digestMaxItems {
+				break
+			}
 			if !releaseTypeEnabled(NotificationPreferences{Albums: user.Albums, EPs: user.EPs, Singles: user.Singles}, item.PrimaryType, item.SecondaryTypes) {
 				continue
 			}

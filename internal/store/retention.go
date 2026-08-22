@@ -97,7 +97,8 @@ func (s *Store) RetentionReport(ctx context.Context, now time.Time) (RetentionRe
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, transientCutoff).Scan(&report.PrunableManualSyncs); err != nil {
 		return RetentionReport{}, err
 	}
-	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs WHERE created_at < ?`, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs WHERE created_at < ?
+		AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
 		return RetentionReport{}, err
 	}
 	report.OldestHistory = oldestTime(report.OldestNotificationEvent, report.OldestDelivery, report.OldestDeliveryAttempt)
@@ -147,7 +148,12 @@ func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionC
 			{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}, &resultStats.AuthTokens},
 			{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(now.Add(-24 * time.Hour))}, &resultStats.LoginAttempts},
 			{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ManualSyncs},
-			{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ImportJobs},
+			// Keep interrupted and failed jobs that still carry a payload: that
+			// payload is the whole reason migration 034 retains it, and deleting
+			// it silently removes the Resume import action for that job.
+			{`DELETE FROM import_jobs WHERE created_at < ?
+				AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`,
+				[]any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ImportJobs},
 		}
 		for _, statement := range statements {
 			result, err := tx.ExecContext(ctx, statement.query, statement.args...)

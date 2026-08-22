@@ -796,7 +796,13 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 		}
 		return nil
 	}
-	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, selected.rule.queuesImmediate(now))
+	// A paused follow defers its delivery to the moment the pause expires
+	// instead of dropping the alert on the floor.
+	queueDeliveries, deliverAt := selected.rule.queuesImmediate(now), now
+	if resumesAt, deferred := selected.rule.pausedDeliveryResumesAt(now); deferred {
+		queueDeliveries, deliverAt = true, resumesAt
+	}
+	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, queueDeliveries, deliverAt)
 }
 
 func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, title, body string) (string, string, error) {
@@ -812,10 +818,14 @@ func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID
 }
 
 func insertNotificationEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
-	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true)
+	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true, now)
 }
 
-func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, queueDeliveries bool) error {
+// insertNotificationEventTxMode records the event and, when queueDeliveries is
+// set, fans it out to the member's destinations. deliverAt is the earliest the
+// delivery may be attempted, which lets a paused follow defer rather than lose
+// its notifications.
+func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, queueDeliveries bool, deliverAt time.Time) error {
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO notification_events
 		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
 		userID, releaseID, eventType, title, body, timeText(now))
@@ -842,7 +852,7 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 		SELECT ?,d.id,`+destinationQueueStatus("d")+`,? FROM destinations d
 		LEFT JOIN destination_health dh ON dh.destination_id=d.id
 		WHERE d.user_id=? AND d.enabled=1
-		AND d.created_at <= (SELECT created_at FROM notification_events WHERE id=?)`, eventID, timeText(now), userID, eventID)
+		AND d.created_at <= (SELECT created_at FROM notification_events WHERE id=?)`, eventID, timeText(deliverAt), userID, eventID)
 	return err
 }
 

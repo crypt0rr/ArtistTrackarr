@@ -114,3 +114,50 @@ func TestRetentionCleanupNeverDeletesDeliveryHistory(t *testing.T) {
 		t.Fatalf("notification events after cleanup=%d, want 1", events)
 	}
 }
+
+func TestRetentionKeepsResumableImportJobs(t *testing.T) {
+	// Migration 034 retains the bounded source upload so an interrupted or
+	// failed import can be resumed. Sweeping those rows by age alone silently
+	// removes the documented Resume import action.
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "retain-import@example.com", "hash", "member", "UTC", "retain-import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := timeText(time.Now().UTC().AddDate(0, 0, -400))
+	rows := []struct {
+		id      string
+		status  string
+		payload string
+	}{
+		{id: "resumable-interrupted", status: "interrupted", payload: "name,mbid\n"},
+		{id: "resumable-failed", status: "failed", payload: "name,mbid\n"},
+		{id: "stale-complete", status: "complete", payload: ""},
+		{id: "stale-failed-no-payload", status: "failed", payload: ""},
+	}
+	for _, row := range rows {
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO import_jobs
+			(user_id,status,created_at,payload) VALUES(?,?,?,?)`,
+			userID, row.status, old, []byte(row.payload)); err != nil {
+			t.Fatalf("seed %s: %v", row.id, err)
+		}
+	}
+	if _, err := s.CleanupRetention(ctx, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var kept, kentTotal int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs
+		WHERE status IN ('interrupted','failed') AND length(payload) > 0`).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 2 {
+		t.Fatalf("resumable import jobs kept=%d, want 2", kept)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs`).Scan(&kentTotal); err != nil {
+		t.Fatal(err)
+	}
+	if kentTotal != 2 {
+		t.Fatalf("total import jobs=%d, want only the 2 resumable ones to survive", kentTotal)
+	}
+}
