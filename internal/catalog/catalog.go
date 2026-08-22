@@ -450,18 +450,39 @@ func (m *MusicBrainz) ArtistReleases(ctx context.Context, mbid string) ([]store.
 	return all, nil
 }
 
-// ArtistReleaseCredits searches MusicBrainz recordings for appearances by an
-// artist and projects them onto their containing release groups. The search is
-// paginated to completion up to a generous safety cap and only returns
-// recordings with an explicit multi-artist credit; primary release-group
-// results remain owned by ArtistReleases. Missing release-group metadata is
-// ignored rather than guessing an identity.
+// musicBrainzReleaseGroup is the release-group projection embedded in each
+// release of a recording search result. The search document does not carry
+// first-release-date at this level; it is declared so a browse-sourced payload
+// that does carry it is still read correctly.
+type musicBrainzReleaseGroup struct {
+	ID               string   `json:"id"`
+	Title            string   `json:"title"`
+	PrimaryType      string   `json:"primary-type"`
+	SecondaryTypes   []string `json:"secondary-types"`
+	FirstReleaseDate string   `json:"first-release-date"`
+}
+
+// ArtistReleaseCredits performs one bounded recording search to find MusicBrainz
+// recordings where an artist appears alongside another artist, and projects them
+// onto their containing release groups. Only recordings with an explicit
+// multi-artist credit are returned; primary release-group results remain owned
+// by ArtistReleases, and missing release-group metadata is ignored rather than
+// guessing an identity.
+//
+// The search is deliberately bounded to a single page, matching the iTunes
+// credit search. Credit discovery is supplementary, it runs for every artist on
+// every scheduled check, and MusicBrainz is throttled to one request a second
+// process-wide, so paging a prolific artist's whole recording catalogue here
+// would consume the provider budget that release observation needs. Reaching
+// the bound is normal and returns the results found, not an error: a
+// CatalogLimitError would put MusicBrainz into a cooldown on every sync of a
+// well-credited artist.
 func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, known []store.Release) ([]store.Release, error) {
 	if !validMBID(mbid) {
 		return nil, errors.New("invalid MusicBrainz artist ID")
 	}
 	const pageSize = 100
-	const maxPages = 100
+	const maxPages = 1
 	offset := 0
 	knownByID := make(map[string]store.Release, len(known))
 	for _, release := range known {
@@ -472,8 +493,12 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 	for page := 0; page < maxPages; page++ {
 		endpoint := fmt.Sprintf("%s/ws/2/recording?fmt=json&limit=%d&offset=%d&query=%s",
 			m.baseURL, pageSize, offset, url.QueryEscape("arid:"+mbid))
+		// The recording search response is a search document, not a browse
+		// document: the total is "count" and each recording carries "releases",
+		// each of which embeds its "release-group". Browse-style names such as
+		// "recording-count" or "release-group-list" never appear here.
 		var response struct {
-			Count      int `json:"recording-count"`
+			Count      int `json:"count"`
 			Recordings []struct {
 				ID            string `json:"id"`
 				Title         string `json:"title"`
@@ -484,22 +509,9 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 						Name string `json:"name"`
 					} `json:"artist"`
 				} `json:"artist-credit"`
-				ReleaseGroups []struct {
-					ID               string   `json:"id"`
-					Title            string   `json:"title"`
-					PrimaryType      string   `json:"primary-type"`
-					SecondaryTypes   []string `json:"secondary-types"`
-					FirstReleaseDate string   `json:"first-release-date"`
-				} `json:"release-group-list"`
 				Releases []struct {
-					ReleaseGroup *struct {
-						ID               string   `json:"id"`
-						Title            string   `json:"title"`
-						PrimaryType      string   `json:"primary-type"`
-						SecondaryTypes   []string `json:"secondary-types"`
-						FirstReleaseDate string   `json:"first-release-date"`
-					} `json:"release-group"`
-				} `json:"release-list"`
+					ReleaseGroup *musicBrainzReleaseGroup `json:"release-group"`
+				} `json:"releases"`
 			} `json:"recordings"`
 		}
 		if err := m.getJSON(ctx, endpoint, &response); err != nil {
@@ -524,14 +536,16 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 			if !credited {
 				continue
 			}
-			groups := recording.ReleaseGroups
-			if len(groups) == 0 {
-				for _, release := range recording.Releases {
-					if release.ReleaseGroup == nil {
-						continue
-					}
-					groups = append(groups, *release.ReleaseGroup)
+			// A search result embeds the release group inside each release. The
+			// search document omits first-release-date there, so a group that is
+			// not already known is stored with an unknown date precision rather
+			// than a guessed date.
+			groups := make([]musicBrainzReleaseGroup, 0, len(recording.Releases))
+			for _, release := range recording.Releases {
+				if release.ReleaseGroup == nil {
+					continue
 				}
+				groups = append(groups, *release.ReleaseGroup)
 			}
 			for _, group := range groups {
 				groupID := strings.TrimSpace(group.ID)
@@ -567,7 +581,9 @@ func (m *MusicBrainz) ArtistReleaseCredits(ctx context.Context, mbid string, kno
 			return result, nil
 		}
 	}
-	return nil, &CatalogLimitError{Provider: "MusicBrainz", Pages: maxPages}
+	// The bound was reached with more recordings advertised upstream. Return the
+	// credits found so far; see the bounding rationale on the doc comment.
+	return result, nil
 }
 
 func releaseDatePrecision(value string) int {

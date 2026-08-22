@@ -183,7 +183,10 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"release-group-list":[{"id":"`+groupID+`","title":"Collab album","primary-type":"Album","first-release-date":"2026-09-01"}]}]}`)
+		// A recording search returns a search document: "count" for the total and
+		// a "releases" array whose entries embed "release-group". The embedded
+		// group carries no first-release-date, which is what upstream sends.
+		_, _ = io.WriteString(w, `{"count":1,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
 	}))
 	defer server.Close()
 	mb := NewMusicBrainz("test@example.com")
@@ -191,6 +194,11 @@ func TestMusicBrainzReleaseCreditsProjectsGuestRecordings(t *testing.T) {
 	credits, err := mb.ArtistReleaseCredits(context.Background(), artistID, nil)
 	if err != nil || len(credits) != 1 || credits[0].MBID != groupID || credits[0].ArtistCreditRole != "featured" || len(credits[0].Credits) != 1 {
 		t.Fatalf("credits=%#v err=%v", credits, err)
+	}
+	// A search document has no release date for the group, so the projection
+	// must record an unknown precision instead of inventing one.
+	if credits[0].FirstReleaseDate != "" || credits[0].DatePrecision != 0 {
+		t.Fatalf("date=%q precision=%d, want empty/0", credits[0].FirstReleaseDate, credits[0].DatePrecision)
 	}
 	credit := credits[0].Credits[0]
 	if credit.Role != "guest" || credit.ProviderID != recordingID || credit.TrackTitle != "Collab track" {
@@ -216,7 +224,7 @@ func TestMusicBrainzRejectsMalformedReleaseGroupID(t *testing.T) {
 	}
 }
 
-func TestMusicBrainzReleaseCreditsPaginatesWithoutApplyingPartialResults(t *testing.T) {
+func TestMusicBrainzReleaseCreditsStopAtOneBoundedPage(t *testing.T) {
 	const artistID = "11111111-1111-4111-8111-111111111111"
 	const groupID = "22222222-2222-4222-8222-222222222222"
 	const recordingID = "33333333-3333-4333-8333-333333333333"
@@ -227,22 +235,26 @@ func TestMusicBrainzReleaseCreditsPaginatesWithoutApplyingPartialResults(t *test
 			return
 		}
 		requests.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		if request.URL.Query().Get("offset") == "100" {
-			_, _ = io.WriteString(w, `{"recording-count":101,"recordings":[]}`)
-			return
-		}
 		if request.URL.Query().Get("offset") != "0" {
-			t.Fatalf("unexpected credit offset=%q", request.URL.Query().Get("offset"))
+			t.Errorf("credit search paged beyond the bound: offset=%q", request.URL.Query().Get("offset"))
 		}
-		_, _ = io.WriteString(w, `{"recording-count":101,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"release-group-list":[{"id":"`+groupID+`","title":"Collab album","primary-type":"Album","first-release-date":"2026-09-01"}]}]}`)
+		w.Header().Set("Content-Type", "application/json")
+		// Advertise far more recordings than one page holds. Credit discovery
+		// runs for every artist on every check against a process-wide one
+		// request per second limiter, so it must take what one page gives and
+		// stop rather than walking the whole catalogue or reporting a limit
+		// error that would cool the provider down.
+		_, _ = io.WriteString(w, `{"count":9001,"recordings":[{"id":"`+recordingID+`","title":"Collab track","artist-credit":[{"name":"Fridayy","artist":{"id":"`+artistID+`","name":"Fridayy"}},{"name":"Other","artist":{"id":"44444444-4444-4444-8444-444444444444","name":"Other"}}],"releases":[{"id":"55555555-5555-4555-8555-555555555555","title":"Collab album","release-group":{"id":"`+groupID+`","title":"Collab album","primary-type":"Album"}}]}]}`)
 	}))
 	defer server.Close()
 	mb := NewMusicBrainz("test@example.com")
 	mb.baseURL, mb.client, mb.interval, mb.retryBase = server.URL, server.Client(), 0, 0
 	credits, err := mb.ArtistReleaseCredits(context.Background(), artistID, nil)
-	if err != nil || len(credits) != 1 || requests.Load() != 2 {
-		t.Fatalf("credits=%#v err=%v requests=%d", credits, err, requests.Load())
+	if err != nil || len(credits) != 1 || credits[0].MBID != groupID {
+		t.Fatalf("credits=%#v err=%v", credits, err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("upstream requests=%d, want 1", requests.Load())
 	}
 }
 

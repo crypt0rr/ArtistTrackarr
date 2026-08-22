@@ -19,6 +19,10 @@ import (
 const (
 	calendarExportPageSize = 500
 	calendarExportMax      = 5000
+	// calendarMonthLimit bounds the month grid. The grid is a browsable view
+	// rather than an export, so it stays bounded and says so instead of paging
+	// an unusually large watchlist into a single page.
+	calendarMonthLimit = 300
 )
 
 var errCalendarExportTooLarge = errors.New("calendar export exceeds the safety limit")
@@ -40,8 +44,17 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 	fromTime, toTime := calendarMonthBounds(month, location)
 	from := fromTime.Format("2006-01-02")
 	to := toTime.Format("2006-01-02")
-	releases, err := a.store.CalendarReleases(r.Context(), session.User.ID, from, to, 300)
+	// Over-fetch by one so a truncated month is detectable. The grid only needs
+	// to know that more exists, so this is cheaper than the export path's
+	// separate probe request.
+	releases, err := a.store.CalendarReleasesPage(r.Context(), session.User.ID, from, to, calendarMonthLimit+1, 0)
 	pageFailed := a.pageStoreError(r, &d, "Release calendar", "calendar releases", err)
+	if len(releases) > calendarMonthLimit {
+		releases = releases[:calendarMonthLimit]
+		d.CalendarNotice = fmt.Sprintf(
+			"This month has more than %d dated releases. Showing the first %d — subscribe to the calendar feed or download the ICS file for the complete list.",
+			calendarMonthLimit, calendarMonthLimit)
+	}
 	d.CalendarMonth = fromTime.Format("January 2006")
 	d.CalendarPrevMonth = fromTime.AddDate(0, -1, 0).Format("2006-01")
 	d.CalendarNextMonth = fromTime.AddDate(0, 1, 0).Format("2006-01")

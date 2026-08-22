@@ -4,6 +4,7 @@
   <div class="actions"><a class="button secondary" href="{{.CalendarICSURL}}">Download ICS</a><a href="/calendar?month={{.CalendarPrevMonth}}" aria-label="Previous month">←</a><strong>{{.CalendarMonth}}</strong><a href="/calendar?month={{.CalendarNextMonth}}" aria-label="Next month">→</a></div>
 </section>
 <section class="panel calendar-panel">
+  {{if .CalendarNotice}}<div class="notice">{{.CalendarNotice}}</div>{{end}}
   {{if .CalendarDays}}
   <div class="calendar-list">
     {{range .CalendarDays}}

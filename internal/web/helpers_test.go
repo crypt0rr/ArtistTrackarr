@@ -181,13 +181,13 @@ func TestProviderTimeValueAcceptsSupportedShapes(t *testing.T) {
 
 func TestUserTimezoneFormattingUsesLocalDateAndHandlesLegacyValues(t *testing.T) {
 	instant := time.Date(2026, time.July, 1, 1, 30, 0, 0, time.UTC)
-	if got := formatTime(instant, "America/Los_Angeles"); got != "2026-06-30 18:30" {
-		t.Fatalf("Pacific display=%q, want 2026-06-30 18:30", got)
+	if got := formatTime(instant, "America/Los_Angeles"); got != "2026-06-30 18:30 PDT" {
+		t.Fatalf("Pacific display=%q, want 2026-06-30 18:30 PDT", got)
 	}
 	if got := providerHealthTime(instant, "Asia/Tokyo"); !strings.Contains(got, "2026-07-01 10:30:00 JST") {
 		t.Fatalf("Tokyo provider display=%q", got)
 	}
-	if got := formatTime(instant, "Not/AZone"); got != "2026-07-01 01:30" {
+	if got := formatTime(instant, "Not/AZone"); got != "2026-07-01 01:30 UTC" {
 		t.Fatalf("invalid timezone display=%q, want UTC fallback", got)
 	}
 	payload := providerHealthPayloadForConfig(store.ProviderHealth{Provider: "spotify", LastSuccessAt: &instant, UpdatedAt: instant}, config.Config{}, "America/Los_Angeles")
