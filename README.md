@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.56.2`; local and published images use the
+footer. The current release is `v0.57.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -396,6 +396,47 @@ or for an administrator - matching what the store already enforced - and the
 shared-versus-private distinction is documented alongside the private evidence
 review actions it is easily confused with.
 
+The v0.57.0 release fixes six defects found by a third review, four of which
+were introduced by earlier fixes in this series.
+
+A notification that took longer than five seconds to send could never record
+that it had been sent: the durable-state budget was started before the send
+rather than after it, and a send is allowed ten seconds. The delivery stayed
+pending with its attempt count unchanged and was re-sent on every later tick,
+never reaching a terminal state. The budget now starts once the send returns.
+
+Retention's unattended sweep deleted interrupted and failed imports along with
+the payload that makes them resumable. The guard added in v0.56.0 was applied
+to the manual cleanup path only, while the path that runs every tick kept
+deleting them - and the admin dry-run used the guarded query, so it reported
+nothing to delete while the scheduler deleted it.
+
+Pausing a follow, which began deferring rather than discarding notifications in
+v0.56.0, interacted badly with two things. The administrator's clock-skew repair
+requeued every deferred delivery, releasing every member's paused notifications
+at once while the interface still showed the pause; and a deferred delivery on
+its own marked the instance degraded, which is what surfaced that button. A
+paused follow also ranked identically to a disabled one when choosing which
+follow rule governs a release, so a disabled follow could win and the deferral
+was dropped while the event was still recorded and could never be re-queued. A
+follow that will deliver at pause expiry now also takes the Trust Guard hold it
+previously skipped.
+
+MusicBrainz-only releases were absent from the release calendar, the ICS
+export, the calendar feed and the digest for any artist who also had a Spotify
+or Apple release, while still generating an announcement. The provider
+preference now suppresses only an unmerged duplicate of the same release rather
+than every catalogue-only release by that artist, and the calendar and upcoming
+lists share one definition of it.
+
+Finally, login throttling behind a reverse proxy: with TRUST_PROXY unset every
+request appears to come from the proxy, so members share one failure counter per
+account and anyone who knows an address can lock its owner out. That was
+documented as a refinement rather than a requirement, and the v0.55.0 note
+claimed the lockout was impossible without saying it depends on this. The
+requirement is now stated plainly, the claim is qualified, and the application
+logs a warning the first time it sees a forwarded header without TRUST_PROXY.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -494,7 +535,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.56.2` publishes `0.56.2`, `0.56`, and `latest`.
+- Pushing a tag such as `v0.57.0` publishes `0.57.0`, `0.57`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -518,7 +559,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.56.2 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.0 docker compose up -d
 ```
 
 ## Configuration
