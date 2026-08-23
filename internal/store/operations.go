@@ -406,6 +406,21 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	var snapshot DiagnosticsSnapshot
 	snapshot.CheckedAt = time.Now().UTC()
+	// Contention is read first: these are in-process counters that stay
+	// meaningful even when the queries below fail, which is exactly the state
+	// an operator is trying to understand.
+	snapshot.WriteRetries = s.writeRetries.Load()
+	snapshot.WriteRetryExhaustions = s.writeRetryExhaustions.Load()
+	if s.DB != nil {
+		writer := s.DB.Stats()
+		snapshot.WriterWaitCount, snapshot.WriterWaitDuration = writer.WaitCount, writer.WaitDuration
+		snapshot.WriterInUse = writer.InUse
+	}
+	if reader := s.readerDB(); reader != nil {
+		stats := reader.Stats()
+		snapshot.ReaderWaitCount, snapshot.ReaderWaitDuration = stats.WaitCount, stats.WaitDuration
+		snapshot.ReaderInUse = stats.InUse
+	}
 	snapshot.DatabaseHealthState = DatabaseHealthy
 	if healthErr := s.Healthy(ctx); healthErr != nil {
 		var classified *DatabaseHealthError

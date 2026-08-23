@@ -186,6 +186,16 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		Destinations: diagnosticsJSONDestinations{
 			Paused: snapshot.PausedDestinations,
 		},
+		Contention: diagnosticsJSONContention{
+			WriteRetries:          snapshot.WriteRetries,
+			WriteRetryExhaustions: snapshot.WriteRetryExhaustions,
+			WriterWaitCount:       snapshot.WriterWaitCount,
+			WriterWaitMillis:      snapshot.WriterWaitDuration.Milliseconds(),
+			WriterInUse:           snapshot.WriterInUse,
+			ReaderWaitCount:       snapshot.ReaderWaitCount,
+			ReaderWaitMillis:      snapshot.ReaderWaitDuration.Milliseconds(),
+			ReaderInUse:           snapshot.ReaderInUse,
+		},
 		Providers: make([]diagnosticsJSONProvider, 0, len(snapshot.Providers)),
 		Retention: diagnosticsJSONRetention{
 			CheckedAt:               retention.CheckedAt,
@@ -245,6 +255,7 @@ type diagnosticsJSONPayload struct {
 	Inventory          diagnosticsJSONInventory    `json:"inventory"`
 	Queue              diagnosticsJSONQueue        `json:"queue"`
 	Destinations       diagnosticsJSONDestinations `json:"destinations"`
+	Contention         diagnosticsJSONContention   `json:"contention"`
 	Providers          []diagnosticsJSONProvider   `json:"providers"`
 	Retention          diagnosticsJSONRetention    `json:"retention"`
 	Runner             diagnosticsJSONRunner       `json:"runner"`
@@ -288,6 +299,20 @@ type diagnosticsJSONInventory struct {
 	LogWriteFailures        uint64     `json:"log_write_failures"`
 	ProviderFailures        int        `json:"provider_failures"`
 	OldestProviderFailureAt *time.Time `json:"oldest_provider_failure_at,omitempty"`
+}
+
+// diagnosticsJSONContention reports SQLite writer/reader pressure. Writes use
+// a single connection behind a 5s busy_timeout, so a non-zero retry count is
+// already multiple seconds of stalled writes.
+type diagnosticsJSONContention struct {
+	WriteRetries          uint64 `json:"write_retries"`
+	WriteRetryExhaustions uint64 `json:"write_retry_exhaustions"`
+	WriterWaitCount       int64  `json:"writer_wait_count"`
+	WriterWaitMillis      int64  `json:"writer_wait_millis"`
+	WriterInUse           int    `json:"writer_in_use"`
+	ReaderWaitCount       int64  `json:"reader_wait_count"`
+	ReaderWaitMillis      int64  `json:"reader_wait_millis"`
+	ReaderInUse           int    `json:"reader_in_use"`
 }
 
 type diagnosticsJSONDestinations struct {
@@ -565,6 +590,10 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 		fmt.Fprintf(&report, "Oldest digest backlog: %s\n", providerHealthTime(snapshot.OldestDigestBacklogAt, timezone))
 	}
 	fmt.Fprintf(&report, "Database size: %d bytes; reusable space: %d bytes\n", snapshot.DatabaseBytes, snapshot.DatabaseFreeBytes)
+	fmt.Fprintf(&report, "SQLite contention: %d write retries, %d exhausted; writer waits %d (%s), in use %d; reader waits %d (%s), in use %d\n",
+		snapshot.WriteRetries, snapshot.WriteRetryExhaustions,
+		snapshot.WriterWaitCount, snapshot.WriterWaitDuration.Round(time.Millisecond), snapshot.WriterInUse,
+		snapshot.ReaderWaitCount, snapshot.ReaderWaitDuration.Round(time.Millisecond), snapshot.ReaderInUse)
 	if snapshot.OldestQueueAt != nil {
 		fmt.Fprintf(&report, "Oldest queued delivery: %s\n", providerHealthTime(snapshot.OldestQueueAt, timezone))
 	}

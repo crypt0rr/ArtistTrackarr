@@ -68,6 +68,12 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 	if snapshot.DroppedLogEntries > 0 || snapshot.LogWriteFailures > 0 {
 		addReason("application log loss")
 	}
+	// Retries are normal under load and are reported without a status change;
+	// exhaustion means a write was actually refused after five attempts and a
+	// 5s busy_timeout on each, which a household should never reach.
+	if snapshot.WriteRetryExhaustions > 0 {
+		addReason("database write contention")
+	}
 	if snapshot.PausedDestinations > 0 {
 		addReason("paused destinations")
 	}
