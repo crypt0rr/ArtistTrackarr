@@ -74,7 +74,7 @@
 <section class="page-head artists-list-head"><div><p class="eyebrow">Your watchlist</p><h2>Followed artists</h2><p>Alphabetically sorted, with provider links and synchronization status.</p></div><span class="badge">{{.FollowCount}} followed</span></section>
 <section class="panel">
   <form id="bulk-follow-rules" method="post" action="/artists/notification-rules/batch" class="bulk-rule-form" data-bulk-rule-form>
-    {{template "csrf" .}}
+    {{template "csrf" .}}{{template "listcontext" .}}
     <label class="bulk-select-all"><input type="checkbox" data-bulk-select-all> Select all visible</label>
     <label>Selected notification mode
       <select name="delivery_mode">
@@ -100,12 +100,12 @@
     <div class="artist-row-content"><div class="actions">{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}
     <a href="https://musicbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>
     <a href="https://listenbrainz.org/artist/{{.MBID}}" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
-    <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}<button class="secondary">Sync now</button></form>
-    <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}<button class="danger link">Remove</button></form></div>
+    <form method="post" action="/artists/{{.ID}}/sync" class="inline">{{template "csrf" $}}{{template "listcontext" $}}<button class="secondary">Sync now</button></form>
+    <form method="post" action="/artists/{{.ID}}/delete" class="inline">{{template "csrf" $}}{{template "listcontext" $}}<button class="danger link">Remove</button></form></div>
     {{$rule := index $.FollowRules .ID}}
     <details class="follow-rule-editor"><summary>{{followRuleSummary $rule}}</summary>
       <form method="post" action="/artists/{{.ID}}/notification-rule" class="follow-rule-form">
-        {{template "csrf" $}}
+        {{template "csrf" $}}{{template "listcontext" $}}
         <label>Delivery <select name="delivery_mode">
           <option value="inherit"{{if eq $rule.DeliveryMode "inherit"}} selected{{end}}>Account defaults</option>
           <option value="immediate"{{if eq $rule.DeliveryMode "immediate"}} selected{{end}}>Immediate only</option>
@@ -125,8 +125,8 @@
         <button class="secondary" type="submit">Save rule</button>
       </form>
       <div class="follow-rule-actions">
-        {{if $rule.PausedUntil}}<form method="post" action="/artists/{{.ID}}/notification-rule/resume" class="inline">{{template "csrf" $}}<button class="link" type="submit">Resume now</button></form>
-        {{else}}<form method="post" action="/artists/{{.ID}}/notification-rule/pause" class="inline">{{template "csrf" $}}<input type="hidden" name="days" value="7"><button class="link" type="submit">Pause for 7 days</button></form>{{end}}
+        {{if $rule.PausedUntil}}<form method="post" action="/artists/{{.ID}}/notification-rule/resume" class="inline">{{template "csrf" $}}{{template "listcontext" $}}<button class="link" type="submit">Resume now</button></form>
+        {{else}}<form method="post" action="/artists/{{.ID}}/notification-rule/pause" class="inline">{{template "csrf" $}}{{template "listcontext" $}}<input type="hidden" name="days" value="7"><button class="link" type="submit">Pause for 7 days</button></form>{{end}}
       </div>
     </details></div>
   </article>{{end}}</div>

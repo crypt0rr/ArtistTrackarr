@@ -1147,9 +1147,32 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	// looks after an import stops reporting. Without the listing a job that a
 	// restart marked resumable was unreachable: Resume is addressed by job id
 	// and nothing ever showed one.
+	d.ArtistListQuery = currentArtistListQuery(d, page)
 	d.ImportJobs, err = a.store.RecentImportJobs(r.Context(), session.User.ID, recentImportJobLimit)
 	failed = a.pageStoreError(r, d, "Artists", "recent imports", err) || failed
 	return failed
+}
+
+// currentArtistListQuery encodes the view a member is looking at so action
+// forms can carry it and the redirect afterwards can restore it. Only the keys
+// the artists page itself reads are included, and the first page is omitted
+// because it is the default.
+func currentArtistListQuery(d *PageData, page int) string {
+	values := url.Values{}
+	for key, value := range map[string]string{
+		"q":       d.Query,
+		"genre":   d.GenreFilter,
+		"country": d.CountryFilter,
+		"type":    d.TypeFilter,
+	} {
+		if value != "" {
+			values.Set(key, value)
+		}
+	}
+	if page > 1 {
+		values.Set("page", strconv.Itoa(page))
+	}
+	return values.Encode()
 }
 
 // recentImportJobLimit bounds the import history shown on the artists page. It
