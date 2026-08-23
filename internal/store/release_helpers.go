@@ -455,7 +455,16 @@ func normalizedReleaseTitle(value string) string {
 			space = true
 		}
 	}
-	return strings.TrimSpace(normalized.String())
+	if collapsed := strings.TrimSpace(normalized.String()); collapsed != "" {
+		return collapsed
+	}
+	// A title made entirely of symbols - "+", "=", "-", "÷", "!!!" are all real
+	// release names - would otherwise normalize to the empty string and compare
+	// equal to every other such title, folding distinct releases into one
+	// release group. Fall back to the symbols themselves so they stay
+	// distinguishable from each other while still matching the same title from
+	// another provider.
+	return strings.Join(strings.Fields(value), " ")
 }
 func upsertProviderObservationTx(
 	ctx context.Context, tx *sql.Tx, provider, providerID string, releaseID int64,
@@ -682,18 +691,26 @@ func enqueueApprovedEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID i
 }
 
 func enqueueEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
-	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, true)
+	_, err := enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, true)
+	return err
 }
 
 // enqueueHeldEventTxMode re-evaluates a previously held event against the
 // owner's current notification rules. Hold bodies already contain the
 // association decoration that was rendered when the hold was created, so the
 // normal message decoration must not be applied a second time.
-func enqueueHeldEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) error {
+// It reports whether the event was admitted for delivery, so a caller acting on
+// an explicit override can tell a genuine re-queue apart from an event that was
+// recorded but is going nowhere.
+func enqueueHeldEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold bool) (bool, error) {
 	return enqueueEventTxModeOptions(ctx, tx, userID, releaseID, eventType, title, body, now, bypassConflictHold, false)
 }
 
-func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold, decorateBody bool) error {
+// enqueueEventTxModeOptions reports whether the event was admitted for
+// delivery under the member's current rules. A held or suppressed event returns
+// false, which is what lets a caller tell "queued" apart from "recorded but
+// going nowhere".
+func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold, decorateBody bool) (bool, error) {
 	type candidate struct {
 		rule FollowNotificationRule
 		role string
@@ -718,7 +735,7 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 		WHERE rg.id=?
 		ORDER BY CASE WHEN f.artist_id=rg.artist_id THEN 0 ELSE 1 END,f.artist_id`, userID, userID, userID, releaseID)
 	if err != nil {
-		return fmt.Errorf("load notification rules for release: %w", err)
+		return false, fmt.Errorf("load notification rules for release: %w", err)
 	}
 	if err := func() error {
 		defer func() { _ = rows.Close() }()
@@ -747,19 +764,19 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 		}
 		return nil
 	}(); err != nil {
-		return err
+		return false, err
 	}
 	if len(candidates) == 0 {
 		// The owner no longer follows this artist (or the release was
 		// removed). Do not create an orphaned notification event.
-		return nil
+		return false, nil
 	}
 	var secondaryTypes []string
 	if err := json.Unmarshal([]byte(secondary), &secondaryTypes); err != nil {
-		return fmt.Errorf("parse release secondary types: %w", err)
+		return false, fmt.Errorf("parse release secondary types: %w", err)
 	}
 	if !releaseTypeEnabled(p, primary, secondaryTypes) {
-		return nil
+		return false, nil
 	}
 	var selected *candidate
 	selectedPriority := -1
@@ -789,12 +806,12 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 		}
 	}
 	if selected == nil {
-		return nil
+		return false, nil
 	}
 	if decorateBody {
 		title, body, err = decorateReleaseMessageTx(ctx, tx, userID, releaseID, title, body)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 	// A paused follow now defers rather than discards, so it will deliver. It
@@ -803,10 +820,14 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 	// anyway, releasing an unreviewed release at pause expiry with no hold row.
 	_, deferredDelivery := selected.rule.pausedDeliveryResumesAt(now)
 	if p.HoldConflictingNotifications && (selected.rule.queuesImmediate(now) || deferredDelivery) && !bypassConflictHold {
-		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
-			return err
+		// It does not always withhold: with no open evidence it admits the
+		// event itself, and an event recorded on an earlier pass was admitted
+		// then. Report admission accordingly rather than assuming a hold.
+		held, err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now)
+		if err != nil {
+			return false, err
 		}
-		return nil
+		return !held, nil
 	}
 	// A paused follow defers its delivery to the moment the pause expires
 	// instead of dropping the alert on the floor.
@@ -814,7 +835,14 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 	if resumesAt, deferred := selected.rule.pausedDeliveryResumesAt(now); deferred {
 		queueDeliveries, deliverAt = true, resumesAt
 	}
-	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, queueDeliveries, deliverAt)
+	if _, err := insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, queueDeliveries, deliverAt); err != nil {
+		return false, err
+	}
+	// Admission is about whether the event reaches the member through any
+	// channel, not whether a delivery row was written now. A digest-only follow
+	// queues nothing here and is still admitted, because the digest collects it;
+	// a disabled follow records the event and it goes nowhere.
+	return selected.rule.effectiveDeliveryMode(now) != FollowDeliveryOff || deferredDelivery, nil
 }
 
 func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, title, body string) (string, string, error) {
@@ -830,32 +858,39 @@ func decorateReleaseMessageTx(ctx context.Context, tx *sql.Tx, userID, releaseID
 }
 
 func insertNotificationEventTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
-	return insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true, now)
+	_, err := insertNotificationEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true, now)
+	return err
 }
 
 // insertNotificationEventTxMode records the event and, when queueDeliveries is
 // set, fans it out to the member's destinations. deliverAt is the earliest the
 // delivery may be attempted, which lets a paused follow defer rather than lose
 // its notifications.
-func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, queueDeliveries bool, deliverAt time.Time) error {
+//
+// It reports whether the event was admitted for delivery. Callers must not infer
+// that from the presence of the notification_events row: that row is written
+// first and unconditionally, so it exists even when the member's current rules
+// admit nothing. A member with no destinations still counts as admitted - the
+// event is real and visible in their inbox; there is simply nowhere to send it.
+func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, queueDeliveries bool, deliverAt time.Time) (bool, error) {
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO notification_events
 		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
 		userID, releaseID, eventType, title, body, timeText(now))
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 	eventID, _ := result.LastInsertId()
 	if n == 0 {
 		if err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events WHERE user_id=? AND release_group_id=? AND event_type=?`, userID, releaseID, eventType).Scan(&eventID); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if !queueDeliveries {
-		return nil
+		return false, nil
 	}
 	// The event insert is idempotent, so the delivery fan-out must be too. A
 	// repeated release-day queue run should never turn an already queued event
@@ -865,7 +900,7 @@ func insertNotificationEventTxMode(ctx context.Context, tx *sql.Tx, userID, rele
 		LEFT JOIN destination_health dh ON dh.destination_id=d.id
 		WHERE d.user_id=? AND d.enabled=1
 		AND d.created_at <= (SELECT created_at FROM notification_events WHERE id=?)`, eventID, timeText(deliverAt), userID, eventID)
-	return err
+	return true, err
 }
 
 type releaseRowScanner interface {
