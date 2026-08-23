@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.57.0`; local and published images use the
+footer. The current release is `v0.57.1`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -437,6 +437,27 @@ claimed the lockout was impossible without saying it depends on this. The
 requirement is now stated plainly, the claim is qualified, and the application
 logs a warning the first time it sees a forwarded header without TRUST_PROXY.
 
+The v0.57.1 patch fixes two ways a release or an alert could be lost silently.
+
+"Notify anyway" on a held release marked the hold released whenever a
+notification event existed. That event row is written before the member's own
+delivery rules are consulted, so for a paused or disabled follow the hold
+disappeared while nothing was delivered - and because an event is unique per
+member, release, and type, it could never be raised again. The override now asks
+whether the event was actually admitted for delivery, and leaves the hold
+pending when it was not so the owner can change the rule and retry. The same
+test was wrong on the drain path and is corrected there too. A digest-only
+follow still counts as admitted, because the digest collects it.
+
+Release titles made entirely of symbols - "+", "=", "-", "÷" are all real names
+- normalized to the empty string, so every one of them compared equal to every
+other and the identity match fell through to the release date alone. Two such
+releases by one artist in the same year were folded into a single release group,
+permanently losing one along with its provider observations, calendar entry and
+notification. Symbol titles now normalize to themselves, so they stay
+distinguishable from each other while still matching the same title from another
+provider.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -535,7 +556,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.57.0` publishes `0.57.0`, `0.57`, and `latest`.
+- Pushing a tag such as `v0.57.1` publishes `0.57.1`, `0.57`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -559,7 +580,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.1 docker compose up -d
 ```
 
 ## Configuration

@@ -11,32 +11,38 @@ import (
 // holdConflictingNotificationTx stores one pending notification when the
 // latest provider evidence contains a warning or critical issue. Informational
 // issues (for example, a missing canonical observation) do not block delivery.
-func holdConflictingNotificationTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) error {
+// holdConflictingNotificationTx reports whether the event was withheld for
+// review. It does not always hold: with no open warning or critical evidence it
+// admits the event itself, and an event that already exists was admitted
+// earlier. Callers need that distinction to tell "queued" from "withheld".
+func holdConflictingNotificationTx(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time) (bool, error) {
 	var exists int
 	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_events
 		WHERE user_id=? AND release_group_id=? AND event_type=? LIMIT 1`, userID, releaseID, eventType).Scan(&exists); err == nil {
-		return nil
+		// Already recorded on an earlier pass, so it was admitted then.
+		return false, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	// A member's explicit discard is terminal until they restore the hold.
 	// Without this guard, each release-day queue pass would recreate the same
 	// discarded review row while the evidence issue remained open.
 	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM notification_holds
 		WHERE user_id=? AND release_group_id=? AND event_type=? AND status='discarded' LIMIT 1`, userID, releaseID, eventType).Scan(&exists); err == nil {
-		return nil
+		return true, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	var reason, fingerprint string
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(group_concat(summary,'; '),''),
 		COALESCE(group_concat(fingerprint,','),'')
 		FROM release_evidence_issues
 		WHERE release_group_id=? AND status='open' AND severity IN ('warning','critical')`, releaseID).Scan(&reason, &fingerprint); err != nil {
-		return err
+		return false, err
 	}
 	if strings.TrimSpace(reason) == "" {
-		return insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
+		// Nothing to review, so admit it rather than withholding it.
+		return false, insertNotificationEventTx(ctx, tx, userID, releaseID, eventType, title, body, now)
 	}
 	var holdID int64
 	err := tx.QueryRowContext(ctx, `SELECT id FROM notification_holds
@@ -51,7 +57,7 @@ func holdConflictingNotificationTx(ctx context.Context, tx *sql.Tx, userID, rele
 		_, err = tx.ExecContext(ctx, `UPDATE notification_holds SET title=?,body=?,reason=?,issue_fingerprint=?,planned_at=? WHERE id=?`,
 			title, body, reason, fingerprint, timeText(now), holdID)
 	}
-	return err
+	return true, err
 }
 
 // drainResolvedNotificationHoldsTx releases holds for a release once its
@@ -121,13 +127,15 @@ func drainNotificationHoldsTxMode(ctx context.Context, tx *sql.Tx, userID, relea
 		return err
 	}
 	for _, item := range holds {
-		if err := enqueueHeldEventTxMode(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now, bypassConflictHold); err != nil {
+		// Ask whether the event was admitted, not whether its row exists. The
+		// notification_events row is written before admission is decided, so it
+		// is present even when the current rules deliver nothing - which made
+		// the suppression branch below unreachable.
+		admitted, err := enqueueHeldEventTxMode(ctx, tx, item.ownerID, releaseID, item.eventType, item.title, item.body, now, bypassConflictHold)
+		if err != nil {
 			return err
 		}
-		var eventID int64
-		err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
-			WHERE user_id=? AND release_group_id=? AND event_type=?`, item.ownerID, releaseID, item.eventType).Scan(&eventID)
-		if errors.Is(err, sql.ErrNoRows) {
+		if !admitted {
 			// Current rules intentionally suppressed this event (for example,
 			// the owner disabled the follow or account-level moment). Keep the
 			// hold available so a later rule change or explicit restore can
@@ -346,19 +354,20 @@ func (s *Store) ResolveNotificationHold(ctx context.Context, userID, holdID int6
 		}
 		status = "discarded"
 		if action == "notify" {
-			if err := enqueueHeldEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true); err != nil {
+			// "Notify anyway" bypasses the conflict hold, not the member's own
+			// delivery rules: a paused or disabled follow still admits nothing.
+			// Testing for the notification_events row could not tell those
+			// apart, because that row is written before admission is decided,
+			// so the hold was marked released while nothing was delivered and
+			// the unique constraint made the event unrepeatable.
+			admitted, err := enqueueHeldEventTxMode(ctx, tx, userID, releaseID, eventType, title, body, now, true)
+			if err != nil {
 				return err
 			}
-			var eventID int64
-			err := tx.QueryRowContext(ctx, `SELECT id FROM notification_events
-			WHERE user_id=? AND release_group_id=? AND event_type=?`, userID, releaseID, eventType).Scan(&eventID)
-			if errors.Is(err, sql.ErrNoRows) {
+			if !admitted {
 				// The current rule intentionally blocks admission. Keep the hold
 				// pending so the owner can change the rule and retry it later.
 				return nil
-			}
-			if err != nil {
-				return err
 			}
 			status = "released"
 		}

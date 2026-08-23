@@ -272,7 +272,13 @@ func releaseRecordsMatch(a, b Release) bool {
 	return a.PrimaryType == b.PrimaryType && releaseIdentityMatches(a, b)
 }
 func releaseIdentityMatches(a, b Release) bool {
-	if normalizedReleaseTitle(a.Title) != normalizedReleaseTitle(b.Title) {
+	titleA, titleB := normalizedReleaseTitle(a.Title), normalizedReleaseTitle(b.Title)
+	// An empty normalized title compares equal to every other empty one, which
+	// would let the match fall through to the date alone and fold genuinely
+	// different releases into one release group. normalizedReleaseTitle keeps
+	// symbol-only titles intact for this reason; this guards what remains, a
+	// title that is genuinely blank.
+	if titleA == "" || titleB == "" || titleA != titleB {
 		return false
 	}
 	if a.DatePrecision == 0 || a.DatePrecision != b.DatePrecision {
