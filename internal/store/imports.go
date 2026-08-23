@@ -98,7 +98,11 @@ func (s *Store) CreateImportJobWithPayload(ctx context.Context, userID int64, pa
 // owner-scoped and idempotent: a retry after a completed request cannot change
 // the result, while a failed request can still be marked explicitly.
 func (s *Store) FinishImportJob(ctx context.Context, userID, jobID int64, status string) error {
-	if status != "complete" && status != "failed" {
+	// "interrupted" is a terminal status too: it is what the schema and
+	// CanResume use for an upload that stopped part-way and can be resumed.
+	// Rejecting it here left such a job stuck in "processing", which is not
+	// resumable, so the member had no route forward until an hourly sweep.
+	if status != "complete" && status != "failed" && status != "interrupted" {
 		return errors.New("invalid import job status")
 	}
 	// The source upload is needed only to recover an incomplete import. Clear

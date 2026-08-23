@@ -242,8 +242,29 @@ func evidenceDatesCompatible(a, b ReleaseEvidence) bool {
 		precision = precisionB
 	}
 	length := map[int]int{1: 4, 2: 7, 3: 10}[precision]
-	return length > 0 && a.FirstReleaseDate[:minInt(length, len(a.FirstReleaseDate))] ==
-		b.FirstReleaseDate[:minInt(length, len(b.FirstReleaseDate))]
+	if length == 0 {
+		return false
+	}
+	dateA := a.FirstReleaseDate[:minInt(length, len(a.FirstReleaseDate))]
+	dateB := b.FirstReleaseDate[:minInt(length, len(b.FirstReleaseDate))]
+	if dateA == dateB {
+		return true
+	}
+	// Apply the same tolerance the merge comparator uses. Demanding exact
+	// equality here meant the store deliberately merged two provider rows a day
+	// or two apart - regional storefronts routinely differ - and evidence review
+	// then raised a conflict on the very release that merge had absorbed,
+	// producing a permanent review item, and a notification hold when the member
+	// has hold-on-conflict enabled.
+	if precision != 3 {
+		return false
+	}
+	left, leftErr := time.Parse("2006-01-02", dateA)
+	right, rightErr := time.Parse("2006-01-02", dateB)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return withinReleaseDateTolerance(left, right)
 }
 
 func evidencePrecision(item ReleaseEvidence) int {

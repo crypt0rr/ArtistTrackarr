@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -277,6 +278,18 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/artists/imports/%d", job.ID), http.StatusSeeOther)
 }
 
+// importBookkeepingContext bounds a durable write that must survive the request
+// it belongs to. An import runs on the HTTP request context under a request
+// timeout; once that fires, recording what happened is exactly the work that
+// must still complete.
+func importBookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	return context.WithTimeout(base, 5*time.Second)
+}
+
 // runArtistImport owns the durable per-row loop shared by fresh and resumed
 // uploads. Every row is independent, so a local write failure leaves the rest
 // of the upload useful while the terminal status tells the user it is
@@ -289,16 +302,44 @@ func (a *App) runArtistImport(ctx context.Context, userID int64, inputs []store.
 	}
 	importStatus := "complete"
 	for _, input := range inputs {
+		// A large upload can outlive the request deadline: every row is its own
+		// write transaction on the single writer, shared with the scheduler.
+		// Stop at the first sign of that rather than failing every remaining row
+		// against a dead context, which produced one error log per row and no
+		// usable record of any of them.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			importStatus = "interrupted"
+			a.logger.Warn("artist import interrupted before completing",
+				"job_id", job.ID, "remaining", len(inputs), "error", ctxErr)
+			break
+		}
 		if _, saveErr := a.store.SaveImportRow(ctx, userID, job.ID, input); saveErr != nil {
+			if errors.Is(saveErr, context.Canceled) || errors.Is(saveErr, context.DeadlineExceeded) {
+				importStatus = "interrupted"
+				a.logger.Warn("artist import interrupted before completing",
+					"job_id", job.ID, "error", saveErr)
+				break
+			}
 			importStatus = "failed"
 			a.logger.Error("save artist import row failed", "job_id", job.ID, "error", saveErr)
 			// Keep the row visible even when one local write fails. This is an
 			// invalid result, never a reason to discard the rest of the upload.
+			// The recovery write gets its own budget: reusing a context that has
+			// just expired discarded the row and swallowed the error, so the
+			// failure never appeared in the results table.
 			input.Reason = "could not save this row"
-			_, _ = a.store.SaveImportRow(ctx, userID, job.ID, input)
+			rowCtx, cancelRow := importBookkeepingContext(ctx)
+			_, _ = a.store.SaveImportRow(rowCtx, userID, job.ID, input)
+			cancelRow()
 		}
 	}
-	if err := a.store.FinishImportJob(ctx, userID, job.ID, importStatus); err != nil {
+	// Finishing must not depend on the context that just expired either: a job
+	// left in "processing" is not resumable, so the member saw a partially
+	// applied import with the Resume action hidden until the hourly sweep
+	// recovered it.
+	finishCtx, cancelFinish := importBookkeepingContext(ctx)
+	defer cancelFinish()
+	if err := a.store.FinishImportJob(finishCtx, userID, job.ID, importStatus); err != nil {
 		a.logger.Error("finish artist import job failed", "job_id", job.ID, "error", err)
 	}
 	job.Status = importStatus

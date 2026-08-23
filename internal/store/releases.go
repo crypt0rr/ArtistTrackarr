@@ -296,11 +296,20 @@ func releaseIdentityMatches(a, b Release) bool {
 	if leftErr != nil || rightErr != nil {
 		return false
 	}
+	return withinReleaseDateTolerance(left, right)
+}
+
+// releaseDateTolerance is how far two day-precision provider dates may differ
+// and still describe the same release. Regional storefronts routinely disagree
+// by a day or two.
+const releaseDateTolerance = 3 * 24 * time.Hour
+
+func withinReleaseDateTolerance(left, right time.Time) bool {
 	delta := left.Sub(right)
 	if delta < 0 {
 		delta = -delta
 	}
-	return delta <= 3*24*time.Hour
+	return delta <= releaseDateTolerance
 }
 
 func providerReleaseTypeDerived(release Release) bool {
