@@ -52,6 +52,23 @@
   <div class="watchlist-tool-actions"><a class="button secondary" href="/artists/export">Export CSV</a>
     <form method="post" action="/artists/import" enctype="multipart/form-data" class="actions import-form">{{template "csrf" .}}<label class="file-field">ArtistTrackarr CSV<input type="file" name="file" accept=".csv,text/csv" required></label><button type="submit">Import CSV</button></form>
   </div>
+  {{if .ImportJobs}}
+  <div class="table-scroll import-history">
+    <table>
+      <thead><tr><th>Started</th><th>Status</th><th>Outcome</th><th></th></tr></thead>
+      <tbody>
+        {{range .ImportJobs}}
+        <tr>
+          <td>{{formatTime .CreatedAt $.User.Timezone}}</td>
+          <td><span class="badge {{.Status}}">{{.Status}}</span>{{if .CanResume}} <span class="badge">resumable</span>{{end}}</td>
+          <td>{{.Added}} added · {{.AlreadyFollowed}} already followed · {{.Invalid}} invalid</td>
+          <td><a href="/artists/imports/{{.ID}}">{{if .CanResume}}Resume{{else}}Details{{end}}</a></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
 </section>
 
 <section class="page-head artists-list-head"><div><p class="eyebrow">Your watchlist</p><h2>Followed artists</h2><p>Alphabetically sorted, with provider links and synchronization status.</p></div><span class="badge">{{.FollowCount}} followed</span></section>

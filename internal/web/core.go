@@ -1143,8 +1143,19 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	failed = a.pageStoreError(r, d, "Artists", "country breakdown", err) || failed
 	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
 	failed = a.pageStoreError(r, d, "Artists", "artist type breakdown", err) || failed
+	// Recent imports live beside the import form because that is where a member
+	// looks after an import stops reporting. Without the listing a job that a
+	// restart marked resumable was unreachable: Resume is addressed by job id
+	// and nothing ever showed one.
+	d.ImportJobs, err = a.store.RecentImportJobs(r.Context(), session.User.ID, recentImportJobLimit)
+	failed = a.pageStoreError(r, d, "Artists", "recent imports", err) || failed
 	return failed
 }
+
+// recentImportJobLimit bounds the import history shown on the artists page. It
+// is a convenience list for finding a job again, not an audit log; the detail
+// page holds the per-row outcome.
+const recentImportJobLimit = 5
 
 func artistsPageURL(r *http.Request, page int) string {
 	values := make(url.Values)

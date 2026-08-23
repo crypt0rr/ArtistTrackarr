@@ -46,6 +46,7 @@ type PageDiscovery struct {
 	RecentReleases      []store.Release
 	ReleaseCount        int
 	FollowCount         int
+	ImportJobs          []store.ImportJob
 	ListenBrainzArtists []store.Artist
 	GenreBreakdown      []store.ArtistBreakdown
 	CountryBreakdown    []store.ArtistBreakdown
