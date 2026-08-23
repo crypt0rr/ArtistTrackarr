@@ -280,7 +280,7 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
 		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
 		JOIN artists a ON a.id=rg.artist_id
 		WHERE h.user_id=? AND h.release_group_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'
-		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID, userID)
+		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID)
 	if err != nil {
 		return nil, err
 	}

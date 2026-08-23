@@ -42,15 +42,6 @@ func (r FollowNotificationRule) effectiveDeliveryMode(now time.Time) string {
 	return normalizeFollowDeliveryMode(r.DeliveryMode)
 }
 
-// AllowsContent determines whether an event for this follow should exist in
-// the member's notification/inbox history. It is retained as a compatibility
-// helper for callers that do not have secondary release metadata. New release
-// paths should use AllowsRelease so compilations can be distinguished from
-// ordinary albums.
-func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType string, now time.Time) bool {
-	return r.AllowsRelease(primaryType, nil, creditRole, eventType, now)
-}
-
 // AllowsRelease determines whether an event for this follow should exist in
 // the member's notification/inbox history. Spotify, iTunes, and MusicBrainz
 // normalize compilations as primary type Album with Compilation in the

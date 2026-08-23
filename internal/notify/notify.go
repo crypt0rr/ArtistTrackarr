@@ -838,6 +838,14 @@ type DestinationInput struct {
 	Topic    string
 }
 
+// BuildURL constructs a transport URL for a supported destination service.
+//
+// The set it accepts is deliberately the set ValidateTransportPolicy accepts.
+// It previously also built gotify: and smtp: URLs, which that policy rejects
+// unconditionally, so those branches could only ever produce a destination that
+// failed validation the moment it was used - a trap for anyone extending the
+// settings form, which does not offer them either. Adding a transport means
+// adding it in both places.
 func BuildURL(input DestinationInput) (string, error) {
 	switch input.Service {
 	case "advanced":
@@ -866,34 +874,12 @@ func BuildURL(input DestinationInput) (string, error) {
 			u.User = url.UserPassword(input.Username, input.Password)
 		}
 		return u.String(), nil
-	case "gotify":
-		if input.Host == "" || input.Token == "" {
-			return "", errors.New("gotify host and token are required")
-		}
-		return (&url.URL{Scheme: "gotify", Host: input.Host, Path: "/" + input.Token}).String(), nil
 	case "generic":
 		target, err := url.Parse(input.Target)
 		if err != nil || (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
 			return "", errors.New("webhook must be an absolute HTTP(S) URL")
 		}
 		return "generic+" + target.String(), nil
-	case "email":
-		if input.Host == "" || input.From == "" || input.To == "" {
-			return "", errors.New("SMTP host, from, and recipient are required")
-		}
-		port := input.Port
-		if port == "" {
-			port = "587"
-		}
-		if _, err := strconv.Atoi(port); err != nil {
-			return "", errors.New("SMTP port is invalid")
-		}
-		u := &url.URL{Scheme: "smtp", Host: net.JoinHostPort(input.Host, port), Path: "/"}
-		if input.Username != "" {
-			u.User = url.UserPassword(input.Username, input.Password)
-		}
-		u.RawQuery = url.Values{"from": []string{input.From}, "to": []string{input.To}}.Encode()
-		return u.String(), nil
 	default:
 		return "", fmt.Errorf("unsupported destination service %q", input.Service)
 	}

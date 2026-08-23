@@ -30,7 +30,6 @@ func TestBuildURL(t *testing.T) {
 		want  string
 	}{
 		{"ntfy", DestinationInput{Service: "ntfy", Topic: "records"}, "ntfy://ntfy.sh/records"},
-		{"gotify", DestinationInput{Service: "gotify", Host: "push.example", Token: "abc"}, "gotify://push.example/abc"},
 		{"generic", DestinationInput{Service: "generic", Target: "https://hooks.example/new"}, "generic+https://hooks.example/new"},
 		{"discord", DestinationInput{Service: "discord", Token: "bot-token", Target: "123456"}, "discord://bot-token@123456"},
 		{"telegram", DestinationInput{Service: "telegram", Token: "bot-token", Target: "-100123"}, "telegram://bot-token@telegram?chats=-100123"},
@@ -46,19 +45,36 @@ func TestBuildURL(t *testing.T) {
 	}
 }
 
-func TestBuildURLEmailAndOptionalCredentials(t *testing.T) {
-	got, err := BuildURL(DestinationInput{Service: "email", Host: "smtp.example", Port: "2525", Username: "mailer", Password: "secret", From: "from@example", To: "to@example"})
-	if err != nil {
-		t.Fatal(err)
+// The former TestBuildURLEmailAndOptionalCredentials covered smtp: URLs, which
+// ValidateTransportPolicy rejects unconditionally, so the builder could only
+// produce a destination that failed the moment it was used. Both the gotify and
+// email branches were removed; the invariant below is what keeps the builder and
+// the policy from drifting apart again.
+func TestBuildURLOnlyProducesTransportsThePolicyAccepts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input DestinationInput
+	}{
+		{"ntfy", DestinationInput{Service: "ntfy", Topic: "records"}},
+		{"generic", DestinationInput{Service: "generic", Target: "https://hooks.example/new"}},
+		{"discord", DestinationInput{Service: "discord", Token: "bot-token", Target: "123456"}},
+		{"telegram", DestinationInput{Service: "telegram", Token: "bot-token", Target: "-100123"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			built, err := BuildURL(test.input)
+			if err != nil {
+				t.Fatalf("BuildURL: %v", err)
+			}
+			if err := ValidateTransportPolicy(built); err != nil {
+				t.Fatalf("BuildURL produced %q, which the transport policy rejects: %v", built, err)
+			}
+		})
 	}
-	parsed := got
-	for _, want := range []string{"smtp://", "smtp.example:2525", "from=from%40example", "to=to%40example", "mailer"} {
-		if !strings.Contains(parsed, want) {
-			t.Fatalf("email URL %q does not contain %q", parsed, want)
+	// A service the policy cannot accept must not be buildable at all.
+	for _, service := range []string{"gotify", "email"} {
+		if _, err := BuildURL(DestinationInput{Service: service, Host: "h", Token: "t", From: "f@e", To: "t@e"}); err == nil {
+			t.Fatalf("BuildURL still constructs %q, which the transport policy always rejects", service)
 		}
-	}
-	if _, err := BuildURL(DestinationInput{Service: "email", Host: "smtp.example", Port: "not-a-port", From: "from@example", To: "to@example"}); err == nil {
-		t.Fatal("invalid SMTP port was accepted")
 	}
 }
 
