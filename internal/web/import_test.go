@@ -237,3 +237,55 @@ func TestImportIdentityValidatorsRejectMalformedURLsAndIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestInterruptedImportStaysResumable(t *testing.T) {
+	// A large upload can outlive the 90-second request timeout: every row is its
+	// own write transaction on the single writer, shared with the scheduler.
+	// The job used to be left in "processing", which is not a resumable status,
+	// so the member saw a partially applied import with the Resume action hidden
+	// until an hourly sweep recovered it - and the compensating write that would
+	// have recorded the failed rows reused the same dead context, so it was
+	// discarded and its error swallowed.
+	database, err := store.Open(t.TempDir() + "/interrupted.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	app := &App{
+		store:  database,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	userID, createErr := database.CreateUser(context.Background(), "interrupted@example.com", "unused", "member", "UTC", "interrupted")
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	// Enough rows that the loop outlives the deadline. Each row is its own
+	// write transaction, so this reproduces the real shape: the job is created,
+	// then the request deadline fires part-way through.
+	inputs := make([]store.ImportInput, 0, 400)
+	for i := range 400 {
+		id := fmt.Sprintf("interrupted-%d", i)
+		inputs = append(inputs, store.ImportInput{SourceValue: id, DisplayName: "Artist " + id, MBID: id})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	job, importErr := app.runArtistImport(ctx, userID, inputs, []byte("name,mbid\n"))
+	if importErr != nil {
+		t.Fatalf("the import did not finish bookkeeping: %v", importErr)
+	}
+	if job.Status != "interrupted" {
+		t.Fatalf("job status=%q, want interrupted so the member can resume", job.Status)
+	}
+	// The terminal status must be durable, not just returned in memory.
+	stored, storedErr := database.ImportJob(context.Background(), userID, job.ID)
+	if storedErr != nil {
+		t.Fatal(storedErr)
+	}
+	if stored.Status != "interrupted" {
+		t.Fatalf("stored status=%q, want interrupted", stored.Status)
+	}
+	if !stored.CanResume {
+		t.Fatal("an interrupted import is not resumable, so the member has no route forward")
+	}
+}

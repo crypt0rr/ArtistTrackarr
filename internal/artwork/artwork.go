@@ -84,6 +84,12 @@ type call struct {
 	asset Asset
 }
 
+// coalescedFetchTimeout bounds a shared artwork fetch. It is generous relative
+// to the 20 second HTTP client timeout because the fetch also covers DNS
+// validation and a disk write, and it must not expire before the request it
+// serves.
+const coalescedFetchTimeout = 45 * time.Second
+
 type Cache struct {
 	root                 string
 	baseURL              string
@@ -153,12 +159,31 @@ func (c *Cache) Get(ctx context.Context, mbid string) Asset {
 	c.inflight[mbid] = pending
 	c.mu.Unlock()
 
-	pending.asset = c.refresh(ctx, mbid)
-	c.mu.Lock()
-	delete(c.inflight, mbid)
-	close(pending.done)
-	c.mu.Unlock()
-	return pending.asset
+	// Run the shared fetch detached from this caller's request. Its result is
+	// handed to every waiter, so one browser navigating away must not turn
+	// everyone else's artwork into a cancellation placeholder - which their
+	// browser then caches for MaxAge - while the upstream was reachable. The
+	// artists grid issues many of these at once, so a single reload during load
+	// used to poison the rest of the page. The work stays bounded by the HTTP
+	// client timeout and its own deadline.
+	fetchCtx, cancelFetch := context.WithTimeout(context.WithoutCancel(ctx), coalescedFetchTimeout)
+	go func() {
+		defer cancelFetch()
+		asset := c.refresh(fetchCtx, mbid)
+		c.mu.Lock()
+		pending.asset = asset
+		delete(c.inflight, mbid)
+		c.mu.Unlock()
+		close(pending.done)
+	}()
+	select {
+	case <-ctx.Done():
+		// This caller gave up; the fetch continues for the others and populates
+		// the cache for the next request.
+		return placeholderAsset("cancelled")
+	case <-pending.done:
+		return pending.asset
+	}
 }
 
 func (c *Cache) cached(mbid string) (Asset, bool) {

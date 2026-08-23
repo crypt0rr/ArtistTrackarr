@@ -381,3 +381,58 @@ func TestPruneHonorsContext(t *testing.T) {
 		t.Fatalf("prune error=%v, want context canceled", err)
 	}
 }
+
+func TestCancelledLeaderDoesNotPoisonOtherWaiters(t *testing.T) {
+	// The shared fetch used to run on the first caller's request context, so one
+	// browser navigating away handed every other waiter a cancellation
+	// placeholder - which their browser then cached - even though the upstream
+	// was reachable. The artists grid issues many of these at once.
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-release
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write([]byte("\xff\xd8\xff\xe0 jpeg body"))
+	}))
+	defer server.Close()
+
+	cache, err := NewCache(t.TempDir(), WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mbid = testMBID
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan Asset, 1)
+	go func() { leaderDone <- cache.Get(leaderCtx, mbid) }()
+
+	// Let the leader take the in-flight slot before the follower arrives.
+	for requests.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	followerDone := make(chan Asset, 1)
+	go func() { followerDone <- cache.Get(context.Background(), mbid) }()
+	time.Sleep(20 * time.Millisecond)
+
+	// The leader gives up, as a closed tab would.
+	cancelLeader()
+	if asset := <-leaderDone; asset.Status != "cancelled" {
+		t.Fatalf("the cancelled leader should get its own cancellation: %#v", asset)
+	}
+
+	close(release)
+	asset := <-followerDone
+	// The leader's cancellation surfaced to the follower as an upstream error
+	// carrying the SVG placeholder, not as "cancelled", so assert on what a
+	// working fetch actually produces rather than on one failure spelling.
+	if asset.Status != "fetched" {
+		t.Fatalf("the follower inherited the leader's cancellation: status=%q, want fetched", asset.Status)
+	}
+	if !bytes.HasPrefix(asset.Data, []byte("\xff\xd8\xff")) {
+		t.Fatalf("the follower did not receive the real image: %q", asset.Data)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("upstream requests=%d, want the fetch to stay coalesced", requests.Load())
+	}
+}

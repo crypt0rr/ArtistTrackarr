@@ -200,3 +200,41 @@ func TestEvidenceConfirmationOnlyDrainsConfirmingMembersHold(t *testing.T) {
 }
 
 func ptrTime(value time.Time) *time.Time { return &value }
+
+func TestEvidenceDateToleranceMatchesTheMergeComparator(t *testing.T) {
+	// The store deliberately merges two provider rows whose day-precision dates
+	// differ by up to three days, because regional storefronts routinely
+	// disagree. Evidence review demanded exact equality, so it raised a conflict
+	// on the very release the merge had just absorbed - a permanent review item
+	// for every regional difference, and a notification hold when the member has
+	// hold-on-conflict enabled.
+	within := func(a, b string) (ReleaseEvidence, ReleaseEvidence) {
+		return ReleaseEvidence{FirstReleaseDate: a, DatePrecision: 3},
+			ReleaseEvidence{FirstReleaseDate: b, DatePrecision: 3}
+	}
+	for _, test := range []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{name: "identical", a: "2024-05-01", b: "2024-05-01", want: true},
+		{name: "two days apart, inside the merge window", a: "2024-05-01", b: "2024-05-03", want: true},
+		{name: "three days apart, the boundary", a: "2024-05-01", b: "2024-05-04", want: true},
+		{name: "four days apart, a real disagreement", a: "2024-05-01", b: "2024-05-05", want: false},
+		{name: "months apart", a: "2024-05-01", b: "2024-09-01", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, b := within(test.a, test.b)
+			if got := evidenceDatesCompatible(a, b); got != test.want {
+				t.Fatalf("evidenceDatesCompatible(%q,%q)=%t, want %t", test.a, test.b, got, test.want)
+			}
+			// The merge comparator must agree, or one of them raises a conflict
+			// the other absorbs.
+			left := Release{Title: "Same", PrimaryType: "Album", FirstReleaseDate: test.a, DatePrecision: 3}
+			right := Release{Title: "Same", PrimaryType: "Album", FirstReleaseDate: test.b, DatePrecision: 3}
+			if merged := releaseIdentityMatches(left, right); merged != test.want {
+				t.Fatalf("releaseIdentityMatches disagrees with evidence: merge=%t evidence=%t", merged, test.want)
+			}
+		})
+	}
+}

@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.57.2`; local and published images use the
+footer. The current release is `v0.57.3`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,27 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.57.3 patch finishes the third review's backlog.
+
+A shared artwork fetch ran on the first requester's connection, so one browser
+navigating away handed every other waiter a placeholder image - which their
+browser then cached - even though the artwork service had answered. The artists
+grid requests many covers at once, so a single reload during loading could spoil
+the rest of the page. The shared fetch is now independent of any one requester
+and stays bounded by its own deadline.
+
+A large CSV import could outlive the request timeout, because every row is its
+own database write. The job was then left in a state that is not resumable, with
+the failed rows unrecorded because the write that would have recorded them
+reused the same expired request. An import that runs out of time now stops
+cleanly, records what happened, and is offered for resume straight away.
+
+Finally, release merging tolerates a few days of disagreement between regional
+storefronts, while evidence review demanded identical dates - so the store
+merged two provider records and review immediately raised a conflict on the
+result, creating a permanent review item, and a withheld notification for
+members who hold conflicting releases. Both now use the same tolerance.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -581,7 +602,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.57.2` publishes `0.57.2`, `0.57`, and `latest`.
+- Pushing a tag such as `v0.57.3` publishes `0.57.3`, `0.57`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -605,7 +626,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.2 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.3 docker compose up -d
 ```
 
 ## Configuration
