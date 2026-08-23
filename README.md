@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.57.3`; local and published images use the
+footer. The current release is `v0.58.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,60 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.58.0 release closes the fourth review's backlog: twenty-five findings,
+each proven by reintroducing the defect and confirming the new test fails.
+
+Three notification defects shared one cause. A pause set on an artist who is
+merely credited on a release - not its canonical artist - was not recognised as
+a pause at all, so the deferred delivery looked like a clock-skewed one and was
+forced out to a member who had explicitly asked for quiet. Lifting a pause early
+left everything it had deferred sitting at its original future time, so silence
+continued until the pause would have expired anyway. Both came from a
+correlation rule that existed as three hand-written copies which had already
+drifted; there is now one definition, and all three sites use it.
+
+Shutdown no longer turns delivered notifications into failures. A send that the
+transport had accepted, but which had not yet reported back when the process
+began stopping, was recorded as a durable failure - so it was retried, and the
+member received it twice. Sends now get a brief grace period to report, and a
+worker cancelled before it starts is skipped rather than counted as a failure.
+
+A slow destination no longer degrades a healthy one. Every HTTP notification
+serialises through one process-wide gate, and the per-send timeout used to start
+when a send entered the queue rather than when it reached the transport. With
+the gate held for a full send timeout, the next send in line arrived with no
+budget left, returned a deadline error without issuing a request, and its
+destination was backed off for a failure that never happened.
+
+Several things the application already knew are now actually shown. The delivery
+log on your dashboard displays why a notification failed, how many attempts it
+took, and when a sent one went out - all of it fetched and redacted already, and
+previously discarded in favour of a bare red badge. The release-truth panel has
+the reason field its stored decision always had. Recent imports are listed
+beside the import form, so an import interrupted by a restart can be resumed
+instead of being unreachable. Artist actions return you to the page and filters
+you were working on. The calendar feed URL, which is shown exactly once, has a
+copy button. Timestamps on the artists page follow your timezone like every
+other page.
+
+Operators gain the four signals the product was missing. A `TRUST_PROXY` setting
+whose CIDRs do not match the proxy actually in front of the application now
+reports itself, instead of silently collapsing login throttling exactly as an
+unset `TRUST_PROXY` does. Application-log drops and write failures are visible
+while the process runs, rather than only on a clean shutdown that an incident
+never reaches. SQLite write retries, retry exhaustion and connection-pool waits
+are counted and reported, so a hanging interface can be told apart from a slow
+provider. And a restore rehearsal can record its result where the application
+reads it, with `RESTORE_RECORD_RESULT=true`, so `Last restore rehearsal` stops
+reading `not recorded` forever.
+
+Underneath, the digest scheduler no longer rebuilds and discards every member's
+entire digest on each sixty-second tick once that period's digest is settled;
+the two duplicated delivery state machines are one; a panic in a request handler
+is logged through the application's own logger with its route rather than a path
+that can carry a credential; and the notification URL builder can no longer
+produce a transport that the transport policy rejects.
+
 The v0.57.3 patch finishes the third review's backlog.
 
 A shared artwork fetch ran on the first requester's connection, so one browser
@@ -602,7 +656,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.57.3` publishes `0.57.3`, `0.57`, and `latest`.
+- Pushing a tag such as `v0.58.0` publishes `0.58.0`, `0.58`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -626,7 +680,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.3 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.58.0 docker compose up -d
 ```
 
 ## Configuration
