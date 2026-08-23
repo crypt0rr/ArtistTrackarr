@@ -141,7 +141,7 @@ type ShoutrrrSender struct {
 	SendTimeout time.Duration
 	// client is owned by this sender. Shoutrrr 0.8 still uses
 	// http.DefaultClient for a few services, so Send temporarily scopes this
-	// client around the call while holding notificationHTTPClientMu and restores
+	// client around the call while holding notificationHTTPClientGate and restores
 	// the previous global immediately afterwards.
 	client   *http.Client
 	lookupIP func(context.Context, string, string) ([]net.IP, error)
@@ -153,7 +153,14 @@ type ShoutrrrSender struct {
 // the compatibility layer can deliver and makes retry timing predictable.
 const DefaultSendTimeout = 10 * time.Second
 
-var notificationHTTPClientMu sync.Mutex
+// notificationHTTPClientGate serialises the compatibility-global swap. It is a
+// one-slot channel rather than a sync.Mutex so a waiting send can abandon the
+// queue when its caller's context ends, instead of blocking uninterruptibly.
+//
+// Every HTTP-based send in the process passes through here, so queue wait is
+// unbounded in the number of destinations. The transport budget therefore must
+// not start until the slot is held; see Send.
+var notificationHTTPClientGate = make(chan struct{}, 1)
 
 // NewShoutrrrSender constructs one sender-owned HTTP client and transport for
 // the application lifetime. Individual sends still use shallow client copies
@@ -379,9 +386,12 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := validateNotificationMessage(serviceURL, title, body); err != nil {
 		return err
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
-	defer cancel()
-	if err := validateOutboundTargetWithLookup(sendCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP); err != nil {
+	// Target validation happens before the queue and gets its own budget; it
+	// performs a DNS lookup with an internal deadline of its own.
+	validateCtx, cancelValidate := context.WithTimeout(ctx, s.sendTimeout())
+	err := validateOutboundTargetWithLookup(validateCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP)
+	cancelValidate()
+	if err != nil {
 		return err
 	}
 	// Shoutrrr's Telegram service reaches jsonclient.DefaultClient through a
@@ -390,6 +400,8 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// carries the caller's cancellation/timeout context all the way to the
 	// sender-owned HTTP client.
 	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
+		sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
+		defer cancel()
 		started := time.Now()
 		err := s.sendTelegram(sendCtx, serviceURL, title, body)
 		if observer != nil {
@@ -401,8 +413,21 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// Scope the sender-owned client only for this operation and restore the
 	// caller's client even when Shoutrrr returns an error or panics.
 	queueStarted := time.Now()
-	notificationHTTPClientMu.Lock()
+	select {
+	case notificationHTTPClientGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	queueWait := time.Since(queueStarted)
+	// The transport budget starts here, not when this call entered the queue.
+	// Previously one context covered both, so with the gate held by another
+	// send for the full send timeout, the next send in line reached the
+	// transport with nothing left: it returned a deadline error having issued
+	// no request at all, and the delivery layer recorded that as a real
+	// failure and backed the destination off. The queue wait stays bounded
+	// because the select above still honours the caller's context.
+	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
+	defer cancel()
 	previousClient := http.DefaultClient
 	previousJSONClient := jsonclient.DefaultClient
 	// Shoutrrr's Telegram transport uses jsonclient.DefaultClient, which is
@@ -418,7 +443,7 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 		holdTime := time.Since(holdStarted)
 		jsonclient.DefaultClient = previousJSONClient
 		http.DefaultClient = previousClient
-		notificationHTTPClientMu.Unlock()
+		<-notificationHTTPClientGate
 		if observer != nil {
 			observer(queueWait, holdTime)
 		}
