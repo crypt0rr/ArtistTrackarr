@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -631,7 +633,7 @@ func timelineStatusClass(status string) string {
 }
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
+	r.Use(middleware.RequestID, a.recoverPanic, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
@@ -771,6 +773,50 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co https://*.mzstatic.com https://*.itunes.apple.com data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverPanic replaces chi's Recoverer so a handler panic reaches the same
+// places every other failure does. chi writes to its own standard-library
+// logger, so a panic bypassed structured logging, the redaction applied to
+// every other message, the persisted application log that the admin
+// diagnostics page reads, and the metrics - leaving an operator with a 500
+// response and no record anywhere of what happened.
+//
+// The route pattern is logged rather than the request path: a path can carry a
+// credential, as /calendar/feed/{token} does.
+func (a *App) recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			// The client went away mid-response; net/http expects this to
+			// propagate rather than be reported as a server fault.
+			if recovered == http.ErrAbortHandler {
+				panic(recovered)
+			}
+			message := notify.RedactError(fmt.Errorf("%v", recovered))
+			if len(message) > 512 {
+				message = message[:512] + "..."
+			}
+			stack := notify.RedactError(errors.New(string(debug.Stack())))
+			if len(stack) > 2048 {
+				stack = stack[:2048] + "..."
+			}
+			route := "unknown"
+			if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
+				route = rctx.RoutePattern()
+			}
+			if a.logger != nil {
+				a.logger.Error("handler panic recovered",
+					"scope", "http handler", "method", r.Method, "route", route,
+					"panic", message, "stack", stack)
+			}
+			http.Error(w, "something went wrong", http.StatusInternalServerError)
+		}()
 		next.ServeHTTP(w, r)
 	})
 }

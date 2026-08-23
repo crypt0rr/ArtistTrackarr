@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -2378,4 +2379,39 @@ func postForm(t *testing.T, client *http.Client, target string, values url.Value
 		t.Fatal(err)
 	}
 	return response
+}
+
+func TestHandlerPanicIsLoggedStructurallyAndRedacted(t *testing.T) {
+	// chi's Recoverer writes to its own standard-library logger, so a handler
+	// panic bypassed structured logging, the redaction every other message gets,
+	// the persisted application log the admin diagnostics page reads, and the
+	// metrics: the operator saw a 500 and no record of why.
+	var logs bytes.Buffer
+	app := &App{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	router := chi.NewRouter()
+	router.Use(app.recoverPanic)
+	router.Get("/boom/{id}", func(http.ResponseWriter, *http.Request) {
+		panic("secret=hunter2 exploded")
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/boom/42", nil))
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", response.Code)
+	}
+	written := logs.String()
+	if !strings.Contains(written, "handler panic recovered") {
+		t.Fatalf("the panic was not logged structurally: %s", written)
+	}
+	// The route pattern, not the resolved path: a path can carry a credential,
+	// as /calendar/feed/{token} does.
+	if !strings.Contains(written, "/boom/{id}") {
+		t.Fatalf("the log does not identify the route: %s", written)
+	}
+	if strings.Contains(written, "/boom/42") {
+		t.Fatalf("the log recorded the resolved path, which can carry a credential: %s", written)
+	}
+	if strings.Contains(written, "hunter2") {
+		t.Fatalf("the panic value was not redacted: %s", written)
+	}
 }
