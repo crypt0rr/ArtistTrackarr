@@ -738,3 +738,69 @@ func TestDigestOnlyFollowGetsADigestRunWithTheAccountDigestOff(t *testing.T) {
 		t.Fatalf("digest runs=%d for a digest-only follow with the account digest off, want 1", runs)
 	}
 }
+
+func TestCalendarKeepsMusicBrainzOnlyReleases(t *testing.T) {
+	// The provider-preference clause used to ask whether the ARTIST had any
+	// provider release, so a genuinely MusicBrainz-only release vanished from
+	// the calendar, the ICS export and the digest the moment that artist gained
+	// a single Spotify release - while the announcement path still notified the
+	// member about it.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "mb-only@example.com", "hash", "member", "UTC", "mb-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "mb-only-artist", Name: "MB Only Artist", SpotifyID: "spotify-artist-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	insert := func(mbid, title, source, date string) {
+		t.Helper()
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+			 musicbrainz_url,source,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, mbid, artist.ID, title, "Album", "[]", date, 3,
+			"https://musicbrainz.org/release-group/"+mbid, source, timeText(now), timeText(now)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spotifyDate := now.AddDate(0, 0, 3).Format("2006-01-02")
+	// Far enough from the Spotify release that it cannot be a duplicate of it.
+	mbDate := now.AddDate(0, 0, 20).Format("2006-01-02")
+	insert("spotify-release", "Provider Album", "spotify", spotifyDate)
+	insert("musicbrainz-release", "Catalogue Only Album", "musicbrainz", mbDate)
+
+	items, err := s.CalendarReleases(ctx, userID, now.Format("2006-01-02"), now.AddDate(0, 2, 0).Format("2006-01-02"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titles := make(map[string]bool, len(items))
+	for _, item := range items {
+		titles[item.Title] = true
+	}
+	if !titles["Provider Album"] {
+		t.Fatalf("the provider release is missing: %v", titles)
+	}
+	if !titles["Catalogue Only Album"] {
+		t.Fatalf("a MusicBrainz-only release was filtered out of the calendar: %v", titles)
+	}
+
+	// A MusicBrainz row that really is an unmerged near-duplicate of the
+	// provider row is still suppressed.
+	insert("musicbrainz-duplicate", "Provider Album (MB copy)", "musicbrainz", spotifyDate)
+	items, err = s.CalendarReleases(ctx, userID, now.Format("2006-01-02"), now.AddDate(0, 2, 0).Format("2006-01-02"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Title == "Provider Album (MB copy)" {
+			t.Fatalf("an unmerged duplicate of a provider release was shown: %v", item)
+		}
+	}
+}

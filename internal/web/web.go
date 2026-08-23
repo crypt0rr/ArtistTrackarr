@@ -4,6 +4,7 @@ import (
 	"html/template"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
@@ -45,8 +46,11 @@ type App struct {
 	destinationTestLimiter  *fixedWindowLimiter
 	destinationRetryLimiter *fixedWindowLimiter
 	calendarFeedLimiter     *fixedWindowLimiter
-	passwordChangeLimiter   *fixedWindowLimiter
-	loginSlots              chan struct{}
+	// untrustedForwardingWarned keeps the proxy misconfiguration warning to one
+	// line per process.
+	untrustedForwardingWarned atomic.Bool
+	passwordChangeLimiter     *fixedWindowLimiter
+	loginSlots                chan struct{}
 }
 
 // UserView is the deliberately narrow projection exposed to templates. The

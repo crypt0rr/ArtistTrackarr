@@ -11,14 +11,29 @@ import (
 	"unicode/utf8"
 )
 
-const calendarPreferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (
-	SELECT 1 FROM release_groups external_release
-	WHERE external_release.artist_id=rg.artist_id
-	AND external_release.source IN ('spotify','itunes','both')
-)) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
-	SELECT 1 FROM release_groups newer
-	WHERE newer.artist_id=rg.artist_id
-	AND newer.source IN ('spotify','itunes','both')
+// calendarPreferredProvider suppresses a MusicBrainz row that is an unmerged
+// near-duplicate of a provider row for the same release.
+//
+// It used to test whether the ARTIST had any provider release at all, which
+// removed every genuinely MusicBrainz-only release from the calendar, the ICS
+// export, the token feed and the digest as soon as that artist gained a single
+// Spotify or iTunes release - while the announcement path, which applies no such
+// filter, still notified the member about it.
+//
+// The duplicate window mirrors releaseIdentityMatches: same artist, same date
+// precision, and within three days at day precision or an exact match otherwise.
+const calendarPreferredProvider = `(rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
+	SELECT 1 FROM release_groups duplicate
+	WHERE duplicate.artist_id=rg.artist_id
+	  AND duplicate.id<>rg.id
+	  AND duplicate.source IN ('spotify','itunes','both')
+	  AND duplicate.date_precision=rg.date_precision
+	  AND (
+		(rg.date_precision=3
+		  AND date(duplicate.first_release_date) BETWEEN date(rg.first_release_date,'-3 day')
+		                                            AND date(rg.first_release_date,'+3 day'))
+		OR (rg.date_precision<>3 AND duplicate.first_release_date=rg.first_release_date)
+	  )
 ))`
 
 // CalendarReleases returns precise, dated releases for one followed artist

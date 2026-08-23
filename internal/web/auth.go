@@ -101,12 +101,30 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "could not sign in", http.StatusInternalServerError)
 			return
 		}
-		if !allowed && key != accountThrottleKey(email) {
+		if !allowed {
+			if key == accountThrottleKey(email) {
+				// The account-scoped counter deliberately does not refuse: a
+				// stranger who knows an address must not be able to lock its
+				// owner out. It is still worth surfacing, because saturating it
+				// means someone is working through passwords for this account
+				// from somewhere.
+				a.logger.Warn("account login failure threshold reached",
+					"page", "Sign in", "throttle_scope", "account")
+				continue
+			}
 			d := a.data(r, "Sign in")
 			d.Error = "Too many attempts. Try again in 15 minutes."
 			a.render(w, "login", d, http.StatusTooManyRequests)
 			return
 		}
+	}
+	// Behind a reverse proxy with TRUST_PROXY unset, clientIP is the proxy for
+	// every caller, so the peer-scoped counter above collapses into a single
+	// bucket per account: any stranger can saturate it and lock the owner out,
+	// and the per-IP limiter becomes one household-wide cap. Say so, once the
+	// evidence is actually in front of us.
+	if !a.cfg.TrustProxy && strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" {
+		a.warnUntrustedForwarding()
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -286,6 +304,19 @@ func (a *App) clientIP(r *http.Request) string {
 // loginThrottleKeys applies both the peer identity and an account identity.
 // The peer key protects a single source while the account key keeps failures
 // throttled when an attacker rotates addresses through a trusted proxy.
+// warnUntrustedForwarding reports a proxied deployment that has not set
+// TRUST_PROXY. It logs once per process: the condition is a static
+// misconfiguration, and a login endpoint is exactly where repeating it would be
+// worst.
+func (a *App) warnUntrustedForwarding() {
+	if a.logger == nil || !a.untrustedForwardingWarned.CompareAndSwap(false, true) {
+		return
+	}
+	a.logger.Warn("login throttling is degraded: X-Forwarded-For is present but TRUST_PROXY is not enabled, "+
+		"so every request appears to come from the proxy and all members share one throttle bucket per account",
+		"page", "Sign in", "remedy", "set TRUST_PROXY=true with the proxy's exact TRUSTED_PROXY_CIDRS")
+}
+
 // accountThrottleKey is the source-independent failure counter for one account.
 // It is deliberately counted but never used to refuse a request on its own; see
 // the comment in login.

@@ -949,11 +949,25 @@ func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, 
 	cutoff := now.Add(horizon)
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ClockSkewRepairStats, error) {
 		var stats ClockSkewRepairStats
+		// Exclude deliveries deferred by a deliberate pause. Since pausing began
+		// deferring rather than discarding, a paused follow's delivery legitimately
+		// sits far in the future, and requeueing it here delivered every member's
+		// paused notifications at once while the UI still read "Paused until ...".
+		// Clock skew is the target; an explicit pause is not skew.
 		result, err := tx.ExecContext(ctx, `UPDATE deliveries
 		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
 		WHERE status IN ('pending','blocked') AND next_attempt_at>?
-		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)`,
-			timeText(now), timeText(cutoff), timeText(now))
+		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)
+		  AND NOT EXISTS (
+			SELECT 1 FROM notification_events ne
+			JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
+			JOIN release_groups rg ON rg.id=ne.release_group_id
+			WHERE ne.id=deliveries.event_id
+			  AND fnr.artist_id=rg.artist_id
+			  AND fnr.paused_until IS NOT NULL
+			  AND fnr.paused_until > ?
+		  )`,
+			timeText(now), timeText(cutoff), timeText(now), timeText(now))
 		if err != nil {
 			return stats, err
 		}

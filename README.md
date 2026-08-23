@@ -333,10 +333,11 @@ household-shared Spotify identity, artwork, or genres another member already
 relies on; guest credits follow the featured-appearance switch as documented
 rather than the primary one; a follow set to "Digest only" now receives a digest
 run even when the account digest is off, instead of recording an event that is
-delivered nowhere and can never be re-queued; and a known email address can no
-longer keep an account locked out, because the account-wide failure counter
-still counts every attempt but no longer refuses one before the password is
-checked.
+delivered nowhere and can never be re-queued; and the account-wide failure
+counter still counts every attempt but no longer refuses one before the password
+is checked, so a known email address cannot by itself keep an account locked
+out. That last property depends on the deployment identifying real client
+addresses: see the reverse proxy section, and the v0.57.0 note below.
 
 Three provider integrations were reading fields their upstream never sends. The
 MusicBrainz artist search decoded a genres key that only the lookup endpoint
@@ -714,10 +715,16 @@ their own account or leave the household without an administrator.
 
 Terminate TLS at Caddy, Traefik, nginx, or another reverse proxy and set
 `PUBLIC_URL` to its HTTPS address. Non-local HTTP is rejected unless
-`ALLOW_INSECURE_HTTP=true` is explicitly set. To preserve accurate login
-throttling, set `TRUST_PROXY=true` together with the proxy's exact
-`TRUSTED_PROXY_CIDRS`; forwarding headers from an untrusted connection are
-ignored.
+`ALLOW_INSECURE_HTTP=true` is explicitly set.
+
+**Set `TRUST_PROXY=true` together with the proxy's exact `TRUSTED_PROXY_CIDRS`.**
+This is not a refinement. Without it every request appears to originate from the
+proxy, so login throttling cannot tell members apart: all of them share one
+failure counter per account, anyone who knows an address can lock its owner out
+by failing five logins, and the per-address request limiter becomes a single
+household-wide cap on signing in. ArtistTrackarr logs a warning on the first
+login request that carries `X-Forwarded-For` while `TRUST_PROXY` is unset.
+Forwarding headers from an untrusted connection are still ignored.
 
 Notification destinations are server-side outbound requests. By default,
 ArtistTrackarr blocks loopback, private, link-local, multicast, and metadata
