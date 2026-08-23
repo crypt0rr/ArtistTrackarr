@@ -769,7 +769,7 @@ type DiagnosticsSnapshot struct {
 	ReaderWaitCount       int64
 	ReaderWaitDuration    time.Duration
 	ReaderInUse           int
-	OldestQueueAt     *time.Time
+	OldestQueueAt         *time.Time
 	// FutureDeliveries flags pending work parked far beyond the normal retry
 	// horizon. This is a safe clock-skew signal; it does not alter admission.
 	FutureDeliveries       int
