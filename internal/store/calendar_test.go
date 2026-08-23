@@ -909,3 +909,111 @@ func TestTimezoneChangeDoesNotSuppressTheNextWeeklyDigest(t *testing.T) {
 		t.Fatalf("this week's digest runs=%d after a timezone change, want 1", runs)
 	}
 }
+
+// TestQueuedDigestIsNotRebuiltOnEveryTick pins the pre-check that makes the
+// scheduler cheap once a member's digest for the period is settled. The
+// scheduler runs on a sixty-second tick and on every UI-triggered wake, and
+// used to run FollowNotificationRules plus up to five CalendarReleasesPage
+// scans - the heaviest read in the store - build the digest body, and only then
+// open a write transaction whose first statement discovered the run already
+// existed. For a daily digest that is roughly nine hundred full rebuilds and
+// discarded write transactions per member per day, against a four-connection
+// reader pool and a single writer shared with the web UI.
+//
+// "Did not scan" is made observable by taking the table the scan reads out of
+// reach. The control case at the end proves the trap actually springs.
+func TestQueuedDigestIsNotRebuiltOnEveryTick(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	userID, err := s.CreateUser(ctx, "settled@example.com", "hash", "member", "UTC", "settled-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "settled-artist", Name: "Settled Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	releaseDate := now.AddDate(0, 0, 1).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "settled-release", artist.ID, "Settled Release", "EP", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/settled-release", "musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	// The destination must predate the run for deliveries to attach, which is
+	// what settles the period.
+	if err := s.AddDestination(ctx, userID, "Digest destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
+
+	queued, err := s.QueueDueReleaseDigests(ctx, now)
+	if err != nil || queued != 1 {
+		t.Fatalf("first tick queued=%d err=%v, want 1", queued, err)
+	}
+	var deliveries int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM release_digest_deliveries`).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries == 0 {
+		t.Fatal("precondition: the run must have deliveries for the period to be settled")
+	}
+
+	hideReleaseGroups(t, s)
+	queued, err = s.QueueDueReleaseDigests(ctx, now)
+	if err != nil {
+		t.Fatalf("a settled period still ran the digest scan: %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("second tick queued=%d, want 0", queued)
+	}
+	restoreReleaseGroups(t, s)
+
+	// Control: with no run for the period, the same call must reach the scan
+	// and fail - otherwise the assertion above would pass for the wrong reason.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM release_digest_deliveries`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM release_digest_runs`); err != nil {
+		t.Fatal(err)
+	}
+	hideReleaseGroups(t, s)
+	defer restoreReleaseGroups(t, s)
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err == nil {
+		t.Fatal("control: an unsettled period did not reach the scan, so this test proves nothing")
+	}
+}
+
+// hideReleaseGroups puts the table the digest scan reads out of reach without
+// touching anything the de-duplication pre-check needs.
+func hideReleaseGroups(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.DB.Exec(`ALTER TABLE release_groups RENAME TO release_groups_hidden`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func restoreReleaseGroups(t *testing.T, s *Store) {
+	t.Helper()
+	if _, err := s.DB.Exec(`ALTER TABLE release_groups_hidden RENAME TO release_groups`); err != nil {
+		t.Fatal(err)
+	}
+}

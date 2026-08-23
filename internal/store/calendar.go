@@ -222,6 +222,22 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			windowEnd = localNow.AddDate(0, 0, 8)
 		}
 		periodKey := periodStart.Format("2006-01-02")
+		// Everything the de-duplication check needs is known here, so ask before
+		// doing the expensive part. The loop below runs FollowNotificationRules
+		// and up to five CalendarReleasesPage scans - the heaviest read in the
+		// store - builds the digest body, and only then opened a write
+		// transaction whose first statement discovered the run already existed.
+		// On the sixty-second tick plus every UI-triggered wake, that rebuilt and
+		// threw away each member's whole digest for the rest of their local
+		// period, contending for the four-connection reader pool and the single
+		// writer that user-facing writes also need.
+		settled, err := s.digestPeriodSettled(ctx, user, periodKey, periodStart, periodEnd)
+		if err != nil {
+			return queued, err
+		}
+		if settled {
+			continue
+		}
 		from := localNow.Format("2006-01-02")
 		to := windowEnd.AddDate(0, 0, -1).Format("2006-01-02")
 		rules, err := s.FollowNotificationRules(ctx, user.ID, nil)
@@ -283,28 +299,10 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		title := fmt.Sprintf("Upcoming releases · %s", localNow.Format("2006-01-02"))
 		queuedRun := false
 		err = s.withWriteTx(ctx, func(tx *sql.Tx) error {
-			// A profile can change timezone between scheduler runs. Only use the
-			// wider time window when the stored run was created under another
-			// timezone; same-timezone periods continue to use the exact key and
-			// cannot suppress a legitimate next-day/week digest.
-			//
-			// The tolerance covers how far a period boundary can move when the
-			// timezone changes, which is bounded by the span of real UTC offsets
-			// (UTC-12 to UTC+14) and never by the length of the period. Expanding
-			// it by a whole period instead meant the previous period's run - which
-			// necessarily carries the old timezone - fell inside the window and
-			// suppressed the new period: a full week of digests for a weekly
-			// subscriber who changed timezone.
-			const periodLookback = 26 * time.Hour
-			periodStartUTC := timeText(periodStart.Add(-periodLookback).UTC())
-			periodEndUTC := timeText(periodEnd.Add(periodLookback).UTC())
 			var runID int64
 			var runStatus string
-			lookupErr := tx.QueryRowContext(ctx, `SELECT id,status FROM release_digest_runs
-				WHERE user_id=? AND frequency=? AND (period_start=? OR
-					(COALESCE(timezone,'UTC')<>? AND created_at>=? AND created_at<?))
-				ORDER BY created_at DESC,id DESC LIMIT 1`, user.ID, user.Frequency, periodKey,
-				user.Timezone, periodStartUTC, periodEndUTC).Scan(&runID, &runStatus)
+			lookupErr := tx.QueryRowContext(ctx, digestRunLookup,
+				digestRunLookupArgs(user, periodKey, periodStart, periodEnd)...).Scan(&runID, &runStatus)
 			insertedRun := errors.Is(lookupErr, sql.ErrNoRows)
 			if lookupErr != nil && !insertedRun {
 				return lookupErr
@@ -363,6 +361,70 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		}
 	}
 	return queued, nil
+}
+
+// periodLookback covers how far a digest period boundary can move when a
+// profile changes timezone, which is bounded by the span of real UTC offsets
+// (UTC-12 to UTC+14) and never by the length of the period. Expanding it by a
+// whole period instead meant the previous period's run - which necessarily
+// carries the old timezone - fell inside the window and suppressed the new
+// period: a full week of digests for a weekly subscriber who changed timezone.
+const periodLookback = 26 * time.Hour
+
+// digestRunLookup finds the run covering a member's logical period. A profile
+// can change timezone between scheduler runs, so the wider time window applies
+// only when the stored run was created under another timezone; same-timezone
+// periods continue to use the exact key and cannot suppress a legitimate
+// next-day or next-week digest.
+//
+// One definition because two call sites need it: the cheap pre-check that
+// decides whether the digest scan is worth doing at all, and the authoritative
+// re-check inside the write transaction. Hand-synchronised copies of a
+// timezone-tolerant period predicate are exactly the sort of thing that drifts.
+const digestRunLookup = `SELECT id,status FROM release_digest_runs
+	WHERE user_id=? AND frequency=? AND (period_start=? OR
+		(COALESCE(timezone,'UTC')<>? AND created_at>=? AND created_at<?))
+	ORDER BY created_at DESC,id DESC LIMIT 1`
+
+func digestRunLookupArgs(user digestUser, periodKey string, periodStart, periodEnd time.Time) []any {
+	return []any{user.ID, user.Frequency, periodKey, user.Timezone,
+		timeText(periodStart.Add(-periodLookback).UTC()), timeText(periodEnd.Add(periodLookback).UTC())}
+}
+
+// digestPeriodSettled reports whether this member's digest for this period is
+// already decided, so the caller can skip building it. It mirrors the two
+// branches inside the write transaction that return without queueing: a run
+// that is no longer pending has a durable outcome, and a pending run that
+// already has deliveries is fully queued.
+//
+// It deliberately does not cover the third branch - a pending run with no
+// deliveries - because that one still attaches destinations, and only when the
+// current scan is non-empty. Skipping on it would queue digests the current
+// code does not.
+//
+// This is an optimisation, not the authority: the transaction repeats the
+// lookup. A state that changes between the two is re-evaluated on the next
+// tick, which is a minute away.
+func (s *Store) digestPeriodSettled(ctx context.Context, user digestUser, periodKey string, periodStart, periodEnd time.Time) (bool, error) {
+	var runID int64
+	var runStatus string
+	err := s.readerDB().QueryRowContext(ctx, digestRunLookup,
+		digestRunLookupArgs(user, periodKey, periodStart, periodEnd)...).Scan(&runID, &runStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if runStatus != "pending" {
+		return true, nil
+	}
+	var deliveries int
+	if err := s.readerDB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM release_digest_deliveries WHERE run_id=?`, runID).Scan(&deliveries); err != nil {
+		return false, err
+	}
+	return deliveries > 0, nil
 }
 
 // reminderMinutes accepts the persisted HH:MM form and harmless legacy
