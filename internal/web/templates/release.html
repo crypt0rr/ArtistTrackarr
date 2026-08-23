@@ -17,12 +17,13 @@
         <div class="actions">{{if .MusicBrainzURL}}<a href="{{.MusicBrainzURL}}" target="_blank" rel="noopener noreferrer">MusicBrainz</a>{{end}}{{if .SpotifyURL}}<a href="{{.SpotifyURL}}" target="_blank" rel="noopener noreferrer">Spotify</a>{{end}}{{if .ITunesURL}}<a href="{{.ITunesURL}}" target="_blank" rel="noopener noreferrer">Apple Music</a>{{end}}{{if and .TruthProvider (releaseURL .Release)}}<a class="button secondary" href="{{releaseURL .Release}}" target="_blank" rel="noopener noreferrer">Open confirmed source</a>{{end}}</div>
         <div class="release-truth-choice">
           <p><strong>Release truth</strong> <span class="badge release-confidence {{releaseTruthClass .Release}}">{{releaseTruthLabel .Release}}</span></p>
-          {{if .TruthReason}}<small>{{.TruthReason}}</small>{{else}}<small>Choose the provider that best represents this release for your household.</small>{{end}}
+          {{if .TruthDecidedByYou}}<small class="truth-attribution">Confirmed by you.</small>{{else if .TruthDecidedByAnotherMember}}<small class="truth-attribution">Confirmed by another household member.{{if ne $.User.Role "admin"}} Ask them or an administrator to change it.{{end}}</small>{{end}}
+          {{if .TruthReason}}<small>{{if .TruthDecidedByAnotherMember}}Their reason: {{end}}{{.TruthReason}}</small>{{else}}<small>Choose the provider that best represents this release for your household.</small>{{end}}
           <div class="actions">
             {{if .SpotifyID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="spotify"><button class="secondary">Confirm Spotify</button></form>{{end}}
             {{if .ITunesID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="itunes"><button class="secondary">Confirm iTunes</button></form>{{end}}
             {{if .MBID}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="confirm"><input type="hidden" name="provider" value="musicbrainz"><button class="secondary">Keep MusicBrainz</button></form>{{end}}
-            {{if eq .TruthState "confirmed"}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="clear"><button class="link">Clear decision</button></form>{{end}}
+            {{if and (eq .TruthState "confirmed") (or (not .TruthDecidedByAnotherMember) (eq $.User.Role "admin"))}}<form method="post" action="/releases/{{.ID}}/truth" class="inline"><input type="hidden" name="_csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="clear"><button class="link">Clear decision</button></form>{{end}}
           </div>
         </div>
       </div>
