@@ -151,6 +151,13 @@ func main() {
 		logger.Error("initialize web application", "error", err)
 		startupFailure()
 	}
+	// Expose the log sink's loss counters while the process runs. Reading them
+	// only during a clean shutdown meant a SIGKILL, a panic or a stalled drain
+	// reported nothing - and the queue fills during exactly the incidents an
+	// operator is looking at the log history to understand.
+	app.SetLogHealth(func() appweb.LogSinkHealth {
+		return appweb.LogSinkHealth{Dropped: applicationLogs.Dropped(), Errors: applicationLogs.Errors()}
+	})
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

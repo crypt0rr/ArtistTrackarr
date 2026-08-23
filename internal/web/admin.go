@@ -107,7 +107,7 @@ func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `inline; filename="artisttrackarr-diagnostics.txt"`)
-	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner, session.User.Timezone)); err != nil {
+	if _, err := io.WriteString(w, diagnosticReport(snapshot, runner, session.User.Timezone, a.logSinkHealth())); err != nil {
 		a.logger.Debug("system diagnostics response interrupted", "error", err)
 	}
 }
@@ -118,12 +118,14 @@ func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 // destination URLs, credentials, or notification bodies.
 func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
+	logHealth := a.logSinkHealth()
 	snapshot, err := a.store.Diagnostics(r.Context())
 	if err != nil {
 		a.logger.Error("system diagnostics JSON failed", "path", r.URL.Path, "error", err)
 		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
 		return
 	}
+	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
 	retention, err := a.store.RetentionReport(r.Context(), now)
 	if err != nil {
 		a.logger.Error("retention diagnostics JSON failed", "path", r.URL.Path, "error", err)
@@ -162,6 +164,8 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 			FollowedArtists:         snapshot.FollowedArtists,
 			Releases:                snapshot.Releases,
 			RecentLogEntries:        snapshot.RecentLogEntries,
+			DroppedLogEntries:       logHealth.Dropped,
+			LogWriteFailures:        logHealth.Errors,
 			ProviderFailures:        snapshot.ProviderFailures,
 			OldestProviderFailureAt: snapshot.OldestProviderFailureAt,
 		},
@@ -273,9 +277,15 @@ type diagnosticsJSONQueue struct {
 }
 
 type diagnosticsJSONInventory struct {
-	FollowedArtists         int        `json:"followed_artists"`
-	Releases                int        `json:"releases"`
-	RecentLogEntries        int        `json:"recent_log_entries"`
+	FollowedArtists  int `json:"followed_artists"`
+	Releases         int `json:"releases"`
+	RecentLogEntries int `json:"recent_log_entries"`
+	// DroppedLogEntries and LogWriteFailures qualify RecentLogEntries: a
+	// non-zero value means the application-log history the panel shows is
+	// incomplete. Without them a truncated history is indistinguishable from a
+	// quiet one.
+	DroppedLogEntries       uint64     `json:"dropped_log_entries"`
+	LogWriteFailures        uint64     `json:"log_write_failures"`
 	ProviderFailures        int        `json:"provider_failures"`
 	OldestProviderFailureAt *time.Time `json:"oldest_provider_failure_at,omitempty"`
 }
@@ -411,6 +421,7 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
 	d.Diagnostics, err = a.store.Diagnostics(r.Context())
+	d.Diagnostics.DroppedLogEntries, d.Diagnostics.LogWriteFailures = a.logSinkHealth().Dropped, a.logSinkHealth().Errors
 	failed = a.pageStoreError(r, &d, "Household administration", "system diagnostics", err) || failed
 	d.Retention, err = a.store.RetentionReport(r.Context(), time.Now().UTC())
 	failed = a.pageStoreError(r, &d, "Household administration", "retention report", err) || failed
@@ -428,9 +439,9 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.OperationalSnapshots, err = a.store.OperationalSnapshots(r.Context(), 24)
 	failed = a.pageStoreError(r, &d, "Household administration", "operational snapshot history", err) || failed
 	if d.User != nil {
-		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, d.User.Timezone)
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, d.User.Timezone, a.logSinkHealth())
 	} else {
-		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, "UTC")
+		d.DiagnosticReport = diagnosticReport(d.Diagnostics, d.RunnerStatus, "UTC", a.logSinkHealth())
 	}
 	d.AdminDestinationHealth, err = a.store.AdminDestinationHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "destination health", err) || failed
@@ -500,7 +511,10 @@ func pluralSuffix(value int) string {
 	return "s"
 }
 
-func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string) string {
+func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStatus, timezone string, logHealth LogSinkHealth) string {
+	// The sink counters do not come from the diagnostics query; fold them in
+	// before deriving status so log loss can contribute a degraded reason.
+	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
 	var report strings.Builder
 	runnerState := "stopped"
 	if runner.Running {
@@ -565,6 +579,13 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 		fmt.Fprintln(&report, "Last restore rehearsal: not recorded")
 	}
 	fmt.Fprintf(&report, "Application events (24h): %d\n", snapshot.RecentLogEntries)
+	// Qualify the count above. Both counters were previously read only on the
+	// clean-shutdown path, so a loss during the outage an operator is actually
+	// diagnosing never reached them.
+	if logHealth.Dropped > 0 || logHealth.Errors > 0 {
+		fmt.Fprintf(&report, "Application log loss: %d dropped (queue full), %d failed to persist - "+
+			"the log history above is incomplete\n", logHealth.Dropped, logHealth.Errors)
+	}
 	fmt.Fprintf(&report, "Scheduler: %s\n", diagnosticHealthLabel(runner.Running))
 	if runner.LastActivityAt != nil {
 		fmt.Fprintf(&report, "Scheduler last activity: %s\n", providerHealthTime(runner.LastActivityAt, timezone))

@@ -51,6 +51,36 @@ type App struct {
 	untrustedForwardingWarned atomic.Bool
 	passwordChangeLimiter     *fixedWindowLimiter
 	loginSlots                chan struct{}
+	// logHealth reports the application-log sink's drop and write-failure
+	// counters. It is set after construction rather than passed to New because
+	// the sink is created around the same store this App is built from.
+	logHealth func() LogSinkHealth
+}
+
+// LogSinkHealth is the application-log sink's runtime loss counters.
+type LogSinkHealth struct {
+	// Dropped counts records discarded because the sink queue was full, and
+	// Errors counts records the sink accepted but failed to persist.
+	Dropped uint64
+	Errors  uint64
+}
+
+// SetLogHealth wires the application-log sink's counters into diagnostics.
+// Both were previously read only on the clean-shutdown path, strictly after an
+// early return that fires whenever the drain is unclean - so a SIGKILL, a
+// panic, or a stalled drain reported nothing, and an operator watching a
+// provider outage fill the 256-entry queue saw a truncated log history with no
+// indication that anything had been lost.
+func (a *App) SetLogHealth(report func() LogSinkHealth) {
+	a.logHealth = report
+}
+
+// logSinkHealth reports the sink counters, or zeroes when nothing is wired.
+func (a *App) logSinkHealth() LogSinkHealth {
+	if a.logHealth == nil {
+		return LogSinkHealth{}
+	}
+	return a.logHealth()
 }
 
 // UserView is the deliberately narrow projection exposed to templates. The

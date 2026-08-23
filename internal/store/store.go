@@ -718,6 +718,13 @@ type DiagnosticsSnapshot struct {
 	PendingDeliveries int
 	FailedDeliveries  int
 	RecentLogEntries  int
+	// DroppedLogEntries and LogWriteFailures qualify RecentLogEntries. They are
+	// filled in by the process that owns the application-log sink rather than
+	// by the diagnostics query, because the counters live in that sink and not
+	// in the database - a write failure is precisely the case where the
+	// database cannot be asked.
+	DroppedLogEntries uint64
+	LogWriteFailures  uint64
 	OldestQueueAt     *time.Time
 	// FutureDeliveries flags pending work parked far beyond the normal retry
 	// horizon. This is a safe clock-skew signal; it does not alter admission.

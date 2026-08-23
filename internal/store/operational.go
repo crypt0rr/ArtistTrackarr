@@ -60,6 +60,14 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 	if snapshot.StaleClaims > 0 {
 		addReason("stale work claims")
 	}
+	// A non-zero counter means the application-log history the admin panel
+	// shows is incomplete. The queue fills exactly when it matters - a provider
+	// outage or a SQLite stall producing a burst of Error records - so an
+	// operator reading that history during an incident needs to be told it has
+	// gaps rather than trusting a quiet-looking page.
+	if snapshot.DroppedLogEntries > 0 || snapshot.LogWriteFailures > 0 {
+		addReason("application log loss")
+	}
 	if snapshot.PausedDestinations > 0 {
 		addReason("paused destinations")
 	}
