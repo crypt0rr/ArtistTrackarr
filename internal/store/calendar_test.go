@@ -823,3 +823,89 @@ func TestCalendarKeepsMusicBrainzOnlyReleases(t *testing.T) {
 		t.Fatal("a different release sharing a provider release's date was hidden from the calendar")
 	}
 }
+
+func TestTimezoneChangeDoesNotSuppressTheNextWeeklyDigest(t *testing.T) {
+	// The duplicate-period lookup widens its window when the stored run carries a
+	// different timezone, to catch the same logical period under a new offset.
+	// Widening it by a whole period meant the PREVIOUS period's run - which
+	// necessarily carries the old timezone - fell inside the window, so a weekly
+	// subscriber who changed timezone lost a full week of digests.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	userID, err := s.CreateUser(ctx, "tz-digest@example.com", "hash", "member", "UTC", "tz-digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "tz-digest-artist", Name: "TZ Digest Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "weekly",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	releaseDate := now.AddDate(0, 0, 2).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "tz-digest-release", artist.ID, "TZ Digest Release", "EP", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/tz-digest-release", "musicbrainz",
+		timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	// Control: with no prior run at all, a digest must be created. If this fails
+	// the scenario is wrong, not the deduplication.
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	var control int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&control); err != nil {
+		t.Fatal(err)
+	}
+	if control != 1 {
+		t.Fatalf("control: a weekly digest was not created at all (runs=%d)", control)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM release_digest_runs WHERE user_id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Last week's run, recorded under the member's previous timezone. Weekly
+	// periods start on Monday, so anchor it to the previous Monday rather than
+	// to an arbitrary day, which is what the scheduler actually writes.
+	thisMonday := now.AddDate(0, 0, -((int(now.Weekday()) + 6) % 7)).Truncate(24 * time.Hour)
+	lastMonday := thisMonday.AddDate(0, 0, -7)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs
+		(user_id,frequency,period_start,timezone,title,body,release_count,status,created_at)
+		VALUES(?,?,?,?,?,?,?, 'sent',?)`, userID, "weekly",
+		lastMonday.Format("2006-01-02"), "America/New_York", "Last week", "body", 1,
+		timeText(lastMonday.Add(12*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+
+	var runs int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=? AND created_at>=?`,
+		userID, timeText(now.Add(-time.Hour))).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("this week's digest runs=%d after a timezone change, want 1", runs)
+	}
+}

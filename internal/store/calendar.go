@@ -287,10 +287,15 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			// wider time window when the stored run was created under another
 			// timezone; same-timezone periods continue to use the exact key and
 			// cannot suppress a legitimate next-day/week digest.
-			periodLookback := 24 * time.Hour
-			if user.Frequency == "weekly" {
-				periodLookback = 7 * 24 * time.Hour
-			}
+			//
+			// The tolerance covers how far a period boundary can move when the
+			// timezone changes, which is bounded by the span of real UTC offsets
+			// (UTC-12 to UTC+14) and never by the length of the period. Expanding
+			// it by a whole period instead meant the previous period's run - which
+			// necessarily carries the old timezone - fell inside the window and
+			// suppressed the new period: a full week of digests for a weekly
+			// subscriber who changed timezone.
+			const periodLookback = 26 * time.Hour
 			periodStartUTC := timeText(periodStart.Add(-periodLookback).UTC())
 			periodEndUTC := timeText(periodEnd.Add(periodLookback).UTC())
 			var runID int64
