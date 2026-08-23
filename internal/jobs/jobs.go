@@ -506,6 +506,160 @@ func (r *Runner) logPanic(scope string, name string, recovered any) {
 	}
 }
 
+// deliveryTarget is the small set of things that differ between a per-release
+// delivery and a digest delivery: which store transitions to call, and how the
+// row is named in a log line. Everything else about the two paths was
+// identical.
+//
+// They were previously two 84-line copies differing in 22 lines, all of them
+// method names and a log key. That duplication had already cost real defects:
+// the fix that moved the durable-state budget after the send, and the fix that
+// stopped a shutdown recording accepted sends as failures, each had to be
+// applied twice, and each was applied to only one copy first.
+type deliveryTarget struct {
+	logKey      string
+	id          int64
+	attempts    int
+	claimOwner  string
+	destination store.Destination
+	title       string
+	body        string
+
+	startAttempt func(ctx context.Context, attempt int, at time.Time) (int64, error)
+	markSent     func(ctx context.Context, owner string, at time.Time) error
+	finalizeSent func(ctx context.Context, at time.Time) error
+	markFailed   func(ctx context.Context, attempt int, reason, owner string, at time.Time) error
+}
+
+func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
+	return r.performDelivery(ctx, now, deliveryTarget{
+		logKey: "delivery_id", id: delivery.ID, attempts: delivery.Attempts,
+		claimOwner: delivery.ClaimOwner, destination: delivery.Destination,
+		title: delivery.Title, body: delivery.Body,
+		startAttempt: func(ctx context.Context, attempt int, at time.Time) (int64, error) {
+			return r.store.StartDeliveryAttempt(ctx, delivery.ID, 0, delivery.Destination, attempt, at)
+		},
+		markSent: func(ctx context.Context, owner string, at time.Time) error {
+			return r.store.MarkDeliverySentOwned(ctx, delivery.ID, owner, at)
+		},
+		finalizeSent: func(ctx context.Context, at time.Time) error {
+			return r.store.FinalizeDeliverySent(ctx, delivery.ID, at)
+		},
+		markFailed: func(ctx context.Context, attempt int, reason, owner string, at time.Time) error {
+			return r.store.MarkDeliveryFailedOwned(ctx, delivery.ID, attempt, reason, owner, at)
+		},
+	})
+}
+
+func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
+	return r.performDelivery(ctx, now, deliveryTarget{
+		logKey: "digest_delivery_id", id: delivery.ID, attempts: delivery.Attempts,
+		claimOwner: delivery.ClaimOwner, destination: delivery.Destination,
+		title: delivery.Title, body: delivery.Body,
+		startAttempt: func(ctx context.Context, attempt int, at time.Time) (int64, error) {
+			return r.store.StartDeliveryAttempt(ctx, 0, delivery.ID, delivery.Destination, attempt, at)
+		},
+		markSent: func(ctx context.Context, owner string, at time.Time) error {
+			return r.store.MarkDigestDeliverySentOwned(ctx, delivery.ID, owner, at)
+		},
+		finalizeSent: func(ctx context.Context, at time.Time) error {
+			return r.store.FinalizeDigestDeliverySent(ctx, delivery.ID, at)
+		},
+		markFailed: func(ctx context.Context, attempt int, reason, owner string, at time.Time) error {
+			return r.store.MarkDigestDeliveryFailedOwned(ctx, delivery.ID, attempt, reason, owner, at)
+		},
+	})
+}
+
+// performDelivery runs one notification through send and durable state recording. It is
+// the single implementation behind both delivery queues.
+func (r *Runner) performDelivery(ctx context.Context, now time.Time, target deliveryTarget) deliveryResult {
+	result := deliveryResult{}
+	attemptCtx, cancelAttempt := deliveryStateContext(ctx)
+	attemptID, attemptErr := target.startAttempt(attemptCtx, target.attempts+1, time.Now().UTC())
+	cancelAttempt()
+	if attemptErr != nil {
+		r.logger.Warn("record delivery attempt failed", target.logKey, target.id,
+			"destination_id", target.destination.ID, "error", notify.RedactError(attemptErr))
+	}
+	var err error
+	if r.cipher == nil {
+		err = errors.New("notification cipher is unavailable")
+	} else {
+		var serviceURL string
+		serviceURL, err = r.cipher.Decrypt(target.destination.EncryptedURL)
+		if err == nil {
+			err = r.sendNotification(ctx, serviceURL, target.title, target.body)
+		}
+	}
+	// Budget the durable state transition from here, after the send. A send is
+	// bounded by notificationSendTimeout, which is longer than this budget, so
+	// starting the clock before it meant a slow but successful send found the
+	// context already expired: the outcome could never be recorded, the row
+	// stayed pending with attempts unchanged, and the same notification was
+	// re-sent on every later tick without ever reaching a terminal state.
+	stateCtx, cancelState := deliveryStateContext(ctx)
+	defer cancelState()
+	if err == nil {
+		if markErr := target.markSent(stateCtx, target.claimOwner, now); markErr != nil {
+			if errors.Is(markErr, sql.ErrNoRows) {
+				r.logger.Warn("notification delivery claim lost after send",
+					target.logKey, target.id, "destination_id", target.destination.ID)
+				if attemptID > 0 {
+					if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+						return deliveryResult{sent: true, err: finishErr}
+					}
+				}
+				if finalizeErr := target.finalizeSent(stateCtx, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
+					r.logger.Warn("notification delivery post-send finalization failed",
+						target.logKey, target.id, "destination_id", target.destination.ID,
+						"error", notify.RedactError(finalizeErr))
+					return deliveryResult{sent: true, err: finalizeErr}
+				}
+				return deliveryResult{sent: true}
+			}
+			if attemptID > 0 {
+				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+			}
+			return deliveryResult{failed: true, err: markErr}
+		}
+		if attemptID > 0 {
+			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
+				return deliveryResult{sent: true, err: finishErr}
+			}
+		}
+		result.sent = true
+		return result
+	}
+
+	result.failed = true
+	redactedError := notify.RedactError(err)
+	r.logger.Warn("notification attempt failed",
+		target.logKey, target.id, "destination_id", target.destination.ID, "error", redactedError)
+	if markErr := target.markFailed(stateCtx, target.attempts+1, redactedError, target.claimOwner, now); markErr != nil {
+		if errors.Is(markErr, sql.ErrNoRows) {
+			r.logger.Warn("notification delivery claim lost after failure",
+				target.logKey, target.id, "destination_id", target.destination.ID)
+		} else {
+			result.err = markErr
+		}
+	}
+	if attemptID > 0 {
+		var nextRetry *time.Time
+		if target.attempts+1 < 5 {
+			next := now.Add(time.Minute * time.Duration(1<<min(target.attempts+1, 6)))
+			nextRetry = &next
+		}
+		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+			result.err = finishErr
+		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.err = ctxErr
+	}
+	return result
+}
+
 func (r *Runner) safeDelivery(ctx context.Context, now time.Time, item deliveryWork) (result deliveryResult) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -1617,176 +1771,4 @@ func deliveryStateContext(ctx context.Context) (context.Context, context.CancelF
 		base = context.WithoutCancel(ctx)
 	}
 	return context.WithTimeout(base, deliveryStateBudget)
-}
-
-func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
-	result := deliveryResult{}
-	attemptCtx, cancelAttempt := deliveryStateContext(ctx)
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(attemptCtx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
-	cancelAttempt()
-	if attemptErr != nil {
-		r.logger.Warn("record delivery attempt failed", "digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
-	}
-	var err error
-	if r.cipher == nil {
-		err = errors.New("notification cipher is unavailable")
-	} else {
-		var serviceURL string
-		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
-		if err == nil {
-			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
-		}
-	}
-	// Budget the durable state transition from here, after the send. A send is
-	// bounded by notificationSendTimeout, which is longer than this budget, so
-	// starting the clock before it meant a slow but successful send found the
-	// context already expired: the outcome could never be recorded, the row
-	// stayed pending with attempts unchanged, and the same notification was
-	// re-sent on every later tick without ever reaching a terminal state.
-	stateCtx, cancelState := deliveryStateContext(ctx)
-	defer cancelState()
-	if err == nil {
-		if markErr := r.store.MarkDigestDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
-			if errors.Is(markErr, sql.ErrNoRows) {
-				r.logger.Warn("notification delivery claim lost after send",
-					"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-				if attemptID > 0 {
-					if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
-						return deliveryResult{sent: true, err: finishErr}
-					}
-				}
-				if finalizeErr := r.store.FinalizeDigestDeliverySent(stateCtx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
-					r.logger.Warn("notification delivery post-send finalization failed",
-						"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
-						"error", notify.RedactError(finalizeErr))
-					return deliveryResult{sent: true, err: finalizeErr}
-				}
-				return deliveryResult{sent: true}
-			}
-			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
-			}
-			return deliveryResult{failed: true, err: markErr}
-		}
-		if attemptID > 0 {
-			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
-				return deliveryResult{sent: true, err: finishErr}
-			}
-		}
-		result.sent = true
-		return result
-	}
-
-	result.failed = true
-	redactedError := notify.RedactError(err)
-	r.logger.Warn("release digest delivery attempt failed",
-		"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDigestDeliveryFailedOwned(stateCtx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		if errors.Is(markErr, sql.ErrNoRows) {
-			r.logger.Warn("notification delivery claim lost after failure",
-				"digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-		} else {
-			result.err = markErr
-		}
-	}
-	if attemptID > 0 {
-		var nextRetry *time.Time
-		if delivery.Attempts+1 < 5 {
-			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
-			nextRetry = &next
-		}
-		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
-			result.err = finishErr
-		}
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		result.err = ctxErr
-	}
-	return result
-}
-
-func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
-	result := deliveryResult{}
-	attemptCtx, cancelAttempt := deliveryStateContext(ctx)
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(attemptCtx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
-	cancelAttempt()
-	if attemptErr != nil {
-		r.logger.Warn("record delivery attempt failed", "delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
-	}
-	var err error
-	if r.cipher == nil {
-		err = errors.New("notification cipher is unavailable")
-	} else {
-		var serviceURL string
-		serviceURL, err = r.cipher.Decrypt(delivery.Destination.EncryptedURL)
-		if err == nil {
-			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
-		}
-	}
-	// Budget the durable state transition from here, after the send. A send is
-	// bounded by notificationSendTimeout, which is longer than this budget, so
-	// starting the clock before it meant a slow but successful send found the
-	// context already expired: the outcome could never be recorded, the row
-	// stayed pending with attempts unchanged, and the same notification was
-	// re-sent on every later tick without ever reaching a terminal state.
-	stateCtx, cancelState := deliveryStateContext(ctx)
-	defer cancelState()
-	if err == nil {
-		if markErr := r.store.MarkDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
-			if errors.Is(markErr, sql.ErrNoRows) {
-				r.logger.Warn("notification delivery claim lost after send",
-					"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-				if attemptID > 0 {
-					if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
-						return deliveryResult{sent: true, err: finishErr}
-					}
-				}
-				if finalizeErr := r.store.FinalizeDeliverySent(stateCtx, delivery.ID, now); finalizeErr != nil && !errors.Is(finalizeErr, sql.ErrNoRows) {
-					r.logger.Warn("notification delivery post-send finalization failed",
-						"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID,
-						"error", notify.RedactError(finalizeErr))
-					return deliveryResult{sent: true, err: finalizeErr}
-				}
-				return deliveryResult{sent: true}
-			}
-			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, markErr.Error(), nil, time.Now().UTC())
-			}
-			return deliveryResult{failed: true, err: markErr}
-		}
-		if attemptID > 0 {
-			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {
-				return deliveryResult{sent: true, err: finishErr}
-			}
-		}
-		result.sent = true
-		return result
-	}
-
-	result.failed = true
-	redactedError := notify.RedactError(err)
-	r.logger.Warn("notification attempt failed",
-		"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", redactedError)
-	if markErr := r.store.MarkDeliveryFailedOwned(stateCtx, delivery.ID, delivery.Attempts+1, redactedError, delivery.ClaimOwner, now); markErr != nil {
-		if errors.Is(markErr, sql.ErrNoRows) {
-			r.logger.Warn("notification delivery claim lost after failure",
-				"delivery_id", delivery.ID, "destination_id", delivery.Destination.ID)
-		} else {
-			result.err = markErr
-		}
-	}
-	if attemptID > 0 {
-		var nextRetry *time.Time
-		if delivery.Attempts+1 < 5 {
-			next := now.Add(time.Minute * time.Duration(1<<min(delivery.Attempts+1, 6)))
-			nextRetry = &next
-		}
-		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, delivery.Destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
-			result.err = finishErr
-		}
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		result.err = ctxErr
-	}
-	return result
 }
