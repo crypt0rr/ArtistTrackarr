@@ -358,3 +358,73 @@ func TestReleaseTruthDecisionBelongsToTheMemberWhoRecordedIt(t *testing.T) {
 		t.Fatalf("a cleared decision was not writable by another member: %v", err)
 	}
 }
+
+func TestReleaseDetailAttributesTheSharedTruthDecision(t *testing.T) {
+	// release_truth_decisions is one shared row per release. Without attribution
+	// another member's decision, including its free-text reason, renders on the
+	// release page as though the viewer had recorded it.
+	ctx := context.Background()
+	s := testStore(t)
+	owner, err := s.CreateUser(ctx, "attr-owner@example.com", "hash", "member", "UTC", "attr-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateUser(ctx, "attr-other@example.com", "hash", "member", "UTC", "attr-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "attr-artist", Name: "Attr Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{owner, other} {
+		if _, err := s.Follow(ctx, id, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "attr-release", artist.ID, "Attr Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/attr-release", "musicbrainz",
+		timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	var releaseID int64
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, "attr-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, err := s.ReleaseDetail(ctx, owner, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.TruthDecidedByYou || detail.TruthDecidedByAnotherMember {
+		t.Fatalf("undecided release reported attribution: you=%t other=%t",
+			detail.TruthDecidedByYou, detail.TruthDecidedByAnotherMember)
+	}
+
+	if err := s.SetReleaseTruthDecision(ctx, owner, releaseID, "musicbrainz", "owner reviewed this"); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, err = s.ReleaseDetail(ctx, owner, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !detail.TruthDecidedByYou || detail.TruthDecidedByAnotherMember {
+		t.Fatalf("the decider's own view: you=%t other=%t", detail.TruthDecidedByYou, detail.TruthDecidedByAnotherMember)
+	}
+
+	detail, err = s.ReleaseDetail(ctx, other, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.TruthDecidedByYou || !detail.TruthDecidedByAnotherMember {
+		t.Fatalf("another member's view: you=%t other=%t", detail.TruthDecidedByYou, detail.TruthDecidedByAnotherMember)
+	}
+	if detail.TruthReason != "owner reviewed this" {
+		t.Fatalf("reason=%q, want the recording member's reason", detail.TruthReason)
+	}
+}

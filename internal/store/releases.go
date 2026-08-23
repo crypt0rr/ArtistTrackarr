@@ -573,6 +573,21 @@ func (s *Store) ReleaseDetail(ctx context.Context, userID, releaseID int64) (Rel
 	if err != nil {
 		return d, err
 	}
+	// Attribute the shared truth decision before any cursor is open: this runs
+	// on the bounded reader pool, and nesting a query inside an open projection
+	// is how this package has exhausted that pool before.
+	var decidedBy sql.NullInt64
+	switch err := s.readerDB().QueryRowContext(ctx,
+		`SELECT decided_by_user_id FROM release_truth_decisions WHERE release_group_id=?`,
+		releaseID).Scan(&decidedBy); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return d, err
+	case decidedBy.Valid && decidedBy.Int64 == userID:
+		d.TruthDecidedByYou = true
+	case decidedBy.Valid:
+		d.TruthDecidedByAnotherMember = true
+	}
 	obs, err := s.readerDB().QueryContext(ctx, `SELECT provider,provider_id,observed_at FROM provider_observations WHERE release_group_id=? ORDER BY observed_at DESC`, releaseID)
 	if err != nil {
 		return d, err

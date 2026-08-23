@@ -50,7 +50,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.56.1`; local and published images use the
+footer. The current release is `v0.56.2`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -386,6 +386,15 @@ endpoint and dead on another. Spotify cannot be captured without client
 credentials, so its fields are listed explicitly as unverified. No runtime
 behaviour changes.
 
+The v0.56.2 patch finishes the Truth Loop ownership work. A release truth
+decision is one shared row per household, so a decision another member recorded
+previously rendered on the release page as though the viewer had made it,
+including its free-text reason. The page now says whether a decision is yours or
+another member's, the Clear action appears only for the member who recorded it
+or for an administrator - matching what the store already enforced - and the
+shared-versus-private distinction is documented alongside the private evidence
+review actions it is easily confused with.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -406,6 +415,14 @@ created or refreshed during normal synchronization, so existing records appear
 after their next provider check. Release details also expose a reversible Truth
 Loop decision: members can explicitly confirm the provider that best represents
 a release for their household without rewriting provider observations.
+
+A Truth Loop decision is **shared across the household**, unlike the evidence
+review actions above, which are private to each member. There is one decision
+per release, and the release page shows whether it was recorded by you or by
+another member so a shared choice is never mistaken for your own. Only the
+member who recorded a decision, or a household administrator, can change or
+clear it; anyone else is told to ask them. A release with no decision yet can be
+confirmed by any member who follows it.
 
 The optional **Release Trust Guard** builds on the Truth Desk. Enable “Hold
 notifications when provider evidence conflicts” under Settings to keep alerts
@@ -476,7 +493,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.56.1` publishes `0.56.1`, `0.56`, and `latest`.
+- Pushing a tag such as `v0.56.2` publishes `0.56.2`, `0.56`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -500,7 +517,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.56.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.56.2 docker compose up -d
 ```
 
 ## Configuration

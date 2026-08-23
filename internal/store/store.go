@@ -485,6 +485,12 @@ type ReleaseDetail struct {
 	Observations []ReleaseObservation
 	Credits      []ReleaseCredit
 	Timeline     []ReleaseTimelineEntry
+	// TruthDecidedByYou and TruthDecidedByAnotherMember describe who recorded
+	// the shared truth decision. release_truth_decisions holds one row per
+	// release with no user dimension, so without this a decision another member
+	// recorded - including its free-text reason - reads as the viewer's own.
+	TruthDecidedByYou           bool
+	TruthDecidedByAnotherMember bool
 }
 
 // CalendarRelease is an owner-scoped release projection used by the calendar
