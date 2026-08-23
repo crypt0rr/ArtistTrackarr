@@ -794,8 +794,9 @@ func (a *App) recoverPanic(next http.Handler) http.Handler {
 				return
 			}
 			// The client went away mid-response; net/http expects this to
-			// propagate rather than be reported as a server fault.
-			if recovered == http.ErrAbortHandler {
+			// propagate rather than be reported as a server fault. Match with
+			// errors.Is so a wrapped ErrAbortHandler propagates too.
+			if err, ok := recovered.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(recovered)
 			}
 			message := notify.RedactError(fmt.Errorf("%v", recovered))
