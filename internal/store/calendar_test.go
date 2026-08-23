@@ -791,16 +791,35 @@ func TestCalendarKeepsMusicBrainzOnlyReleases(t *testing.T) {
 		t.Fatalf("a MusicBrainz-only release was filtered out of the calendar: %v", titles)
 	}
 
-	// A MusicBrainz row that really is an unmerged near-duplicate of the
-	// provider row is still suppressed.
-	insert("musicbrainz-duplicate", "Provider Album (MB copy)", "musicbrainz", spotifyDate)
+	// A MusicBrainz row that really is an unmerged duplicate of the provider row
+	// is still suppressed. The title must match: the clause compares case-folded
+	// titles rather than reimplementing the Go normaliser in SQL, so it
+	// deliberately suppresses less than releaseIdentityMatches would.
+	insert("musicbrainz-duplicate", "provider album", "musicbrainz", spotifyDate)
 	items, err = s.CalendarReleases(ctx, userID, now.Format("2006-01-02"), now.AddDate(0, 2, 0).Format("2006-01-02"), 50)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range items {
-		if item.Title == "Provider Album (MB copy)" {
+		if item.Title == "provider album" {
 			t.Fatalf("an unmerged duplicate of a provider release was shown: %v", item)
 		}
+	}
+
+	// A differently titled release on the same day is a different release, not a
+	// duplicate, and must stay visible. Comparing only artist and date hid these.
+	insert("musicbrainz-sameday", "A Completely Different Record", "musicbrainz", spotifyDate)
+	items, err = s.CalendarReleases(ctx, userID, now.Format("2006-01-02"), now.AddDate(0, 2, 0).Format("2006-01-02"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range items {
+		if item.Title == "A Completely Different Record" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a different release sharing a provider release's date was hidden from the calendar")
 	}
 }

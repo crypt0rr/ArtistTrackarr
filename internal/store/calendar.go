@@ -22,12 +22,31 @@ import (
 //
 // The duplicate window mirrors releaseIdentityMatches: same artist, same date
 // precision, and within three days at day precision or an exact match otherwise.
+// calendarPreferredProvider suppresses a MusicBrainz row that is an unmerged
+// near-duplicate of a provider row for the same release.
+//
+// The title comparison is deliberately narrower than releaseIdentityMatches.
+// That function normalises titles in Go - stripping provider type suffixes and
+// edition markers - and SQL cannot call it. Reimplementing that normalisation
+// here would create a second definition of "same title" that drifts from the
+// first, which is the exact failure mode that has produced several defects in
+// this project. Comparing case-folded, trimmed titles instead means this clause
+// suppresses strictly less than the merge comparator would: a near-duplicate
+// whose titles differ only by an edition suffix stays visible.
+//
+// That asymmetry is the safe direction. Showing one redundant row costs a
+// member almost nothing; hiding a real release costs them the release. The
+// previous version compared artist and date but no title at all, so any
+// provider release within three days hid an unrelated MusicBrainz-only release
+// from the calendar, the ICS feed, the token feed, the digest and the dashboard
+// at once - while the announcement path still told the member it existed.
 const calendarPreferredProvider = `(rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
 	SELECT 1 FROM release_groups duplicate
 	WHERE duplicate.artist_id=rg.artist_id
 	  AND duplicate.id<>rg.id
 	  AND duplicate.source IN ('spotify','itunes','both')
 	  AND duplicate.date_precision=rg.date_precision
+	  AND lower(trim(duplicate.title))=lower(trim(rg.title))
 	  AND (
 		(rg.date_precision=3
 		  AND date(duplicate.first_release_date) BETWEEN date(rg.first_release_date,'-3 day')
