@@ -1669,7 +1669,8 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		t.Fatalf("due deliveries=%#v err=%v", deliveries, err)
 	}
 	if err := database.MarkDeliveryFailed(
-		context.Background(), deliveries[0].ID, 5, "provider rejected secret detail",
+		context.Background(), deliveries[0].ID, 5,
+		"provider rejected https://ntfy.example/secret-topic token=abcd1234",
 		time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
 	); err != nil {
 		t.Fatal(err)
@@ -1680,9 +1681,24 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	dashboardBody, _ := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if !strings.Contains(string(dashboardBody), "delivery-scroll") ||
-		strings.Contains(string(dashboardBody), "provider rejected secret detail") {
-		t.Fatalf("dashboard delivery log is not compact: %q", dashboardBody)
+	dashboard := string(dashboardBody)
+	if !strings.Contains(dashboard, "delivery-scroll") {
+		t.Fatalf("dashboard delivery log is not a compact scrolling list: %q", dashboard)
+	}
+	// The member is told why their own notification failed - the same
+	// safeDeliveryError-redacted text the destinations panel already shows
+	// them - but never the raw provider string behind it. This assertion used
+	// to forbid the reason outright, which also hid the redacted form and left
+	// a member staring at a bare "failed" badge with nothing to act on.
+	for _, redacted := range []string{"[redacted destination]", "token=[redacted]"} {
+		if !strings.Contains(dashboard, redacted) {
+			t.Fatalf("dashboard does not show the redacted failure reason %q: %q", redacted, dashboard)
+		}
+	}
+	for _, secret := range []string{"ntfy.example/secret-topic", "abcd1234"} {
+		if strings.Contains(dashboard, secret) {
+			t.Fatalf("dashboard leaked unredacted provider detail %q: %q", secret, dashboard)
+		}
 	}
 	response, err = client.Get(server.URL + "/admin")
 	if err != nil {
@@ -1702,7 +1718,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	if strings.Contains(string(body), "encrypted-secret") {
 		t.Fatalf("admin audit exposed encrypted destination: %q", body)
 	}
-	if strings.Contains(string(body), "provider rejected secret detail") {
+	if strings.Contains(string(body), "provider rejected") {
 		t.Fatalf("admin summary exposed notification error without explicit access: %q", body)
 	}
 	detailResponse, err := client.Get(server.URL + "/admin/deliveries/" + strconv.FormatInt(deliveries[0].ID, 10))
@@ -1711,7 +1727,8 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	detailBody, _ := io.ReadAll(detailResponse.Body)
 	_ = detailResponse.Body.Close()
-	if detailResponse.StatusCode != http.StatusOK || !strings.Contains(string(detailBody), "provider rejected secret detail") {
+	if detailResponse.StatusCode != http.StatusOK ||
+		!strings.Contains(string(detailBody), "provider rejected [redacted destination] token=[redacted]") {
 		t.Fatalf("admin delivery detail status/body=%d %q", detailResponse.StatusCode, detailBody)
 	}
 	bad := noRedirectClient(client)
