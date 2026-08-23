@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -323,5 +325,55 @@ func TestProviderHealthAndAdminArtistQueries(t *testing.T) {
 	health, err = s.ProviderHealthByName(ctx, "spotify")
 	if err != nil || health.RateLimited || health.QuotaExceeded || health.LastError != "" || health.NextCheckAt != nil || health.LastSuccessAt == nil {
 		t.Fatalf("successful provider health reset: %#v, err=%v", health, err)
+	}
+}
+
+// TestRestoreRehearsalMarkerIsReadableAndReachable covers the two halves of
+// "when did we last prove we can restore, and did it pass?" - the most valuable
+// line in a backup-confidence report, and the one that could never be
+// populated. The rehearsal script wrote its marker into the throwaway volume it
+// destroys on exit, so the live instance read "not recorded" forever on the
+// admin page, in the support report, in /admin/diagnostics.json and across
+// thirty days of hourly snapshots.
+//
+// The first half pins the on-disk format the script emits against the parser
+// that reads it: they live in different languages in different files and
+// nothing else would catch them drifting. The second half pins the script's
+// opt-in write to the live volume.
+func TestRestoreRehearsalMarkerIsReadableAndReachable(t *testing.T) {
+	dir := t.TempDir()
+	s := &Store{dataDir: dir}
+	// Byte-for-byte what restore-smoke.sh writes:
+	//   printf "%s\n%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok"
+	if err := os.WriteFile(filepath.Join(dir, restoreMarkerFile), []byte("2026-08-22T09:30:00Z\nok\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	at, result := s.operationalMarker(restoreMarkerFile)
+	if at == nil {
+		t.Fatal("the marker the rehearsal script writes does not parse")
+	}
+	if got := at.UTC().Format(time.RFC3339); got != "2026-08-22T09:30:00Z" {
+		t.Fatalf("marker timestamp=%q", got)
+	}
+	if result != "ok" {
+		t.Fatalf("marker result=%q, want ok", result)
+	}
+
+	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "restore-smoke.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rehearsal := string(script)
+	if !strings.Contains(rehearsal, "RESTORE_RECORD_RESULT") {
+		t.Fatal("the rehearsal offers no way to record its result where the application reads it")
+	}
+	// It must reach the live container's volume, not only the temporary one.
+	if !strings.Contains(rehearsal, "--volumes-from \"$live_id\"") {
+		t.Fatalf("the opt-in path does not write to the live /data volume: %s", rehearsal)
+	}
+	// And it must stay opt-in: the rehearsal is otherwise isolated from
+	// production, so the default must not touch a live volume.
+	if !strings.Contains(rehearsal, `"${RESTORE_RECORD_RESULT:-false}" = "true"`) {
+		t.Fatalf("recording on the live instance is not opt-in: %s", rehearsal)
 	}
 }

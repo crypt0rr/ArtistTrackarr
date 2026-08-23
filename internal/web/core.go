@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -631,7 +633,7 @@ func timelineStatusClass(status string) string {
 }
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.Recoverer, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
+	r.Use(middleware.RequestID, a.recoverPanic, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
@@ -771,6 +773,51 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; img-src 'self' https://i.scdn.co https://*.mzstatic.com https://*.itunes.apple.com data:; style-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoverPanic replaces chi's Recoverer so a handler panic reaches the same
+// places every other failure does. chi writes to its own standard-library
+// logger, so a panic bypassed structured logging, the redaction applied to
+// every other message, the persisted application log that the admin
+// diagnostics page reads, and the metrics - leaving an operator with a 500
+// response and no record anywhere of what happened.
+//
+// The route pattern is logged rather than the request path: a path can carry a
+// credential, as /calendar/feed/{token} does.
+func (a *App) recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			// The client went away mid-response; net/http expects this to
+			// propagate rather than be reported as a server fault. Match with
+			// errors.Is so a wrapped ErrAbortHandler propagates too.
+			if err, ok := recovered.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(recovered)
+			}
+			message := notify.RedactError(fmt.Errorf("%v", recovered))
+			if len(message) > 512 {
+				message = message[:512] + "..."
+			}
+			stack := notify.RedactError(errors.New(string(debug.Stack())))
+			if len(stack) > 2048 {
+				stack = stack[:2048] + "..."
+			}
+			route := "unknown"
+			if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
+				route = rctx.RoutePattern()
+			}
+			if a.logger != nil {
+				a.logger.Error("handler panic recovered",
+					"scope", "http handler", "method", r.Method, "route", route,
+					"panic", message, "stack", stack)
+			}
+			http.Error(w, "something went wrong", http.StatusInternalServerError)
+		}()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1097,8 +1144,42 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	failed = a.pageStoreError(r, d, "Artists", "country breakdown", err) || failed
 	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
 	failed = a.pageStoreError(r, d, "Artists", "artist type breakdown", err) || failed
+	// Recent imports live beside the import form because that is where a member
+	// looks after an import stops reporting. Without the listing a job that a
+	// restart marked resumable was unreachable: Resume is addressed by job id
+	// and nothing ever showed one.
+	d.ArtistListQuery = currentArtistListQuery(d, page)
+	d.ImportJobs, err = a.store.RecentImportJobs(r.Context(), session.User.ID, recentImportJobLimit)
+	failed = a.pageStoreError(r, d, "Artists", "recent imports", err) || failed
 	return failed
 }
+
+// currentArtistListQuery encodes the view a member is looking at so action
+// forms can carry it and the redirect afterwards can restore it. Only the keys
+// the artists page itself reads are included, and the first page is omitted
+// because it is the default.
+func currentArtistListQuery(d *PageData, page int) string {
+	values := url.Values{}
+	for key, value := range map[string]string{
+		"q":       d.Query,
+		"genre":   d.GenreFilter,
+		"country": d.CountryFilter,
+		"type":    d.TypeFilter,
+	} {
+		if value != "" {
+			values.Set(key, value)
+		}
+	}
+	if page > 1 {
+		values.Set("page", strconv.Itoa(page))
+	}
+	return values.Encode()
+}
+
+// recentImportJobLimit bounds the import history shown on the artists page. It
+// is a convenience list for finding a job again, not an audit log; the detail
+// page holds the per-row outcome.
+const recentImportJobLimit = 5
 
 func artistsPageURL(r *http.Request, page int) string {
 	values := make(url.Values)

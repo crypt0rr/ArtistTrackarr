@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2969,5 +2970,69 @@ func TestUpsertArtistNeverRepointsAStoredSpotifyIdentity(t *testing.T) {
 	}
 	if backfilled.SpotifyImageURL != "https://i.scdn.co/image/discovered" {
 		t.Fatalf("artwork for the kept identity was not backfilled: %#v", backfilled)
+	}
+}
+
+// TestWriteContentionIsCounted pins observability onto the bounded write-retry
+// loops. Every write goes through one connection behind a 5s busy_timeout, so
+// a single retry is already a multi-second stall - yet no retry, and no
+// exhaustion after five attempts, produced a counter, a log line or a
+// diagnostics field. An operator facing a hanging UI could not tell a slow
+// provider from requests queueing behind the writer, and a reader-pool
+// exhaustion presented only as generic page errors.
+func TestWriteContentionIsCounted(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// A retried-then-settled write records the retries and no exhaustion.
+	var attempts int
+	if err := s.withWriteTx(ctx, func(*sql.Tx) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("database is locked")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.writeRetries.Load(); got != 2 {
+		t.Fatalf("write retries=%d, want 2", got)
+	}
+	if got := s.writeRetryExhaustions.Load(); got != 0 {
+		t.Fatalf("exhaustions=%d after a write that eventually succeeded, want 0", got)
+	}
+
+	// A write that stays busy exhausts the loop and records that separately.
+	err := s.withWriteTx(ctx, func(*sql.Tx) error { return errors.New("database is locked") })
+	if err == nil {
+		t.Fatal("a permanently busy write reported success")
+	}
+	if got := s.writeRetryExhaustions.Load(); got != 1 {
+		t.Fatalf("exhaustions=%d after a write that gave up, want 1", got)
+	}
+
+	// A non-retryable failure is not contention and must not be counted.
+	before := s.writeRetryExhaustions.Load()
+	_ = s.withWriteTx(ctx, func(*sql.Tx) error { return errors.New("constraint failed") })
+	if got := s.writeRetryExhaustions.Load(); got != before {
+		t.Fatalf("a constraint violation was counted as contention: %d, want %d", got, before)
+	}
+
+	// And it has to reach the operator, not just live in the struct.
+	snapshot, err := s.Diagnostics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.WriteRetries == 0 || snapshot.WriteRetryExhaustions == 0 {
+		t.Fatalf("diagnostics carry no contention detail: %+v", snapshot)
+	}
+	status, reasons := OperationalStatus(DiagnosticsSnapshot{
+		CheckedAt: time.Now().UTC(), DatabaseHealthy: true, WriteRetryExhaustions: 1,
+	}, "running", time.Now().UTC())
+	if status != "degraded" {
+		t.Fatalf("operational status=%q after a refused write, want degraded", status)
+	}
+	if !slices.Contains(reasons, "database write contention") {
+		t.Fatalf("operational reasons=%v, want a write contention reason", reasons)
 	}
 }

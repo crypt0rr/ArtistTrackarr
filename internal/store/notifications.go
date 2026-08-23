@@ -353,13 +353,29 @@ func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID
 			return 0, sql.ErrNoRows
 		}
 		count := 0
-		for _, query := range []string{
-			`UPDATE deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
+		// Recovering a destination must not cancel a deliberate pause. A follow
+		// paused by its owner defers its delivery on purpose; requeueing it here
+		// delivered it immediately while the interface still read "Paused until".
+		// Digest deliveries carry no per-follow deferral, so only the per-release
+		// queue needs the exclusion - and it needs the extra bound argument.
+		type recoveryStatement struct {
+			query string
+			args  []any
+		}
+		for _, statement := range []recoveryStatement{
+			{
+				query: `UPDATE deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
+			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')
+			  AND NOT ` + pausedDeliveryDeferral("deliveries.event_id"),
+				args: []any{timeText(now), destinationID, timeText(now)},
+			},
+			{
+				query: `UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
 			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
-			`UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
-			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
+				args: []any{timeText(now), destinationID},
+			},
 		} {
-			result, updateErr := tx.ExecContext(ctx, query, timeText(now), destinationID)
+			result, updateErr := tx.ExecContext(ctx, statement.query, statement.args...)
 			if updateErr != nil {
 				return 0, updateErr
 			}
@@ -939,6 +955,35 @@ type ClockSkewRepairStats struct {
 // healthy while it never reaches the due queue. Active leases are excluded so
 // this cannot steal work from a live worker; blocked rows remain blocked until
 // their destination is recovered or retried explicitly.
+// pausedDeliveryDeferral reports, for the delivery row named by eventIDExpr's
+// enclosing query, whether an active pause is the reason its next attempt is in
+// the future. It exists as one definition because three call sites need it -
+// clock-skew detection, clock-skew repair, and destination recovery - and
+// hand-synchronised copies have already shipped a defect: the first version
+// correlated on the release's canonical artist alone, so a pause on a credited
+// artist was classified as clock skew and force-delivered.
+//
+// A follow governs a release exactly as the admission side decides it in
+// enqueueEventTxModeOptions: the member follows the canonical release artist,
+// OR they follow an artist credited on that release. Both must be considered
+// here, or the two sides disagree about which follow deferred the delivery.
+//
+// Binds one argument: the instant to compare paused_until against.
+func pausedDeliveryDeferral(eventIDExpr string) string {
+	return `EXISTS (
+		SELECT 1 FROM notification_events ne
+		JOIN release_groups rg ON rg.id=ne.release_group_id
+		JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
+		WHERE ne.id=` + eventIDExpr + `
+		  AND fnr.paused_until IS NOT NULL
+		  AND fnr.paused_until > ?
+		  AND (fnr.artist_id=rg.artist_id OR EXISTS (
+			SELECT 1 FROM release_credits rc
+			WHERE rc.release_group_id=rg.id AND rc.artist_id=fnr.artist_id
+		  ))
+	)`
+}
+
 func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, horizon time.Duration) (ClockSkewRepairStats, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -958,15 +1003,7 @@ func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, 
 		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
 		WHERE status IN ('pending','blocked') AND next_attempt_at>?
 		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)
-		  AND NOT EXISTS (
-			SELECT 1 FROM notification_events ne
-			JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
-			JOIN release_groups rg ON rg.id=ne.release_group_id
-			WHERE ne.id=deliveries.event_id
-			  AND fnr.artist_id=rg.artist_id
-			  AND fnr.paused_until IS NOT NULL
-			  AND fnr.paused_until > ?
-		  )`,
+		  AND NOT `+pausedDeliveryDeferral("deliveries.event_id"),
 			timeText(now), timeText(cutoff), timeText(now), timeText(now))
 		if err != nil {
 			return stats, err

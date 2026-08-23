@@ -130,6 +130,52 @@ if [ "$before_fingerprint" != "$after_fingerprint" ]; then
 	echo "restore: database state changed across restart" >&2
 	exit 1
 fi
+# The rehearsal volume is destroyed on exit, so a marker written into it is
+# only ever a record of this script's own success and reaches nothing that
+# outlives the run. Keep writing it there - it costs nothing and documents the
+# rehearsal for anyone inspecting the volume before the trap fires - but the
+# line an operator actually reads is on the live instance.
 docker run --rm -v "$volume:/data" "$HELPER_IMAGE" sh -ec \
 	'printf "%s\\n%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok" > /data/.artist-trackarr-last-restore && chown 10001:10001 /data/.artist-trackarr-last-restore && chmod 640 /data/.artist-trackarr-last-restore'
+
+# Opt-in: also stamp the result on the live instance, which is where the
+# application reads it from. "When did we last prove we can restore, and did it
+# pass?" is the most valuable line in a backup-confidence report, and without
+# this it is the one line that can never be populated: the admin page, the
+# support report, /admin/diagnostics.json and thirty days of hourly snapshots
+# all read "not recorded" forever, which trains an operator to ignore the
+# field. It stays opt-in because the rehearsal is otherwise strictly isolated
+# from production, and writing to a live volume is not something this script
+# should start doing unannounced.
+if [ "${RESTORE_RECORD_RESULT:-false}" = "true" ]; then
+	service=${COMPOSE_SERVICE:-app}
+	# Resolve the live container the way scripts/backup.sh does. A rehearsal
+	# result must never be attributed to an arbitrary replica.
+	live_ids=$(docker compose ps -aq "$service" 2>/dev/null || true)
+	live_count=$(printf '%s\n' "$live_ids" | awk 'NF {count++} END {print count+0}')
+	if [ "$live_count" -ne 1 ]; then
+		echo "restore: RESTORE_RECORD_RESULT needs exactly one Compose container for service $service; found $live_count" >&2
+		exit 1
+	fi
+	live_id=$(printf '%s\n' "$live_ids" | awk 'NF {print; exit}')
+	live_mounts=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}} {{.Name}}{{"\n"}}{{end}}{{end}}' "$live_id")
+	live_mount_count=$(printf '%s' "$live_mounts" | awk 'NF {count++} END {print count+0}')
+	if [ "$live_mount_count" -ne 1 ]; then
+		echo "restore: RESTORE_RECORD_RESULT expected exactly one /data volume mount on $service" >&2
+		exit 1
+	fi
+	if [ "$(printf '%s' "$live_mounts" | awk 'NF {print $1}')" != "volume" ]; then
+		echo "restore: RESTORE_RECORD_RESULT requires /data to be a named Docker volume" >&2
+		exit 1
+	fi
+	# Same UID and atomic-rename pattern as the backup marker in backup.sh, so
+	# the application never reads a half-written file.
+	docker run --rm --user 10001:10001 --volumes-from "$live_id" "$HELPER_IMAGE" sh -ec '
+umask 027
+marker=/data/.artist-trackarr-last-restore
+temporary="$marker.$$"
+printf "%s\\n%s\\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ok" > "$temporary"
+mv -f "$temporary" "$marker"'
+	echo "restore: recorded the rehearsal result on live service $service"
+fi
 echo "restore: readiness, foreign-key check, key-preserving startup, and restart persistence passed (state $after_fingerprint)"

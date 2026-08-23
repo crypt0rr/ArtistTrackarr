@@ -8,13 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5"
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -689,38 +692,111 @@ func TestAccountThrottleAloneDoesNotLockTheOwnerOut(t *testing.T) {
 	}
 }
 
-func TestProxiedDeploymentWithoutTrustProxyIsReported(t *testing.T) {
-	// With TRUST_PROXY unset behind a reverse proxy, clientIP is the proxy for
+func TestForwardedIdentityThatCannotBeUsedIsReported(t *testing.T) {
+	// Whenever the forwarded header cannot be used, clientIP is the proxy for
 	// every caller, so the peer-scoped counter collapses to one bucket per
 	// account and a stranger can lock the owner out. The misconfiguration is
 	// invisible otherwise, so it must at least be said out loud.
-	var logs bytes.Buffer
-	app := &App{
-		store:        nil,
-		logger:       slog.New(slog.NewJSONHandler(&logs, nil)),
-		loginLimiter: newFixedWindowLimiter(50, time.Minute),
+	//
+	// Every case below drives resolveClientIP, the function login actually
+	// consults. An earlier version of this test re-implemented the trigger
+	// (`!TrustProxy && header != ""`) and so agreed with a warning that only
+	// covered the first case, leaving the second - which an operator is far
+	// likelier to hit, having configured the feature and got the CIDR wrong -
+	// silently degrading throttling.
+	_, mismatched, err := net.ParseCIDR("10.9.0.0/24")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if app.cfg.TrustProxy {
-		t.Fatal("precondition: TrustProxy must default to false")
+	_, matching, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, tc := range []struct {
+		name       string
+		cfg        config.Config
+		forwarded  string
+		wantReason string
+		wantRemedy string
+	}{
+		{
+			name:       "trust proxy unset",
+			cfg:        config.Config{},
+			forwarded:  "203.0.113.9",
+			wantReason: "trust-proxy-disabled",
+			wantRemedy: "set TRUST_PROXY=true",
+		},
+		{
+			name:       "cidrs do not cover the real proxy",
+			cfg:        config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{mismatched}},
+			forwarded:  "203.0.113.9",
+			wantReason: "peer-outside-trusted-cidrs",
+			wantRemedy: "192.0.2.10",
+		},
+		{
+			name:       "header carries no untrusted entry",
+			cfg:        config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{matching}},
+			forwarded:  "192.0.2.11",
+			wantReason: "no-untrusted-forwarded-entry",
+			wantRemedy: "append the client address",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			app := &App{
+				cfg:          tc.cfg,
+				logger:       slog.New(slog.NewJSONHandler(&logs, nil)),
+				loginLimiter: newFixedWindowLimiter(50, time.Minute),
+			}
+			request := httptest.NewRequest(http.MethodGet, "/login", nil)
+			request.RemoteAddr = "192.0.2.10:41234"
+			request.Header.Set("X-Forwarded-For", tc.forwarded)
+
+			ip, reason := app.resolveClientIP(request)
+			if reason != tc.wantReason {
+				t.Fatalf("reason=%q, want %q", reason, tc.wantReason)
+			}
+			if ip != "192.0.2.10" {
+				t.Fatalf("clientIP=%q, want the peer: throttling has not actually collapsed", ip)
+			}
+			app.warnUntrustedForwarding(reason, ip)
+
+			written := logs.String()
+			if !strings.Contains(written, "login throttling is degraded") {
+				t.Fatalf("no warning: %s", written)
+			}
+			if !strings.Contains(written, tc.wantRemedy) {
+				t.Fatalf("the warning does not name the remedy %q: %s", tc.wantRemedy, written)
+			}
+			// It must not repeat on every login request.
+			before := len(written)
+			app.warnUntrustedForwarding(reason, ip)
+			app.warnUntrustedForwarding(reason, ip)
+			if len(logs.String()) != before {
+				t.Fatalf("the warning repeated: %s", logs.String())
+			}
+		})
+	}
+}
+
+// TestTrustedProxyWithMatchingCidrsIsNotReported keeps the warning honest: a
+// correctly configured deployment must stay silent, or the operator learns to
+// ignore the line.
+func TestTrustedProxyWithMatchingCidrsIsNotReported(t *testing.T) {
+	_, matching, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{matching}}}
 	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.RemoteAddr = "192.0.2.10:41234"
 	request.Header.Set("X-Forwarded-For", "203.0.113.9")
-	if strings.TrimSpace(request.Header.Get("X-Forwarded-For")) != "" && !app.cfg.TrustProxy {
-		app.warnUntrustedForwarding()
+	ip, reason := app.resolveClientIP(request)
+	if reason != "" {
+		t.Fatalf("reason=%q, want none for a correct configuration", reason)
 	}
-	written := logs.String()
-	if !strings.Contains(written, "login throttling is degraded") {
-		t.Fatalf("no warning for a proxied deployment without TRUST_PROXY: %s", written)
-	}
-	if !strings.Contains(written, "TRUSTED_PROXY_CIDRS") {
-		t.Fatalf("the warning does not name the remedy: %s", written)
-	}
-	// It must not repeat on every login request.
-	before := len(written)
-	app.warnUntrustedForwarding()
-	app.warnUntrustedForwarding()
-	if len(logs.String()) != before {
-		t.Fatalf("the warning repeated: %s", logs.String())
+	if ip != "203.0.113.9" {
+		t.Fatalf("clientIP=%q, want the forwarded client", ip)
 	}
 }
 
@@ -1593,7 +1669,8 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 		t.Fatalf("due deliveries=%#v err=%v", deliveries, err)
 	}
 	if err := database.MarkDeliveryFailed(
-		context.Background(), deliveries[0].ID, 5, "provider rejected secret detail",
+		context.Background(), deliveries[0].ID, 5,
+		"provider rejected https://ntfy.example/secret-topic token=abcd1234",
 		time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
 	); err != nil {
 		t.Fatal(err)
@@ -1604,9 +1681,24 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	dashboardBody, _ := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if !strings.Contains(string(dashboardBody), "delivery-scroll") ||
-		strings.Contains(string(dashboardBody), "provider rejected secret detail") {
-		t.Fatalf("dashboard delivery log is not compact: %q", dashboardBody)
+	dashboard := string(dashboardBody)
+	if !strings.Contains(dashboard, "delivery-scroll") {
+		t.Fatalf("dashboard delivery log is not a compact scrolling list: %q", dashboard)
+	}
+	// The member is told why their own notification failed - the same
+	// safeDeliveryError-redacted text the destinations panel already shows
+	// them - but never the raw provider string behind it. This assertion used
+	// to forbid the reason outright, which also hid the redacted form and left
+	// a member staring at a bare "failed" badge with nothing to act on.
+	for _, redacted := range []string{"[redacted destination]", "token=[redacted]"} {
+		if !strings.Contains(dashboard, redacted) {
+			t.Fatalf("dashboard does not show the redacted failure reason %q: %q", redacted, dashboard)
+		}
+	}
+	for _, secret := range []string{"ntfy.example/secret-topic", "abcd1234"} {
+		if strings.Contains(dashboard, secret) {
+			t.Fatalf("dashboard leaked unredacted provider detail %q: %q", secret, dashboard)
+		}
 	}
 	response, err = client.Get(server.URL + "/admin")
 	if err != nil {
@@ -1626,7 +1718,7 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	if strings.Contains(string(body), "encrypted-secret") {
 		t.Fatalf("admin audit exposed encrypted destination: %q", body)
 	}
-	if strings.Contains(string(body), "provider rejected secret detail") {
+	if strings.Contains(string(body), "provider rejected") {
 		t.Fatalf("admin summary exposed notification error without explicit access: %q", body)
 	}
 	detailResponse, err := client.Get(server.URL + "/admin/deliveries/" + strconv.FormatInt(deliveries[0].ID, 10))
@@ -1635,7 +1727,8 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}
 	detailBody, _ := io.ReadAll(detailResponse.Body)
 	_ = detailResponse.Body.Close()
-	if detailResponse.StatusCode != http.StatusOK || !strings.Contains(string(detailBody), "provider rejected secret detail") {
+	if detailResponse.StatusCode != http.StatusOK ||
+		!strings.Contains(string(detailBody), "provider rejected [redacted destination] token=[redacted]") {
 		t.Fatalf("admin delivery detail status/body=%d %q", detailResponse.StatusCode, detailBody)
 	}
 	bad := noRedirectClient(client)
@@ -2378,4 +2471,65 @@ func postForm(t *testing.T, client *http.Client, target string, values url.Value
 		t.Fatal(err)
 	}
 	return response
+}
+
+func TestHandlerPanicIsLoggedStructurallyAndRedacted(t *testing.T) {
+	// chi's Recoverer writes to its own standard-library logger, so a handler
+	// panic bypassed structured logging, the redaction every other message gets,
+	// the persisted application log the admin diagnostics page reads, and the
+	// metrics: the operator saw a 500 and no record of why.
+	var logs bytes.Buffer
+	app := &App{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	router := chi.NewRouter()
+	router.Use(app.recoverPanic)
+	router.Get("/boom/{id}", func(http.ResponseWriter, *http.Request) {
+		panic("secret=hunter2 exploded")
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/boom/42", nil))
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", response.Code)
+	}
+	written := logs.String()
+	if !strings.Contains(written, "handler panic recovered") {
+		t.Fatalf("the panic was not logged structurally: %s", written)
+	}
+	// The route pattern, not the resolved path: a path can carry a credential,
+	// as /calendar/feed/{token} does.
+	if !strings.Contains(written, "/boom/{id}") {
+		t.Fatalf("the log does not identify the route: %s", written)
+	}
+	if strings.Contains(written, "/boom/42") {
+		t.Fatalf("the log recorded the resolved path, which can carry a credential: %s", written)
+	}
+	if strings.Contains(written, "hunter2") {
+		t.Fatalf("the panic value was not redacted: %s", written)
+	}
+}
+
+func TestNoTemplateRendersARawClockTime(t *testing.T) {
+	// Every authenticated surface renders timestamps in the signed-in member's
+	// timezone through formatTime, which also appends the zone abbreviation. The
+	// Artists page was the one place still printing a raw UTC clock with no zone
+	// label, so a member read a "Next check" time that was not in their timezone
+	// and had no way to tell.
+	paths, err := filepath.Glob(filepath.Join("templates", "*.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no templates found; the check would pass vacuously")
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A bare .Format on a time value bypasses the member's timezone. The
+		// machine-readable RFC3339 attributes are deliberate and stay.
+		if strings.Contains(string(data), `.Format "2006-01-02 15:04"`) {
+			t.Errorf("%s renders a raw clock time; use formatTime with $.User.Timezone", filepath.Base(path))
+		}
+	}
 }

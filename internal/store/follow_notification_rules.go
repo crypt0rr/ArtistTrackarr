@@ -42,15 +42,6 @@ func (r FollowNotificationRule) effectiveDeliveryMode(now time.Time) string {
 	return normalizeFollowDeliveryMode(r.DeliveryMode)
 }
 
-// AllowsContent determines whether an event for this follow should exist in
-// the member's notification/inbox history. It is retained as a compatibility
-// helper for callers that do not have secondary release metadata. New release
-// paths should use AllowsRelease so compilations can be distinguished from
-// ordinary albums.
-func (r FollowNotificationRule) AllowsContent(primaryType, creditRole, eventType string, now time.Time) bool {
-	return r.AllowsRelease(primaryType, nil, creditRole, eventType, now)
-}
-
 // AllowsRelease determines whether an event for this follow should exist in
 // the member's notification/inbox history. Spotify, iTunes, and MusicBrainz
 // normalize compilations as primary type Album with Compilation in the
@@ -390,8 +381,43 @@ func (s *Store) PauseFollowNotificationRule(ctx context.Context, userID, artistI
 		return err
 	}
 	rule.PausedUntil = until
-	_, err = s.UpdateFollowNotificationRules(ctx, userID, []int64{artistID}, rule)
-	return err
+	if _, err = s.UpdateFollowNotificationRules(ctx, userID, []int64{artistID}, rule); err != nil {
+		return err
+	}
+	// Pausing defers a delivery to the pause expiry, so changing the pause has
+	// to move those deliveries with it. Without this, lifting a pause early left
+	// its notifications parked at the original expiry - the member sees the
+	// follow active again and hears nothing for the rest of the original window -
+	// and extending a pause left them due at the old, earlier time.
+	return s.realignDeferredDeliveries(ctx, userID, artistID, until, time.Now().UTC())
+}
+
+// realignDeferredDeliveries moves the deliveries deferred by one member's follow
+// to match that follow's current pause. Deliveries are matched the same way
+// admission selects the governing follow: the canonical release artist, or an
+// artist credited on the release.
+func (s *Store) realignDeferredDeliveries(ctx context.Context, userID, artistID int64, until *time.Time, now time.Time) error {
+	target := now
+	if until != nil && until.After(now) {
+		target = *until
+	}
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE deliveries
+		SET next_attempt_at=?
+		WHERE status IN ('pending','blocked')
+		  AND next_attempt_at>?
+		  AND EXISTS (
+			SELECT 1 FROM notification_events ne
+			JOIN release_groups rg ON rg.id=ne.release_group_id
+			WHERE ne.id=deliveries.event_id
+			  AND ne.user_id=?
+			  AND (rg.artist_id=? OR EXISTS (
+				SELECT 1 FROM release_credits rc
+				WHERE rc.release_group_id=rg.id AND rc.artist_id=?
+			  ))
+		  )`, timeText(target), timeText(target), userID, artistID, artistID)
+		return err
+	})
 }
 
 func followRuleFromColumns(mode string, primary, featured, albums, eps, singles, compilations, announcements, releaseDay int, paused string, updated string, userID, artistID int64) (FollowNotificationRule, error) {

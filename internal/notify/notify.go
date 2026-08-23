@@ -141,7 +141,7 @@ type ShoutrrrSender struct {
 	SendTimeout time.Duration
 	// client is owned by this sender. Shoutrrr 0.8 still uses
 	// http.DefaultClient for a few services, so Send temporarily scopes this
-	// client around the call while holding notificationHTTPClientMu and restores
+	// client around the call while holding notificationHTTPClientGate and restores
 	// the previous global immediately afterwards.
 	client   *http.Client
 	lookupIP func(context.Context, string, string) ([]net.IP, error)
@@ -153,7 +153,14 @@ type ShoutrrrSender struct {
 // the compatibility layer can deliver and makes retry timing predictable.
 const DefaultSendTimeout = 10 * time.Second
 
-var notificationHTTPClientMu sync.Mutex
+// notificationHTTPClientGate serialises the compatibility-global swap. It is a
+// one-slot channel rather than a sync.Mutex so a waiting send can abandon the
+// queue when its caller's context ends, instead of blocking uninterruptibly.
+//
+// Every HTTP-based send in the process passes through here, so queue wait is
+// unbounded in the number of destinations. The transport budget therefore must
+// not start until the slot is held; see Send.
+var notificationHTTPClientGate = make(chan struct{}, 1)
 
 // NewShoutrrrSender constructs one sender-owned HTTP client and transport for
 // the application lifetime. Individual sends still use shallow client copies
@@ -379,9 +386,12 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := validateNotificationMessage(serviceURL, title, body); err != nil {
 		return err
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
-	defer cancel()
-	if err := validateOutboundTargetWithLookup(sendCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP); err != nil {
+	// Target validation happens before the queue and gets its own budget; it
+	// performs a DNS lookup with an internal deadline of its own.
+	validateCtx, cancelValidate := context.WithTimeout(ctx, s.sendTimeout())
+	err := validateOutboundTargetWithLookup(validateCtx, serviceURL, s.AllowPrivateTargets, true, s.lookupIP)
+	cancelValidate()
+	if err != nil {
 		return err
 	}
 	// Shoutrrr's Telegram service reaches jsonclient.DefaultClient through a
@@ -390,6 +400,8 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// carries the caller's cancellation/timeout context all the way to the
 	// sender-owned HTTP client.
 	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
+		sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
+		defer cancel()
 		started := time.Now()
 		err := s.sendTelegram(sendCtx, serviceURL, title, body)
 		if observer != nil {
@@ -401,8 +413,21 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// Scope the sender-owned client only for this operation and restore the
 	// caller's client even when Shoutrrr returns an error or panics.
 	queueStarted := time.Now()
-	notificationHTTPClientMu.Lock()
+	select {
+	case notificationHTTPClientGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	queueWait := time.Since(queueStarted)
+	// The transport budget starts here, not when this call entered the queue.
+	// Previously one context covered both, so with the gate held by another
+	// send for the full send timeout, the next send in line reached the
+	// transport with nothing left: it returned a deadline error having issued
+	// no request at all, and the delivery layer recorded that as a real
+	// failure and backed the destination off. The queue wait stays bounded
+	// because the select above still honours the caller's context.
+	sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
+	defer cancel()
 	previousClient := http.DefaultClient
 	previousJSONClient := jsonclient.DefaultClient
 	// Shoutrrr's Telegram transport uses jsonclient.DefaultClient, which is
@@ -418,7 +443,7 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 		holdTime := time.Since(holdStarted)
 		jsonclient.DefaultClient = previousJSONClient
 		http.DefaultClient = previousClient
-		notificationHTTPClientMu.Unlock()
+		<-notificationHTTPClientGate
 		if observer != nil {
 			observer(queueWait, holdTime)
 		}
@@ -442,9 +467,12 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := service.Send(body, &params); err != nil {
 		return err
 	}
-	if err := sendCtx.Err(); err != nil {
-		return err
-	}
+	// Deliberately not re-checking sendCtx here. The transport has already
+	// accepted the message, so reporting the deadline instead would turn a
+	// delivered notification into a durable failure that is retried and sent to
+	// the member twice. An expiry that matters is caught by the in-flight check
+	// below, which asks whether a request is still outstanding rather than
+	// whether the clock ran out after the work completed.
 	if transportObserver.hasInFlightRequest() {
 		return context.DeadlineExceeded
 	}
@@ -835,6 +863,14 @@ type DestinationInput struct {
 	Topic    string
 }
 
+// BuildURL constructs a transport URL for a supported destination service.
+//
+// The set it accepts is deliberately the set ValidateTransportPolicy accepts.
+// It previously also built gotify: and smtp: URLs, which that policy rejects
+// unconditionally, so those branches could only ever produce a destination that
+// failed validation the moment it was used - a trap for anyone extending the
+// settings form, which does not offer them either. Adding a transport means
+// adding it in both places.
 func BuildURL(input DestinationInput) (string, error) {
 	switch input.Service {
 	case "advanced":
@@ -863,34 +899,12 @@ func BuildURL(input DestinationInput) (string, error) {
 			u.User = url.UserPassword(input.Username, input.Password)
 		}
 		return u.String(), nil
-	case "gotify":
-		if input.Host == "" || input.Token == "" {
-			return "", errors.New("gotify host and token are required")
-		}
-		return (&url.URL{Scheme: "gotify", Host: input.Host, Path: "/" + input.Token}).String(), nil
 	case "generic":
 		target, err := url.Parse(input.Target)
 		if err != nil || (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
 			return "", errors.New("webhook must be an absolute HTTP(S) URL")
 		}
 		return "generic+" + target.String(), nil
-	case "email":
-		if input.Host == "" || input.From == "" || input.To == "" {
-			return "", errors.New("SMTP host, from, and recipient are required")
-		}
-		port := input.Port
-		if port == "" {
-			port = "587"
-		}
-		if _, err := strconv.Atoi(port); err != nil {
-			return "", errors.New("SMTP port is invalid")
-		}
-		u := &url.URL{Scheme: "smtp", Host: net.JoinHostPort(input.Host, port), Path: "/"}
-		if input.Username != "" {
-			u.User = url.UserPassword(input.Username, input.Password)
-		}
-		u.RawQuery = url.Values{"from": []string{input.From}, "to": []string{input.To}}.Encode()
-		return u.String(), nil
 	default:
 		return "", fmt.Errorf("unsupported destination service %q", input.Service)
 	}

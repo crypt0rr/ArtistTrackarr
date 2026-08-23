@@ -289,3 +289,74 @@ func TestInterruptedImportStaysResumable(t *testing.T) {
 		t.Fatal("an interrupted import is not resumable, so the member has no route forward")
 	}
 }
+
+// TestArtistsPageListsResumableImports pins the route back to an interrupted
+// job. Recovery marks such a job resumable and the detail page offers Resume,
+// but the action is addressed by job id and nothing listed ids anywhere - so a
+// member whose import died to a restart could only reach it by still having
+// the original redirect in their history. The import feature documents Resume;
+// this asserts a member can actually get to it.
+func TestArtistsPageListsResumableImports(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJobWithPayload(ctx, user.ID, []byte("mbid,name\nabc,Retained Artist\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what an unclean shutdown leaves behind.
+	if err := database.FinishImportJob(ctx, user.ID, job.ID, "interrupted"); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/artists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	page := string(raw)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("artists status=%d", response.StatusCode)
+	}
+	link := fmt.Sprintf("/artists/imports/%d", job.ID)
+	if !strings.Contains(page, link) {
+		t.Fatalf("the artists page does not link the resumable import %s, so Resume is unreachable", link)
+	}
+	if !strings.Contains(page, "resumable") {
+		t.Fatalf("the resumable job is listed but not marked resumable: %s", page)
+	}
+}
+
+// TestRecentImportJobsIsOwnerScoped keeps the new listing inside the household
+// ownership model that every other store listing follows.
+func TestRecentImportJobsIsOwnerScoped(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	_ = server
+	_ = client
+	ctx := context.Background()
+	mine, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := database.CreateUser(ctx, "stranger@example.com", "hash", "member", "UTC", "stranger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := database.CreateImportJobWithPayload(ctx, otherID, []byte("mbid,name\nxyz,Theirs\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := database.RecentImportJobs(ctx, mine.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		if job.ID == theirs.ID {
+			t.Fatalf("another member's import job %d is listed", theirs.ID)
+		}
+	}
+}

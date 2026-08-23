@@ -38,14 +38,18 @@ type PageMeta struct {
 
 // PageDiscovery contains artist search and watchlist projections.
 type PageDiscovery struct {
-	Artists             []store.Artist
-	Results             []catalog.ArtistResult
-	SpotifyResults      []catalog.SpotifyArtist
-	ITunesResults       []catalog.ITunesArtist
-	UpcomingReleases    []store.Release
-	RecentReleases      []store.Release
-	ReleaseCount        int
-	FollowCount         int
+	Artists          []store.Artist
+	Results          []catalog.ArtistResult
+	SpotifyResults   []catalog.SpotifyArtist
+	ITunesResults    []catalog.ITunesArtist
+	UpcomingReleases []store.Release
+	RecentReleases   []store.Release
+	ReleaseCount     int
+	FollowCount      int
+	ImportJobs       []store.ImportJob
+	// ArtistListQuery is the current pagination and filter state, echoed into
+	// action forms so a redirect can return to the same view.
+	ArtistListQuery     string
 	ListenBrainzArtists []store.Artist
 	GenreBreakdown      []store.ArtistBreakdown
 	CountryBreakdown    []store.ArtistBreakdown

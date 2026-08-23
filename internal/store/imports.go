@@ -237,8 +237,9 @@ func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, 
 	var created string
 	var finished sql.NullString
 	var payloadSize int64
-	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,status,created_at,finished_at,LENGTH(payload) FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
-		Scan(&job.ID, &job.UserID, &job.Status, &created, &finished, &payloadSize)
+	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,status,created_at,finished_at,LENGTH(payload),`+
+		resumableImportJob+` FROM import_jobs WHERE id=? AND user_id=?`, jobID, userID).
+		Scan(&job.ID, &job.UserID, &job.Status, &created, &finished, &payloadSize, &job.CanResume)
 	if err != nil {
 		return ImportJob{}, err
 	}
@@ -251,7 +252,6 @@ func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, 
 	}
 	if payloadSize > 0 {
 		job.PayloadSize = int(payloadSize)
-		job.CanResume = job.Status == "interrupted" || job.Status == "failed"
 	}
 	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,job_id,source_value,display_name,status,artist_id,reason
 		FROM import_rows WHERE job_id=? ORDER BY id`, jobID)
@@ -282,6 +282,53 @@ func (s *Store) ImportJob(ctx context.Context, userID, jobID int64) (ImportJob, 
 	return job, rows.Err()
 }
 
+// RecentImportJobs lists a member's own import jobs, newest first, with the row
+// tallies computed in the same statement. It exists so a resumable job can be
+// found again: recovery marks an interrupted job resumable and the documented
+// Resume action is addressed by job id, but nothing listed those ids, so the
+// only way to hold one was to still have the redirect from the original upload
+// in your browser history. A member whose import died to a restart had no
+// route back to it at all.
+//
+// The tallies are aggregate subqueries rather than a follow-up query per job,
+// because the caller iterates this cursor; issuing a query per row inside an
+// open cursor is what exhausts the bounded reader pool.
+func (s *Store) RecentImportJobs(ctx context.Context, userID int64, limit int) ([]ImportJob, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT id,user_id,status,created_at,finished_at,LENGTH(payload),`+
+		resumableImportJob+`,
+			(SELECT COUNT(*) FROM import_rows r WHERE r.job_id=import_jobs.id AND r.status='added'),
+			(SELECT COUNT(*) FROM import_rows r WHERE r.job_id=import_jobs.id AND r.status='already_followed'),
+			(SELECT COUNT(*) FROM import_rows r WHERE r.job_id=import_jobs.id AND r.status='invalid')
+		FROM import_jobs WHERE user_id=? ORDER BY created_at DESC, id DESC LIMIT ?`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var jobs []ImportJob
+	for rows.Next() {
+		var job ImportJob
+		var created string
+		var finished sql.NullString
+		var payloadSize int64
+		if err := rows.Scan(&job.ID, &job.UserID, &job.Status, &created, &finished, &payloadSize,
+			&job.CanResume, &job.Added, &job.AlreadyFollowed, &job.Invalid); err != nil {
+			return nil, err
+		}
+		if job.CreatedAt, err = parseStoredTime(created, "import job created_at"); err != nil {
+			return nil, err
+		}
+		if job.FinishedAt, err = parseStoredNullableTime(finished, "import job finished_at"); err != nil {
+			return nil, err
+		}
+		job.PayloadSize = int(payloadSize)
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 // ImportJobPayload returns the retained source upload for an interrupted or
 // failed owner-scoped job. The payload is never exposed cross-user and is
 // copied before returning so callers cannot mutate store-owned memory.
@@ -300,6 +347,17 @@ func (s *Store) ImportJobPayload(ctx context.Context, userID, jobID int64) ([]by
 	}
 	return append([]byte(nil), payload...), nil
 }
+
+// resumableImportJob matches an import job whose retained payload is the only
+// thing that makes the documented Resume action work. Migration 034 exists to
+// keep it, so every sweep that deletes by age must exclude it.
+//
+// One definition on purpose: this predicate previously existed as separate
+// hand-written copies in the unattended sweep, the manual cleanup, and the
+// prunable-count query. They drifted - the guard was added to two of them and
+// not the third - so the scheduler deleted resumable imports while the admin
+// dry-run reported nothing to delete.
+const resumableImportJob = `(status IN ('interrupted','failed') AND length(payload) > 0)`
 
 // PruneExpiredState removes only expired or completed transient state. It
 // deliberately leaves active sessions, current login blocks, queued work, and
@@ -330,7 +388,7 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 		// is the path that runs unattended on every tick, so the two must agree
 		// or the admin dry-run reports nothing while this sweep deletes.
 		{`DELETE FROM import_jobs WHERE created_at < ?
-			AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`, []any{timeText(manualCutoff)}},
+			AND NOT ` + resumableImportJob, []any{timeText(manualCutoff)}},
 	}
 	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (MaintenanceStats, error) {
 		var stats MaintenanceStats

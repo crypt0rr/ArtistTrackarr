@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -36,6 +37,15 @@ type Store struct {
 	retentionPolicy     RetentionPolicy
 	closeOnce           sync.Once
 	closeErr            error
+	// writeRetries counts write attempts replayed after transient SQLite
+	// contention, and writeRetryExhaustions counts bounded retry loops that
+	// gave up. Every write goes through one connection behind a 5s
+	// busy_timeout, so a single retry is already a multi-second stall - and
+	// until these existed nothing in the product could tell an operator
+	// whether a hanging UI was a slow provider or requests queueing behind the
+	// writer.
+	writeRetries          atomic.Uint64
+	writeRetryExhaustions atomic.Uint64
 }
 
 // RetentionPolicy describes the bounded operational state that may be
@@ -134,10 +144,10 @@ func (s *Store) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
 			return tx, nil
 		}
 		lastErr = err
-		if !sqliteBusy(err) || attempt == 4 {
+		if s.writeAttemptSettled(err, attempt) {
 			break
 		}
-		if err := waitWriteRetry(ctx, attempt); err != nil {
+		if err := s.waitWriteRetry(ctx, attempt); err != nil {
 			return nil, err
 		}
 	}
@@ -170,10 +180,10 @@ func (s *Store) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		} else {
 			return nil
 		}
-		if !sqliteBusy(lastErr) || attempt == 4 {
+		if s.writeAttemptSettled(lastErr, attempt) {
 			return lastErr
 		}
-		if err := waitWriteRetry(ctx, attempt); err != nil {
+		if err := s.waitWriteRetry(ctx, attempt); err != nil {
 			return err
 		}
 	}
@@ -208,17 +218,21 @@ func (s *Store) execWriteContext(ctx context.Context, query string, args ...any)
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		result, lastErr = s.DB.ExecContext(ctx, query, args...)
-		if lastErr == nil || !sqliteBusy(lastErr) || attempt == 4 {
+		if lastErr == nil || s.writeAttemptSettled(lastErr, attempt) {
 			return result, lastErr
 		}
-		if err := waitWriteRetry(ctx, attempt); err != nil {
+		if err := s.waitWriteRetry(ctx, attempt); err != nil {
 			return nil, err
 		}
 	}
 	return result, lastErr
 }
 
-func waitWriteRetry(ctx context.Context, attempt int) error {
+// waitWriteRetry backs off before replaying a write. It is a method so every
+// retry across the three bounded loops is counted in one place rather than at
+// each call site.
+func (s *Store) waitWriteRetry(ctx context.Context, attempt int) error {
+	s.writeRetries.Add(1)
 	delay := time.Duration(25*(1<<attempt)) * time.Millisecond
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -228,6 +242,22 @@ func waitWriteRetry(ctx context.Context, attempt int) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// writeAttemptSettled reports whether a bounded retry loop should stop, and
+// records the case where it stops because it ran out of attempts against a
+// busy database. That branch previously existed three times over with no
+// counter on any of them, so retry exhaustion reached an operator only as
+// whatever generic error the caller happened to log.
+func (s *Store) writeAttemptSettled(err error, attempt int) bool {
+	if !sqliteBusy(err) {
+		return true
+	}
+	if attempt == 4 {
+		s.writeRetryExhaustions.Add(1)
+		return true
+	}
+	return false
 }
 
 func sqliteBusy(err error) bool {
@@ -718,7 +748,28 @@ type DiagnosticsSnapshot struct {
 	PendingDeliveries int
 	FailedDeliveries  int
 	RecentLogEntries  int
-	OldestQueueAt     *time.Time
+	// DroppedLogEntries and LogWriteFailures qualify RecentLogEntries. They are
+	// filled in by the process that owns the application-log sink rather than
+	// by the diagnostics query, because the counters live in that sink and not
+	// in the database - a write failure is precisely the case where the
+	// database cannot be asked.
+	DroppedLogEntries uint64
+	LogWriteFailures  uint64
+	// SQLite contention. WriteRetries and WriteRetryExhaustions are cumulative
+	// since process start; the pool waits come from database/sql and say how
+	// often a caller had to queue for a connection. README documents that the
+	// concurrency controls "keep manual work from starving scheduled
+	// synchronization or the SQLite writer", and before these fields nothing
+	// in the product could confirm or refute that for a given household.
+	WriteRetries          uint64
+	WriteRetryExhaustions uint64
+	WriterWaitCount       int64
+	WriterWaitDuration    time.Duration
+	WriterInUse           int
+	ReaderWaitCount       int64
+	ReaderWaitDuration    time.Duration
+	ReaderInUse           int
+	OldestQueueAt         *time.Time
 	// FutureDeliveries flags pending work parked far beyond the normal retry
 	// horizon. This is a safe clock-skew signal; it does not alter admission.
 	FutureDeliveries       int

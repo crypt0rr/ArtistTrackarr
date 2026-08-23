@@ -30,7 +30,6 @@ func TestBuildURL(t *testing.T) {
 		want  string
 	}{
 		{"ntfy", DestinationInput{Service: "ntfy", Topic: "records"}, "ntfy://ntfy.sh/records"},
-		{"gotify", DestinationInput{Service: "gotify", Host: "push.example", Token: "abc"}, "gotify://push.example/abc"},
 		{"generic", DestinationInput{Service: "generic", Target: "https://hooks.example/new"}, "generic+https://hooks.example/new"},
 		{"discord", DestinationInput{Service: "discord", Token: "bot-token", Target: "123456"}, "discord://bot-token@123456"},
 		{"telegram", DestinationInput{Service: "telegram", Token: "bot-token", Target: "-100123"}, "telegram://bot-token@telegram?chats=-100123"},
@@ -46,19 +45,36 @@ func TestBuildURL(t *testing.T) {
 	}
 }
 
-func TestBuildURLEmailAndOptionalCredentials(t *testing.T) {
-	got, err := BuildURL(DestinationInput{Service: "email", Host: "smtp.example", Port: "2525", Username: "mailer", Password: "secret", From: "from@example", To: "to@example"})
-	if err != nil {
-		t.Fatal(err)
+// The former TestBuildURLEmailAndOptionalCredentials covered smtp: URLs, which
+// ValidateTransportPolicy rejects unconditionally, so the builder could only
+// produce a destination that failed the moment it was used. Both the gotify and
+// email branches were removed; the invariant below is what keeps the builder and
+// the policy from drifting apart again.
+func TestBuildURLOnlyProducesTransportsThePolicyAccepts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input DestinationInput
+	}{
+		{"ntfy", DestinationInput{Service: "ntfy", Topic: "records"}},
+		{"generic", DestinationInput{Service: "generic", Target: "https://hooks.example/new"}},
+		{"discord", DestinationInput{Service: "discord", Token: "bot-token", Target: "123456"}},
+		{"telegram", DestinationInput{Service: "telegram", Token: "bot-token", Target: "-100123"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			built, err := BuildURL(test.input)
+			if err != nil {
+				t.Fatalf("BuildURL: %v", err)
+			}
+			if err := ValidateTransportPolicy(built); err != nil {
+				t.Fatalf("BuildURL produced %q, which the transport policy rejects: %v", built, err)
+			}
+		})
 	}
-	parsed := got
-	for _, want := range []string{"smtp://", "smtp.example:2525", "from=from%40example", "to=to%40example", "mailer"} {
-		if !strings.Contains(parsed, want) {
-			t.Fatalf("email URL %q does not contain %q", parsed, want)
+	// A service the policy cannot accept must not be buildable at all.
+	for _, service := range []string{"gotify", "email"} {
+		if _, err := BuildURL(DestinationInput{Service: service, Host: "h", Token: "t", From: "f@e", To: "t@e"}); err == nil {
+			t.Fatalf("BuildURL still constructs %q, which the transport policy always rejects", service)
 		}
-	}
-	if _, err := BuildURL(DestinationInput{Service: "email", Host: "smtp.example", Port: "not-a-port", From: "from@example", To: "to@example"}); err == nil {
-		t.Fatal("invalid SMTP port was accepted")
 	}
 }
 
@@ -626,4 +642,96 @@ func BenchmarkShoutrrrSendSerialization(b *testing.B) {
 		b.ReportMetric(float64(atomic.LoadInt64(&queueWaitNanos))/float64(count), "queue-wait-ns/op")
 		b.ReportMetric(float64(atomic.LoadInt64(&clientHoldNanos))/float64(count), "client-mutex-ns/op")
 	}
+}
+
+// TestQueuedSendGetsItsOwnTransportBudget pins where the per-send watchdog
+// starts. Every HTTP-based send serialises through one process-global gate,
+// because Shoutrrr reaches http.DefaultClient for several services. The send
+// context used to be created before that gate was acquired, so queue time was
+// charged against the transport budget: with the gate held for a full send
+// timeout by someone else, the next send in line arrived with nothing left,
+// returned a deadline error having issued no request at all, and the delivery
+// layer recorded that as a genuine failure and backed the destination off - a
+// slow destination degrading a healthy unrelated one.
+func TestQueuedSendGetsItsOwnTransportBudget(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	slowStarted := make(chan struct{})
+	var fastRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			close(slowStarted)
+			// Outlast the sender's whole budget so the gate is held for it.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * budget):
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		fastRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: budget}
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		// Expected to fail; it is here only to hold the gate.
+		_ = sender.Send(context.Background(), "generic+"+server.URL+"/slow", "title", "body")
+	}()
+	<-slowStarted
+
+	// This send queues behind the slow one. Its budget must start when it
+	// reaches the transport, not now.
+	err := sender.Send(context.Background(), "generic+"+server.URL+"/fast", "title", "body")
+	if err != nil {
+		t.Fatalf("a send queued behind a slow one failed without reaching its destination: %v", err)
+	}
+	if got := fastRequests.Load(); got != 1 {
+		t.Fatalf("requests to the healthy destination=%d, want 1", got)
+	}
+	<-slowDone
+}
+
+// TestQueuedSendStopsWaitingWhenItsCallerGivesUp keeps the queue bounded now
+// that waiting no longer consumes the send budget. Shutdown and per-delivery
+// deadlines both arrive as a cancelled context, and a send still parked in the
+// queue has to honour them rather than block on the gate.
+func TestQueuedSendStopsWaitingWhenItsCallerGivesUp(t *testing.T) {
+	held := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hold" {
+			close(held)
+			<-release
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 5 * time.Second}
+	holder := make(chan struct{})
+	go func() {
+		defer close(holder)
+		_ = sender.Send(context.Background(), "generic+"+server.URL+"/hold", "title", "body")
+	}()
+	<-held
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan error, 1)
+	go func() { waiting <- sender.Send(ctx, "generic+"+server.URL+"/queued", "title", "body") }()
+	// Give the second send time to reach the gate, then withdraw it.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-waiting:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued send returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled send stayed blocked on the gate")
+	}
+	close(release)
+	<-holder
 }

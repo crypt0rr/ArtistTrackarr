@@ -49,13 +49,13 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
-		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Synchronization could not be queued. Please try again.")), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, safeActionMessage(err, "Synchronization could not be queued. Please try again.")), http.StatusSeeOther)
 		return
 	}
 	if a.jobs != nil {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery("Synchronization queued"), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, "Synchronization queued"), http.StatusSeeOther)
 }
 
 func parseFollowArtistID(r *http.Request) (int64, error) {
@@ -102,10 +102,10 @@ func (a *App) updateArtistNotificationRule(w http.ResponseWriter, r *http.Reques
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "The notification rule could not be saved. Please try again.")), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, safeActionMessage(err, "The notification rule could not be saved. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery("Notification rule updated"), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, "Notification rule updated"), http.StatusSeeOther)
 }
 
 func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.Request) {
@@ -128,11 +128,11 @@ func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.R
 		artistIDs = append(artistIDs, id)
 	}
 	if len(artistIDs) == 0 {
-		http.Redirect(w, r, "/artists?"+a.statusQuery("Select at least one artist"), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, "Select at least one artist"), http.StatusSeeOther)
 		return
 	}
 	if len(artistIDs) > 50 {
-		http.Redirect(w, r, "/artists?"+a.statusQuery("Select no more than 50 artists"), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, "Select no more than 50 artists"), http.StatusSeeOther)
 		return
 	}
 	changed, err := a.store.SetFollowNotificationDeliveryMode(r.Context(), session.User.ID, artistIDs, r.FormValue("delivery_mode"))
@@ -141,10 +141,10 @@ func (a *App) updateArtistNotificationRuleBatch(w http.ResponseWriter, r *http.R
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "The notification mode could not be saved. Please try again.")), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, safeActionMessage(err, "The notification mode could not be saved. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery(fmt.Sprintf("Notification mode updated for %d artists", changed)), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, fmt.Sprintf("Notification mode updated for %d artists", changed)), http.StatusSeeOther)
 }
 
 func (a *App) pauseArtistNotifications(w http.ResponseWriter, r *http.Request) {
@@ -164,10 +164,10 @@ func (a *App) pauseArtistNotifications(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Notifications could not be paused. Please try again.")), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, safeActionMessage(err, "Notifications could not be paused. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery(fmt.Sprintf("Notifications paused for %d days", days)), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, fmt.Sprintf("Notifications paused for %d days", days)), http.StatusSeeOther)
 }
 
 func (a *App) resumeArtistNotifications(w http.ResponseWriter, r *http.Request) {
@@ -182,11 +182,50 @@ func (a *App) resumeArtistNotifications(w http.ResponseWriter, r *http.Request) 
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, "/artists?"+a.statusQuery(safeActionMessage(err, "Notifications could not be resumed. Please try again.")), http.StatusSeeOther)
+		http.Redirect(w, r, a.artistsRedirect(r, safeActionMessage(err, "Notifications could not be resumed. Please try again.")), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery("Notifications resumed"), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, "Notifications resumed"), http.StatusSeeOther)
 }
+
+// artistsRedirect returns to the followed list the action was started from.
+// That list is paginated and filtered, so a bare "/artists" dropped a member
+// back to page one of an unfiltered list after every sync, pause or removal -
+// losing the position they were working through, which is worst precisely when
+// they are working down a filtered page applying the same action repeatedly.
+//
+// The context travels in a hidden field on each action form rather than in the
+// Referer header, which proxies and browser privacy settings routinely strip.
+func (a *App) artistsRedirect(r *http.Request, message string) string {
+	target := "/artists?" + a.statusQuery(message)
+	if list := artistListQuery(r); list != "" {
+		target += "&" + list
+	}
+	return target
+}
+
+// artistListQuery echoes back the followed-list parameters and nothing else.
+// The result lands in a Location header from a caller-submitted field, so it
+// is rebuilt from a known set of keys rather than passed through; an unknown
+// or malformed value degrades to the unfiltered list.
+func artistListQuery(r *http.Request) string {
+	raw := strings.TrimSpace(r.FormValue("list"))
+	if raw == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return ""
+	}
+	preserved := url.Values{}
+	for _, key := range []string{"q", "genre", "country", "type", "page"} {
+		if value := strings.TrimSpace(values.Get(key)); value != "" {
+			preserved.Set(key, value)
+		}
+	}
+	return preserved.Encode()
+}
+
 func (a *App) search(w http.ResponseWriter, r *http.Request) {
 	target := "/artists"
 	if query := strings.TrimSpace(r.URL.Query().Get("q")); query != "" {
@@ -565,7 +604,7 @@ func (a *App) unfollow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "artist could not be removed", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/artists?"+a.statusQuery("Artist removed"), http.StatusSeeOther)
+	http.Redirect(w, r, a.artistsRedirect(r, "Artist removed"), http.StatusSeeOther)
 }
 func (a *App) artistResolution(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)

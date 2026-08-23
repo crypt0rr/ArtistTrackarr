@@ -406,6 +406,21 @@ func (s *Store) ProviderHealth(ctx context.Context) ([]ProviderHealth, error) {
 func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	var snapshot DiagnosticsSnapshot
 	snapshot.CheckedAt = time.Now().UTC()
+	// Contention is read first: these are in-process counters that stay
+	// meaningful even when the queries below fail, which is exactly the state
+	// an operator is trying to understand.
+	snapshot.WriteRetries = s.writeRetries.Load()
+	snapshot.WriteRetryExhaustions = s.writeRetryExhaustions.Load()
+	if s.DB != nil {
+		writer := s.DB.Stats()
+		snapshot.WriterWaitCount, snapshot.WriterWaitDuration = writer.WaitCount, writer.WaitDuration
+		snapshot.WriterInUse = writer.InUse
+	}
+	if reader := s.readerDB(); reader != nil {
+		stats := reader.Stats()
+		snapshot.ReaderWaitCount, snapshot.ReaderWaitDuration = stats.WaitCount, stats.WaitDuration
+		snapshot.ReaderInUse = stats.InUse
+	}
 	snapshot.DatabaseHealthState = DatabaseHealthy
 	if healthErr := s.Healthy(ctx); healthErr != nil {
 		var classified *DatabaseHealthError
@@ -461,13 +476,7 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(value) FROM (
 		SELECT next_attempt_at AS value FROM deliveries d
 		WHERE d.status IN ('pending','blocked') AND d.next_attempt_at>?
-		  AND NOT EXISTS (
-			SELECT 1 FROM notification_events ne
-			JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
-			JOIN release_groups rg ON rg.id=ne.release_group_id
-			WHERE ne.id=d.event_id AND fnr.artist_id=rg.artist_id
-			  AND fnr.paused_until IS NOT NULL AND fnr.paused_until > ?
-		  )
+		  AND NOT `+pausedDeliveryDeferral("d.event_id")+`
 		UNION ALL
 		SELECT next_attempt_at FROM release_digest_deliveries
 		WHERE status IN ('pending','blocked') AND next_attempt_at>?)`,

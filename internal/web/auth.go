@@ -118,13 +118,13 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Behind a reverse proxy with TRUST_PROXY unset, clientIP is the proxy for
+	// Whenever the forwarded header cannot be used, clientIP is the proxy for
 	// every caller, so the peer-scoped counter above collapses into a single
 	// bucket per account: any stranger can saturate it and lock the owner out,
 	// and the per-IP limiter becomes one household-wide cap. Say so, once the
 	// evidence is actually in front of us.
-	if !a.cfg.TrustProxy && strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" {
-		a.warnUntrustedForwarding()
+	if peer, reason := a.resolveClientIP(r); reason != "" && strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" {
+		a.warnUntrustedForwarding(reason, peer)
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -274,13 +274,30 @@ func (a *App) acquirePasswordSlot(w http.ResponseWriter, r *http.Request, limite
 	}
 }
 func (a *App) clientIP(r *http.Request) string {
+	ip, _ := a.resolveClientIP(r)
+	return ip
+}
+
+// resolveClientIP returns the throttling identity for a request along with the
+// reason the forwarded header was not used, empty when it was. Callers that
+// only need the identity go through clientIP; the reason exists so the
+// misconfiguration warning is derived from this function's actual decision
+// rather than from a second copy of the same conditions. That matters here:
+// the first version of the warning tested only TrustProxy, so the case this
+// function rejects one line further down - TRUST_PROXY set with CIDRs that do
+// not match the real proxy - collapsed throttling exactly like an unset
+// TRUST_PROXY while reporting nothing.
+func (a *App) resolveClientIP(r *http.Request) (string, string) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	peer := net.ParseIP(host)
-	if !a.cfg.TrustProxy || peer == nil || !a.trustedProxy(peer) {
-		return host
+	if !a.cfg.TrustProxy {
+		return host, "trust-proxy-disabled"
+	}
+	if peer == nil || !a.trustedProxy(peer) {
+		return host, "peer-outside-trusted-cidrs"
 	}
 	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 	// Walk from the nearest proxy toward the original client. Ignore entries
@@ -292,29 +309,44 @@ func (a *App) clientIP(r *http.Request) string {
 			continue
 		}
 		if !a.trustedProxy(candidate) {
-			return candidate.String()
+			return candidate.String(), ""
 		}
 	}
 	// If every forwarded entry is trusted (or malformed), there is no
 	// trustworthy client identity in the header. Use the direct peer instead
 	// of accepting a caller-controlled leftmost value as a throttling key.
-	return host
+	return host, "no-untrusted-forwarded-entry"
 }
 
 // loginThrottleKeys applies both the peer identity and an account identity.
 // The peer key protects a single source while the account key keeps failures
 // throttled when an attacker rotates addresses through a trusted proxy.
-// warnUntrustedForwarding reports a proxied deployment that has not set
-// TRUST_PROXY. It logs once per process: the condition is a static
-// misconfiguration, and a login endpoint is exactly where repeating it would be
-// worst.
-func (a *App) warnUntrustedForwarding() {
+// warnUntrustedForwarding reports a proxied deployment whose forwarded client
+// identity cannot be used, so login throttling collapses to one bucket per
+// account. It logs once per process: every reason below is a static
+// misconfiguration, and a login endpoint is exactly where repeating the line
+// would be worst.
+func (a *App) warnUntrustedForwarding(reason, peer string) {
 	if a.logger == nil || !a.untrustedForwardingWarned.CompareAndSwap(false, true) {
 		return
 	}
-	a.logger.Warn("login throttling is degraded: X-Forwarded-For is present but TRUST_PROXY is not enabled, "+
-		"so every request appears to come from the proxy and all members share one throttle bucket per account",
-		"page", "Sign in", "remedy", "set TRUST_PROXY=true with the proxy's exact TRUSTED_PROXY_CIDRS")
+	// The remedies differ, and the middle one is the hardest to diagnose
+	// unaided: the operator has configured TRUST_PROXY and TRUSTED_PROXY_CIDRS
+	// and has no signal that the CIDRs do not cover the proxy actually in
+	// front of the app. Log the peer so the correct value is readable straight
+	// from the warning.
+	remedy := "set TRUST_PROXY=true with the proxy's exact TRUSTED_PROXY_CIDRS"
+	switch reason {
+	case "peer-outside-trusted-cidrs":
+		remedy = "TRUST_PROXY is enabled but TRUSTED_PROXY_CIDRS does not cover peer " + peer +
+			"; add the network the proxy connects from"
+	case "no-untrusted-forwarded-entry":
+		remedy = "every X-Forwarded-For entry is itself a trusted proxy; " +
+			"configure the proxy to append the client address"
+	}
+	a.logger.Warn("login throttling is degraded: X-Forwarded-For is present but is not being used to identify "+
+		"the client, so all members share one throttle bucket per account",
+		"page", "Sign in", "reason", reason, "remedy", remedy)
 }
 
 // accountThrottleKey is the source-independent failure counter for one account.
