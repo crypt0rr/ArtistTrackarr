@@ -829,9 +829,23 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 			var artist store.Artist
 			artist, syncErr = r.store.ArtistByID(ctx, *req.ArtistID)
 			if syncErr == nil {
-				// A manual request is an explicit refresh. Do not let the
-				// adaptive Spotify watermark turn this into a bookkeeping-only
-				// cycle for artists whose next Spotify check is still in the future.
+				// A manual request is an explicit refresh, so clear a terminal
+				// identity state first. Without this an artist whose MusicBrainz
+				// identity check exhausted its attempt budget was refused here
+				// with "run an explicit sync to retry" - which is exactly what
+				// this is - while also being excluded from the scheduled
+				// admission predicate and from the backlog metric, leaving it
+				// stranded with no route back.
+				//
+				// The reset is inlined rather than delegated to SyncArtistNow:
+				// runSyncCadence already holds syncMu when it calls this, and
+				// that mutex is not reentrant.
+				syncErr = r.store.ResetArtistIdentity(ctx, artist.ID, now)
+			}
+			if syncErr == nil {
+				// Do not let the adaptive Spotify watermark turn this into a
+				// bookkeeping-only cycle for artists whose next Spotify check is
+				// still in the future.
 				artist.SpotifyNextCheckAt = nil
 				r.invalidateSpotifyReleaseCache(artist)
 				_, syncErr = r.syncOne(ctx, artist, now)
@@ -1433,13 +1447,22 @@ func providerFailureRetryDelay(rateLimit *catalog.SpotifyRateLimitError, interva
 
 func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, error) {
 	var summary deliveryStats
-	deliveries, err := r.store.ClaimDueDeliveries(ctx, now, 25, r.workerID, 5*time.Minute)
+	// Give each queue its own reservation rather than letting the digest have
+	// whatever the normal queue leaves over. A saturated normal queue - five
+	// members at the per-user claim cap, a release-day burst, or a backlog
+	// re-armed after an outage - left a limit of zero, so digest deliveries were
+	// not even queried and sat pending indefinitely while the pending digest run
+	// stopped a replacement from being created.
+	const deliveryBatch = 25
+	const digestReservation = 5
+	deliveries, err := r.store.ClaimDueDeliveries(ctx, now, deliveryBatch-digestReservation, r.workerID, 5*time.Minute)
 	if err != nil {
 		return summary, err
 	}
-	digestLimit := 25 - len(deliveries)
-	if digestLimit < 0 {
-		digestLimit = 0
+	// Anything the normal queue did not use is still available to the digest.
+	digestLimit := deliveryBatch - len(deliveries)
+	if digestLimit < digestReservation {
+		digestLimit = digestReservation
 	}
 	digestDeliveries, err := r.store.ClaimDueDigestDeliveries(ctx, now, digestLimit, r.workerID, 5*time.Minute)
 	if err != nil {

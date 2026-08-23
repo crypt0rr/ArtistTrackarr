@@ -207,3 +207,58 @@ func TestCreateUserFromInviteGeneratesAndValidatesUsernamesAtomically(t *testing
 		t.Fatal("invalid timezone invite was accepted")
 	}
 }
+
+func TestCredentialChangeRevokesTheCalendarFeedToken(t *testing.T) {
+	// The calendar feed token is a year-long bearer credential in a plain URL,
+	// usable without a session and without CSRF, exposing the member's upcoming
+	// releases. A member changing their password after losing a device
+	// reasonably expects that to end access, and the README tells them the
+	// change revokes everything active.
+	ctx := context.Background()
+	for _, test := range []struct {
+		name   string
+		change func(t *testing.T, s *Store, userID int64)
+	}{
+		{
+			name: "password change",
+			change: func(t *testing.T, s *Store, userID int64) {
+				if err := s.UpdatePassword(ctx, userID, "new-hash"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "password reset",
+			change: func(t *testing.T, s *Store, userID int64) {
+				raw, err := s.CreateAuthToken(ctx, "reset", "feed-revoke@example.com", &userID, userID, time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.ResetPasswordWithToken(ctx, raw, "new-hash"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := testStore(t)
+			userID, err := s.CreateUser(ctx, "feed-revoke@example.com", "hash", "member", "UTC", "feed-revoke")
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := s.CreateCalendarFeedToken(ctx, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.UserIDByCalendarFeedToken(ctx, raw); err != nil {
+				t.Fatalf("the freshly minted token did not resolve: %v", err)
+			}
+
+			test.change(t, s, userID)
+
+			if _, err := s.UserIDByCalendarFeedToken(ctx, raw); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("the calendar feed token still resolves after a credential change: err=%v", err)
+			}
+		})
+	}
+}

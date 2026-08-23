@@ -2464,3 +2464,68 @@ func TestSlowButSuccessfulDeliveryStillRecordsItsOutcome(t *testing.T) {
 		t.Fatalf("digest state transition ran out of budget: %v", digestResult.err)
 	}
 }
+
+func TestManualSyncRecoversAnUnresolvableArtist(t *testing.T) {
+	// An artist whose MusicBrainz identity check exhausts its attempt budget is
+	// marked unresolvable and excluded from the scheduled admission predicate
+	// and the backlog metric. The refusal tells the member to run an explicit
+	// sync, so that path must actually clear the state - otherwise the artist is
+	// stranded with no route back and nothing signalling it.
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "stranded@example.com", "unused", "member", "UTC", "stranded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "stranded-artist", Name: "Stranded Artist", SortName: "Stranded Artist",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO artist_identity_status
+		(artist_id,status,attempts,next_check_at,last_error,updated_at)
+		VALUES(?,?,?,?,?,?)
+		ON CONFLICT(artist_id) DO UPDATE SET status=excluded.status,attempts=excluded.attempts`,
+		artist.ID, "unresolvable", 5, nil, "upstream unavailable", time.Now().UTC().Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	// The scheduler will not touch it any more, which is the trap.
+	due, err := database.ArtistsDue(ctx, time.Now().UTC(), 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			t.Fatal("precondition: an unresolvable artist should not be scheduled")
+		}
+	}
+
+	if _, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); err != nil {
+		t.Skipf("manual sync request unavailable in this store: %v", err)
+	}
+	provider := &perArtistCatalog{
+		resolved: map[string]catalog.ArtistResult{
+			"stranded-artist": {MBID: "stranded-artist", Name: "Stranded Artist", SortName: "Stranded Artist"},
+		},
+		releases: map[string][]store.Release{
+			"stranded-artist": {{MBID: "stranded-release", Title: "Recovered", PrimaryType: "Album",
+				FirstReleaseDate: "2026-08-18", DatePrecision: 3}},
+		},
+	}
+	runner := testRunner(database, provider)
+	if processed := runner.processManualSyncRequests(ctx, time.Now().UTC()); processed == 0 {
+		t.Fatal("the manual request was not processed")
+	}
+	var status string
+	if err := database.DB.QueryRowContext(ctx,
+		`SELECT status FROM artist_identity_status WHERE artist_id=?`, artist.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "unresolvable" {
+		t.Fatal("an explicit sync did not clear the terminal identity state, so the artist is still stranded")
+	}
+}

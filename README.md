@@ -30,8 +30,11 @@ deployment:
 
 Members can change their password from Settings after confirming their current
 password. The change revokes every active session, including the session used
-to submit it; administrators can also issue the existing one-hour reset link.
-Email remains the recovery and login identity.
+to submit it, and revokes any calendar feed token, because that token grants
+unauthenticated read access to the member's upcoming releases for up to a year.
+Generate a new feed URL from Settings afterwards if you use one. Administrators
+can also issue the existing one-hour reset link, which revokes both in the same
+way. Email remains the recovery and login identity.
 
 Application data remains on the existing Compose volume mapping so upgrades do
 not move user data. Docker Compose names the container `artist-trackarr` for
@@ -50,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.57.1`; local and published images use the
+footer. The current release is `v0.57.2`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -458,6 +461,28 @@ notification. Symbol titles now normalize to themselves, so they stay
 distinguishable from each other while still matching the same title from another
 provider.
 
+The v0.57.2 patch revokes the calendar feed token when a member changes or
+resets their password. The token is a year-long bearer credential in a plain
+URL, usable without a session, and it exposes the member's upcoming releases;
+until now it outlived every credential change, so a member acting on a lost
+device or a leaked feed URL had no way to end access short of finding a separate
+Settings action. Generate a new feed URL after changing a password if you use
+one.
+
+The same patch gives the release digest its own share of each delivery batch.
+The digest previously received whatever the normal delivery queue left over, so
+a saturated queue - several members at the per-member claim cap, a release-day
+burst, or a backlog re-armed after an outage - left nothing and digest
+deliveries were never attempted, while the pending digest run stopped a
+replacement from being created.
+
+An artist whose MusicBrainz identity check exhausted its retry budget is marked
+unresolvable and excluded from scheduled synchronization. The refusal told the
+member to run an explicit sync, but that path did not clear the state, so the
+artist was stranded: never synchronized, absent from the backlog figure, and
+unreachable from the interface. An explicit sync now clears it, which is what
+the message always promised.
+
 The **Release inbox** keeps one owner-scoped entry for each alertable release.
 It shows the latest announcement or release-day event, provider confidence,
 observation history, and source links even when a notification destination was
@@ -556,7 +581,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.57.1` publishes `0.57.1`, `0.57`, and `latest`.
+- Pushing a tag such as `v0.57.2` publishes `0.57.2`, `0.57`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -580,7 +605,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.57.2 docker compose up -d
 ```
 
 ## Configuration

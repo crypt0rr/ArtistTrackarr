@@ -297,8 +297,20 @@ func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) e
 		if changed != 1 {
 			return sql.ErrNoRows
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID)
-		return err
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID); err != nil {
+			return err
+		}
+		// A credential change must also cut off the calendar feed token. It is a
+		// year-long bearer credential in a plain URL, usable without a session
+		// and without CSRF, and it exposes the member's upcoming releases. A
+		// member changing their password after a device is lost reasonably
+		// expects that to end access; leaving it live meant the only kill switch
+		// was a separate Settings action they were never pointed at.
+		if _, err := tx.ExecContext(ctx, `UPDATE calendar_feed_tokens SET revoked_at=?
+			WHERE user_id=? AND revoked_at IS NULL`, nowText(), userID); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 func (s *Store) UpdateProfile(ctx context.Context, userID int64, timezone, reminder, username string) error {
@@ -463,6 +475,12 @@ func (s *Store) ResetPasswordWithToken(ctx context.Context, raw, hash string) er
 			return errors.New("reset token has no user")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash=? WHERE id=?`, hash, userID.Int64); err != nil {
+			return err
+		}
+		// Same reasoning as UpdatePassword: a reset is a credential change, so
+		// the year-long calendar feed token must not outlive it.
+		if _, err := tx.ExecContext(ctx, `UPDATE calendar_feed_tokens SET revoked_at=?
+			WHERE user_id=? AND revoked_at IS NULL`, nowText(), userID.Int64); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, userID.Int64); err != nil {
