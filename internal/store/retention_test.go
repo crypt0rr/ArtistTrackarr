@@ -143,7 +143,12 @@ func TestRetentionKeepsResumableImportJobs(t *testing.T) {
 			t.Fatalf("seed %s: %v", row.id, err)
 		}
 	}
+	// Both deletion paths must apply the guard. PruneExpiredState is the one
+	// that runs unattended on every tick, and it was the one missing it.
 	if _, err := s.CleanupRetention(ctx, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PruneExpiredState(ctx, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	var kept, kentTotal int

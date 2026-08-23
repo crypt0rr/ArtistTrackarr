@@ -624,3 +624,42 @@ func TestPausedFollowDefersDeliveryInsteadOfDiscardingIt(t *testing.T) {
 		}
 	}
 }
+
+func TestPausedFollowSurvivesADisabledFollowOnTheSameRelease(t *testing.T) {
+	// effectiveDeliveryMode reports a paused follow as "off", which used to tie
+	// it with a genuinely disabled follow. The tie-break keeps the first
+	// candidate, so a disabled follow on the canonical artist could beat a
+	// paused immediate follow on a credited artist: the deferral was evaluated
+	// against the wrong rule and dropped, while the event row was still written
+	// and permanently consumed its uniqueness constraint.
+	now := time.Now().UTC()
+	resume := now.Add(48 * time.Hour)
+
+	disabled := FollowNotificationRule{DeliveryMode: FollowDeliveryOff}
+	pausedImmediate := FollowNotificationRule{DeliveryMode: FollowDeliveryImmediate, PausedUntil: &resume}
+
+	// Both report "off" while paused, which is precisely the collision.
+	if disabled.effectiveDeliveryMode(now) != pausedImmediate.effectiveDeliveryMode(now) {
+		t.Fatal("precondition changed: a paused follow no longer projects as off")
+	}
+	// Ranking must use the configured mode so the paused follow outranks the
+	// disabled one regardless of candidate order.
+	rank := func(r FollowNotificationRule) int {
+		switch normalizeFollowDeliveryMode(r.DeliveryMode) {
+		case FollowDeliveryInherit, FollowDeliveryImmediate:
+			return 3
+		case FollowDeliveryDigest:
+			return 2
+		}
+		return 1
+	}
+	if rank(pausedImmediate) <= rank(disabled) {
+		t.Fatalf("paused immediate rank=%d, disabled rank=%d: the paused follow must win",
+			rank(pausedImmediate), rank(disabled))
+	}
+	// And it must still be recognised as a deferral once selected.
+	at, deferred := pausedImmediate.pausedDeliveryResumesAt(now)
+	if !deferred || !at.Equal(resume) {
+		t.Fatalf("selected paused follow did not defer: at=%s deferred=%t", at, deferred)
+	}
+}

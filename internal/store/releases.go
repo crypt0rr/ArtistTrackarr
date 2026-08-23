@@ -485,9 +485,8 @@ func (s *Store) DashboardReleases(
 		OR (rg.date_precision=1 AND length(rg.first_release_date)=4
 			AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
 	)`
-	const preferredProvider = `((a.spotify_id IS NULL AND NOT EXISTS (SELECT 1 FROM release_groups external_release WHERE external_release.artist_id=rg.artist_id AND external_release.source IN ('spotify','itunes','both'))) OR rg.source IN ('spotify','itunes','both') OR NOT EXISTS (
-		SELECT 1 FROM release_groups newer WHERE newer.artist_id=rg.artist_id AND newer.source IN ('spotify','itunes','both')
-	))`
+	// One definition, so the upcoming list and the calendar cannot drift apart.
+	const preferredProvider = calendarPreferredProvider
 	upcoming, err = func() ([]Release, error) {
 		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
 			WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND `+definitelyFuture+`

@@ -2404,3 +2404,63 @@ func (c *countingResolveCatalog) ResolveArtist(ctx context.Context, mbid string)
 	c.resolves.Add(1)
 	return catalog.ArtistResult{MBID: mbid, Name: "Genreless Artist", SortName: "Genreless Artist"}, nil
 }
+
+// slowSender returns success only after the durable-state budget has elapsed.
+type slowSender struct{ delay time.Duration }
+
+func (s slowSender) Validate(string) error { return nil }
+
+func (s slowSender) Send(ctx context.Context, _, _, _ string) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestSlowButSuccessfulDeliveryStillRecordsItsOutcome(t *testing.T) {
+	// The durable-state budget used to start before the send, and a send is
+	// bounded by a longer timeout. A send that succeeded slowly therefore found
+	// the state context already expired: the outcome could not be recorded, the
+	// row stayed pending with attempts unchanged, and the same notification was
+	// re-sent on every later tick, never reaching a terminal state.
+	previous := deliveryStateBudget
+	deliveryStateBudget = 40 * time.Millisecond
+	t.Cleanup(func() { deliveryStateBudget = previous })
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	cipher, err := security.NewCipher("slow delivery secret with at least 32 characters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceURL, err := cipher.Encrypt("test://slow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The send outlasts the state budget but stays well inside the send timeout.
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, slowSender{delay: 120 * time.Millisecond},
+		cipher, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	result := runner.deliverOne(ctx, now, store.Delivery{
+		ID: 1, Destination: store.Destination{ID: 1, EncryptedURL: serviceURL},
+	})
+	if result.failed {
+		t.Fatalf("a successful slow send was reported as failed: %#v", result)
+	}
+	if result.err != nil && errors.Is(result.err, context.DeadlineExceeded) {
+		t.Fatalf("the state transition ran out of budget that started before the send: %v", result.err)
+	}
+
+	digestResult := runner.deliverDigestOne(ctx, now, store.DigestDelivery{
+		ID: 1, Destination: store.Destination{ID: 1, EncryptedURL: serviceURL},
+	})
+	if digestResult.failed {
+		t.Fatalf("a successful slow digest send was reported as failed: %#v", digestResult)
+	}
+	if digestResult.err != nil && errors.Is(digestResult.err, context.DeadlineExceeded) {
+		t.Fatalf("digest state transition ran out of budget: %v", digestResult.err)
+	}
+}

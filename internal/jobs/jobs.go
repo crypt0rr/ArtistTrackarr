@@ -1521,19 +1521,23 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 // immediately before shutdown; recording that outcome prevents an avoidable
 // duplicate on the next run. The bounded context still guarantees shutdown
 // cannot wait indefinitely on a locked database.
+// deliveryStateBudget bounds each durable state transition. It is a variable so
+// tests can shrink it; nothing outside tests reassigns it.
+var deliveryStateBudget = 5 * time.Second
+
 func deliveryStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.Background()
 	if ctx != nil {
 		base = context.WithoutCancel(ctx)
 	}
-	return context.WithTimeout(base, 5*time.Second)
+	return context.WithTimeout(base, deliveryStateBudget)
 }
 
 func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery store.DigestDelivery) deliveryResult {
 	result := deliveryResult{}
-	stateCtx, cancelState := deliveryStateContext(ctx)
-	defer cancelState()
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(stateCtx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	attemptCtx, cancelAttempt := deliveryStateContext(ctx)
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(attemptCtx, 0, delivery.ID, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	cancelAttempt()
 	if attemptErr != nil {
 		r.logger.Warn("record delivery attempt failed", "digest_delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
 	}
@@ -1547,6 +1551,14 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
 		}
 	}
+	// Budget the durable state transition from here, after the send. A send is
+	// bounded by notificationSendTimeout, which is longer than this budget, so
+	// starting the clock before it meant a slow but successful send found the
+	// context already expired: the outcome could never be recorded, the row
+	// stayed pending with attempts unchanged, and the same notification was
+	// re-sent on every later tick without ever reaching a terminal state.
+	stateCtx, cancelState := deliveryStateContext(ctx)
+	defer cancelState()
 	if err == nil {
 		if markErr := r.store.MarkDigestDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
 			if errors.Is(markErr, sql.ErrNoRows) {
@@ -1609,9 +1621,9 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 
 func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
 	result := deliveryResult{}
-	stateCtx, cancelState := deliveryStateContext(ctx)
-	defer cancelState()
-	attemptID, attemptErr := r.store.StartDeliveryAttempt(stateCtx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	attemptCtx, cancelAttempt := deliveryStateContext(ctx)
+	attemptID, attemptErr := r.store.StartDeliveryAttempt(attemptCtx, delivery.ID, 0, delivery.Destination, delivery.Attempts+1, time.Now().UTC())
+	cancelAttempt()
 	if attemptErr != nil {
 		r.logger.Warn("record delivery attempt failed", "delivery_id", delivery.ID, "destination_id", delivery.Destination.ID, "error", notify.RedactError(attemptErr))
 	}
@@ -1625,6 +1637,14 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 			err = r.sendNotification(ctx, serviceURL, delivery.Title, delivery.Body)
 		}
 	}
+	// Budget the durable state transition from here, after the send. A send is
+	// bounded by notificationSendTimeout, which is longer than this budget, so
+	// starting the clock before it meant a slow but successful send found the
+	// context already expired: the outcome could never be recorded, the row
+	// stayed pending with attempts unchanged, and the same notification was
+	// re-sent on every later tick without ever reaching a terminal state.
+	stateCtx, cancelState := deliveryStateContext(ctx)
+	defer cancelState()
 	if err == nil {
 		if markErr := r.store.MarkDeliverySentOwned(stateCtx, delivery.ID, delivery.ClaimOwner, now); markErr != nil {
 			if errors.Is(markErr, sql.ErrNoRows) {

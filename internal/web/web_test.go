@@ -689,6 +689,41 @@ func TestAccountThrottleAloneDoesNotLockTheOwnerOut(t *testing.T) {
 	}
 }
 
+func TestProxiedDeploymentWithoutTrustProxyIsReported(t *testing.T) {
+	// With TRUST_PROXY unset behind a reverse proxy, clientIP is the proxy for
+	// every caller, so the peer-scoped counter collapses to one bucket per
+	// account and a stranger can lock the owner out. The misconfiguration is
+	// invisible otherwise, so it must at least be said out loud.
+	var logs bytes.Buffer
+	app := &App{
+		store:        nil,
+		logger:       slog.New(slog.NewJSONHandler(&logs, nil)),
+		loginLimiter: newFixedWindowLimiter(50, time.Minute),
+	}
+	if app.cfg.TrustProxy {
+		t.Fatal("precondition: TrustProxy must default to false")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if strings.TrimSpace(request.Header.Get("X-Forwarded-For")) != "" && !app.cfg.TrustProxy {
+		app.warnUntrustedForwarding()
+	}
+	written := logs.String()
+	if !strings.Contains(written, "login throttling is degraded") {
+		t.Fatalf("no warning for a proxied deployment without TRUST_PROXY: %s", written)
+	}
+	if !strings.Contains(written, "TRUSTED_PROXY_CIDRS") {
+		t.Fatalf("the warning does not name the remedy: %s", written)
+	}
+	// It must not repeat on every login request.
+	before := len(written)
+	app.warnUntrustedForwarding()
+	app.warnUntrustedForwarding()
+	if len(logs.String()) != before {
+		t.Fatalf("the warning repeated: %s", logs.String())
+	}
+}
+
 func TestSearchFailureLogDoesNotContainQuery(t *testing.T) {
 	var logs bytes.Buffer
 	app := &App{

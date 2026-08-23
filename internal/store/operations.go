@@ -455,13 +455,24 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 		return DiagnosticsSnapshot{}, err
 	}
 	var earliestFuture sql.NullString
+	// A follow paused by its owner defers its delivery on purpose, so it must not
+	// be counted as clock skew: doing so marked a healthy instance degraded and
+	// surfaced a repair action that would have cancelled the pause.
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(value) FROM (
-		SELECT next_attempt_at AS value FROM deliveries
-		WHERE status IN ('pending','blocked') AND next_attempt_at>?
+		SELECT next_attempt_at AS value FROM deliveries d
+		WHERE d.status IN ('pending','blocked') AND d.next_attempt_at>?
+		  AND NOT EXISTS (
+			SELECT 1 FROM notification_events ne
+			JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
+			JOIN release_groups rg ON rg.id=ne.release_group_id
+			WHERE ne.id=d.event_id AND fnr.artist_id=rg.artist_id
+			  AND fnr.paused_until IS NOT NULL AND fnr.paused_until > ?
+		  )
 		UNION ALL
 		SELECT next_attempt_at FROM release_digest_deliveries
 		WHERE status IN ('pending','blocked') AND next_attempt_at>?)`,
-		timeText(snapshot.CheckedAt.Add(24*time.Hour)), timeText(snapshot.CheckedAt.Add(24*time.Hour))).
+		timeText(snapshot.CheckedAt.Add(24*time.Hour)), timeText(snapshot.CheckedAt),
+		timeText(snapshot.CheckedAt.Add(24*time.Hour))).
 		Scan(&snapshot.FutureDeliveries, &earliestFuture); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}

@@ -769,8 +769,15 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 			!item.rule.allowsAccountNotificationMoment(p, eventType) {
 			continue
 		}
+		// Rank on the configured mode, not the paused projection of it. A
+		// paused follow reports "off", which used to tie it with a genuinely
+		// disabled follow; the tie-break keeps the first candidate, so a
+		// disabled follow on the canonical artist could win over a paused
+		// immediate follow on a credited artist. The deferral was then
+		// evaluated against the wrong rule and dropped, while the event row was
+		// still written and permanently consumed its uniqueness constraint.
 		priority := 1
-		switch item.rule.effectiveDeliveryMode(now) {
+		switch normalizeFollowDeliveryMode(item.rule.DeliveryMode) {
 		case FollowDeliveryInherit, FollowDeliveryImmediate:
 			priority = 3
 		case FollowDeliveryDigest:
@@ -790,7 +797,12 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 			return err
 		}
 	}
-	if p.HoldConflictingNotifications && selected.rule.queuesImmediate(now) && !bypassConflictHold {
+	// A paused follow now defers rather than discards, so it will deliver. It
+	// must therefore still take the conflict hold: gating only on
+	// queuesImmediate skipped the hold while the deferral queued the delivery
+	// anyway, releasing an unreviewed release at pause expiry with no hold row.
+	_, deferredDelivery := selected.rule.pausedDeliveryResumesAt(now)
+	if p.HoldConflictingNotifications && (selected.rule.queuesImmediate(now) || deferredDelivery) && !bypassConflictHold {
 		if err := holdConflictingNotificationTx(ctx, tx, userID, releaseID, eventType, title, body, now); err != nil {
 			return err
 		}

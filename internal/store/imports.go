@@ -320,7 +320,13 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 		{`DELETE FROM auth_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, []any{timeText(now)}},
 		{`DELETE FROM login_attempts WHERE first_at < ?`, []any{timeText(cutoff)}},
 		{`DELETE FROM manual_sync_requests WHERE status IN ('completed','failed') AND finished_at IS NOT NULL AND finished_at < ?`, []any{timeText(manualCutoff)}},
-		{`DELETE FROM import_jobs WHERE created_at < ?`, []any{timeText(manualCutoff)}},
+		// Keep interrupted and failed jobs that still carry a payload. That
+		// payload is why migration 034 retains it, and deleting it removes the
+		// Resume import action. CleanupRetention carries the same guard; this
+		// is the path that runs unattended on every tick, so the two must agree
+		// or the admin dry-run reports nothing while this sweep deletes.
+		{`DELETE FROM import_jobs WHERE created_at < ?
+			AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`, []any{timeText(manualCutoff)}},
 	}
 	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (MaintenanceStats, error) {
 		var stats MaintenanceStats
