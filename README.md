@@ -888,7 +888,25 @@ APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
 ```
 
 The rehearsal records a non-sensitive restore result marker in its temporary
-volume; that volume is removed when the rehearsal exits.
+volume; that volume is removed when the rehearsal exits, so by default nothing
+about the rehearsal reaches the running instance and `Last restore rehearsal`
+keeps reading `not recorded`.
+
+To have the running instance report the rehearsal, set `RESTORE_RECORD_RESULT=true`.
+The script then also stamps the marker on the live `/data` volume, resolved from
+the Compose service (`COMPOSE_SERVICE`, default `app`) exactly as `scripts/backup.sh`
+resolves it, writing as UID 10001 through an atomic rename. The timestamp and
+result then appear as `Last restore rehearsal` on the administration page, in the
+support report, in `/admin/diagnostics.json`, and in the hourly operational
+snapshots. It is opt-in because the rehearsal is otherwise fully isolated from
+production:
+
+```console
+APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
+  ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr@sha256:<release-digest> \
+  RESTORE_RECORD_RESULT=true \
+  ./scripts/restore-smoke.sh artist-trackarr-backup.tgz
+```
 
 ## Development
 
