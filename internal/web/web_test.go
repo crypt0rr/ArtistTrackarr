@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -691,38 +692,111 @@ func TestAccountThrottleAloneDoesNotLockTheOwnerOut(t *testing.T) {
 	}
 }
 
-func TestProxiedDeploymentWithoutTrustProxyIsReported(t *testing.T) {
-	// With TRUST_PROXY unset behind a reverse proxy, clientIP is the proxy for
+func TestForwardedIdentityThatCannotBeUsedIsReported(t *testing.T) {
+	// Whenever the forwarded header cannot be used, clientIP is the proxy for
 	// every caller, so the peer-scoped counter collapses to one bucket per
 	// account and a stranger can lock the owner out. The misconfiguration is
 	// invisible otherwise, so it must at least be said out loud.
-	var logs bytes.Buffer
-	app := &App{
-		store:        nil,
-		logger:       slog.New(slog.NewJSONHandler(&logs, nil)),
-		loginLimiter: newFixedWindowLimiter(50, time.Minute),
+	//
+	// Every case below drives resolveClientIP, the function login actually
+	// consults. An earlier version of this test re-implemented the trigger
+	// (`!TrustProxy && header != ""`) and so agreed with a warning that only
+	// covered the first case, leaving the second - which an operator is far
+	// likelier to hit, having configured the feature and got the CIDR wrong -
+	// silently degrading throttling.
+	_, mismatched, err := net.ParseCIDR("10.9.0.0/24")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if app.cfg.TrustProxy {
-		t.Fatal("precondition: TrustProxy must default to false")
+	_, matching, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, tc := range []struct {
+		name       string
+		cfg        config.Config
+		forwarded  string
+		wantReason string
+		wantRemedy string
+	}{
+		{
+			name:       "trust proxy unset",
+			cfg:        config.Config{},
+			forwarded:  "203.0.113.9",
+			wantReason: "trust-proxy-disabled",
+			wantRemedy: "set TRUST_PROXY=true",
+		},
+		{
+			name:       "cidrs do not cover the real proxy",
+			cfg:        config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{mismatched}},
+			forwarded:  "203.0.113.9",
+			wantReason: "peer-outside-trusted-cidrs",
+			wantRemedy: "192.0.2.10",
+		},
+		{
+			name:       "header carries no untrusted entry",
+			cfg:        config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{matching}},
+			forwarded:  "192.0.2.11",
+			wantReason: "no-untrusted-forwarded-entry",
+			wantRemedy: "append the client address",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			app := &App{
+				cfg:          tc.cfg,
+				logger:       slog.New(slog.NewJSONHandler(&logs, nil)),
+				loginLimiter: newFixedWindowLimiter(50, time.Minute),
+			}
+			request := httptest.NewRequest(http.MethodGet, "/login", nil)
+			request.RemoteAddr = "192.0.2.10:41234"
+			request.Header.Set("X-Forwarded-For", tc.forwarded)
+
+			ip, reason := app.resolveClientIP(request)
+			if reason != tc.wantReason {
+				t.Fatalf("reason=%q, want %q", reason, tc.wantReason)
+			}
+			if ip != "192.0.2.10" {
+				t.Fatalf("clientIP=%q, want the peer: throttling has not actually collapsed", ip)
+			}
+			app.warnUntrustedForwarding(reason, ip)
+
+			written := logs.String()
+			if !strings.Contains(written, "login throttling is degraded") {
+				t.Fatalf("no warning: %s", written)
+			}
+			if !strings.Contains(written, tc.wantRemedy) {
+				t.Fatalf("the warning does not name the remedy %q: %s", tc.wantRemedy, written)
+			}
+			// It must not repeat on every login request.
+			before := len(written)
+			app.warnUntrustedForwarding(reason, ip)
+			app.warnUntrustedForwarding(reason, ip)
+			if len(logs.String()) != before {
+				t.Fatalf("the warning repeated: %s", logs.String())
+			}
+		})
+	}
+}
+
+// TestTrustedProxyWithMatchingCidrsIsNotReported keeps the warning honest: a
+// correctly configured deployment must stay silent, or the operator learns to
+// ignore the line.
+func TestTrustedProxyWithMatchingCidrsIsNotReported(t *testing.T) {
+	_, matching, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: config.Config{TrustProxy: true, TrustedProxyNetworks: []*net.IPNet{matching}}}
 	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.RemoteAddr = "192.0.2.10:41234"
 	request.Header.Set("X-Forwarded-For", "203.0.113.9")
-	if strings.TrimSpace(request.Header.Get("X-Forwarded-For")) != "" && !app.cfg.TrustProxy {
-		app.warnUntrustedForwarding()
+	ip, reason := app.resolveClientIP(request)
+	if reason != "" {
+		t.Fatalf("reason=%q, want none for a correct configuration", reason)
 	}
-	written := logs.String()
-	if !strings.Contains(written, "login throttling is degraded") {
-		t.Fatalf("no warning for a proxied deployment without TRUST_PROXY: %s", written)
-	}
-	if !strings.Contains(written, "TRUSTED_PROXY_CIDRS") {
-		t.Fatalf("the warning does not name the remedy: %s", written)
-	}
-	// It must not repeat on every login request.
-	before := len(written)
-	app.warnUntrustedForwarding()
-	app.warnUntrustedForwarding()
-	if len(logs.String()) != before {
-		t.Fatalf("the warning repeated: %s", logs.String())
+	if ip != "203.0.113.9" {
+		t.Fatalf("clientIP=%q, want the forwarded client", ip)
 	}
 }
 
