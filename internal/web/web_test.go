@@ -16,6 +16,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -2413,5 +2414,31 @@ func TestHandlerPanicIsLoggedStructurallyAndRedacted(t *testing.T) {
 	}
 	if strings.Contains(written, "hunter2") {
 		t.Fatalf("the panic value was not redacted: %s", written)
+	}
+}
+
+func TestNoTemplateRendersARawClockTime(t *testing.T) {
+	// Every authenticated surface renders timestamps in the signed-in member's
+	// timezone through formatTime, which also appends the zone abbreviation. The
+	// Artists page was the one place still printing a raw UTC clock with no zone
+	// label, so a member read a "Next check" time that was not in their timezone
+	// and had no way to tell.
+	paths, err := filepath.Glob(filepath.Join("templates", "*.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no templates found; the check would pass vacuously")
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A bare .Format on a time value bypasses the member's timezone. The
+		// machine-readable RFC3339 attributes are deliberate and stay.
+		if strings.Contains(string(data), `.Format "2006-01-02 15:04"`) {
+			t.Errorf("%s renders a raw clock time; use formatTime with $.User.Timezone", filepath.Base(path))
+		}
 	}
 }

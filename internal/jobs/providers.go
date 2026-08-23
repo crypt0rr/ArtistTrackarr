@@ -256,15 +256,30 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	}
 
 	observation.attempted = true
+	// A credit-enrichment failure does not invalidate the releases themselves, so
+	// it is carried alongside them rather than replacing the observation.
+	creditFailure := ""
 	releases, err := r.itunesReleasesForArtist(ctx, artist)
 	if err == nil {
 		r.clearITunesProviderCooldown()
 		if creditProvider, ok := r.itunes.(catalog.ReleaseCreditProvider); ok {
 			credits, creditErr := creditProvider.ArtistReleaseCredits(ctx, artist.Name, releases)
-			if creditErr != nil {
-				r.logger.Debug("iTunes credit enrichment failed", "artist_id", artist.ID, "error", creditErr)
-			} else {
+			switch {
+			case creditErr == nil:
 				releases = append(releases, credits...)
+			case errors.Is(creditErr, context.Canceled), errors.Is(creditErr, context.DeadlineExceeded):
+				// Shutdown or a cancelled sync is not a provider fault.
+				r.logger.Debug("iTunes credit enrichment cancelled", "artist_id", artist.ID)
+			default:
+				// The releases themselves are good, so this is not an outage and
+				// the fallback chain should not be disturbed - but it must not be
+				// invisible either. The MusicBrainz credit path records health and
+				// a reason for exactly this; iTunes reported "healthy" with the
+				// failure only at Debug, so repeated credit failures looked like a
+				// provider with nothing to say.
+				creditFailure = sanitizedProviderError(creditErr)
+				r.logger.Warn("iTunes credit enrichment failed",
+					"artist_id", artist.ID, "error", creditFailure)
 			}
 		}
 		observation.healthy = true
@@ -272,8 +287,12 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 		observation.empty = len(releases) == 0
 		observation.releases = releases
 		observation.status = "healthy"
+		if creditFailure != "" {
+			observation.status = "degraded"
+			observation.lastError = creditFailure
+		}
 		observation.nextCheckAt = timePtr(now.Add(r.interval))
-		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, "")
+		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, creditFailure)
 		return observation, nil
 	}
 
