@@ -98,7 +98,7 @@ func (s *Store) RetentionReport(ctx context.Context, now time.Time) (RetentionRe
 		return RetentionReport{}, err
 	}
 	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*) FROM import_jobs WHERE created_at < ?
-		AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
+		AND NOT `+resumableImportJob, transientCutoff).Scan(&report.PrunableImportJobs); err != nil {
 		return RetentionReport{}, err
 	}
 	report.OldestHistory = oldestTime(report.OldestNotificationEvent, report.OldestDelivery, report.OldestDeliveryAttempt)
@@ -152,7 +152,7 @@ func (s *Store) CleanupRetention(ctx context.Context, now time.Time) (RetentionC
 			// payload is the whole reason migration 034 retains it, and deleting
 			// it silently removes the Resume import action for that job.
 			{`DELETE FROM import_jobs WHERE created_at < ?
-				AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`,
+				AND NOT ` + resumableImportJob,
 				[]any{timeText(now.Add(-time.Duration(policy.TransientStateDays) * 24 * time.Hour))}, &resultStats.ImportJobs},
 		}
 		for _, statement := range statements {

@@ -301,6 +301,17 @@ func (s *Store) ImportJobPayload(ctx context.Context, userID, jobID int64) ([]by
 	return append([]byte(nil), payload...), nil
 }
 
+// resumableImportJob matches an import job whose retained payload is the only
+// thing that makes the documented Resume action work. Migration 034 exists to
+// keep it, so every sweep that deletes by age must exclude it.
+//
+// One definition on purpose: this predicate previously existed as separate
+// hand-written copies in the unattended sweep, the manual cleanup, and the
+// prunable-count query. They drifted - the guard was added to two of them and
+// not the third - so the scheduler deleted resumable imports while the admin
+// dry-run reported nothing to delete.
+const resumableImportJob = `(status IN ('interrupted','failed') AND length(payload) > 0)`
+
 // PruneExpiredState removes only expired or completed transient state. It
 // deliberately leaves active sessions, current login blocks, queued work, and
 // notification/delivery history untouched.
@@ -330,7 +341,7 @@ func (s *Store) PruneExpiredState(ctx context.Context, now time.Time) (Maintenan
 		// is the path that runs unattended on every tick, so the two must agree
 		// or the admin dry-run reports nothing while this sweep deletes.
 		{`DELETE FROM import_jobs WHERE created_at < ?
-			AND NOT (status IN ('interrupted','failed') AND length(payload) > 0)`, []any{timeText(manualCutoff)}},
+			AND NOT ` + resumableImportJob, []any{timeText(manualCutoff)}},
 	}
 	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (MaintenanceStats, error) {
 		var stats MaintenanceStats
