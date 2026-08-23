@@ -129,12 +129,17 @@ type deliveryWork struct {
 // indefinitely.
 const notificationSendTimeout = notify.DefaultSendTimeout
 
-// sendCompletionGrace is how long a send that is already in flight may take to
-// report after its context ends. It exists so a notification the provider has
-// accepted is not recorded as a failure - which burned an attempt and delivered
-// the notification to the member a second time - and is short enough that four
-// workers cannot meaningfully extend the shutdown budget.
-const sendCompletionGrace = 2 * time.Second
+// sendCompletionGrace covers the gap between a send returning and its goroutine
+// being scheduled to report, so a notification the provider has already accepted
+// is not recorded as a failure - which burned an attempt and delivered it to the
+// member a second time.
+//
+// It is deliberately far shorter than any transport timeout. A send that has not
+// returned yet is genuinely still in flight, and its context has just been
+// cancelled, so treating it as cancelled is correct; waiting longer would only
+// let a sender that ignores cancellation hold up shutdown, which
+// TestNotificationSendReturnsWhenSenderIgnoresCancellation exists to prevent.
+const sendCompletionGrace = 250 * time.Millisecond
 
 type artworkBackfillStats struct {
 	ArtistID int64
