@@ -379,3 +379,64 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 		}
 	}
 }
+
+// TestDeliveryLogRendersTheFailureDetailItLoads closes the gap between what
+// DeliveryHistory fetches and what a member is shown. The query already
+// selects the attempt count, the sent time and a redacted last_error, and the
+// dashboard already loads ten rows of it - but the template printed only a red
+// "failed" badge, so a member who is not the household admin had no way to
+// learn why their own release alert failed. The reason was in hand and already
+// safe to display.
+func TestDeliveryLogRendersTheFailureDetailItLoads(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "delivery-log.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	cfg := config.Config{SessionSecret: "delivery log session secret with at least 32 bytes", EncryptionKey: "delivery log encryption key with at least 32 bytes"}
+	cipher, err := security.NewCipher(cfg.EncryptionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(cfg, database, fakeCatalog{}, nil, fakeSender{}, cipher, fakeArtwork{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	sent := now.Add(3 * time.Minute)
+	data := PageData{
+		PageMeta: PageMeta{
+			Title: "Dashboard", User: &UserView{ID: 1, Email: "member@example.com", Role: "member", Timezone: "UTC"}, CSRF: "csrf",
+		},
+		PageAccount: PageAccount{History: []store.DeliveryHistory{
+			{
+				Title: "Failed Album", EventType: "announcement", Destination: "Primary",
+				Status: "failed", Attempts: 4, LastError: "destination refused the notification",
+				CreatedAt: now,
+			},
+			{
+				Title: "Delivered Album", EventType: "announcement", Destination: "Primary",
+				Status: "sent", Attempts: 1, CreatedAt: now, SentAt: &sent,
+			},
+		}},
+	}
+	var output bytes.Buffer
+	if err := app.templates.ExecuteTemplate(&output, "dashboard.html", data); err != nil {
+		t.Fatal(err)
+	}
+	page := output.String()
+	if !strings.Contains(page, "destination refused the notification") {
+		t.Fatalf("the delivery log shows a failure with no reason: %s", page)
+	}
+	if !strings.Contains(page, "4 attempts") {
+		t.Fatalf("the delivery log does not show the attempt count it loaded: %s", page)
+	}
+	if !strings.Contains(page, formatTime(sent, "UTC")) {
+		t.Fatalf("the delivery log does not show when a sent notification went out: %s", page)
+	}
+	// A single-attempt success should stay quiet rather than adding noise.
+	if strings.Contains(page, "1 attempts") {
+		t.Fatalf("the delivery log labels an unremarkable single attempt: %s", page)
+	}
+}
