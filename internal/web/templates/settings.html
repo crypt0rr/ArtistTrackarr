@@ -38,7 +38,8 @@
   <div class="section-head"><div><p class="eyebrow">Calendar sync</p><h2>Subscribe to your release calendar</h2><p>Generate a private ICS feed for your calendar app. The feed includes precise releases from the next year and does not require your ArtistTrackarr login.</p></div>{{if .CalendarFeedActive}}<span class="badge sent">Active</span>{{end}}</div>
   {{if .CalendarFeedURL}}
     <div class="notice"><strong>Copy this URL now.</strong> The token is only shown once and expires {{formatProviderTime .CalendarFeedExpiresAt .User.Timezone}}.</div>
-    <label>Private calendar feed URL<input value="{{.CalendarFeedURL}}" readonly autocomplete="off" spellcheck="false" aria-label="Private calendar feed URL"></label>
+    <label>Private calendar feed URL<input id="calendar-feed-url" value="{{.CalendarFeedURL}}" readonly autocomplete="off" spellcheck="false" aria-label="Private calendar feed URL"></label>
+    <button type="button" class="secondary" data-copy data-copy-target="#calendar-feed-url">Copy feed URL</button>
     <form method="post" action="/settings/calendar-feed" class="inline-form">
       {{template "csrf" .}}<input type="hidden" name="action" value="revoke"><button class="danger">Revoke feed</button>
     </form>

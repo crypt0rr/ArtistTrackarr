@@ -440,3 +440,51 @@ func TestDeliveryLogRendersTheFailureDetailItLoads(t *testing.T) {
 		t.Fatalf("the delivery log labels an unremarkable single attempt: %s", page)
 	}
 }
+
+// TestCalendarFeedURLCanBeCopied pins a copy affordance onto the one value in
+// the product that is shown exactly once. The panel tells a member "Copy this
+// URL now" because the token is never displayed again, but offered no way to
+// copy it - leaving hand-selecting a long opaque URL from a readonly input as
+// the only option, on a value where a partial selection silently produces a
+// feed that never loads. The admin invite link, which has the same
+// show-once-then-gone shape, has had a Copy button all along.
+func TestCalendarFeedURLCanBeCopied(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "feed-copy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	cfg := config.Config{SessionSecret: "feed copy session secret with at least 32 bytes", EncryptionKey: "feed copy encryption key with at least 32 bytes"}
+	cipher, err := security.NewCipher(cfg.EncryptionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(cfg, database, fakeCatalog{}, nil, fakeSender{}, cipher, fakeArtwork{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	data := PageData{
+		PageMeta: PageMeta{Title: "Settings", User: &UserView{ID: 1, Email: "member@example.com", Role: "member", Timezone: "UTC"}, CSRF: "csrf"},
+		PageRelease: PageRelease{
+			CalendarFeedURL:       "https://tracker.example/calendar/feed/opaque-token-value.ics",
+			CalendarFeedActive:    true,
+			CalendarFeedExpiresAt: &expires,
+		},
+	}
+	var output bytes.Buffer
+	if err := app.templates.ExecuteTemplate(&output, "settings.html", data); err != nil {
+		t.Fatal(err)
+	}
+	page := output.String()
+	if !strings.Contains(page, "data-copy") {
+		t.Fatalf("the show-once feed URL has no copy control: %s", page)
+	}
+	// The control has to address this field, or it copies whatever other
+	// [data-copy-value] the page happens to render.
+	if !strings.Contains(page, `data-copy-target="#calendar-feed-url"`) ||
+		!strings.Contains(page, `id="calendar-feed-url"`) {
+		t.Fatalf("the copy control is not bound to the feed URL field: %s", page)
+	}
+}
