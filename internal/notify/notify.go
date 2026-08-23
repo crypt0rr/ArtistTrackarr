@@ -442,9 +442,12 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	if err := service.Send(body, &params); err != nil {
 		return err
 	}
-	if err := sendCtx.Err(); err != nil {
-		return err
-	}
+	// Deliberately not re-checking sendCtx here. The transport has already
+	// accepted the message, so reporting the deadline instead would turn a
+	// delivered notification into a durable failure that is retried and sent to
+	// the member twice. An expiry that matters is caught by the in-flight check
+	// below, which asks whether a request is still outstanding rather than
+	// whether the clock ran out after the work completed.
 	if transportObserver.hasInFlightRequest() {
 		return context.DeadlineExceeded
 	}

@@ -111,7 +111,11 @@ type deliveryStats struct {
 type deliveryResult struct {
 	sent   bool
 	failed bool
-	err    error
+	// skipped marks a delivery that was never attempted, so it is neither a
+	// success nor a failure: the row keeps its attempt count and its claim
+	// simply lapses for the next run to pick up.
+	skipped bool
+	err     error
 }
 
 type deliveryWork struct {
@@ -124,6 +128,13 @@ type deliveryWork struct {
 // after Send returns without allowing a stuck transport to hold a worker
 // indefinitely.
 const notificationSendTimeout = notify.DefaultSendTimeout
+
+// sendCompletionGrace is how long a send that is already in flight may take to
+// report after its context ends. It exists so a notification the provider has
+// accepted is not recorded as a failure - which burned an attempt and delivered
+// the notification to the member a second time - and is short enough that four
+// workers cannot meaningfully extend the shutdown budget.
+const sendCompletionGrace = 2 * time.Second
 
 type artworkBackfillStats struct {
 	ArtistID int64
@@ -497,6 +508,13 @@ func (r *Runner) safeDelivery(ctx context.Context, now time.Time, item deliveryW
 			result = r.recordDeliveryPanic(ctx, now, item)
 		}
 	}()
+	// Do not start work that cannot reach the provider. Without this a delivery
+	// dispatched just before cancellation was recorded as failed with an attempt
+	// consumed, even though nothing was ever sent. Leaving it untouched lets the
+	// claim lapse and the next run pick it up intact.
+	if err := ctx.Err(); err != nil {
+		return deliveryResult{skipped: true}
+	}
 	if item.normal != nil {
 		return r.deliverOne(ctx, now, *item.normal)
 	}
@@ -548,16 +566,42 @@ func (r *Runner) sendNotification(ctx context.Context, serviceURL, title, body s
 		}()
 		result <- r.sender.Send(sendCtx, serviceURL, title, body)
 	}()
+	// A send that has already returned is authoritative, whatever the context
+	// says. Reporting a cancellation instead turned a notification the provider
+	// had accepted into a durable failure: the row burned one of its five
+	// attempts, was pushed out by the retry backoff, and was delivered to the
+	// member a second time. Every SIGTERM landing inside a delivery batch did
+	// this to up to four notifications, so a deployment that updates its image
+	// automatically produced duplicates on every restart.
+	//
+	// The non-blocking check comes first because a bare select picks uniformly
+	// among ready cases: with both a buffered result and a cancelled context
+	// ready, the completed send would be discarded half the time.
 	select {
 	case err := <-result:
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	default:
+	}
+	select {
+	case err := <-result:
+		return err
 	case <-sendCtx.Done():
-		return sendCtx.Err()
+		// sendCtx derives from ctx, so this covers both the caller shutting down
+		// and the send timing out. In either case the send may already have
+		// succeeded and simply not been scheduled to report yet, so give it a
+		// bounded moment rather than calling it a failure immediately. The
+		// sender's own transport is already bounded, so this cannot wait long.
+		timer := time.NewTimer(sendCompletionGrace)
+		defer timer.Stop()
+		select {
+		case err := <-result:
+			return err
+		case <-timer.C:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return sendCtx.Err()
+		}
 	}
 }
 
@@ -1488,6 +1532,15 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 	}
 	feedCanceled := false
 	for _, delivery := range deliveries {
+		// Check first rather than relying on the select: with both cases ready
+		// Go chooses uniformly, so work kept reaching workers after cancellation.
+		// Those deliveries never reach the provider - the sender returns at its
+		// own context guard - yet each still consumed an attempt and recorded a
+		// failure.
+		if ctx.Err() != nil {
+			feedCanceled = true
+			break
+		}
 		item := delivery
 		select {
 		case <-ctx.Done():
@@ -1519,6 +1572,11 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 
 	var storageErrors []error
 	for result := range results {
+		if result.skipped {
+			// Never attempted, so it is neither attempted nor failed. Counting it
+			// would report a shutdown as a burst of delivery failures.
+			continue
+		}
 		summary.Attempted++
 		if result.sent {
 			summary.Sent++

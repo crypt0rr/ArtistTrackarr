@@ -2529,3 +2529,80 @@ func TestManualSyncRecoversAnUnresolvableArtist(t *testing.T) {
 		t.Fatal("an explicit sync did not clear the terminal identity state, so the artist is still stranded")
 	}
 }
+
+// cancellingSender reports success but cancels the runner context on its first
+// call, standing in for a SIGTERM that lands while a send is in flight.
+type cancellingSender struct {
+	cancel func()
+	calls  atomic.Int32
+}
+
+func (s *cancellingSender) Validate(string) error { return nil }
+
+func (s *cancellingSender) Send(context.Context, string, string, string) error {
+	if s.calls.Add(1) == 1 && s.cancel != nil {
+		s.cancel()
+	}
+	return nil
+}
+
+func TestShutdownDoesNotRecordAcceptedSendsAsFailures(t *testing.T) {
+	// sendNotification used to overwrite a completed send with the context
+	// error, and a bare select could prefer ctx.Done() over an already-buffered
+	// success. Either way a notification the provider had accepted was written
+	// as a durable failure: an attempt burned, the retry pushed out, and the
+	// member notified a second time. Every SIGTERM inside a delivery batch did
+	// this, so an auto-updating deployment duplicated notifications on restart.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	cipher, err := security.NewCipher("shutdown delivery secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceURL, err := cipher.Encrypt("test://shutdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &cancellingSender{cancel: cancel}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Exercise the send path directly: deliverOne's storage writes are a
+	// separate concern, and the defect is entirely in how a completed send is
+	// reported once the context has been cancelled underneath it.
+	plainURL, err := cipher.Decrypt(serviceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendErr := runner.sendNotification(ctx, plainURL, "title", "body")
+	if sender.calls.Load() != 1 {
+		t.Fatalf("sender calls=%d, want 1", sender.calls.Load())
+	}
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the sender should have cancelled the context")
+	}
+	if sendErr != nil {
+		t.Fatalf("a send the provider accepted was reported as %v", sendErr)
+	}
+	_ = now
+}
+
+func TestCancelledWorkerSkipsRatherThanFailing(t *testing.T) {
+	// A delivery dispatched just before cancellation cannot reach the provider,
+	// so recording it as failed burned an attempt for work never attempted.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	database := resolutionTestStore(t)
+	runner := testRunner(database, nil)
+	result := runner.safeDelivery(ctx, time.Now().UTC(), deliveryWork{
+		normal: &store.Delivery{ID: 1, Destination: store.Destination{ID: 1}},
+	})
+	if !result.skipped {
+		t.Fatalf("a delivery on a cancelled context was not skipped: %#v", result)
+	}
+	if result.failed {
+		t.Fatalf("work that never ran was recorded as a failure: %#v", result)
+	}
+}
