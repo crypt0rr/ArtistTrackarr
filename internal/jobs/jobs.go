@@ -1056,16 +1056,13 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 	}
 	processed := 0
 	for _, req := range requests {
-		// Stop before touching a claimed request once the runner is shutting
-		// down. Without this the first store call fails with context.Canceled,
-		// and because the completion write deliberately detaches from
-		// cancellation it then succeeds - durably marking the request "failed"
-		// and clearing its lease, which is exactly what stops RecoverExpiredWork
-		// healing the interruption. Every request still claimed but never
-		// touched was retired the same way.
-		//
-		// Leaving them untouched lets the lease lapse so the next run picks them
-		// up intact, which is what the delivery path already does.
+		// Do not start new work once the runner is shutting down. This covers
+		// cancellation observed BETWEEN requests, where the previous one
+		// finished cleanly and so produced no error to react to; a request
+		// interrupted mid-work is handled by the check before the completion
+		// write below. Leaving a claimed request untouched lets its lease lapse
+		// so the next run picks it up intact, which is what the delivery path
+		// already does.
 		if err := ctx.Err(); err != nil {
 			r.logger.Info("manual synchronization stopped for shutdown; claimed requests will be retried",
 				"remaining", len(requests)-processed)
@@ -1106,6 +1103,16 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 		// Completion must remain durable even when the runner context was
 		// cancelled during shutdown. Keep it bounded while allowing the write
 		// to finish independently of the cancelled work context.
+		// A request interrupted by shutdown is not a failed request. The
+		// completion write detaches from cancellation on purpose, so writing a
+		// terminal state here would durably record "failed" and clear the lease
+		// - which is precisely what stops RecoverExpiredWork re-queueing it.
+		// Leaving the lease to lapse is what makes the interruption heal.
+		if errors.Is(syncErr, context.Canceled) || errors.Is(syncErr, context.DeadlineExceeded) {
+			r.logger.Info("manual synchronization interrupted; request will be retried",
+				"request_id", req.ID)
+			break
+		}
 		completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		completionErr := r.store.CompleteManualSyncRequestOwned(completionCtx, req.ID, r.workerID, syncErr)
 		cancel()

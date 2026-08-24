@@ -2713,54 +2713,96 @@ func TestDigestDeliveryOutcomeIsRecordedAfterCancellation(t *testing.T) {
 	}
 }
 
+// cancellingCatalog cancels the runner context while the first request of a
+// batch is being processed, which is what a SIGTERM landing after the claim but
+// during the loop actually looks like. Cancelling before the call instead makes
+// the claim itself fail, so no request is ever touched and the defect cannot
+// appear - which is why an already-cancelled context proves nothing here.
+type cancellingCatalog struct {
+	cancel context.CancelFunc
+	calls  atomic.Int32
+}
+
+func (c *cancellingCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
+	return nil, nil
+}
+
+func (c *cancellingCatalog) ResolveArtist(context.Context, string) (catalog.ArtistResult, error) {
+	return catalog.ArtistResult{}, nil
+}
+
+func (c *cancellingCatalog) ResolveExternalArtist(context.Context, string) ([]catalog.ArtistResult, error) {
+	return nil, nil
+}
+
+func (c *cancellingCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	if c.calls.Add(1) == 1 && c.cancel != nil {
+		c.cancel()
+	}
+	return nil, nil
+}
+
 // TestShutdownLeavesManualSyncRequestsRetryable is #255. The manual-sync loop
 // claimed up to three requests with a five-minute lease and iterated them with
-// no cancellation guard. On SIGTERM the first store call failed with
-// context.Canceled, and because the completion write deliberately detaches from
-// cancellation it then succeeded - durably writing status='failed' and clearing
-// the lease, which is precisely what stops RecoverExpiredWork healing the
-// interruption. Requests still claimed but never touched were retired the same
-// way, so a member's "Sync now" came back as a permanent failure it never had.
+// no cancellation guard. When a shutdown landed mid-batch the first store call
+// failed with context.Canceled, and because the completion write deliberately
+// detaches from cancellation it then SUCCEEDED - durably writing status='failed'
+// and clearing the lease, which is exactly what stops RecoverExpiredWork healing
+// the interruption. Requests still claimed but never touched were retired the
+// same way, so a member's "Sync now" came back as a permanent failure that never
+// actually happened.
 func TestShutdownLeavesManualSyncRequestsRetryable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	now := time.Now().UTC()
 	database := resolutionTestStore(t)
 	userID, err := database.CreateUser(ctx, "manual-sync@example.com", "hash", "member", "UTC", "manual-sync")
 	if err != nil {
 		t.Fatal(err)
 	}
-	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "manual-sync-artist", Name: "Manual Sync Artist"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); err != nil {
-		t.Fatal(err)
-	}
-
-	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	// The runner is already stopping when the batch runs, which is what a
-	// SIGTERM landing just after the claim looks like.
-	cancel()
-	processed := runner.processManualSyncRequests(ctx, now)
-	if processed != 0 {
-		t.Fatalf("processed=%d during shutdown, want 0 retired", processed)
+	// Three requests, so the batch has work left after the shutdown lands.
+	for i := 0; i < 3; i++ {
+		artist, err := database.UpsertArtist(ctx, store.Artist{
+			MBID: fmt.Sprintf("manual-sync-artist-%d", i), Name: fmt.Sprintf("Manual Sync Artist %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	var status string
-	var leaseOwner sql.NullString
+	// The claim succeeds on a live context; cancellation lands while the first
+	// request is being processed.
+	runner := New(database, &cancellingCatalog{cancel: cancel}, catalog.AlbumEPNormalizer{}, nil, nil,
+		time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	runner.processManualSyncRequests(ctx, now)
+
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the runner context should have been cancelled during the batch")
+	}
+	var failed int
 	if err := database.DB.QueryRow(
-		`SELECT status,lease_owner FROM manual_sync_requests WHERE requested_by=?`, userID).
-		Scan(&status, &leaseOwner); err != nil {
+		`SELECT COUNT(*) FROM manual_sync_requests WHERE requested_by=? AND status='failed'`, userID).
+		Scan(&failed); err != nil {
 		t.Fatal(err)
 	}
-	if status == "failed" {
-		t.Fatal("a queued Sync now request was durably marked failed by a shutdown that never attempted it")
+	if failed > 0 {
+		t.Fatalf("%d queued Sync now requests were durably marked failed by a shutdown, so RecoverExpiredWork cannot heal them", failed)
 	}
-	if status == "completed" {
-		t.Fatalf("status=%q, want the request left retryable", status)
+	// The untouched requests must keep a lease that can lapse, so the next run
+	// picks them up intact.
+	var retryable int
+	if err := database.DB.QueryRow(
+		`SELECT COUNT(*) FROM manual_sync_requests WHERE requested_by=? AND status IN ('queued','running')`, userID).
+		Scan(&retryable); err != nil {
+		t.Fatal(err)
+	}
+	if retryable == 0 {
+		t.Fatal("no manual sync request survived the shutdown in a retryable state")
 	}
 }
