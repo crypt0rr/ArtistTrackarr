@@ -155,8 +155,40 @@ func appendField(fields *[]Field, attr slog.Attr) {
 	*fields = append(*fields, Field{Key: key, Value: fmt.Sprint(attr.Value)})
 }
 
+// safeDiagnosticKeys are attribute keys that trip the substring net below but
+// carry nothing secret by construction. They are matched EXACTLY: a substring
+// allowlist would reopen the hole the net exists to close, so "auth_tokens" is
+// exempt while "auth_token" is not.
+//
+// Every entry needs a reason to be here, because each one is a hole:
+//
+//	token_fingerprint - a truncated SHA-256 prefix, not reversible to the token.
+//	    It exists so an operator can correlate a failing invite or reset link
+//	    without ever seeing the token; redacting it removes the only thing it
+//	    was added for.
+//	auth_tokens       - an integer row count reported by the retention sweep and
+//	    the maintenance job. Rendering a count as [redacted] reads as though a
+//	    leak was prevented, which teaches an operator to distrust the marker.
+//	public_url        - the operator-configured public base URL. It is public by
+//	    definition and is the one startup line confirming PUBLIC_URL parsed as
+//	    intended, which is the most common source of broken notification and
+//	    calendar links.
+var safeDiagnosticKeys = map[string]struct{}{
+	"token_fingerprint": {},
+	"auth_tokens":       {},
+	"public_url":        {},
+}
+
+// sensitiveKey reports whether an attribute value must be destroyed before it
+// reaches stdout, the in-memory ring, or the application_logs table. The
+// substring net is deliberately broad because it must also cover keys nobody
+// anticipated; safeDiagnosticKeys carves out the few that the application emits
+// on purpose as operator signal.
 func sensitiveKey(key string) bool {
-	key = strings.ToLower(key)
+	key = strings.ToLower(strings.TrimSpace(key))
+	if _, safe := safeDiagnosticKeys[key]; safe {
+		return false
+	}
 	for _, part := range []string{"password", "secret", "token", "credential", "encrypted", "url", "body"} {
 		if strings.Contains(key, part) {
 			return true

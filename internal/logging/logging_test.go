@@ -88,3 +88,70 @@ func TestHandlerAttributesGroupsAndSink(t *testing.T) {
 		t.Fatal("async sink did not signal Done after close")
 	}
 }
+
+// TestDeliberateDiagnosticFieldsSurviveRedaction pins the three fields the
+// application emits specifically as operator signal. The redaction net matches
+// key SUBSTRINGS, so "token_fingerprint", "auth_tokens" and "public_url" were
+// all destroyed - in stdout, in the in-memory ring, and in the application_logs
+// row the admin page renders. The fingerprint is a truncated SHA-256 prefix
+// added precisely so an operator can correlate a failing invite link without
+// seeing the token; redacting it removed the only thing it was for, and a row
+// count rendered as [redacted] reads as though a leak was prevented.
+func TestDeliberateDiagnosticFieldsSurviveRedaction(t *testing.T) {
+	for _, key := range []string{"token_fingerprint", "auth_tokens", "public_url"} {
+		if sensitiveKey(key) {
+			t.Errorf("%q is redacted, so the operator signal it exists to carry never arrives", key)
+		}
+	}
+}
+
+// TestRedactionAllowlistIsExactNotSubstring keeps the carve-out from reopening
+// the hole the net exists to close. Every key below is a near miss of an
+// allowlisted one and must still be destroyed.
+func TestRedactionAllowlistIsExactNotSubstring(t *testing.T) {
+	for _, key := range []string{
+		"token", "auth_token", "session_token", "api_token",
+		"public_url_secret", "public_urls", "url", "callback_url",
+		"password", "client_secret", "encrypted_url", "body",
+		"TOKEN_FINGERPRINT_RAW", "x-auth-tokens-header",
+	} {
+		if !sensitiveKey(key) {
+			t.Errorf("%q is not redacted; the allowlist is matching too loosely", key)
+		}
+	}
+	// Case and surrounding space must not smuggle a value past the net either.
+	for _, key := range []string{"  Token  ", "SECRET", " Password "} {
+		if !sensitiveKey(key) {
+			t.Errorf("%q is not redacted", key)
+		}
+	}
+}
+
+// TestAllowlistedKeysReachTheHandlerIntact drives the real handler rather than
+// the predicate, because redactAttr runs in both Handle and WithAttrs and the
+// value has to survive both paths.
+func TestAllowlistedKeysReachTheHandlerIntact(t *testing.T) {
+	var buf bytes.Buffer
+	handler := NewHandler(slog.NewJSONHandler(&buf, nil), 16)
+	logger := slog.New(handler)
+	logger.Info("server listening", "public_url", "https://tracker.example", "token_fingerprint", "a1b2c3d4e5f6")
+	logger.With("auth_tokens", 42).Info("retention cleanup completed")
+
+	out := buf.String()
+	for _, want := range []string{"https://tracker.example", "a1b2c3d4e5f6", "42"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("value %q did not survive redaction: %s", want, out)
+		}
+	}
+	if strings.Contains(out, "[redacted]") {
+		t.Fatalf("a deliberately safe field was redacted: %s", out)
+	}
+	// And the ring the admin page reads must agree with stdout.
+	for _, entry := range handler.Snapshot() {
+		for _, f := range entry.Attributes {
+			if f.Value == "[redacted]" {
+				t.Fatalf("field %q redacted in the ring but not in stdout", f.Key)
+			}
+		}
+	}
+}
