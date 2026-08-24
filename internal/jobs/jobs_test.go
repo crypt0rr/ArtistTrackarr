@@ -2806,3 +2806,75 @@ func TestShutdownLeavesManualSyncRequestsRetryable(t *testing.T) {
 		t.Fatal("no manual sync request survived the shutdown in a retryable state")
 	}
 }
+
+// TestTruncatedITunesCatalogueDoesNotSuppressTheFallback is #256. Apple's lookup
+// endpoint hard-caps at 200 collections and ignores offset, so a prolific
+// artist's catalogue arrives as an arbitrary, non-chronological subset. The
+// releases found are still worth importing, but reporting the fetch as a clean
+// success set observation.succeeded, and succeeded is exactly what suppresses
+// the MusicBrainz observation that would have supplied the missing releases —
+// so the gap was never filled and the provider status read healthy.
+//
+// Verified live on 2026-08-24: limit=150 returns 150 collections while
+// limit=200, 250 and 300 all return exactly 200.
+func TestTruncatedITunesCatalogueDoesNotSuppressTheFallback(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "trunc-artist", Name: "Trunc Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := []store.Release{{MBID: "trunc-release", ArtistID: artist.ID, Title: "Trunc Release",
+		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes"}}
+	provider := &canonicalITunesReleaseCatalog{
+		releases: found,
+		err:      &catalog.ITunesCatalogTruncatedError{ArtistID: "42", Limit: 200},
+	}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+
+	observation, err := runner.observeITunes(ctx, artist, now, true)
+	if err != nil {
+		t.Fatalf("a truncated catalogue was reported as a failure: %v", err)
+	}
+	// The partial catalogue is still imported.
+	if len(observation.releases) != 1 {
+		t.Fatalf("releases=%d, want the partial catalogue kept", len(observation.releases))
+	}
+	// But it must not count as success, or MusicBrainz never runs.
+	if observation.succeeded {
+		t.Fatal("a truncated iTunes catalogue counted as success, so the MusicBrainz fallback that would fill the gap is suppressed")
+	}
+	if observation.status != "degraded" {
+		t.Fatalf("status=%q for a truncated catalogue, want degraded", observation.status)
+	}
+	if observation.lastError == "" {
+		t.Fatal("truncation was not recorded as a provider reason, so an operator sees a healthy check")
+	}
+}
+
+// TestCompleteITunesCatalogueStillCountsAsSuccess keeps the change off the
+// ordinary path: an artist under the cap must still short-circuit the fallback,
+// or every sync would make a pointless MusicBrainz request.
+func TestCompleteITunesCatalogueStillCountsAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "whole-artist", Name: "Whole Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &canonicalITunesReleaseCatalog{releases: []store.Release{{
+		MBID: "whole-release", ArtistID: artist.ID, Title: "Whole Release",
+		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes",
+	}}}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	observation, err := runner.observeITunes(ctx, artist, time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observation.succeeded || observation.status != "healthy" {
+		t.Fatalf("a complete catalogue observation=%#v, want succeeded and healthy", observation)
+	}
+}

@@ -1366,15 +1366,20 @@ func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artis
 	releases, resolvedID, resolvedURL, err := canonical.ArtistReleasesForCanonical(
 		ctx, artist.MBID, artist.Name, providerID,
 	)
-	if err != nil {
+	// A truncated catalogue is reported alongside usable releases rather than
+	// instead of them, so it must not discard them here either. The identity is
+	// still worth saving: the lookup succeeded, it was only incomplete.
+	truncated := &catalog.ITunesCatalogTruncatedError{}
+	catalogTruncated := errors.As(err, &truncated)
+	if err != nil && !catalogTruncated {
 		return nil, err
 	}
 	if strings.TrimSpace(resolvedID) != "" && (!found || identity.ProviderID != resolvedID) {
-		if err := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); err != nil {
-			return nil, fmt.Errorf("persist iTunes artist identity: %w", err)
+		if saveErr := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); saveErr != nil {
+			return nil, fmt.Errorf("persist iTunes artist identity: %w", saveErr)
 		}
 	}
-	return releases, nil
+	return releases, err
 }
 
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {

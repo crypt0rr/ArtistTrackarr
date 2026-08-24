@@ -1710,14 +1710,50 @@ func TestITunesAlbumLookupIssuesOneRequestBecauseOffsetIsIgnored(t *testing.T) {
 	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
 	releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
 		"11111111-1111-4111-8111-111111111111", "Prolific Artist", "42")
-	if err != nil {
-		t.Fatalf("a full page was reported as an error instead of a bound: %v", err)
+	// The releases must still be returned - discarding a prolific artist's
+	// catalogue is what #186 fixed - but a full page also means Apple truncated
+	// it, and that is now reported alongside them rather than passed off as a
+	// clean result. Verified live: limit=150 yields 150 collections while 200,
+	// 250 and 300 all yield exactly 200.
+	truncated := &ITunesCatalogTruncatedError{}
+	if !errors.As(err, &truncated) {
+		t.Fatalf("a full page was not reported as truncated: %v", err)
+	}
+	if truncated.Limit != 200 {
+		t.Fatalf("truncation limit=%d, want 200", truncated.Limit)
 	}
 	if len(releases) != 200 {
-		t.Fatalf("releases=%d, want the full page of 200", len(releases))
+		t.Fatalf("releases=%d, want the full page of 200 kept despite the truncation signal", len(releases))
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("upstream requests=%d, want exactly 1", got)
+	}
+}
+
+// TestITunesShortPageIsNotReportedAsTruncated keeps the signal off the ordinary
+// case: an artist whose catalogue fits under the cap must produce no truncation
+// error, or every sync would degrade the provider and force a pointless fallback.
+func TestITunesShortPageIsNotReportedAsTruncated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rows := []string{`{"wrapperType":"artist","artistType":"Artist","artistId":43,"artistName":"Modest Artist"}`}
+		for id := 1; id <= 12; id++ {
+			rows = append(rows, fmt.Sprintf(
+				`{"wrapperType":"collection","collectionType":"Album","collectionId":%d,"collectionName":"Album %d","artistName":"Modest Artist","releaseDate":"2026-09-01T00:00:00Z","trackCount":10}`,
+				2000+id, id))
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"resultCount":%d,"results":[`, len(rows))+strings.Join(rows, ",")+`]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
+		"22222222-2222-4222-8222-222222222222", "Modest Artist", "43")
+	if err != nil {
+		t.Fatalf("a short page reported an error: %v", err)
+	}
+	if len(releases) != 12 {
+		t.Fatalf("releases=%d, want 12", len(releases))
 	}
 }
 
