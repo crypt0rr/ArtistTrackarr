@@ -411,6 +411,10 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	// an operator is trying to understand.
 	snapshot.WriteRetries = s.writeRetries.Load()
 	snapshot.WriteRetryExhaustions = s.writeRetryExhaustions.Load()
+	if nanos := s.writeRetryExhaustedAt.Load(); nanos > 0 {
+		at := time.Unix(0, nanos).UTC()
+		snapshot.LastWriteContentionAt = &at
+	}
 	if s.DB != nil {
 		writer := s.DB.Stats()
 		snapshot.WriterWaitCount, snapshot.WriterWaitDuration = writer.WaitCount, writer.WaitDuration

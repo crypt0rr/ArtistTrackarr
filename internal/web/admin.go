@@ -126,6 +126,10 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
+	if !logHealth.LastLossAt.IsZero() {
+		lossAt := logHealth.LastLossAt
+		snapshot.LastLogLossAt = &lossAt
+	}
 	retention, err := a.store.RetentionReport(r.Context(), now)
 	if err != nil {
 		a.logger.Error("retention diagnostics JSON failed", "path", r.URL.Path, "error", err)
@@ -446,7 +450,12 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
 	d.Diagnostics, err = a.store.Diagnostics(r.Context())
-	d.Diagnostics.DroppedLogEntries, d.Diagnostics.LogWriteFailures = a.logSinkHealth().Dropped, a.logSinkHealth().Errors
+	health := a.logSinkHealth()
+	d.Diagnostics.DroppedLogEntries, d.Diagnostics.LogWriteFailures = health.Dropped, health.Errors
+	if !health.LastLossAt.IsZero() {
+		lossAt := health.LastLossAt
+		d.Diagnostics.LastLogLossAt = &lossAt
+	}
 	failed = a.pageStoreError(r, &d, "Household administration", "system diagnostics", err) || failed
 	d.Retention, err = a.store.RetentionReport(r.Context(), time.Now().UTC())
 	failed = a.pageStoreError(r, &d, "Household administration", "retention report", err) || failed
@@ -540,6 +549,10 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	// The sink counters do not come from the diagnostics query; fold them in
 	// before deriving status so log loss can contribute a degraded reason.
 	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
+	if !logHealth.LastLossAt.IsZero() {
+		lossAt := logHealth.LastLossAt
+		snapshot.LastLogLossAt = &lossAt
+	}
 	var report strings.Builder
 	runnerState := "stopped"
 	if runner.Running {

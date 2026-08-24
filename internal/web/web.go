@@ -63,6 +63,10 @@ type LogSinkHealth struct {
 	// Errors counts records the sink accepted but failed to persist.
 	Dropped uint64
 	Errors  uint64
+	// LastLossAt is when loss most recently occurred. The counters are
+	// cumulative for the process lifetime, so without this a single dropped
+	// record pins the operational status to degraded until a restart.
+	LastLossAt time.Time
 }
 
 // SetLogHealth wires the application-log sink's counters into diagnostics.

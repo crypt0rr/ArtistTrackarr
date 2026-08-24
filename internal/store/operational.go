@@ -19,6 +19,10 @@ const (
 	// indicates that the backlog is no longer making useful progress.
 	operationalDigestWarnAfter = 15 * time.Minute
 	operationalBackupWarnAfter = 7 * 24 * time.Hour
+	// operationalLossWindow is how long a log-loss or write-contention event
+	// keeps describing the instance. Both are driven by cumulative counters, so
+	// without a window a single event degrades the instance until restart.
+	operationalLossWindow = time.Hour
 )
 
 // OperationalStatus classifies safe, non-sensitive health signals for an
@@ -65,13 +69,21 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 	// outage or a SQLite stall producing a burst of Error records - so an
 	// operator reading that history during an incident needs to be told it has
 	// gaps rather than trusting a quiet-looking page.
-	if snapshot.DroppedLogEntries > 0 || snapshot.LogWriteFailures > 0 {
+	//
+	// The counters are cumulative for the process lifetime, so they are paired
+	// with the instant of the most recent occurrence: on their own, one dropped
+	// record at 03:00 left the instance reading degraded until it restarted,
+	// which is unlike every other reason here and trains an operator to ignore
+	// the banner.
+	if (snapshot.DroppedLogEntries > 0 || snapshot.LogWriteFailures > 0) &&
+		operationalWithin(snapshot.LastLogLossAt, now, operationalLossWindow) {
 		addReason("application log loss")
 	}
 	// Retries are normal under load and are reported without a status change;
 	// exhaustion means a write was actually refused after five attempts and a
 	// 5s busy_timeout on each, which a household should never reach.
-	if snapshot.WriteRetryExhaustions > 0 {
+	if snapshot.WriteRetryExhaustions > 0 &&
+		operationalWithin(snapshot.LastWriteContentionAt, now, operationalLossWindow) {
 		addReason("database write contention")
 	}
 	if snapshot.PausedDestinations > 0 {
@@ -97,6 +109,21 @@ func OperationalStatus(snapshot DiagnosticsSnapshot, runnerStatus string, now ti
 		addReason("backup overdue")
 	}
 	return status, reasons
+}
+
+// operationalWithin reports whether an event happened recently enough to still
+// describe the instance's current condition. It is the counterpart of
+// operationalAgeAtLeast: that one waits for a condition to persist, this one
+// lets a past event stop counting.
+//
+// A nil instant means the condition has a count but no recorded time, which is
+// only possible for a snapshot assembled before the timestamps existed; treat it
+// as current so an upgrade cannot silently hide a real problem.
+func operationalWithin(at *time.Time, now time.Time, window time.Duration) bool {
+	if at == nil {
+		return true
+	}
+	return now.Sub(at.UTC()) <= window
 }
 
 func operationalAgeAtLeast(at *time.Time, now time.Time, threshold time.Duration) bool {

@@ -46,6 +46,12 @@ type Store struct {
 	// writer.
 	writeRetries          atomic.Uint64
 	writeRetryExhaustions atomic.Uint64
+	// writeRetryExhaustedAt is the unix-nano instant of the most recent
+	// exhaustion. The counters above are cumulative for the process lifetime, so
+	// on their own they pin the operational status to degraded until a restart -
+	// every other reason in OperationalStatus is either current state or
+	// age-thresholded. This lets the reason clear the way the others do.
+	writeRetryExhaustedAt atomic.Int64
 }
 
 // RetentionPolicy describes the bounded operational state that may be
@@ -255,6 +261,7 @@ func (s *Store) writeAttemptSettled(err error, attempt int) bool {
 	}
 	if attempt == 4 {
 		s.writeRetryExhaustions.Add(1)
+		s.writeRetryExhaustedAt.Store(time.Now().UTC().UnixNano())
 		return true
 	}
 	return false
@@ -763,6 +770,11 @@ type DiagnosticsSnapshot struct {
 	// in the product could confirm or refute that for a given household.
 	WriteRetries          uint64
 	WriteRetryExhaustions uint64
+	// LastWriteContentionAt and LastLogLossAt let the derived operational status
+	// clear once the condition stops recurring, instead of a single lifetime
+	// event pinning the instance to degraded until it restarts.
+	LastWriteContentionAt *time.Time
+	LastLogLossAt         *time.Time
 	WriterWaitCount       int64
 	WriterWaitDuration    time.Duration
 	WriterInUse           int
