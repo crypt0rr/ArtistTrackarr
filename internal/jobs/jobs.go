@@ -15,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/metrics"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
@@ -24,8 +25,13 @@ import (
 type Runner struct {
 	// genreBackfillEmpty records artists MusicBrainz reports no genres for, so
 	// the backfill lookup is not repeated on every scheduled sync.
-	genreBackfillEmpty        map[int64]time.Time
-	genreBackfillMu           sync.Mutex
+	genreBackfillEmpty map[int64]time.Time
+	genreBackfillMu    sync.Mutex
+	// logHealth reports the application-log sink's loss counters. It is set
+	// after construction and read from the maintenance goroutine, so it is
+	// guarded rather than assumed immutable.
+	logHealth                 func() logging.SinkHealth
+	logHealthMu               sync.RWMutex
 	store                     *store.Store
 	catalog                   catalog.CatalogProvider
 	spotify                   catalog.SpotifyReleaseProvider
@@ -844,6 +850,27 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 	}
 }
 
+// SetLogHealth wires the application-log sink's counters into the hourly
+// operational snapshot. It mirrors the web App's hook because both derive the
+// same status from the same numbers, and is set after construction because the
+// sink is built around the store this Runner already holds.
+func (r *Runner) SetLogHealth(report func() logging.SinkHealth) {
+	r.logHealthMu.Lock()
+	r.logHealth = report
+	r.logHealthMu.Unlock()
+}
+
+// logSinkHealth reports the sink counters, or zeroes when nothing is wired.
+func (r *Runner) logSinkHealth() logging.SinkHealth {
+	r.logHealthMu.RLock()
+	report := r.logHealth
+	r.logHealthMu.RUnlock()
+	if report == nil {
+		return logging.SinkHealth{}
+	}
+	return report()
+}
+
 func (r *Runner) runMaintenance(ctx context.Context) {
 	r.metrics.RecordMaintenance()
 	now := time.Now().UTC()
@@ -908,6 +935,17 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 	if snapshot, err := r.store.Diagnostics(ctx); err != nil {
 		r.logger.Warn("operational snapshot capture failed", "error", err)
 	} else {
+		// The sink counters live in the process, not the database, so
+		// Store.Diagnostics cannot see them. Without this the persisted history
+		// could never record log loss at all: the admin banner would say
+		// degraded while the 24-hour history it sits above said healthy for the
+		// same moment.
+		health := r.logSinkHealth()
+		snapshot.DroppedLogEntries, snapshot.LogWriteFailures = health.Dropped, health.Errors
+		if !health.LastLossAt.IsZero() {
+			lossAt := health.LastLossAt
+			snapshot.LastLogLossAt = &lossAt
+		}
 		status, _ := store.OperationalStatus(snapshot, "running", now)
 		if err := r.store.RecordOperationalSnapshot(ctx, snapshot, status, "running"); err != nil {
 			r.logger.Warn("operational snapshot persistence failed", "error", err)

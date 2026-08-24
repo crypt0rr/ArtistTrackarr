@@ -15,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -2876,5 +2877,41 @@ func TestCompleteITunesCatalogueStillCountsAsSuccess(t *testing.T) {
 	}
 	if !observation.succeeded || observation.status != "healthy" {
 		t.Fatalf("a complete catalogue observation=%#v, want succeeded and healthy", observation)
+	}
+}
+
+// TestPersistedSnapshotRecordsLogLoss is #276, the other half of #267. The sink
+// counters live in the process rather than the database, so Store.Diagnostics
+// cannot see them and the hourly snapshot persisted by the scheduler could never
+// record log loss - the admin banner could read "degraded" while the 24-hour
+// history shown directly above it reported "healthy" for the same moment.
+func TestPersistedSnapshotRecordsLogLoss(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// No hook wired: the snapshot is healthy.
+	runner.runMaintenance(ctx)
+	var status string
+	if err := database.DB.QueryRow(
+		`SELECT status FROM operational_snapshots ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "degraded" {
+		t.Fatalf("baseline snapshot is already degraded (%q), so this test cannot show the difference", status)
+	}
+
+	// With loss reported, the persisted status must follow.
+	runner.SetLogHealth(func() logging.SinkHealth {
+		return logging.SinkHealth{Dropped: 5, LastLossAt: time.Now().UTC()}
+	})
+	runner.runMaintenance(ctx)
+	if err := database.DB.QueryRow(
+		`SELECT status FROM operational_snapshots ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "degraded" {
+		t.Fatalf("persisted status=%q with active log loss, want degraded - the history cannot record what the banner shows", status)
 	}
 }

@@ -118,6 +118,25 @@ func (s *AsyncSink) Dropped() uint64 { return s.dropped.Load() }
 
 func (s *AsyncSink) Errors() uint64 { return s.errors.Load() }
 
+// SinkHealth is the application-log sink's runtime loss counters, shared by
+// every consumer that needs them: the admin diagnostics rendered by the web
+// layer and the hourly snapshot persisted by the scheduler. It lives here
+// because both must report the same numbers - when only the web layer could see
+// them, the persisted history could never record log loss at all.
+type SinkHealth struct {
+	Dropped uint64
+	Errors  uint64
+	// LastLossAt is when loss most recently occurred. The counters are
+	// cumulative for the process lifetime, so without this a single dropped
+	// record pins the operational status to degraded until a restart.
+	LastLossAt time.Time
+}
+
+// Health reports the sink's current loss counters.
+func (s *AsyncSink) Health() SinkHealth {
+	return SinkHealth{Dropped: s.Dropped(), Errors: s.Errors(), LastLossAt: s.LastLossAt()}
+}
+
 // LastLossAt reports when a record was most recently dropped or failed to
 // persist, or the zero time if neither has happened.
 func (s *AsyncSink) LastLossAt() time.Time {
