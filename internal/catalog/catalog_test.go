@@ -432,7 +432,7 @@ func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
 				if provider == "spotify" {
 					got, _, _ = spotifyReleaseType("single", "single", "", tracks)
 				} else {
-					got = iTunesReleaseType("", tracks)
+					got, _ = iTunesReleaseType("", tracks, "Solo Artist")
 				}
 				if got != "EP" {
 					t.Fatalf("%s %d-track release=%q, want EP", provider, tracks, got)
@@ -455,7 +455,7 @@ func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
 				if provider == "spotify" {
 					got, _, ok = spotifyReleaseType("album", "", test.title, 0)
 				} else {
-					got = iTunesReleaseType(test.title, 0)
+					got, _ = iTunesReleaseType(test.title, 0, "Solo Artist")
 					ok = got != ""
 				}
 				if !ok || got != test.want {
@@ -1827,6 +1827,49 @@ func TestITunesGuestCreditsReadTheTrackTitle(t *testing.T) {
 			if got := creditsFollowedArtist(test.artistName, test.trackName, test.followed); got != test.want {
 				t.Fatalf("creditsFollowedArtist(%q, %q, %q)=%v, want %v",
 					test.artistName, test.trackName, test.followed, got, test.want)
+			}
+		})
+	}
+}
+
+// TestITunesCompilationsCarryTheSecondaryType is #258. iTunesReleaseType
+// hard-coded its kind to "album" and discarded the secondary types, so the one
+// branch that emits "Compilation" could never fire and store.Release.
+// SecondaryTypes was always nil for iTunes releases. The per-follow Compilations
+// toggle therefore had nothing to match: it worked on a Spotify deployment and
+// silently did nothing on an iTunes one.
+//
+// Apple's album-lookup payload carries no compilation flag at all - verified
+// live on 2026-08-24, no collectionType distinction and no collectionArtistName
+// on collection rows - so the artist label is the only available signal, and it
+// is localised per storefront.
+func TestITunesCompilationsCarryTheSecondaryType(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		artist     string
+		trackCount int
+		want       []string
+	}{
+		{name: "US and GB label", artist: "Various Artists", trackCount: 14, want: []string{"Compilation"}},
+		{name: "German and French label", artist: "Multi-interprètes", trackCount: 12, want: []string{"Compilation"}},
+		{name: "Japanese label", artist: "ヴァリアス・アーティスト", trackCount: 18, want: []string{"Compilation"}},
+		{name: "a real artist is never a compilation", artist: "Nicki Minaj", trackCount: 14, want: nil},
+		{name: "an empty artist is not a compilation", artist: "", trackCount: 14, want: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary, secondary := iTunesReleaseType("Jazz Loves Disney", test.trackCount, test.artist)
+			if len(secondary) != len(test.want) {
+				t.Fatalf("secondary types=%v for artist %q, want %v", secondary, test.artist, test.want)
+			}
+			for i := range test.want {
+				if secondary[i] != test.want[i] {
+					t.Fatalf("secondary types=%v, want %v", secondary, test.want)
+				}
+			}
+			// A compilation stays an Album regardless of track count, which is
+			// what the shared heuristic already guarantees.
+			if len(test.want) > 0 && primary != "Album" {
+				t.Fatalf("compilation primary type=%q, want Album", primary)
 			}
 		})
 	}

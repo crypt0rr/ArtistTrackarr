@@ -553,7 +553,7 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 			if date == "" {
 				continue
 			}
-			primaryType := iTunesReleaseType(item.CollectionName, item.TrackCount)
+			primaryType, secondaryTypes := iTunesReleaseType(item.CollectionName, item.TrackCount, item.ArtistName)
 			releaseURL := strings.TrimSpace(item.CollectionViewURL)
 			if releaseURL == "" {
 				releaseURL = "https://itunes.apple.com/album/id" + id
@@ -563,6 +563,7 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 				MBID:             "itunes:" + id,
 				Title:            strings.TrimSpace(item.CollectionName),
 				PrimaryType:      primaryType,
+				SecondaryTypes:   secondaryTypes,
 				FirstReleaseDate: date,
 				DatePrecision:    precision,
 				ITunesID:         id,
@@ -635,9 +636,19 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 			if releaseURL == "" {
 				releaseURL = "https://itunes.apple.com/album/id" + collectionID
 			}
+			// Song rows carry collectionArtistName, which names the album's
+			// artist rather than the track's - the cleaner compilation signal,
+			// and the only place Apple exposes it. Fall back to the track's
+			// artist when it is absent.
+			collectionArtist := strings.TrimSpace(item.CollectionArtistName)
+			if collectionArtist == "" {
+				collectionArtist = item.ArtistName
+			}
+			creditPrimaryType, creditSecondaryTypes := iTunesReleaseType(item.CollectionName, item.TrackCount, collectionArtist)
 			release = store.Release{
 				MBID: "itunes:" + collectionID, Title: strings.TrimSpace(item.CollectionName),
-				PrimaryType:      iTunesReleaseType(item.CollectionName, item.TrackCount),
+				PrimaryType:      creditPrimaryType,
+				SecondaryTypes:   creditSecondaryTypes,
 				FirstReleaseDate: date, DatePrecision: precision, ITunesID: collectionID, ITunesURL: releaseURL,
 				ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
 			}
@@ -839,12 +850,73 @@ func iTunesDate(value string) (string, int) {
 	return "", 0
 }
 
-func iTunesReleaseType(title string, trackCount int) string {
-	primaryType, _, ok := classifyReleaseType("album", "", title, trackCount)
-	if !ok {
-		return "Album"
+// variousArtistsLabels are the storefront-localised names Apple uses for the
+// compilation pseudo-artist, in the form normalizeCreditText produces. That
+// normaliser keeps only ASCII letters and digits, so accented labels appear here
+// already mangled ("Multi-interprètes" -> "multi interpr tes"); the values are
+// taken from its actual output rather than written by hand.
+//
+// The album-lookup payload carries no compilation flag - no collectionType
+// distinction, no collectionArtistName on collection rows - so the artist label
+// is the only signal it offers, and it is localised per storefront. Verified
+// live on 2026-08-24 against one compilation across five storefronts: US and GB
+// return "Various Artists", DE and FR "Multi-interprètes", JP the katakana form
+// below.
+//
+// This is best-effort by construction: a storefront whose label is absent here
+// classifies its compilations as plain albums, which is what every storefront
+// did before. It cannot produce a false positive, because no real artist is
+// named any of these.
+var variousArtistsLabels = map[string]struct{}{
+	"various artists":          {},
+	"various artist":           {},
+	"multi interpr tes":        {},
+	"verschiedene interpreten": {},
+	"varios artistas":          {},
+	"artisti vari":             {},
+	"diversos artistas":        {},
+	"olika artister":           {},
+	"forskellige kunstnere":    {},
+	"eri esitt ji":             {},
+}
+
+// variousArtistsRawMarkers cover labels the ASCII-only normaliser reduces to the
+// empty string, so they must be matched before normalisation.
+var variousArtistsRawMarkers = []string{"ヴァリアス"}
+
+// isVariousArtists reports whether an iTunes artist label denotes a compilation.
+func isVariousArtists(name string) bool {
+	for _, marker := range variousArtistsRawMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
 	}
-	return primaryType
+	normalized := normalizeCreditText(name)
+	if normalized == "" {
+		return false
+	}
+	_, ok := variousArtistsLabels[normalized]
+	return ok
+}
+
+// iTunesReleaseType classifies an iTunes collection, returning any secondary
+// types alongside the primary one.
+//
+// The secondary types used to be discarded, and the kind was hard-coded to
+// "album", so the single branch that emits "Compilation" could never fire for an
+// iTunes release. store.Release.SecondaryTypes was therefore always nil and the
+// per-follow Compilations toggle had nothing to match: it worked on a Spotify
+// deployment and silently did nothing on an iTunes one.
+func iTunesReleaseType(title string, trackCount int, artistName string) (string, []string) {
+	kind := "album"
+	if isVariousArtists(artistName) {
+		kind = "compilation"
+	}
+	primaryType, secondary, ok := classifyReleaseType(kind, "", title, trackCount)
+	if !ok {
+		return "Album", nil
+	}
+	return primaryType, secondary
 }
 
 func validITunesID(value string) bool {
