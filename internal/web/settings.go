@@ -151,7 +151,7 @@ func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
 		rateLimited(w, 900, "destination retries are temporarily rate limited; try again later")
 		return
 	}
-	count, err := a.store.RetryFailedDeliveries(r.Context(), session.User.ID, id, time.Now().UTC())
+	stats, err := a.store.RetryFailedDeliveries(r.Context(), session.User.ID, id, time.Now().UTC())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
@@ -161,10 +161,18 @@ func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "destination deliveries could not be retried", http.StatusInternalServerError)
 		return
 	}
-	if a.jobs != nil && count > 0 {
+	if a.jobs != nil && stats.Requeued > 0 {
 		a.jobs.Wake()
 	}
-	http.Redirect(w, r, "/settings?"+a.statusQuery(fmt.Sprintf("%d failed deliveries queued for retry", count)), http.StatusSeeOther)
+	// Say what happened to the rows a pause is holding back. Reporting only the
+	// requeued count showed "0 failed deliveries queued for retry" next to a
+	// destination still badged with failures, which reads as the button being
+	// broken rather than as a pause doing its job.
+	message := fmt.Sprintf("%d failed deliveries queued for retry", stats.Requeued)
+	if stats.Deferred > 0 {
+		message += fmt.Sprintf("; %d unblocked and held until a paused follow resumes", stats.Deferred)
+	}
+	http.Redirect(w, r, "/settings?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) renameDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
