@@ -186,3 +186,78 @@ func truthConfirmForm(page string) (string, bool) {
 		rest = rest[end+len("</form>"):]
 	}
 }
+
+// TestAdminCanOverrideAnotherMembersTruthDecision pins the confirm form to the
+// store's own authorisation rule. releaseTruthDecisionWritableTx explicitly
+// permits an administrator to change a decision another member made, and the
+// "Clear decision" form has always carried that exception - but the confirm form
+// introduced with the reason field guarded on TruthDecidedByAnotherMember alone,
+// which is role-independent. The page told members "Ask them or an administrator
+// to change it" while giving that administrator no control to change it with.
+func TestAdminCanOverrideAnotherMembersTruthDecision(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	admin, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Promote the signed-in member, the pattern the other admin tests use.
+	if _, err := database.DB.Exec(`UPDATE users SET role='admin' WHERE id=?`, admin.ID); err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := database.CreateUser(ctx, "other-decider@example.com", "hash", "member", "UTC", "other-decider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "admin-truth-artist", Name: "Admin Truth Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, admin.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_id,spotify_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "admin-truth-release", artist.ID, "Admin Truth Release", "Album", "[]",
+		"2026-08-08", 3, "https://musicbrainz.org/release-group/admin-truth-release", "admin-truth-spotify",
+		"https://open.spotify.com/album/admin-truth-release", "spotify",
+		time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := result.LastInsertId()
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO provider_observations
+		(provider,provider_id,release_group_id,payload_hash,observed_at) VALUES('spotify',?,?,'hash',?)`,
+		"admin-truth-spotify", releaseID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	// The other member must own the release too for their decision to be valid.
+	if _, err := database.Follow(ctx, otherID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Another member decides first.
+	if err := database.SetReleaseTruthDecision(ctx, otherID, releaseID, "spotify", "their reason"); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/releases/" + fmt.Sprint(releaseID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	page := string(raw)
+
+	form, ok := truthConfirmForm(page)
+	if !ok {
+		t.Fatalf("an administrator has no confirm control over another member's decision: %s", page)
+	}
+	if !strings.Contains(form, `name="reason"`) {
+		t.Fatalf("the administrator's confirm form carries no reason input: %q", form)
+	}
+	// The other member's words must not be pre-filled into the admin's box.
+	if strings.Contains(form, "their reason") {
+		t.Fatalf("another member's reason was prefilled for the administrator: %q", form)
+	}
+}

@@ -19,7 +19,12 @@
           <p><strong>Release truth</strong> <span class="badge release-confidence {{releaseTruthClass .Release}}">{{releaseTruthLabel .Release}}</span></p>
           {{if .TruthDecidedByYou}}<small class="truth-attribution">Confirmed by you.</small>{{else if .TruthDecidedByAnotherMember}}<small class="truth-attribution">Confirmed by another household member.{{if ne $.User.Role "admin"}} Ask them or an administrator to change it.{{end}}</small>{{end}}
           {{if .TruthReason}}<small>{{if .TruthDecidedByAnotherMember}}Their reason: {{end}}{{.TruthReason}}</small>{{else}}<small>Choose the provider that best represents this release for your household.</small>{{end}}
-          {{if not .TruthDecidedByAnotherMember}}
+          {{/* Mirror the store's rule: the owner of the decision, or any
+               administrator. TruthDecidedByAnotherMember is role-independent, so
+               guarding on it alone removed the confirm control from the very
+               administrator the line above tells members to ask. The Clear form
+               below has always carried the admin exception. */}}
+          {{if or (not .TruthDecidedByAnotherMember) (eq $.User.Role "admin")}}
           <form method="post" action="/releases/{{.ID}}/truth" class="stack compact release-truth-form">
             <input type="hidden" name="_csrf" value="{{$.CSRF}}">
             <input type="hidden" name="action" value="confirm">
