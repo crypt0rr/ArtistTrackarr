@@ -2606,3 +2606,35 @@ func TestCancelledWorkerSkipsRatherThanFailing(t *testing.T) {
 		t.Fatalf("work that never ran was recorded as a failure: %#v", result)
 	}
 }
+
+// TestQueuedSendKeepsItsTransportBudgetUnderTheWorkerWatchdog is the delivery
+// layer's half of the send-budget fix.
+//
+// The sender takes its transport budget only after acquiring the process-global
+// gate, so queue wait is not charged against the transport. But this layer
+// wrapped the whole Send - queue wait included - in a context whose timeout was
+// the SAME constant, and context.WithTimeout only ever shortens: the inner
+// "fresh" budget silently inherited the outer deadline and queue time was billed
+// to the transport again.
+//
+// The shipped notify-side test cannot catch this because it passes
+// context.Background(), which production never does. This drives the real
+// wrapper.
+func TestQueuedSendKeepsItsTransportBudgetUnderTheWorkerWatchdog(t *testing.T) {
+	if notificationSendTimeout <= notify.DefaultSendTimeout {
+		t.Fatalf("worker watchdog %s does not exceed the transport timeout %s, so queue wait is charged against the transport",
+			notificationSendTimeout, notify.DefaultSendTimeout)
+	}
+
+	// A sender that spends most of the transport budget, as a real slow provider
+	// does, must still succeed when the caller's watchdog wraps it.
+	runner := &Runner{sender: slowSender{delay: notify.DefaultSendTimeout / 2}}
+	// Simulate having already waited in the gate for most of one transport
+	// budget before this send starts.
+	elapsed := notify.DefaultSendTimeout - (notify.DefaultSendTimeout / 4)
+	ctx, cancel := context.WithTimeout(context.Background(), notificationSendTimeout-elapsed)
+	defer cancel()
+	if err := runner.sendNotification(ctx, "generic+https://example.invalid/hook", "title", "body"); err != nil {
+		t.Fatalf("a send that queued before starting lost its transport budget: %v", err)
+	}
+}
