@@ -663,3 +663,185 @@ func TestPausedFollowSurvivesADisabledFollowOnTheSameRelease(t *testing.T) {
 		t.Fatalf("selected paused follow did not defer: at=%s deferred=%t", at, deferred)
 	}
 }
+
+// seedTwoFollowScenario gives one member two follows on one release: the
+// canonical artist and a guest credited on it. Both are genuinely their own, so
+// pausing either is a single click in the interface.
+func seedTwoFollowScenario(t *testing.T, s *Store) (userID, canonicalID, guestID, eventID, deliveryID int64) {
+	t.Helper()
+	ctx := context.Background()
+	var err error
+	userID, err = s.CreateUser(ctx, "two-follow@example.com", "hash", "member", "UTC", "two-follow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := s.UpsertArtist(ctx, Artist{MBID: "tf-canonical", Name: "TF Canonical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := s.UpsertArtist(ctx, Artist{MBID: "tf-guest", Name: "TF Guest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalID, guestID = canonical.ID, guest.ID
+	for _, id := range []int64{canonical.ID, guest.ID} {
+		if _, err := s.Follow(ctx, userID, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	var releaseID int64
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "tf-release", canonical.ID, "TF Release", "Album", "[]",
+		now.Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/tf-release",
+		"musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM release_groups WHERE mbid=?`, "tf-release").Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_credits
+		(release_group_id,artist_id,provider,provider_id,role,track_title,credit_name,provider_url,confidence,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, releaseID, guest.ID, "musicbrainz", "tf-rec", "guest", "Track",
+		"TF Guest", "https://musicbrainz.org/recording/tf-rec", "confirmed", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "TF destination", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	// The delivery insert admits only destinations that already existed when the
+	// event was created, so the destination has to predate it.
+	setDestinationCreatedAt(t, s, userID, now.Add(-time.Hour))
+	// Admit the event through the real path so the delivery is queued exactly as
+	// production queues it.
+	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		_, err := enqueueEventTxModeOptions(ctx, tx, userID, releaseID, "announcement", "TF Release", "body", now, true, false)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM notification_events WHERE user_id=? AND release_group_id=?`,
+		userID, releaseID).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM deliveries WHERE event_id=?`, eventID).Scan(&deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	return userID, canonicalID, guestID, eventID, deliveryID
+}
+
+func deliveryNextAttempt(t *testing.T, s *Store, deliveryID int64) time.Time {
+	t.Helper()
+	var raw string
+	if err := s.DB.QueryRow(`SELECT next_attempt_at FROM deliveries WHERE id=?`, deliveryID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseStoredTime(raw, "next attempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+// TestPausingOneFollowDoesNotMoveAnotherFollowsDelivery pins realignment to the
+// GOVERNING follow. The predecessor matched every delivery whose release had
+// the artist as canonical or credited, so pausing or resuming one follow moved
+// an alert a different, still-active follow governs - and the Artists page went
+// on showing that other follow as active while its alert had been rescheduled.
+func TestPausingOneFollowDoesNotMoveAnotherFollowsDelivery(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, guestID, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// The canonical follow governs this delivery (it wins admission's
+	// tie-break). Pause it, so the delivery is deliberately deferred far out.
+	governing := time.Now().UTC().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &governing); err != nil {
+		t.Fatal(err)
+	}
+	deferred := deliveryNextAttempt(t, s, deliveryID)
+	if deferred.Before(governing.Add(-time.Minute)) {
+		t.Fatalf("the governing pause did not defer the delivery: next=%s want>=%s", deferred, governing)
+	}
+
+	// Now pause the OTHER follow, which governs nothing here, for a shorter
+	// window. The predecessor matched on the release rather than the governing
+	// follow, so this dragged the alert forward to the guest follow's expiry
+	// while /artists still read "Paused until <the later date>".
+	shorter := time.Now().UTC().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, guestID, &shorter); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryNextAttempt(t, s, deliveryID); !got.Equal(deferred) {
+		t.Fatalf("pausing a non-governing follow moved the delivery: %s -> %s", deferred, got)
+	}
+
+	// Resuming the non-governing follow must not release it either.
+	if err := s.PauseFollowNotificationRule(ctx, userID, guestID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryNextAttempt(t, s, deliveryID); !got.Equal(deferred) {
+		t.Fatalf("resuming a non-governing follow released a delivery the governing pause still holds: %s -> %s", deferred, got)
+	}
+}
+
+// TestExtendingAPauseMovesItsDeliveriesLater is #249: the predecessor bounded
+// its update with next_attempt_at > target, which admits only the earlier
+// direction, so extending a pause left its alerts due at the old, earlier time
+// and they fired while the follow still read "Paused until <later date>".
+func TestExtendingAPauseMovesItsDeliveriesLater(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, _, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	first := time.Now().UTC().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &first); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryNextAttempt(t, s, deliveryID); got.Before(first.Add(-time.Minute)) {
+		t.Fatalf("pause did not defer the delivery: next=%s want>=%s", got, first)
+	}
+
+	extended := first.Add(14 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &extended); err != nil {
+		t.Fatal(err)
+	}
+	got := deliveryNextAttempt(t, s, deliveryID)
+	if got.Before(extended.Add(-time.Minute)) {
+		t.Fatalf("extending the pause left the delivery at the old expiry: next=%s want>=%s", got, extended)
+	}
+
+	// Shortening must still pull it back.
+	shortened := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &shortened); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryNextAttempt(t, s, deliveryID); got.After(shortened.Add(time.Minute)) {
+		t.Fatalf("shortening the pause left the delivery at the later expiry: next=%s want<=%s", got, shortened)
+	}
+}
+
+// TestRealignmentDoesNotResetAnOrdinaryRetryBackoff is the second half of #248.
+// A delivery already in exponential backoff was created by failures, not by a
+// pause; resuming an unrelated follow reset it to now and forced an immediate
+// re-attempt against a destination that was already failing.
+func TestRealignmentDoesNotResetAnOrdinaryRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _, guestID, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	backoff := time.Now().UTC().Add(20 * time.Minute).Truncate(time.Second)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET attempts=3,next_attempt_at=? WHERE id=?`,
+		timeText(backoff), deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	// No pause anywhere; resume a follow that is not paused.
+	if err := s.PauseFollowNotificationRule(ctx, userID, guestID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryNextAttempt(t, s, deliveryID); !got.Equal(backoff) {
+		t.Fatalf("an ordinary retry backoff was reset: %s -> %s", backoff, got)
+	}
+}
