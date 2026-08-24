@@ -15,6 +15,31 @@ const artistProviderStatusColumns = `artist_id,provider,status,last_attempt_at,l
 // RecordArtistProviderStatus persists an individual artist/provider outcome.
 // ReleaseCount may be set to -1 when an outcome did not return a release
 // batch; in that case the previously observed count is retained.
+// providerNotContacted reports whether a status means the provider was
+// deliberately not called on this pass, so the observation carries no fresh
+// evidence and must not overwrite the evidence already stored.
+//
+// The set is written out because the gate previously read
+// `status == "standby" || status == "skipped"`, and those two values are not
+// the ones the scheduler emits: internal/jobs/providers.go produces standby,
+// deferred, not_configured and cooldown, and emits "skipped" nowhere at all.
+// So deferred, not_configured and cooldown took the destructive branch and
+// wrote last_error=” over a real provider failure on the artist's next tick.
+//
+// "skipped" is retained only because internal/web/core.go still renders it as
+// "Standby" for any legacy row; nothing writes it.
+//
+// Everything absent from this list - healthy, failed, degraded, not_found,
+// ambiguous - is the outcome of an actual call and must overwrite.
+func providerNotContacted(status string) bool {
+	switch status {
+	case "standby", "skipped", "deferred", "not_configured", "cooldown":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistProviderStatus) error {
 	provider := strings.ToLower(strings.TrimSpace(status.Provider))
 	status.Status = strings.ToLower(strings.TrimSpace(status.Status))
@@ -31,13 +56,11 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 	if updated.IsZero() {
 		updated = time.Now().UTC()
 	}
-	// A standby/skipped result means this provider was deliberately not
-	// contacted because an earlier provider supplied a usable catalog (or its
-	// check was deferred). It must update the current per-artist state without
+	// A not-contacted result must update the current per-artist state without
 	// erasing the last meaningful failure, success, error, or retry deadline.
-	// In particular, replacing a previous failure with an empty status would
-	// make the Trust Center lose the evidence needed to explain recovery.
-	if status.Status == "standby" || status.Status == "skipped" {
+	// Replacing a previous failure with an empty status would make the Trust
+	// Center lose the evidence needed to explain recovery.
+	if providerNotContacted(status.Status) {
 		_, err := s.execWriteContext(ctx, `INSERT INTO artist_provider_status
 			(artist_id,provider,status,last_attempt_at,last_success_at,last_failure_at,next_check_at,
 			 release_count,last_error,updated_at)
