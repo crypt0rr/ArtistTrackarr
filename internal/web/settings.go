@@ -104,13 +104,22 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if a.destinationTestLimiter != nil && !a.destinationTestLimiter.Allow(fmt.Sprintf("%d|%d", session.User.ID, id)) {
-		rateLimited(w, 900, "destination tests are temporarily rate limited; try again later")
-		return
-	}
+	// Establish ownership first: an unknown or foreign id must 404 without
+	// spending the member's budget, and must never reach the limiter at all.
 	destination, err := a.store.Destination(r.Context(), session.User.ID, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		http.NotFound(w, r)
+		return
+	}
+	// Keyed on the member alone, not on the destination id. The id is
+	// caller-chosen: destinations.id is a plain INTEGER PRIMARY KEY, so
+	// delete-then-add mints a fresh id and with it a fresh empty bucket, and
+	// the limiter evicts its oldest entry at maxEntries - so 4096 requests
+	// naming non-existent ids could flush every other member's bucket out of
+	// the shared limiter. The resource being protected is outbound sends from
+	// this process, which is a per-member budget.
+	if a.destinationTestLimiter != nil && !a.destinationTestLimiter.Allow(strconv.FormatInt(session.User.ID, 10)) {
+		rateLimited(w, 900, "destination tests are temporarily rate limited; try again later")
 		return
 	}
 	if err == nil {
@@ -135,7 +144,10 @@ func (a *App) retryDestination(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if a.destinationRetryLimiter != nil && !a.destinationRetryLimiter.Allow(fmt.Sprintf("%d|%d", session.User.ID, id)) {
+	// Per-member for the same reason as the test limiter above: the id is
+	// caller-chosen, so embedding it both multiplies the budget and lets one
+	// member evict every other member's bucket from the shared limiter.
+	if a.destinationRetryLimiter != nil && !a.destinationRetryLimiter.Allow(strconv.FormatInt(session.User.ID, 10)) {
 		rateLimited(w, 900, "destination retries are temporarily rate limited; try again later")
 		return
 	}
