@@ -858,9 +858,22 @@ func (a *App) csrf(next http.Handler) http.Handler {
 		}
 		if raw == "" {
 			raw, _ = security.Token(24)
+			// Lax, matching artist_session deliberately. Strict withheld this
+			// cookie on cross-site top-level navigations that still carried the
+			// session cookie, and the branch above cannot tell "no token yet"
+			// from "token withheld", so it minted a fresh one and silently
+			// invalidated the token held by every page already open. Arriving
+			// from a homelab dashboard tile, a webmail tab, or this app's own
+			// ICS event links - which point at {PublicURL}/releases/{id} - cost
+			// the member their in-progress form input and a bare 403.
+			//
+			// Strict was not what stopped forgery here: Lax still withholds the
+			// cookie on a cross-site POST, so the compare below fails exactly as
+			// before, and artist_session being Lax already means a cross-site
+			// POST is unauthenticated regardless.
 			http.SetCookie(w, &http.Cookie{
 				Name: name, Value: security.SignedToken(a.cfg.SessionSecret, raw), Path: "/",
-				HttpOnly: true, Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteStrictMode,
+				HttpOnly: true, Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
 				MaxAge: int(sessionLifetime.Seconds()),
 			})
 		}
