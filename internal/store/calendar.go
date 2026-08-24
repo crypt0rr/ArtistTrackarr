@@ -365,10 +365,16 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 
 // periodLookback covers how far a digest period boundary can move when a
 // profile changes timezone, which is bounded by the span of real UTC offsets
-// (UTC-12 to UTC+14) and never by the length of the period. Expanding it by a
-// whole period instead meant the previous period's run - which necessarily
-// carries the old timezone - fell inside the window and suppressed the new
-// period: a full week of digests for a weekly subscriber who changed timezone.
+// (UTC-12 to UTC+14).
+//
+// It is NOT sufficient on its own. A weekly period is 168h, so 26h cannot reach
+// the previous week's run - which is all the original fix was verified against.
+// A daily period is 24h, and the previous day's run is created at the member's
+// reminder time, so for a 23:00 reminder it sits one hour before the current
+// period even starts. No fixed window can separate those two cases, because the
+// reminder offset moves the previous run arbitrarily close to the boundary.
+// The lookup therefore also excludes the previous period by key; see
+// digestRunLookup.
 const periodLookback = 26 * time.Hour
 
 // digestRunLookup finds the run covering a member's logical period. A profile
@@ -377,17 +383,33 @@ const periodLookback = 26 * time.Hour
 // periods continue to use the exact key and cannot suppress a legitimate
 // next-day or next-week digest.
 //
+// The timezone-tolerant branch additionally requires the stored run to be for a
+// different period key than the immediately previous period. The time window
+// alone silently skipped a whole day for every daily subscriber who changed
+// timezone: yesterday's run was created inside [periodStart-26h, ...] at any
+// reminder time, the lookup found it, saw a non-pending status and reported the
+// period settled - with no run row, no delivery, no log line, and a return value
+// of 0 rather than an error.
+//
+// Excluding the previous period by key is exact where a window cannot be. It
+// errs toward sending a duplicate digest rather than silently sending none,
+// which is the right direction for a notification product: a member who changes
+// timezone may see one extra digest, never one fewer.
+//
 // One definition because two call sites need it: the cheap pre-check that
 // decides whether the digest scan is worth doing at all, and the authoritative
 // re-check inside the write transaction. Hand-synchronised copies of a
 // timezone-tolerant period predicate are exactly the sort of thing that drifts.
 const digestRunLookup = `SELECT id,status FROM release_digest_runs
 	WHERE user_id=? AND frequency=? AND (period_start=? OR
-		(COALESCE(timezone,'UTC')<>? AND created_at>=? AND created_at<?))
+		(COALESCE(timezone,'UTC')<>? AND period_start<>? AND created_at>=? AND created_at<?))
 	ORDER BY created_at DESC,id DESC LIMIT 1`
 
 func digestRunLookupArgs(user digestUser, periodKey string, periodStart, periodEnd time.Time) []any {
-	return []any{user.ID, user.Frequency, periodKey, user.Timezone,
+	// The previous period's key is this period's start shifted back by exactly
+	// one period, so it is correct for daily and weekly without a special case.
+	previousKey := periodStart.Add(-periodEnd.Sub(periodStart)).Format("2006-01-02")
+	return []any{user.ID, user.Frequency, periodKey, user.Timezone, previousKey,
 		timeText(periodStart.Add(-periodLookback).UTC()), timeText(periodEnd.Add(periodLookback).UTC())}
 }
 
