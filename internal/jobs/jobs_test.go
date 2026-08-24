@@ -2712,3 +2712,55 @@ func TestDigestDeliveryOutcomeIsRecordedAfterCancellation(t *testing.T) {
 		t.Fatalf("a digest the provider accepted was not recorded during shutdown: %#v", result)
 	}
 }
+
+// TestShutdownLeavesManualSyncRequestsRetryable is #255. The manual-sync loop
+// claimed up to three requests with a five-minute lease and iterated them with
+// no cancellation guard. On SIGTERM the first store call failed with
+// context.Canceled, and because the completion write deliberately detaches from
+// cancellation it then succeeded - durably writing status='failed' and clearing
+// the lease, which is precisely what stops RecoverExpiredWork healing the
+// interruption. Requests still claimed but never touched were retired the same
+// way, so a member's "Sync now" came back as a permanent failure it never had.
+func TestShutdownLeavesManualSyncRequestsRetryable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "manual-sync@example.com", "hash", "member", "UTC", "manual-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "manual-sync-artist", Name: "Manual Sync Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// The runner is already stopping when the batch runs, which is what a
+	// SIGTERM landing just after the claim looks like.
+	cancel()
+	processed := runner.processManualSyncRequests(ctx, now)
+	if processed != 0 {
+		t.Fatalf("processed=%d during shutdown, want 0 retired", processed)
+	}
+
+	var status string
+	var leaseOwner sql.NullString
+	if err := database.DB.QueryRow(
+		`SELECT status,lease_owner FROM manual_sync_requests WHERE requested_by=?`, userID).
+		Scan(&status, &leaseOwner); err != nil {
+		t.Fatal(err)
+	}
+	if status == "failed" {
+		t.Fatal("a queued Sync now request was durably marked failed by a shutdown that never attempted it")
+	}
+	if status == "completed" {
+		t.Fatalf("status=%q, want the request left retryable", status)
+	}
+}

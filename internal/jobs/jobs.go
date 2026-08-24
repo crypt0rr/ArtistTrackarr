@@ -1054,7 +1054,23 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 		r.logger.Warn("manual synchronization queue failed", "error", err)
 		return 0
 	}
+	processed := 0
 	for _, req := range requests {
+		// Stop before touching a claimed request once the runner is shutting
+		// down. Without this the first store call fails with context.Canceled,
+		// and because the completion write deliberately detaches from
+		// cancellation it then succeeds - durably marking the request "failed"
+		// and clearing its lease, which is exactly what stops RecoverExpiredWork
+		// healing the interruption. Every request still claimed but never
+		// touched was retired the same way.
+		//
+		// Leaving them untouched lets the lease lapse so the next run picks them
+		// up intact, which is what the delivery path already does.
+		if err := ctx.Err(); err != nil {
+			r.logger.Info("manual synchronization stopped for shutdown; claimed requests will be retried",
+				"remaining", len(requests)-processed)
+			break
+		}
 		var syncErr error
 		if req.Scope == "artist" && req.ArtistID != nil {
 			var artist store.Artist
@@ -1096,8 +1112,11 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 		if completionErr != nil {
 			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", completionErr)
 		}
+		processed++
 	}
-	return len(requests)
+	// Report what was actually retired, not what was claimed: after a shutdown
+	// break the remainder keep their lease and are picked up by the next run.
+	return processed
 }
 
 func (r *Runner) ResolveArtistResolutionNow(ctx context.Context, resolution store.ArtistResolution) (string, error) {
