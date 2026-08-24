@@ -24,12 +24,28 @@
       "description": "Group pinned Go quality tooling updates",
       "groupName": "Go quality tooling",
       "matchManagers": [
-        "gomod"
+        "gomod",
+        "custom.regex"
       ],
       "matchPackageNames": [
         "github.com/golangci/golangci-lint/v2",
         "golang.org/x/vuln"
       ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The pinned Go quality tooling is invoked as `go run <module>/cmd/...@<version>`. No built-in manager parses that: gomod reads go.mod (these modules are not required there), dockerfile reads FROM, and github-actions reads uses.",
+      "managerFilePatterns": [
+        "/^Makefile$/",
+        "/^Dockerfile$/",
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "go run (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v[^\\s\"']+)"
+      ],
+      "datasourceTemplate": "go"
     }
   ]
 }
