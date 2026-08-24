@@ -1786,3 +1786,48 @@ func TestPreferredSpotifyImagePicksADisplayableRendition(t *testing.T) {
 		})
 	}
 }
+
+// TestITunesGuestCreditsReadTheTrackTitle is #257. Apple expresses a feature two
+// ways: inside artistName ("Ariana Grande, Normani & Nicki Minaj") or - far more
+// commonly - by leaving artistName as the lead artist and putting the feature in
+// trackName ("Side To Side (feat. Nicki Minaj)"). Only the first was checked, so
+// the second was discarded even though the search had already returned and paid
+// for it. Measured against the live endpoint on 2026-08-24, 31 of 50 rows for
+// one artist carried the credit only in the track title.
+func TestITunesGuestCreditsReadTheTrackTitle(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		artistName string
+		trackName  string
+		followed   string
+		want       bool
+	}{
+		{
+			name: "feature in the track title", artistName: "Justin Bieber",
+			trackName: "Beauty and a Beat (feat. Nicki Minaj)", followed: "Nicki Minaj", want: true,
+		},
+		{
+			name: "feature in the artist string", artistName: "Ariana Grande, Normani & Nicki Minaj",
+			trackName: "Bad To You", followed: "Nicki Minaj", want: true,
+		},
+		{
+			name: "the artist's own release is not a guest credit", artistName: "Nicki Minaj",
+			trackName: "Super Bass", followed: "Nicki Minaj", want: false,
+		},
+		{
+			name: "an unrelated track", artistName: "Justin Bieber",
+			trackName: "Sorry", followed: "Nicki Minaj", want: false,
+		},
+		{
+			name: "a different artist with a similar-looking title", artistName: "Drake",
+			trackName: "Nice For What", followed: "Nicki Minaj", want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := creditsFollowedArtist(test.artistName, test.trackName, test.followed); got != test.want {
+				t.Fatalf("creditsFollowedArtist(%q, %q, %q)=%v, want %v",
+					test.artistName, test.trackName, test.followed, got, test.want)
+			}
+		})
+	}
+}

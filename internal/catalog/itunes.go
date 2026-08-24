@@ -614,8 +614,8 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 	for _, item := range response.Results {
 		if item.WrapperType != "track" || item.CollectionID <= 0 || item.TrackID <= 0 ||
 			strings.TrimSpace(item.TrackName) == "" || strings.TrimSpace(item.CollectionName) == "" ||
-			strings.TrimSpace(item.ReleaseDate) == "" || !creditIncludesArtist(item.ArtistName, artistName) ||
-			strings.EqualFold(strings.TrimSpace(item.ArtistName), artistName) {
+			strings.TrimSpace(item.ReleaseDate) == "" ||
+			!creditsFollowedArtist(item.ArtistName, item.TrackName, artistName) {
 			continue
 		}
 		collectionID := strconv.FormatInt(item.CollectionID, 10)
@@ -650,6 +650,27 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 		result = append(result, release)
 	}
 	return result, nil
+}
+
+// creditsFollowedArtist reports whether an iTunes song row is a GUEST credit for
+// the followed artist.
+//
+// Apple expresses a feature two ways, and only the first was ever checked:
+// inside artistName ("Ariana Grande, Normani & Nicki Minaj"), or - far more
+// commonly - by leaving artistName as the lead artist and putting the feature in
+// trackName ("Side To Side (feat. Nicki Minaj)"). Measured against the live
+// endpoint on 2026-08-24 for one artist, 50 returned rows contained 31 whose
+// credit appears only in trackName; every one of them was discarded even though
+// the search had already paid for it.
+//
+// A row whose artistName IS the followed artist is still excluded: those are the
+// artist's own releases and ArtistReleases already returns them, so admitting
+// them here would duplicate the catalogue rather than extend it.
+func creditsFollowedArtist(artistNameField, trackName, artist string) bool {
+	if strings.EqualFold(strings.TrimSpace(artistNameField), strings.TrimSpace(artist)) {
+		return false
+	}
+	return creditIncludesArtist(artistNameField, artist) || creditIncludesArtist(trackName, artist)
 }
 
 func creditIncludesArtist(credit, artist string) bool {
