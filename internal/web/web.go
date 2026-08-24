@@ -108,9 +108,26 @@ func followDeliveryLabel(mode string) string {
 	}
 }
 
-func followRuleSummary(rule store.FollowNotificationRule) string {
-	if rule.PausedUntil != nil {
-		return "Paused until " + rule.PausedUntil.Format("2006-01-02 15:04")
+// followRulePaused reports whether a pause is still in force.
+//
+// Nothing ever clears paused_until once it lapses - PauseFollowNotificationRule
+// is its only writer - so a nil check reports a follow as paused forever after
+// a single 7-day pause, while the delivery engine, which compares against now
+// (internal/store/follow_notification_rules.go:38-42), resumed delivering the
+// moment it expired. The page then asserted "paused" over an artist that was
+// actively alerting, and removed the Pause control so the member could not
+// re-pause without first clicking "Resume now".
+func followRulePaused(rule store.FollowNotificationRule) bool {
+	return rule.PausedUntil != nil && rule.PausedUntil.After(time.Now().UTC())
+}
+
+// followRuleSummary describes a follow's delivery state for the Artists page.
+// The expiry goes through formatTime so it carries the reader's timezone and a
+// zone label; it was the last raw-UTC clock render in the product, and it lives
+// in Go where the regression guard that globs the template tree cannot see it.
+func followRuleSummary(rule store.FollowNotificationRule, timezones ...string) string {
+	if followRulePaused(rule) {
+		return "Paused until " + formatTime(*rule.PausedUntil, timezones...)
 	}
 	return followDeliveryLabel(rule.DeliveryMode)
 }

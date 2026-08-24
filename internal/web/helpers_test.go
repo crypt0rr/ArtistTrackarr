@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"io"
@@ -486,5 +487,83 @@ func TestCalendarFeedURLCanBeCopied(t *testing.T) {
 	if !strings.Contains(page, `data-copy-target="#calendar-feed-url"`) ||
 		!strings.Contains(page, `id="calendar-feed-url"`) {
 		t.Fatalf("the copy control is not bound to the feed URL field: %s", page)
+	}
+}
+
+// TestLapsedPauseIsNotReportedAsPaused covers the pair of defects in
+// followRuleSummary. paused_until is never cleared once it lapses, so a nil
+// check reported a follow as paused forever after one 7-day pause while the
+// delivery engine had already resumed delivering - and the Pause control was
+// replaced by "Resume now", whose label promises the opposite of what the
+// member wants. The expiry was also the last raw-UTC clock render in the
+// product, in Go where the guard that globs *.html cannot reach it.
+func TestLapsedPauseIsNotReportedAsPaused(t *testing.T) {
+	past := time.Now().UTC().Add(-48 * time.Hour)
+	future := time.Now().UTC().Add(48 * time.Hour)
+
+	lapsed := store.FollowNotificationRule{DeliveryMode: store.FollowDeliveryImmediate, PausedUntil: &past}
+	if followRulePaused(lapsed) {
+		t.Fatal("a lapsed pause still reports as active, so the page removes the Pause control")
+	}
+	if got := followRuleSummary(lapsed, "UTC"); got != "Immediate only" {
+		t.Fatalf("lapsed pause summary=%q, want the delivery mode", got)
+	}
+
+	active := store.FollowNotificationRule{DeliveryMode: store.FollowDeliveryImmediate, PausedUntil: &future}
+	if !followRulePaused(active) {
+		t.Fatal("an active pause reports as not paused")
+	}
+	summary := followRuleSummary(active, "America/Los_Angeles")
+	if !strings.HasPrefix(summary, "Paused until ") {
+		t.Fatalf("active pause summary=%q", summary)
+	}
+	// It must carry a zone label, and render in the reader's zone rather than UTC.
+	if !strings.HasSuffix(summary, " PDT") && !strings.HasSuffix(summary, " PST") {
+		t.Fatalf("pause expiry %q carries no reader-timezone zone label", summary)
+	}
+	if got := followRuleSummary(active, "UTC"); !strings.HasSuffix(got, " UTC") {
+		t.Fatalf("pause expiry %q carries no zone label", got)
+	}
+	// A rule that was never paused is unaffected.
+	never := store.FollowNotificationRule{DeliveryMode: store.FollowDeliveryDigest}
+	if followRulePaused(never) || followRuleSummary(never, "UTC") != "Digest only" {
+		t.Fatalf("unpaused rule summary=%q", followRuleSummary(never, "UTC"))
+	}
+}
+
+// TestArtistsPageOffersPauseAfterAPauseLapses drives the template, because the
+// control the member actually needs is chosen there and it tested the same nil
+// condition independently of the summary line.
+func TestArtistsPageOffersPauseAfterAPauseLapses(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "lapsed-pause-artist", Name: "Lapsed Pause Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	lapsed := time.Now().UTC().Add(-72 * time.Hour)
+	if err := database.PauseFollowNotificationRule(ctx, user.ID, artist.ID, &lapsed); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.Get(server.URL + "/artists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	page := string(raw)
+	if strings.Contains(page, "Paused until") {
+		t.Fatalf("the page reports a lapsed pause as still active: %s", page)
+	}
+	if !strings.Contains(page, "/notification-rule/pause") {
+		t.Fatalf("the Pause control is missing after the pause lapsed: %s", page)
 	}
 }

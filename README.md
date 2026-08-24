@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.58.0`; local and published images use the
+footer. The current release is `v0.59.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,44 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.59.0 release starts on the fifth review's backlog, and rebuilds the part
+of the notification engine that backlog kept pointing at.
+
+Five separate defects all came from one place. Three different pieces of code
+decided which of your follows governs a given alert, and only one of them
+actually chose: the other two matched *any* follow connected to the release.
+Pausing one artist could therefore move an alert that a different, still-active
+follow was in charge of; extending a pause left its alerts due at the old,
+earlier time, so they arrived while the follow still read "Paused until" a later
+date; and an alert held back by a pause, on a destination that then failed
+often enough to be switched off, had no automatic way back once the destination
+recovered - you had to know to press "Retry failed deliveries" a second time
+after the pause expired, which nothing told you. Removing an artist from your
+watchlist left its already-queued alerts in place, so a notification could still
+arrive months later for an artist you had removed.
+
+There is now one definition of "which follow governs this alert", and the code
+that admits a notification calls the same function as everything that reschedules
+one. Recovering a destination now reports separately how many alerts it made
+runnable and how many it unblocked but is holding until a pause ends, instead of
+saying "0 queued for retry" beside a destination still showing failures.
+
+Elsewhere: pausing an artist and letting the pause lapse no longer leaves the
+Artists page insisting it is still paused with the Pause button replaced by
+"Resume now"; that page also shows the pause expiry in your own timezone. Arriving
+from a dashboard tile, a webmail tab, or one of this application's own calendar
+links no longer silently invalidates open forms and loses what you had typed.
+
+For operators: a `TRUST_PROXY` misconfiguration, application-log loss, and SQLite
+write contention are all reported rather than silent; provider failure messages
+survive a tick where the provider was deliberately not contacted, instead of
+being erased; startup security warnings now reach the stored log rather than only
+stdout; and three diagnostic fields that exist purely as operator signal -
+including the invite-link fingerprint added so a failing link can be traced -
+are no longer destroyed by the log redaction.
+
+Twenty-seven findings from that review remain open and will follow.
+
 The v0.58.0 release closes the fourth review's backlog: twenty-five findings,
 each proven by reintroducing the defect and confirming the new test fails.
 
@@ -656,7 +694,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.58.0` publishes `0.58.0`, `0.58`, and `latest`.
+- Pushing a tag such as `v0.59.0` publishes `0.59.0`, `0.59`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -680,7 +718,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.58.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.59.0 docker compose up -d
 ```
 
 ## Configuration

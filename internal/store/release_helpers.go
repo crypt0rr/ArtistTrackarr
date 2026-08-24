@@ -711,13 +711,9 @@ func enqueueHeldEventTxMode(ctx context.Context, tx *sql.Tx, userID, releaseID i
 // false, which is what lets a caller tell "queued" apart from "recorded but
 // going nowhere".
 func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseID int64, eventType, title, body string, now time.Time, bypassConflictHold, decorateBody bool) (bool, error) {
-	type candidate struct {
-		rule FollowNotificationRule
-		role string
-	}
 	var p NotificationPreferences
 	var primary, secondary string
-	var candidates []candidate
+	var candidates []followCandidate
 	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(p.albums,1),COALESCE(p.eps,1),COALESCE(p.singles,1),
 		COALESCE(p.announcements,1),COALESCE(p.release_day,1),COALESCE(p.hold_conflicting_notifications,0),
 		f.artist_id,rg.primary_type,COALESCE(rg.secondary_types,'[]'),
@@ -757,7 +753,7 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 			if err != nil {
 				return err
 			}
-			candidates = append(candidates, candidate{rule: rule, role: role})
+			candidates = append(candidates, followCandidate{rule: rule, role: role})
 		}
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("scan notification rules for release: %w", err)
@@ -778,33 +774,12 @@ func enqueueEventTxModeOptions(ctx context.Context, tx *sql.Tx, userID, releaseI
 	if !releaseTypeEnabled(p, primary, secondaryTypes) {
 		return false, nil
 	}
-	var selected *candidate
-	selectedPriority := -1
-	for index := range candidates {
-		item := &candidates[index]
-		if !item.rule.AllowsRelease(primary, secondaryTypes, item.role, eventType, now) ||
-			!item.rule.allowsAccountNotificationMoment(p, eventType) {
-			continue
-		}
-		// Rank on the configured mode, not the paused projection of it. A
-		// paused follow reports "off", which used to tie it with a genuinely
-		// disabled follow; the tie-break keeps the first candidate, so a
-		// disabled follow on the canonical artist could win over a paused
-		// immediate follow on a credited artist. The deferral was then
-		// evaluated against the wrong rule and dropped, while the event row was
-		// still written and permanently consumed its uniqueness constraint.
-		priority := 1
-		switch normalizeFollowDeliveryMode(item.rule.DeliveryMode) {
-		case FollowDeliveryInherit, FollowDeliveryImmediate:
-			priority = 3
-		case FollowDeliveryDigest:
-			priority = 2
-		}
-		if selected == nil || priority > selectedPriority {
-			selected = item
-			selectedPriority = priority
-		}
-	}
+	// One implementation of "which follow governs this delivery", shared with
+	// the recompute the pause, retry and maintenance paths use. Admission is a
+	// caller of it rather than the original that the others copy: that is the
+	// whole point, because hand-synchronised copies of this ranking are what
+	// produced #248, #249 and #250.
+	selected := selectGoverningCandidate(candidates, p, primary, secondaryTypes, eventType, now)
 	if selected == nil {
 		return false, nil
 	}

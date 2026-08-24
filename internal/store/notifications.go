@@ -343,56 +343,279 @@ func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinatio
 // RetryFailedDeliveries requeues all permanently failed deliveries for an
 // owned destination. It is intentionally owner-scoped and resets the circuit
 // only after the queue has been made runnable.
-func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID int64, now time.Time) (int, error) {
-	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+// RetryQueueStats reports what a destination recovery did to the queue.
+// Requeued rows are runnable now. Deferred rows were unblocked - the
+// destination-caused block is gone - but stay parked at their governing
+// follow's pause expiry. Recovering a destination must not cancel a deliberate
+// pause, but neither may it leave a row blocked with no automatic route home;
+// unblocking without rescheduling satisfies both.
+type RetryQueueStats struct {
+	Requeued int
+	Deferred int
+}
+
+// Total is every row this recovery touched.
+func (s RetryQueueStats) Total() int { return s.Requeued + s.Deferred }
+
+func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID int64, now time.Time) (RetryQueueStats, error) {
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (RetryQueueStats, error) {
+		var stats RetryQueueStats
 		var owned int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM destinations WHERE id=? AND user_id=?`, destinationID, userID).Scan(&owned); err != nil {
-			return 0, err
+			return stats, err
 		}
 		if owned == 0 {
-			return 0, sql.ErrNoRows
+			return stats, sql.ErrNoRows
 		}
-		count := 0
-		// Recovering a destination must not cancel a deliberate pause. A follow
-		// paused by its owner defers its delivery on purpose; requeueing it here
-		// delivered it immediately while the interface still read "Paused until".
-		// Digest deliveries carry no per-follow deferral, so only the per-release
-		// queue needs the exclusion - and it needs the extra bound argument.
-		type recoveryStatement struct {
-			query string
-			args  []any
+		// Phase one: read the candidates and drain the cursor before any other
+		// statement runs. The reader pool is four connections and a query issued
+		// inside an open cursor is what exhausts it.
+		type queued struct {
+			id      int64
+			eventID int64
 		}
-		for _, statement := range []recoveryStatement{
-			{
-				query: `UPDATE deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
-			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')
-			  AND NOT ` + pausedDeliveryDeferral("deliveries.event_id"),
-				args: []any{timeText(now), destinationID, timeText(now)},
-			},
-			{
-				query: `UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
+		var candidates []queued
+		if err := func() error {
+			rows, err := tx.QueryContext(ctx, `SELECT id,event_id FROM deliveries
+				WHERE destination_id=? AND status IN ('failed','blocked')`, destinationID)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var item queued
+				if err := rows.Scan(&item.id, &item.eventID); err != nil {
+					return err
+				}
+				candidates = append(candidates, item)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return stats, err
+		}
+		// Phase two: ask the one governing-follow implementation which of these
+		// a pause is deliberately holding back.
+		eventIDs := make([]int64, 0, len(candidates))
+		for _, item := range candidates {
+			eventIDs = append(eventIDs, item.eventID)
+		}
+		governing, err := governingFollows(ctx, tx, eventIDs, now)
+		if err != nil {
+			return stats, err
+		}
+		// A row whose governing follow cannot be resolved requeues, preserving
+		// today's behaviour for deliveries whose artist the member never
+		// followed - it is never grounds to strand or discard work.
+		requeue := make([]int64, 0, len(candidates))
+		deferBuckets := make(map[string][]int64)
+		for _, item := range candidates {
+			if g, ok := governing[item.eventID]; ok && g.Deferred {
+				key := timeText(g.DeferTo)
+				deferBuckets[key] = append(deferBuckets[key], item.id)
+				continue
+			}
+			requeue = append(requeue, item.id)
+		}
+		const transportCase = `CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END`
+		applyBucket := func(ids []int64, attemptAt string) (int, error) {
+			changed := 0
+			for start := 0; start < len(ids); start += governingFollowBatchSize {
+				end := start + governingFollowBatchSize
+				if end > len(ids) {
+					end = len(ids)
+				}
+				chunk := ids[start:end]
+				placeholders := make([]byte, 0, len(chunk)*2)
+				args := make([]any, 0, len(chunk)+1)
+				args = append(args, attemptAt)
+				for i, id := range chunk {
+					if i > 0 {
+						placeholders = append(placeholders, ',')
+					}
+					placeholders = append(placeholders, '?')
+					args = append(args, id)
+				}
+				result, err := tx.ExecContext(ctx, `UPDATE deliveries SET status=`+transportCase+`,
+					attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL
+					WHERE id IN (`+string(placeholders)+`)`, args...)
+				if err != nil {
+					return 0, err
+				}
+				n, err := result.RowsAffected()
+				if err != nil {
+					return 0, err
+				}
+				changed += int(n)
+			}
+			return changed, nil
+		}
+		requeued, err := applyBucket(requeue, timeText(now))
+		if err != nil {
+			return stats, err
+		}
+		stats.Requeued += requeued
+		for attemptAt, ids := range deferBuckets {
+			deferred, err := applyBucket(ids, attemptAt)
+			if err != nil {
+				return stats, err
+			}
+			stats.Deferred += deferred
+		}
+		// Digest deliveries carry no per-follow deferral, as the queueing side
+		// already notes, so they requeue unconditionally.
+		result, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries SET status=CASE WHEN COALESCE((SELECT transport_status FROM destinations WHERE id=release_digest_deliveries.destination_id),'supported')='supported' AND LOWER(COALESCE((SELECT service FROM destinations WHERE id=release_digest_deliveries.destination_id),'')) IN ('discord','telegram','ntfy','generic') THEN 'pending' ELSE 'blocked' END,
 			attempts=0,next_attempt_at=?,last_error='',claim_owner=NULL,claim_expires_at=NULL WHERE destination_id=? AND status IN ('failed','blocked')`,
-				args: []any{timeText(now), destinationID},
-			},
-		} {
-			result, updateErr := tx.ExecContext(ctx, statement.query, statement.args...)
-			if updateErr != nil {
-				return 0, updateErr
-			}
-			changed, rowsErr := result.RowsAffected()
-			if rowsErr != nil {
-				return 0, rowsErr
-			}
-			count += int(changed)
+			timeText(now), destinationID)
+		if err != nil {
+			return stats, err
 		}
+		digest, err := result.RowsAffected()
+		if err != nil {
+			return stats, err
+		}
+		stats.Requeued += int(digest)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,next_retry_at,last_error,updated_at)
 		VALUES(?,'healthy',0,NULL,'',?)
 		ON CONFLICT(destination_id) DO UPDATE SET status='healthy',consecutive_failures=0,next_retry_at=NULL,last_error='',updated_at=excluded.updated_at`, destinationID, timeText(now)); err != nil {
-			return 0, err
+			return stats, err
 		}
-		return count, nil
+		return stats, nil
 	})
 }
+
+// ReleasePauseBlockedDeliveries returns durable work to the runnable queue once
+// the reason it was blocked has gone.
+//
+// A destination circuit-pause converts every pending row for that destination to
+// blocked, including rows a paused follow had deferred and nothing had yet
+// attempted. Recovery deliberately does not requeue those - a pause must not be
+// cancelled by fixing a destination - but that left them blocked with no
+// automatic pass and nothing in the interface saying a second Retry press would
+// be needed once the pause expired.
+//
+// Rows stay blocked while their destination is still paused, disabled or on an
+// unsupported transport, and while their governing follow still defers them.
+// attempts and next_attempt_at are deliberately untouched: this restores
+// runnability, it is not a manual "start over". A row deferred to a pause that
+// has since expired already carries a past next_attempt_at and becomes due
+// immediately, which is the case this exists for.
+func (s *Store) ReleasePauseBlockedDeliveries(ctx context.Context, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		type queued struct {
+			id      int64
+			eventID int64
+		}
+		var candidates []queued
+		if err := func() error {
+			rows, err := tx.QueryContext(ctx, `SELECT d.id,d.event_id FROM deliveries d
+				JOIN destinations dst ON dst.id=d.destination_id
+				LEFT JOIN destination_health dh ON dh.destination_id=dst.id
+				WHERE d.status='blocked' AND dst.enabled=1
+				  AND `+supportedDestinationServicePredicate("dst")+`
+				  AND `+destinationAdmissionPredicate)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var item queued
+				if err := rows.Scan(&item.id, &item.eventID); err != nil {
+					return err
+				}
+				candidates = append(candidates, item)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return 0, err
+		}
+		if len(candidates) == 0 {
+			return 0, nil
+		}
+		eventIDs := make([]int64, 0, len(candidates))
+		for _, item := range candidates {
+			eventIDs = append(eventIDs, item.eventID)
+		}
+		governing, err := governingFollows(ctx, tx, eventIDs, now)
+		if err != nil {
+			return 0, err
+		}
+		releasable := make([]int64, 0, len(candidates))
+		for _, item := range candidates {
+			if g, ok := governing[item.eventID]; ok && g.Deferred {
+				continue
+			}
+			releasable = append(releasable, item.id)
+		}
+		released := 0
+		for start := 0; start < len(releasable); start += governingFollowBatchSize {
+			end := start + governingFollowBatchSize
+			if end > len(releasable) {
+				end = len(releasable)
+			}
+			chunk := releasable[start:end]
+			placeholders := make([]byte, 0, len(chunk)*2)
+			args := make([]any, 0, len(chunk))
+			for i, id := range chunk {
+				if i > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+				args = append(args, id)
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE deliveries
+				SET status='pending',claim_owner=NULL,claim_expires_at=NULL,
+				    last_error=CASE WHEN last_error='destination paused after repeated failures' THEN '' ELSE last_error END
+				WHERE id IN (`+string(placeholders)+`) AND status='blocked'`, args...)
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			released += int(changed)
+		}
+		return released, nil
+	})
+}
+
+// CancelOrphanedDeliveries removes queued deliveries their owner can no longer
+// reach or cancel: nothing they follow qualifies for the release any more.
+//
+// It asks the coarse visibility question and never the governing-follow
+// recompute. Metadata drift or a tightened account preference can empty the
+// candidate set for a release the member plainly still follows, and deleting
+// there would turn a display glitch into permanent alert loss - permanent
+// because notification_events is UNIQUE(user_id, release_group_id, event_type)
+// and the release is no longer newly observed.
+//
+// Only the delivery row is removed; the notification_events row is kept so
+// re-following restores inbox history and the uniqueness slot is not recycled.
+// The unclaimed guard keeps this from deleting a row a live worker is sending.
+func (s *Store) CancelOrphanedDeliveries(ctx context.Context, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result, err := s.execWriteContext(ctx, `DELETE FROM deliveries WHERE id IN (
+		SELECT d.id FROM deliveries d
+		JOIN notification_events ne ON ne.id=d.event_id
+		JOIN release_groups rg ON rg.id=ne.release_group_id
+		WHERE d.status IN ('pending','blocked')
+		  AND (d.claim_owner IS NULL OR d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
+		  AND NOT `+followedReleasePredicate("ne.user_id")+`)`, timeText(now))
+	if err != nil {
+		return 0, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(changed), nil
+}
+
 func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination, error) {
 	var d Destination
 	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled,COALESCE(transport_status,'supported'),COALESCE(transport_message,'')
@@ -955,33 +1178,58 @@ type ClockSkewRepairStats struct {
 // healthy while it never reaches the due queue. Active leases are excluded so
 // this cannot steal work from a live worker; blocked rows remain blocked until
 // their destination is recovered or retried explicitly.
-// pausedDeliveryDeferral reports, for the delivery row named by eventIDExpr's
-// enclosing query, whether an active pause is the reason its next attempt is in
-// the future. It exists as one definition because three call sites need it -
-// clock-skew detection, clock-skew repair, and destination recovery - and
-// hand-synchronised copies have already shipped a defect: the first version
-// correlated on the release's canonical artist alone, so a pause on a credited
-// artist was classified as clock skew and force-delivered.
+// skewedDeliveryIDs returns queued deliveries parked beyond cutoff whose
+// governing follow is NOT deferring them - genuine clock skew, as opposed to a
+// deliberate pause.
 //
-// A follow governs a release exactly as the admission side decides it in
-// enqueueEventTxModeOptions: the member follows the canonical release artist,
-// OR they follow an artist credited on that release. Both must be considered
-// here, or the two sides disagree about which follow deferred the delivery.
+// Diagnostics counts exactly this set and RepairClockSkewedDeliveries repairs
+// exactly this set, from one implementation: when they disagreed, the operator
+// was shown a non-zero "clock-skewed future deliveries" figure and a repair
+// button that then reported nothing to do.
 //
-// Binds one argument: the instant to compare paused_until against.
-func pausedDeliveryDeferral(eventIDExpr string) string {
-	return `EXISTS (
-		SELECT 1 FROM notification_events ne
-		JOIN release_groups rg ON rg.id=ne.release_group_id
-		JOIN follow_notification_rules fnr ON fnr.user_id=ne.user_id
-		WHERE ne.id=` + eventIDExpr + `
-		  AND fnr.paused_until IS NOT NULL
-		  AND fnr.paused_until > ?
-		  AND (fnr.artist_id=rg.artist_id OR EXISTS (
-			SELECT 1 FROM release_credits rc
-			WHERE rc.release_group_id=rg.id AND rc.artist_id=fnr.artist_id
-		  ))
-	)`
+// Active leases are excluded so this can never steal work from a live worker.
+func skewedDeliveryIDs(ctx context.Context, q rowQuerier, now, cutoff time.Time) ([]int64, error) {
+	type queued struct {
+		id      int64
+		eventID int64
+	}
+	var candidates []queued
+	if err := func() error {
+		rows, err := q.QueryContext(ctx, `SELECT id,event_id FROM deliveries
+			WHERE status IN ('pending','blocked') AND next_attempt_at>?
+			  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)`,
+			timeText(cutoff), timeText(now))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var item queued
+			if err := rows.Scan(&item.id, &item.eventID); err != nil {
+				return err
+			}
+			candidates = append(candidates, item)
+		}
+		return rows.Err()
+	}(); err != nil {
+		return nil, err
+	}
+	eventIDs := make([]int64, 0, len(candidates))
+	for _, item := range candidates {
+		eventIDs = append(eventIDs, item.eventID)
+	}
+	governing, err := governingFollows(ctx, q, eventIDs, now)
+	if err != nil {
+		return nil, err
+	}
+	skewed := make([]int64, 0, len(candidates))
+	for _, item := range candidates {
+		if g, ok := governing[item.eventID]; ok && g.Deferred {
+			continue
+		}
+		skewed = append(skewed, item.id)
+	}
+	return skewed, nil
 }
 
 func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, horizon time.Duration) (ClockSkewRepairStats, error) {
@@ -994,27 +1242,45 @@ func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, 
 	cutoff := now.Add(horizon)
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (ClockSkewRepairStats, error) {
 		var stats ClockSkewRepairStats
-		// Exclude deliveries deferred by a deliberate pause. Since pausing began
-		// deferring rather than discarding, a paused follow's delivery legitimately
-		// sits far in the future, and requeueing it here delivered every member's
-		// paused notifications at once while the UI still read "Paused until ...".
-		// Clock skew is the target; an explicit pause is not skew.
-		result, err := tx.ExecContext(ctx, `UPDATE deliveries
-		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
-		WHERE status IN ('pending','blocked') AND next_attempt_at>?
-		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)
-		  AND NOT `+pausedDeliveryDeferral("deliveries.event_id"),
-			timeText(now), timeText(cutoff), timeText(now), timeText(now))
+		// Deliveries a deliberate pause is holding back are not clock skew.
+		// Since pausing began deferring rather than discarding, a paused
+		// follow's delivery legitimately sits far in the future, and requeueing
+		// it here delivered every member's paused notifications at once while
+		// the interface still read "Paused until ...".
+		skewed, err := skewedDeliveryIDs(ctx, tx, now, cutoff)
 		if err != nil {
 			return stats, err
 		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return stats, err
+		for start := 0; start < len(skewed); start += governingFollowBatchSize {
+			end := start + governingFollowBatchSize
+			if end > len(skewed) {
+				end = len(skewed)
+			}
+			chunk := skewed[start:end]
+			placeholders := make([]byte, 0, len(chunk)*2)
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, timeText(now))
+			for i, id := range chunk {
+				if i > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+				args = append(args, id)
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE deliveries
+				SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
+				WHERE id IN (`+string(placeholders)+`)`, args...)
+			if err != nil {
+				return stats, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return stats, err
+			}
+			stats.Deliveries += int(changed)
 		}
-		stats.Deliveries = int(changed)
 
-		result, err = tx.ExecContext(ctx, `UPDATE release_digest_deliveries
+		result, err := tx.ExecContext(ctx, `UPDATE release_digest_deliveries
 		SET next_attempt_at=?,claim_owner=NULL,claim_expires_at=NULL
 		WHERE status IN ('pending','blocked') AND next_attempt_at>?
 		  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)`,
@@ -1022,7 +1288,7 @@ func (s *Store) RepairClockSkewedDeliveries(ctx context.Context, now time.Time, 
 		if err != nil {
 			return stats, err
 		}
-		changed, err = result.RowsAffected()
+		changed, err := result.RowsAffected()
 		if err != nil {
 			return stats, err
 		}

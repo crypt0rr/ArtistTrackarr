@@ -123,11 +123,24 @@ type deliveryWork struct {
 	digest *store.DigestDelivery
 }
 
-// Keep the outer worker watchdog aligned with the sender's transport timeout.
-// This still leaves a small amount of room for transactional state updates
-// after Send returns without allowing a stuck transport to hold a worker
-// indefinitely.
-const notificationSendTimeout = notify.DefaultSendTimeout
+// maxDeliveryWorkers bounds the concurrent send fan-out.
+const maxDeliveryWorkers = 4
+
+// notificationSendTimeout bounds one worker's whole attempt: waiting for the
+// process-global send gate plus the transport itself.
+//
+// It MUST be strictly larger than notify.DefaultSendTimeout. context.WithTimeout
+// only ever shortens a deadline, so when this equalled the transport timeout the
+// sender's own budget - which it takes only after acquiring the gate, precisely
+// so queue wait is not charged against the transport - silently inherited this
+// deadline instead. Queue time was therefore billed to the transport again and
+// a send behind a slow one failed on its own queueing, which is the defect the
+// gate change was made to fix.
+//
+// Every HTTP transport serialises through one gate slot, so in the worst case
+// every other worker is ahead of this one; allow for that plus one full
+// transport budget.
+const notificationSendTimeout = notify.DefaultSendTimeout * (maxDeliveryWorkers + 1)
 
 // sendCompletionGrace covers the gap between a send returning and its goroutine
 // being scheduled to report, so a notification the provider has already accepted
@@ -843,6 +856,21 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 		r.logger.Warn("stale delivery attempt reconciliation failed", "error", err)
 	} else if reconciled > 0 {
 		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
+	}
+	// A delivery a pause deferred, then a destination circuit-pause blocked, has
+	// no other automatic route back: destination recovery deliberately skips it
+	// so that fixing a webhook cannot cancel a deliberate pause.
+	if released, err := r.store.ReleasePauseBlockedDeliveries(ctx, now); err != nil {
+		r.logger.Warn("pause-blocked delivery release failed", "error", err)
+	} else if released > 0 {
+		r.logger.Info("pause-blocked deliveries released", "rows", released)
+	}
+	// Queued work whose owner no longer follows anything qualifying for the
+	// release would otherwise fire months later for an artist they removed.
+	if cancelled, err := r.store.CancelOrphanedDeliveries(ctx, now); err != nil {
+		r.logger.Warn("orphaned delivery cancellation failed", "error", err)
+	} else if cancelled > 0 {
+		r.logger.Info("orphaned deliveries cancelled", "rows", cancelled)
 	}
 	policy := r.store.RetentionPolicy()
 	if err := r.store.PruneApplicationLogs(ctx, now.Add(-time.Duration(policy.ApplicationLogsDays)*24*time.Hour)); err != nil {
@@ -1675,7 +1703,7 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 		return summary, nil
 	}
 
-	workerCount := min(4, len(deliveries)+len(digestDeliveries))
+	workerCount := min(maxDeliveryWorkers, len(deliveries)+len(digestDeliveries))
 	work := make(chan deliveryWork)
 	results := make(chan deliveryResult, len(deliveries)+len(digestDeliveries))
 	var workers sync.WaitGroup

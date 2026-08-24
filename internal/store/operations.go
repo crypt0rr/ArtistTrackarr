@@ -469,21 +469,45 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	if snapshot.OldestQueueAt, err = parseStoredNullableTime(oldest, "oldest queued delivery"); err != nil {
 		return DiagnosticsSnapshot{}, err
 	}
-	var earliestFuture sql.NullString
-	// A follow paused by its owner defers its delivery on purpose, so it must not
-	// be counted as clock skew: doing so marked a healthy instance degraded and
-	// surfaced a repair action that would have cancelled the pause.
-	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(value) FROM (
-		SELECT next_attempt_at AS value FROM deliveries d
-		WHERE d.status IN ('pending','blocked') AND d.next_attempt_at>?
-		  AND NOT `+pausedDeliveryDeferral("d.event_id")+`
-		UNION ALL
-		SELECT next_attempt_at FROM release_digest_deliveries
-		WHERE status IN ('pending','blocked') AND next_attempt_at>?)`,
-		timeText(snapshot.CheckedAt.Add(24*time.Hour)), timeText(snapshot.CheckedAt),
-		timeText(snapshot.CheckedAt.Add(24*time.Hour))).
-		Scan(&snapshot.FutureDeliveries, &earliestFuture); err != nil {
+	// A follow paused by its owner defers its delivery on purpose, so it must
+	// not be counted as clock skew: doing so marked a healthy instance degraded
+	// and surfaced a repair action that would have cancelled the pause.
+	//
+	// This counts exactly the set RepairClockSkewedDeliveries repairs, through
+	// the same helper. When the two disagreed the operator saw a non-zero
+	// figure beside a button that then reported nothing to do.
+	skewed, err := skewedDeliveryIDs(ctx, s.readerDB(), snapshot.CheckedAt, snapshot.CheckedAt.Add(24*time.Hour))
+	if err != nil {
 		return DiagnosticsSnapshot{}, err
+	}
+	snapshot.FutureDeliveries = len(skewed)
+	var earliestFuture sql.NullString
+	if len(skewed) > 0 {
+		placeholders := make([]byte, 0, len(skewed)*2)
+		args := make([]any, 0, len(skewed))
+		for i, id := range skewed {
+			if i > 0 {
+				placeholders = append(placeholders, ',')
+			}
+			placeholders = append(placeholders, '?')
+			args = append(args, id)
+		}
+		if err := s.readerDB().QueryRowContext(ctx,
+			`SELECT MIN(next_attempt_at) FROM deliveries WHERE id IN (`+string(placeholders)+`)`, args...).
+			Scan(&earliestFuture); err != nil {
+			return DiagnosticsSnapshot{}, err
+		}
+	}
+	var digestFuture sql.NullString
+	var digestCount int
+	if err := s.readerDB().QueryRowContext(ctx, `SELECT COUNT(*),MIN(next_attempt_at) FROM release_digest_deliveries
+		WHERE status IN ('pending','blocked') AND next_attempt_at>?`,
+		timeText(snapshot.CheckedAt.Add(24*time.Hour))).Scan(&digestCount, &digestFuture); err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
+	snapshot.FutureDeliveries += digestCount
+	if !earliestFuture.Valid || (digestFuture.Valid && digestFuture.String < earliestFuture.String) {
+		earliestFuture = digestFuture
 	}
 	if snapshot.EarliestFutureDelivery, err = parseStoredNullableTime(earliestFuture, "earliest future delivery"); err != nil {
 		return DiagnosticsSnapshot{}, err

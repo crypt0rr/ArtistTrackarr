@@ -2606,3 +2606,109 @@ func TestCancelledWorkerSkipsRatherThanFailing(t *testing.T) {
 		t.Fatalf("work that never ran was recorded as a failure: %#v", result)
 	}
 }
+
+// TestQueuedSendKeepsItsTransportBudgetUnderTheWorkerWatchdog is the delivery
+// layer's half of the send-budget fix.
+//
+// The sender takes its transport budget only after acquiring the process-global
+// gate, so queue wait is not charged against the transport. But this layer
+// wrapped the whole Send - queue wait included - in a context whose timeout was
+// the SAME constant, and context.WithTimeout only ever shortens: the inner
+// "fresh" budget silently inherited the outer deadline and queue time was billed
+// to the transport again.
+//
+// The shipped notify-side test cannot catch this because it passes
+// context.Background(), which production never does. This drives the real
+// wrapper.
+func TestQueuedSendKeepsItsTransportBudgetUnderTheWorkerWatchdog(t *testing.T) {
+	if notificationSendTimeout <= notify.DefaultSendTimeout {
+		t.Fatalf("worker watchdog %s does not exceed the transport timeout %s, so queue wait is charged against the transport",
+			notificationSendTimeout, notify.DefaultSendTimeout)
+	}
+
+	// A sender that spends most of the transport budget, as a real slow provider
+	// does, must still succeed when the caller's watchdog wraps it.
+	runner := &Runner{sender: slowSender{delay: notify.DefaultSendTimeout / 2}}
+	// Simulate having already waited in the gate for most of one transport
+	// budget before this send starts.
+	elapsed := notify.DefaultSendTimeout - (notify.DefaultSendTimeout / 4)
+	ctx, cancel := context.WithTimeout(context.Background(), notificationSendTimeout-elapsed)
+	defer cancel()
+	if err := runner.sendNotification(ctx, "generic+https://example.invalid/hook", "title", "body"); err != nil {
+		t.Fatalf("a send that queued before starting lost its transport budget: %v", err)
+	}
+}
+
+// TestDeliveryOutcomeIsRecordedAfterTheRunnerContextIsCancelled guards the one
+// call that makes shutdown safe: deliveryStateContext detaches the durable
+// write with context.WithoutCancel, so a notification the provider already
+// accepted still reaches a terminal state when the process is stopping.
+//
+// That detachment is the whole mechanism behind two closed issues, and neither
+// closure covered it. Both of their tests pass with the detachment removed: one
+// disclaims the storage path in its own comment and asserts only that the send
+// returned nil, and the other never cancels its context, so WithoutCancel makes
+// no difference. Reverting the detachment left the entire suite green across all
+// twelve packages.
+//
+// Without it, every container restart re-sends whatever was in flight: the row
+// stays pending with attempts unchanged, so it is picked up again and again and
+// never reaches a terminal state.
+func TestDeliveryOutcomeIsRecordedAfterTheRunnerContextIsCancelled(t *testing.T) {
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	cipher, err := security.NewCipher("cancelled delivery secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceURL, err := cipher.Encrypt("test://cancelled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, &cancellingSender{cancel: cancel},
+		cipher, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	result := runner.deliverOne(ctx, now, store.Delivery{
+		ID: 1, Destination: store.Destination{ID: 1, EncryptedURL: serviceURL},
+	})
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the runner context should have been cancelled during the send")
+	}
+	if result.failed {
+		t.Fatalf("a notification the provider accepted was recorded as failed because the runner was stopping: %#v", result)
+	}
+	if !result.sent {
+		t.Fatalf("the delivery outcome was not recorded, so it will be re-sent on the next start: %#v", result)
+	}
+	if result.err != nil && errors.Is(result.err, context.Canceled) {
+		t.Fatalf("the durable state write inherited the cancelled runner context: %v", result.err)
+	}
+}
+
+// TestDigestDeliveryOutcomeIsRecordedAfterCancellation covers the digest leg of
+// the same detachment, which shares performDelivery but its own store calls.
+func TestDigestDeliveryOutcomeIsRecordedAfterCancellation(t *testing.T) {
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	cipher, err := security.NewCipher("cancelled digest secret with at least 32 chars!!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceURL, err := cipher.Encrypt("test://cancelled-digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, &cancellingSender{cancel: cancel},
+		cipher, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	result := runner.deliverDigestOne(ctx, now, store.DigestDelivery{
+		ID: 1, Destination: store.Destination{ID: 1, EncryptedURL: serviceURL},
+	})
+	if result.failed || !result.sent {
+		t.Fatalf("a digest the provider accepted was not recorded during shutdown: %#v", result)
+	}
+}

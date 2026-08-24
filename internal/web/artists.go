@@ -218,7 +218,15 @@ func artistListQuery(r *http.Request) string {
 		return ""
 	}
 	preserved := url.Values{}
-	for _, key := range []string{"q", "genre", "country", "type", "page"} {
+	// Deliberately excludes "q". The discovery term is not a followed-list
+	// parameter - the list query reads only the three filters - and echoing it
+	// back re-ran provider discovery (Spotify, then Apple/iTunes, then
+	// MusicBrainz) on every sync, remove, pause, resume and rule save. Local
+	// bookkeeping became third-party API calls that consumed the shared
+	// MusicBrainz budget, and thirty actions in five minutes exhausted the
+	// search limiter, showing "search is temporarily rate limited" on a page
+	// where the member never searched.
+	for _, key := range []string{"genre", "country", "type", "page"} {
 		if value := strings.TrimSpace(values.Get(key)); value != "" {
 			preserved.Set(key, value)
 		}

@@ -95,3 +95,48 @@ func TestArtistActionRedirectIgnoresUnknownListKeys(t *testing.T) {
 		t.Fatalf("the encoded value carries a line break: %q", got)
 	}
 }
+
+// TestArtistActionsDoNotReplayTheDiscoveryQuery pins the #236 list context to
+// parameters the followed list actually reads. It preserved "q" as well, but the
+// list query never consults it - it feeds provider discovery alone - so every
+// sync, remove, pause, resume and rule save replayed a Spotify, Apple/iTunes and
+// MusicBrainz search for a purely local change. Those calls consume the shared
+// per-second MusicBrainz budget, and thirty actions in five minutes exhausted
+// the search limiter, showing a red "search is temporarily rate limited" banner
+// on a page where the member never searched.
+func TestArtistActionsDoNotReplayTheDiscoveryQuery(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/artists/1/sync",
+		strings.NewReader("list="+url.QueryEscape("q=radiohead&genre=rock&page=3")))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	got := artistListQuery(request)
+	values, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.Get("q") != "" {
+		t.Fatalf("the discovery term survived into an action redirect: %q", got)
+	}
+	// The genuine list parameters must still be preserved.
+	if values.Get("genre") != "rock" || values.Get("page") != "3" {
+		t.Fatalf("list parameters were lost: %q", got)
+	}
+}
+
+// TestArtistsPageListContextOmitsTheSearchTerm covers the other half: the value
+// the page hands to its action forms.
+func TestArtistsPageListContextOmitsTheSearchTerm(t *testing.T) {
+	d := &PageData{}
+	d.Query = "radiohead"
+	d.GenreFilter = "rock"
+	got := currentArtistListQuery(d, 2)
+	values, err := url.ParseQuery(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.Get("q") != "" {
+		t.Fatalf("the page hands the discovery term to its action forms: %q", got)
+	}
+	if values.Get("genre") != "rock" || values.Get("page") != "2" {
+		t.Fatalf("list parameters missing from the page context: %q", got)
+	}
+}

@@ -306,8 +306,8 @@ func TestDestinationHealthAndDeliveryAttemptAudit(t *testing.T) {
 	if due, err := s.DueDigestDeliveries(ctx, now.Add(2*time.Hour), 10); err != nil || len(due) != 0 {
 		t.Fatalf("paused destination returned digest due deliveries=%#v err=%v", due, err)
 	}
-	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 2 {
-		t.Fatalf("retry count=%d err=%v, want normal and digest rows", count, err)
+	if stats, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || stats.Total() != 2 {
+		t.Fatalf("retry stats=%+v err=%v, want normal and digest rows", stats, err)
 	}
 	var status string
 	var attempts int
@@ -377,8 +377,8 @@ func TestUnsupportedDestinationRemainsVisibleAndQueuesBlockedWork(t *testing.T) 
 	if due, err := s.DueDeliveries(ctx, now.Add(24*time.Hour), 10); err != nil || len(due) != 0 {
 		t.Fatalf("blocked destination returned due deliveries=%#v err=%v", due, err)
 	}
-	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 1 {
-		t.Fatalf("blocked destination retry count=%d err=%v", count, err)
+	if stats, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || stats.Total() != 1 {
+		t.Fatalf("blocked destination retry stats=%+v err=%v", stats, err)
 	}
 	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE destination_id=?`, destination.ID).Scan(&status); err != nil {
 		t.Fatal(err)
@@ -391,8 +391,8 @@ func TestUnsupportedDestinationRemainsVisibleAndQueuesBlockedWork(t *testing.T) 
 	if _, err := s.DB.ExecContext(ctx, `UPDATE destinations SET service='generic',transport_status='supported',transport_message='' WHERE id=?`, destination.ID); err != nil {
 		t.Fatal(err)
 	}
-	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 1 {
-		t.Fatalf("recovered destination retry count=%d err=%v", count, err)
+	if stats, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || stats.Total() != 1 {
+		t.Fatalf("recovered destination retry stats=%+v err=%v", stats, err)
 	}
 	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE destination_id=?`, destination.ID).Scan(&status); err != nil {
 		t.Fatal(err)
@@ -478,8 +478,8 @@ func TestPausingDestinationBlocksQueuedNormalAndDigestWork(t *testing.T) {
 	if normalStatus != "blocked" || digestStatus != "blocked" {
 		t.Fatalf("queued work statuses normal=%q digest=%q, want blocked", normalStatus, digestStatus)
 	}
-	if count, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || count != 2 {
-		t.Fatalf("retry count=%d err=%v, want both blocked rows", count, err)
+	if stats, err := s.RetryFailedDeliveries(ctx, userID, destination.ID, now); err != nil || stats.Total() != 2 {
+		t.Fatalf("retry stats=%+v err=%v, want both blocked rows", stats, err)
 	}
 	if err := s.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE event_id=?`, eventID).Scan(&normalStatus); err != nil {
 		t.Fatal(err)

@@ -182,6 +182,22 @@ func scanFollowNotificationRule(row interface{ Scan(...any) error }) (FollowNoti
 // digest builder; requested IDs that predate the migration receive the same
 // safe inherit defaults as a newly-created follow.
 func (s *Store) FollowNotificationRules(ctx context.Context, userID int64, artistIDs []int64) (map[int64]FollowNotificationRule, error) {
+	return followNotificationRulesQ(ctx, s.readerDB(), userID, artistIDs)
+}
+
+// followNotificationRulesTx reads rules inside an open write transaction, so a
+// caller can read, decide and write atomically.
+func followNotificationRulesTx(ctx context.Context, tx *sql.Tx, userID int64, artistIDs []int64) (map[int64]FollowNotificationRule, error) {
+	return followNotificationRulesQ(ctx, tx, userID, artistIDs)
+}
+
+// followNotificationRulesQ returns one rule per followed artist, defaulting for
+// follows that have no explicit row yet.
+//
+// Each cursor is drained and closed before the next statement runs. The reader
+// pool is four connections, and holding one cursor open across a second query
+// is how that pool gets exhausted.
+func followNotificationRulesQ(ctx context.Context, q rowQuerier, userID int64, artistIDs []int64) (map[int64]FollowNotificationRule, error) {
 	now := time.Now().UTC()
 	result := make(map[int64]FollowNotificationRule)
 	followQuery := `SELECT artist_id FROM follows WHERE user_id=?`
@@ -211,37 +227,80 @@ func (s *Store) FollowNotificationRules(ctx context.Context, userID int64, artis
 		followQuery += ` AND artist_id IN (` + strings.Join(placeholders, ",") + ")"
 		query += ` AND r.artist_id IN (` + strings.Join(placeholders, ",") + ")"
 	}
-	followRows, err := s.readerDB().QueryContext(ctx, followQuery, followArgs...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = followRows.Close() }()
-	for followRows.Next() {
-		var artistID int64
-		if err := followRows.Scan(&artistID); err != nil {
-			return nil, err
-		}
-		result[artistID] = defaultFollowNotificationRule(userID, artistID, now)
-	}
-	if err := followRows.Err(); err != nil {
-		return nil, err
-	}
-	rows, err := s.readerDB().QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		rule, err := scanFollowNotificationRule(rows)
+	if err := func() error {
+		followRows, err := q.QueryContext(ctx, followQuery, followArgs...)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		result[rule.ArtistID] = rule
+		defer func() { _ = followRows.Close() }()
+		for followRows.Next() {
+			var artistID int64
+			if err := followRows.Scan(&artistID); err != nil {
+				return err
+			}
+			result[artistID] = defaultFollowNotificationRule(userID, artistID, now)
+		}
+		return followRows.Err()
+	}(); err != nil {
+		return nil, err
 	}
-	if err := rows.Err(); err != nil {
+	if err := func() error {
+		rows, err := q.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			rule, err := scanFollowNotificationRule(rows)
+			if err != nil {
+				return err
+			}
+			result[rule.ArtistID] = rule
+		}
+		return rows.Err()
+	}(); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// upsertFollowNotificationRulesTx is the write half of
+// UpdateFollowNotificationRules, extracted so a caller can perform the rule
+// write and the delivery realignment in ONE transaction against ONE clock.
+// Pausing previously wrote the rule in one transaction and realigned in a
+// second, with a second time.Now(): the recompute must see the pause it is
+// reacting to, which is only guaranteed inside the same transaction.
+func upsertFollowNotificationRulesTx(ctx context.Context, tx *sql.Tx, userID int64, ids []int64, rule FollowNotificationRule, now time.Time) error {
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, userID)
+	for _, artistID := range ids {
+		args = append(args, artistID)
+	}
+	var followed int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+		return err
+	}
+	if followed != len(ids) {
+		return sql.ErrNoRows
+	}
+	for _, artistID := range ids {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
+		(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,paused_until,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(user_id,artist_id) DO UPDATE SET
+		delivery_mode=excluded.delivery_mode,include_primary=excluded.include_primary,
+		include_featured=excluded.include_featured,albums=excluded.albums,eps=excluded.eps,
+		singles=excluded.singles,compilations=excluded.compilations,
+		announcements=excluded.announcements,release_day=excluded.release_day,
+		paused_until=excluded.paused_until,updated_at=excluded.updated_at`,
+			userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
+			boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
+			boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) FollowNotificationRule(ctx context.Context, userID, artistID int64) (FollowNotificationRule, error) {
@@ -284,34 +343,14 @@ func (s *Store) UpdateFollowNotificationRules(ctx context.Context, userID int64,
 	rule.DeliveryMode = normalizeFollowDeliveryMode(rule.DeliveryMode)
 	now := time.Now().UTC()
 	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
-		args := make([]any, 0, len(ids)+1)
-		args = append(args, userID)
-		for _, artistID := range ids {
-			args = append(args, artistID)
-		}
-		var followed int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM follows WHERE user_id=? AND artist_id IN (`+placeholders+`)`, args...).Scan(&followed); err != nil {
+		if err := upsertFollowNotificationRulesTx(ctx, tx, userID, ids, rule, now); err != nil {
 			return 0, err
 		}
-		if followed != len(ids) {
-			return 0, sql.ErrNoRows
-		}
-		for _, artistID := range ids {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO follow_notification_rules
-			(user_id,artist_id,delivery_mode,include_primary,include_featured,albums,eps,singles,compilations,announcements,release_day,paused_until,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(user_id,artist_id) DO UPDATE SET
-			delivery_mode=excluded.delivery_mode,include_primary=excluded.include_primary,
-			include_featured=excluded.include_featured,albums=excluded.albums,eps=excluded.eps,
-			singles=excluded.singles,compilations=excluded.compilations,
-			announcements=excluded.announcements,release_day=excluded.release_day,
-			paused_until=excluded.paused_until,updated_at=excluded.updated_at`,
-				userID, artistID, rule.DeliveryMode, boolInt(rule.IncludePrimary), boolInt(rule.IncludeFeatured),
-				boolInt(rule.Albums), boolInt(rule.EPs), boolInt(rule.Singles), boolInt(rule.Compilations),
-				boolInt(rule.Announcements), boolInt(rule.ReleaseDay), nullableTime(rule.PausedUntil), timeText(now)); err != nil {
-				return 0, err
-			}
+		// A rule change can hand governance of a queued delivery from one follow
+		// to another - a pause, or a mode change that outranks the incumbent -
+		// so the queue has to be re-derived here too, not only on pause.
+		if err := realignQueuedDeliveriesTx(ctx, tx, userID, ids, now); err != nil {
+			return 0, err
 		}
 		return len(ids), nil
 	})
@@ -371,53 +410,182 @@ func (s *Store) SetFollowNotificationDeliveryMode(ctx context.Context, userID in
 		if err != nil {
 			return 0, err
 		}
+		// A mode change can outrank the follow that currently governs a queued
+		// delivery, so the schedule has to be re-derived here as well.
+		if err := realignQueuedDeliveriesTx(ctx, tx, userID, ids, time.Now().UTC()); err != nil {
+			return 0, err
+		}
 		return int(changed), nil
 	})
 }
 
+// PauseFollowNotificationRule sets or clears a follow's pause and moves the
+// deliveries that pause governs to match, in one transaction against one clock.
+//
+// The realignment must run after the upsert so the recompute observes the new
+// pause, and both must be atomic: a crash between them left deliveries parked
+// against a pause that no longer existed.
 func (s *Store) PauseFollowNotificationRule(ctx context.Context, userID, artistID int64, until *time.Time) error {
-	rule, err := s.FollowNotificationRule(ctx, userID, artistID)
+	now := time.Now().UTC()
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		rules, err := followNotificationRulesTx(ctx, tx, userID, []int64{artistID})
+		if err != nil {
+			return err
+		}
+		rule, ok := rules[artistID]
+		if !ok {
+			return sql.ErrNoRows
+		}
+		rule.PausedUntil = until
+		if err := upsertFollowNotificationRulesTx(ctx, tx, userID, []int64{artistID}, rule, now); err != nil {
+			return err
+		}
+		return realignQueuedDeliveriesTx(ctx, tx, userID, []int64{artistID}, now)
+	})
+}
+
+// realignQueuedDeliveriesTx re-derives the governing follow for every queued
+// delivery of userID that a change to any of artistIDs could affect, and
+// rewrites next_attempt_at to match whatever follow now governs it.
+//
+// It is keyed on the release correlation, not on the follow that changed, on
+// purpose: a pause or a mode change can hand governance from one follow to
+// another, and the row must end up on the NEW governor's schedule. A delivery
+// governed by a different, still-active follow is therefore visited and left
+// exactly where that follow put it - which is precisely what pausing or
+// resuming one follow used to break for every other follow on the same release.
+//
+// The predecessor bounded its update with next_attempt_at > target, which admits
+// only the earlier direction; extending a pause therefore left its deliveries
+// due at the old, earlier time. There is no such bound here.
+func realignQueuedDeliveriesTx(ctx context.Context, tx *sql.Tx, userID int64, artistIDs []int64, now time.Time) error {
+	if userID < 1 || len(artistIDs) == 0 {
+		return nil
+	}
+	type queued struct {
+		id        int64
+		eventID   int64
+		attempts  int
+		nextAt    time.Time
+		hasNextAt bool
+	}
+	var candidates []queued
+	seen := make(map[int64]struct{})
+	for _, artistID := range artistIDs {
+		if artistID < 1 {
+			continue
+		}
+		// ne.user_id=? is load-bearing: two members can hold deliveries deferred
+		// by their own follows on the same artist id.
+		if err := func() error {
+			rows, err := tx.QueryContext(ctx, `SELECT d.id,d.event_id,d.attempts,d.next_attempt_at
+				FROM deliveries d
+				WHERE d.status IN ('pending','blocked')
+				  AND EXISTS (
+					SELECT 1 FROM notification_events ne
+					JOIN release_groups rg ON rg.id=ne.release_group_id
+					WHERE ne.id=d.event_id AND ne.user_id=?
+					  AND (rg.artist_id=? OR EXISTS (
+						SELECT 1 FROM release_credits rc
+						WHERE rc.release_group_id=rg.id AND rc.artist_id=?
+					  ))
+				  )`, userID, artistID, artistID)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var item queued
+				var nextAt sql.NullString
+				if err := rows.Scan(&item.id, &item.eventID, &item.attempts, &nextAt); err != nil {
+					return err
+				}
+				if nextAt.Valid && strings.TrimSpace(nextAt.String) != "" {
+					parsed, err := parseStoredTime(nextAt.String, "delivery next attempt")
+					if err != nil {
+						return err
+					}
+					item.nextAt, item.hasNextAt = parsed, true
+				}
+				if _, dup := seen[item.id]; dup {
+					continue
+				}
+				seen[item.id] = struct{}{}
+				candidates = append(candidates, item)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return err
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	eventIDs := make([]int64, 0, len(candidates))
+	for _, item := range candidates {
+		eventIDs = append(eventIDs, item.eventID)
+	}
+	governing, err := governingFollows(ctx, tx, eventIDs, now)
 	if err != nil {
 		return err
 	}
-	rule.PausedUntil = until
-	if _, err = s.UpdateFollowNotificationRules(ctx, userID, []int64{artistID}, rule); err != nil {
-		return err
+	// Bucket by target instant so each distinct value is one statement.
+	buckets := make(map[string][]int64)
+	for _, item := range candidates {
+		g, ok := governing[item.eventID]
+		if !ok {
+			// No follow governs this delivery any more - metadata drift, a
+			// tightened preference, or an unfollow. Leave it exactly where it
+			// is: whether the member may still be sent it at all is a different
+			// question, and only the coarse visibility predicate may answer it.
+			continue
+		}
+		switch {
+		case g.Deferred && item.attempts == 0:
+			// The pause decides, in both directions. This is the extend case.
+			buckets[timeText(g.DeferTo)] = append(buckets[timeText(g.DeferTo)], item.id)
+		case g.Deferred && item.attempts > 0:
+			// Honour the pause without ever pulling a retry backoff earlier.
+			target := g.DeferTo
+			if item.hasNextAt && item.nextAt.After(target) {
+				target = item.nextAt
+			}
+			buckets[timeText(target)] = append(buckets[timeText(target)], item.id)
+		case !g.Deferred && item.attempts == 0:
+			// No pause governs it; make it due, but never push it later.
+			if item.hasNextAt && item.nextAt.After(now) {
+				buckets[timeText(now)] = append(buckets[timeText(now)], item.id)
+			}
+		default:
+			// An ordinary retry backoff that no pause created. Resuming an
+			// unrelated follow used to reset these to now, forcing an immediate
+			// re-attempt against a destination that was already failing.
+		}
 	}
-	// Pausing defers a delivery to the pause expiry, so changing the pause has
-	// to move those deliveries with it. Without this, lifting a pause early left
-	// its notifications parked at the original expiry - the member sees the
-	// follow active again and hears nothing for the rest of the original window -
-	// and extending a pause left them due at the old, earlier time.
-	return s.realignDeferredDeliveries(ctx, userID, artistID, until, time.Now().UTC())
-}
-
-// realignDeferredDeliveries moves the deliveries deferred by one member's follow
-// to match that follow's current pause. Deliveries are matched the same way
-// admission selects the governing follow: the canonical release artist, or an
-// artist credited on the release.
-func (s *Store) realignDeferredDeliveries(ctx context.Context, userID, artistID int64, until *time.Time, now time.Time) error {
-	target := now
-	if until != nil && until.After(now) {
-		target = *until
+	for target, ids := range buckets {
+		for start := 0; start < len(ids); start += governingFollowBatchSize {
+			end := start + governingFollowBatchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			chunk := ids[start:end]
+			placeholders := make([]byte, 0, len(chunk)*2)
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, target)
+			for i, id := range chunk {
+				if i > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+				args = append(args, id)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET next_attempt_at=?
+				WHERE id IN (`+string(placeholders)+`)`, args...); err != nil {
+				return err
+			}
+		}
 	}
-	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE deliveries
-		SET next_attempt_at=?
-		WHERE status IN ('pending','blocked')
-		  AND next_attempt_at>?
-		  AND EXISTS (
-			SELECT 1 FROM notification_events ne
-			JOIN release_groups rg ON rg.id=ne.release_group_id
-			WHERE ne.id=deliveries.event_id
-			  AND ne.user_id=?
-			  AND (rg.artist_id=? OR EXISTS (
-				SELECT 1 FROM release_credits rc
-				WHERE rc.release_group_id=rg.id AND rc.artist_id=?
-			  ))
-		  )`, timeText(target), timeText(target), userID, artistID, artistID)
-		return err
-	})
+	return nil
 }
 
 func followRuleFromColumns(mode string, primary, featured, albums, eps, singles, compilations, announcements, releaseDay int, paused string, updated string, userID, artistID int64) (FollowNotificationRule, error) {
