@@ -1174,8 +1174,10 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 // because it is the default.
 func currentArtistListQuery(d *PageData, page int) string {
 	values := url.Values{}
+	// "q" is excluded on purpose; see artistListQuery. It drives discovery, not
+	// the followed list, so carrying it through an action re-runs provider
+	// searches for a purely local change.
 	for key, value := range map[string]string{
-		"q":       d.Query,
 		"genre":   d.GenreFilter,
 		"country": d.CountryFilter,
 		"type":    d.TypeFilter,
