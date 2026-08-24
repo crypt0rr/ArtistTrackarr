@@ -130,10 +130,27 @@ func (s *Store) Follow(ctx context.Context, userID, artistID int64) (bool, error
 			VALUES(?,?, 'inherit',1,1,1,1,1,1,1,1,?)`, userID, artistID, now); err != nil {
 			return false, err
 		}
+		// A new follow can outrank whichever follow currently governs an
+		// already-queued delivery for the same release: a fresh rule is
+		// "inherit", which is full priority, and on the canonical artist it also
+		// wins admission's tie-break. Re-derive so the row lands on the new
+		// governor's schedule.
+		if err := realignQueuedDeliveriesTx(ctx, tx, userID, []int64{artistID}, time.Now().UTC()); err != nil {
+			return false, err
+		}
 		return n > 0, nil
 	})
 }
+
+// Unfollow removes a follow and cleans up the work it was the reason for.
+//
+// Removing an artist from the watchlist previously left already-queued
+// deliveries in place, so an alert for an artist the member had removed still
+// arrived - potentially months later, since a deferred or backed-off row can sit
+// far in the future - with the artist absent from every page that would explain
+// it.
 func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
+	now := time.Now().UTC()
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, artistID)
 		if err != nil {
@@ -145,7 +162,33 @@ func (s *Store) Unfollow(ctx context.Context, userID, artistID int64) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM follow_notification_rules WHERE user_id=? AND artist_id=?`, userID, artistID); err != nil {
 			return err
 		}
-		return nil
+		// Both DELETEs must land first: the predicates below have to see
+		// post-unfollow state.
+		//
+		// Cancellation asks the COARSE visibility question - does the member
+		// still follow anything that qualifies for this release - and never the
+		// governing-follow recompute. A recompute can come back empty for a
+		// release the member plainly still follows (metadata drift, a tightened
+		// account preference), and deleting on that would be permanent: the
+		// event row is UNIQUE(user_id, release_group_id, event_type) and the
+		// release is no longer newly observed, so the alert could never be
+		// recreated. The unclaimed guard keeps this off a row a worker is
+		// currently sending.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM deliveries WHERE id IN (
+			SELECT d.id FROM deliveries d
+			JOIN notification_events ne ON ne.id=d.event_id
+			JOIN release_groups rg ON rg.id=ne.release_group_id
+			WHERE ne.user_id=? AND d.status IN ('pending','blocked')
+			  AND (d.claim_owner IS NULL OR d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
+			  AND (rg.artist_id=? OR EXISTS (SELECT 1 FROM release_credits rc
+				WHERE rc.release_group_id=rg.id AND rc.artist_id=?))
+			  AND NOT `+followedReleasePredicate("ne.user_id")+`)`,
+			userID, timeText(now), artistID, artistID); err != nil {
+			return err
+		}
+		// Whatever survived is still reachable through another follow; re-key it
+		// onto whichever follow governs it now.
+		return realignQueuedDeliveriesTx(ctx, tx, userID, []int64{artistID}, now)
 	})
 }
 

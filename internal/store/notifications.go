@@ -482,6 +482,140 @@ func (s *Store) RetryFailedDeliveries(ctx context.Context, userID, destinationID
 		return stats, nil
 	})
 }
+
+// ReleasePauseBlockedDeliveries returns durable work to the runnable queue once
+// the reason it was blocked has gone.
+//
+// A destination circuit-pause converts every pending row for that destination to
+// blocked, including rows a paused follow had deferred and nothing had yet
+// attempted. Recovery deliberately does not requeue those - a pause must not be
+// cancelled by fixing a destination - but that left them blocked with no
+// automatic pass and nothing in the interface saying a second Retry press would
+// be needed once the pause expired.
+//
+// Rows stay blocked while their destination is still paused, disabled or on an
+// unsupported transport, and while their governing follow still defers them.
+// attempts and next_attempt_at are deliberately untouched: this restores
+// runnability, it is not a manual "start over". A row deferred to a pause that
+// has since expired already carries a past next_attempt_at and becomes due
+// immediately, which is the case this exists for.
+func (s *Store) ReleasePauseBlockedDeliveries(ctx context.Context, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return withWriteTxResult(s, ctx, func(tx *sql.Tx) (int, error) {
+		type queued struct {
+			id      int64
+			eventID int64
+		}
+		var candidates []queued
+		if err := func() error {
+			rows, err := tx.QueryContext(ctx, `SELECT d.id,d.event_id FROM deliveries d
+				JOIN destinations dst ON dst.id=d.destination_id
+				LEFT JOIN destination_health dh ON dh.destination_id=dst.id
+				WHERE d.status='blocked' AND dst.enabled=1
+				  AND `+supportedDestinationServicePredicate("dst")+`
+				  AND `+destinationAdmissionPredicate)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var item queued
+				if err := rows.Scan(&item.id, &item.eventID); err != nil {
+					return err
+				}
+				candidates = append(candidates, item)
+			}
+			return rows.Err()
+		}(); err != nil {
+			return 0, err
+		}
+		if len(candidates) == 0 {
+			return 0, nil
+		}
+		eventIDs := make([]int64, 0, len(candidates))
+		for _, item := range candidates {
+			eventIDs = append(eventIDs, item.eventID)
+		}
+		governing, err := governingFollows(ctx, tx, eventIDs, now)
+		if err != nil {
+			return 0, err
+		}
+		releasable := make([]int64, 0, len(candidates))
+		for _, item := range candidates {
+			if g, ok := governing[item.eventID]; ok && g.Deferred {
+				continue
+			}
+			releasable = append(releasable, item.id)
+		}
+		released := 0
+		for start := 0; start < len(releasable); start += governingFollowBatchSize {
+			end := start + governingFollowBatchSize
+			if end > len(releasable) {
+				end = len(releasable)
+			}
+			chunk := releasable[start:end]
+			placeholders := make([]byte, 0, len(chunk)*2)
+			args := make([]any, 0, len(chunk))
+			for i, id := range chunk {
+				if i > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+				args = append(args, id)
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE deliveries
+				SET status='pending',claim_owner=NULL,claim_expires_at=NULL,
+				    last_error=CASE WHEN last_error='destination paused after repeated failures' THEN '' ELSE last_error END
+				WHERE id IN (`+string(placeholders)+`) AND status='blocked'`, args...)
+			if err != nil {
+				return 0, err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			released += int(changed)
+		}
+		return released, nil
+	})
+}
+
+// CancelOrphanedDeliveries removes queued deliveries their owner can no longer
+// reach or cancel: nothing they follow qualifies for the release any more.
+//
+// It asks the coarse visibility question and never the governing-follow
+// recompute. Metadata drift or a tightened account preference can empty the
+// candidate set for a release the member plainly still follows, and deleting
+// there would turn a display glitch into permanent alert loss - permanent
+// because notification_events is UNIQUE(user_id, release_group_id, event_type)
+// and the release is no longer newly observed.
+//
+// Only the delivery row is removed; the notification_events row is kept so
+// re-following restores inbox history and the uniqueness slot is not recycled.
+// The unclaimed guard keeps this from deleting a row a live worker is sending.
+func (s *Store) CancelOrphanedDeliveries(ctx context.Context, now time.Time) (int, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result, err := s.execWriteContext(ctx, `DELETE FROM deliveries WHERE id IN (
+		SELECT d.id FROM deliveries d
+		JOIN notification_events ne ON ne.id=d.event_id
+		JOIN release_groups rg ON rg.id=ne.release_group_id
+		WHERE d.status IN ('pending','blocked')
+		  AND (d.claim_owner IS NULL OR d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
+		  AND NOT `+followedReleasePredicate("ne.user_id")+`)`, timeText(now))
+	if err != nil {
+		return 0, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(changed), nil
+}
+
 func (s *Store) Destination(ctx context.Context, userID, id int64) (Destination, error) {
 	var d Destination
 	err := s.readerDB().QueryRowContext(ctx, `SELECT id,user_id,name,service,encrypted_url,enabled,COALESCE(transport_status,'supported'),COALESCE(transport_message,'')

@@ -845,3 +845,152 @@ func TestRealignmentDoesNotResetAnOrdinaryRetryBackoff(t *testing.T) {
 		t.Fatalf("an ordinary retry backoff was reset: %s -> %s", backoff, got)
 	}
 }
+
+// TestPauseDeferredDeliveryBlockedByADestinationRecoversAutomatically is #247.
+// A destination circuit-pause converts every pending row to blocked, including
+// one a paused follow had deferred and nothing had attempted. Destination
+// recovery deliberately skips those - fixing a webhook must not cancel a
+// pause - so the row had no automatic route home at all: the member had to know
+// to press Retry a second time after the pause expired, which nothing said.
+func TestPauseDeferredDeliveryBlockedByADestinationRecoversAutomatically(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, _, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// The governing follow is paused, so the delivery is deliberately deferred.
+	until := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &until); err != nil {
+		t.Fatal(err)
+	}
+	// The destination then circuit-pauses, flipping it to blocked.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='blocked',
+		last_error='destination paused after repeated failures' WHERE id=?`, deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	// While the pause is still in force the row must stay blocked.
+	if released, err := s.ReleasePauseBlockedDeliveries(ctx, time.Now().UTC()); err != nil || released != 0 {
+		t.Fatalf("released=%d err=%v while the pause was still active, want 0", released, err)
+	}
+	var status string
+	if err := s.DB.QueryRow(`SELECT status FROM deliveries WHERE id=?`, deliveryID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "blocked" {
+		t.Fatalf("status=%q during an active pause, want blocked", status)
+	}
+
+	// Once the pause has expired the maintenance sweep must bring it home with
+	// no member action at all.
+	after := until.Add(time.Hour)
+	released, err := s.ReleasePauseBlockedDeliveries(ctx, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released != 1 {
+		t.Fatalf("released=%d after the pause expired, want 1", released)
+	}
+	var lastError string
+	if err := s.DB.QueryRow(`SELECT status,last_error FROM deliveries WHERE id=?`, deliveryID).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("status=%q after the pause expired, want pending", status)
+	}
+	if lastError != "" {
+		t.Fatalf("last_error=%q, want the circuit-pause message cleared", lastError)
+	}
+}
+
+// TestUnfollowCancelsItsQueuedDeliveries is #251. Removing an artist left its
+// already-queued notifications in place, so an alert still arrived for an
+// artist the member had removed - and a deferred or backed-off row can sit
+// months out, long after every page that would explain it stopped showing the
+// artist.
+func TestUnfollowCancelsItsQueuedDeliveries(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, guestID, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// Unfollowing the guest must NOT cancel: the member still follows the
+	// canonical artist, so the release is still theirs to hear about.
+	if err := s.Unfollow(ctx, userID, guestID); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE id=?`, deliveryID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatal("unfollowing one of two qualifying follows cancelled a delivery the member can still legitimately receive")
+	}
+
+	// Unfollowing the last qualifying artist must cancel it.
+	if err := s.Unfollow(ctx, userID, canonicalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE id=?`, deliveryID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatal("a delivery survived after its last qualifying follow was removed, so the alert still fires for a removed artist")
+	}
+	// The event row is deliberately kept: it is the inbox history, and its
+	// uniqueness slot must not be recycled.
+	var events int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM notification_events WHERE user_id=?`, userID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("notification_events=%d, want the audit row kept", events)
+	}
+}
+
+// TestOrphanCancellationSweepMatchesUnfollow keeps the unattended sweep and the
+// unfollow path agreeing, since a delivery can also be orphaned by a route that
+// does not run Unfollow at all.
+func TestOrphanCancellationSweepMatchesUnfollow(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, guestID, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// Remove both follows directly, bypassing Unfollow entirely.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	_ = canonicalID
+	_ = guestID
+	cancelled, err := s.CancelOrphanedDeliveries(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled != 1 {
+		t.Fatalf("sweep cancelled=%d, want 1", cancelled)
+	}
+	var remaining int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE id=?`, deliveryID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatal("the sweep left an orphaned delivery queued")
+	}
+}
+
+// TestOrphanSweepDoesNotTouchClaimedWork keeps the cancellation off a row a
+// live worker is mid-send on.
+func TestOrphanSweepDoesNotTouchClaimedWork(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _, _, _, deliveryID := seedTwoFollowScenario(t, s)
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	lease := time.Now().UTC().Add(5 * time.Minute)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET claim_owner='worker-1',claim_expires_at=? WHERE id=?`,
+		timeText(lease), deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := s.CancelOrphanedDeliveries(ctx, time.Now().UTC()); err != nil || cancelled != 0 {
+		t.Fatalf("cancelled=%d err=%v, want the claimed row left alone", cancelled, err)
+	}
+}

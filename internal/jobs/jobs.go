@@ -844,6 +844,21 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 	} else if reconciled > 0 {
 		r.logger.Info("stale delivery attempts reconciled", "attempts", reconciled)
 	}
+	// A delivery a pause deferred, then a destination circuit-pause blocked, has
+	// no other automatic route back: destination recovery deliberately skips it
+	// so that fixing a webhook cannot cancel a deliberate pause.
+	if released, err := r.store.ReleasePauseBlockedDeliveries(ctx, now); err != nil {
+		r.logger.Warn("pause-blocked delivery release failed", "error", err)
+	} else if released > 0 {
+		r.logger.Info("pause-blocked deliveries released", "rows", released)
+	}
+	// Queued work whose owner no longer follows anything qualifying for the
+	// release would otherwise fire months later for an artist they removed.
+	if cancelled, err := r.store.CancelOrphanedDeliveries(ctx, now); err != nil {
+		r.logger.Warn("orphaned delivery cancellation failed", "error", err)
+	} else if cancelled > 0 {
+		r.logger.Info("orphaned deliveries cancelled", "rows", cancelled)
+	}
 	policy := r.store.RetentionPolicy()
 	if err := r.store.PruneApplicationLogs(ctx, now.Add(-time.Duration(policy.ApplicationLogsDays)*24*time.Hour)); err != nil {
 		r.logger.Debug("application log pruning failed", "error", err)
