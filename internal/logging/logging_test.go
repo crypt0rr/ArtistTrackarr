@@ -155,3 +155,75 @@ func TestAllowlistedKeysReachTheHandlerIntact(t *testing.T) {
 		}
 	}
 }
+
+// TestRecordsLoggedBeforeTheSinkExistsArePersisted covers the startup ordering.
+// The sink writes to SQLite, so it cannot be attached until the database is
+// open — but the process legitimately logs before that, including the two
+// "security explicitly weakened" warnings for AllowInsecureHTTP and
+// AllowPrivateNotificationTargets. Those reached stdout and the in-memory ring
+// but were never enqueued, so application_logs held no record of them; and the
+// admin page only falls back to the ring when the table returns zero rows,
+// which never happens on a running install. Neither flag is surfaced anywhere
+// else in the UI, so there was no in-app evidence at all.
+func TestRecordsLoggedBeforeTheSinkExistsArePersisted(t *testing.T) {
+	handler := NewHandler(slog.NewJSONHandler(io.Discard, nil), 16)
+	logger := slog.New(handler)
+
+	// Emitted before the database is open, exactly as cmd/server/main.go does.
+	logger.Warn("insecure HTTP public URL explicitly enabled")
+	logger.Warn("private notification targets explicitly enabled")
+
+	var persisted []Entry
+	handler.SetSink(func(e Entry) { persisted = append(persisted, e) })
+
+	if len(persisted) != 2 {
+		t.Fatalf("persisted %d pre-sink records, want 2: %+v", len(persisted), persisted)
+	}
+	if persisted[0].Message != "insecure HTTP public URL explicitly enabled" ||
+		persisted[1].Message != "private notification targets explicitly enabled" {
+		t.Fatalf("pre-sink records replayed out of order: %+v", persisted)
+	}
+
+	// Records after attachment still go straight through, exactly once.
+	logger.Info("server listening")
+	if len(persisted) != 3 || persisted[2].Message != "server listening" {
+		t.Fatalf("post-sink record not persisted once: %+v", persisted)
+	}
+}
+
+// TestSinkReplayHappensOnlyOnce keeps the backlog from being re-delivered if a
+// sink is swapped or removed later; a duplicate would show as a phantom repeat
+// of a startup warning in the admin log.
+func TestSinkReplayHappensOnlyOnce(t *testing.T) {
+	handler := NewHandler(slog.NewJSONHandler(io.Discard, nil), 16)
+	logger := slog.New(handler)
+	logger.Warn("early record")
+
+	var first, second []Entry
+	handler.SetSink(func(e Entry) { first = append(first, e) })
+	handler.SetSink(nil)
+	logger.Warn("while detached")
+	handler.SetSink(func(e Entry) { second = append(second, e) })
+
+	if len(first) != 1 {
+		t.Fatalf("first sink got %d records, want 1", len(first))
+	}
+	if len(second) != 0 {
+		t.Fatalf("second sink replayed %d records that were already delivered: %+v", len(second), second)
+	}
+}
+
+// TestPreSinkBacklogIsBounded keeps a sink that never arrives from growing an
+// unbounded buffer.
+func TestPreSinkBacklogIsBounded(t *testing.T) {
+	handler := NewHandler(slog.NewJSONHandler(io.Discard, nil), 16)
+	logger := slog.New(handler)
+	for i := 0; i < pendingSinkLimit+50; i++ {
+		logger.Info("early")
+	}
+	var persisted int
+	handler.SetSink(func(Entry) { persisted++ })
+	if persisted != pendingSinkLimit {
+		t.Fatalf("replayed %d records, want the %d-record cap", persisted, pendingSinkLimit)
+	}
+}

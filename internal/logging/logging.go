@@ -31,7 +31,24 @@ type Handler struct {
 type sinkState struct {
 	mu sync.RWMutex
 	fn func(Entry)
+	// pending holds records emitted before a sink was attached. The sink
+	// persists to SQLite, so it cannot exist until the database is open, but
+	// the process legitimately logs before that point - the two "security
+	// explicitly weakened" startup warnings are emitted there and were
+	// therefore never written to application_logs, leaving no in-app record of
+	// a deliberately weakened deployment. Retaining them here and replaying on
+	// SetSink fixes the whole class rather than moving those two calls.
+	//
+	// attached records whether a sink has ever been set, so a sink removed
+	// later cannot cause the backlog to be replayed a second time.
+	pending  []Entry
+	attached bool
 }
+
+// pendingSinkLimit bounds the pre-sink backlog. Startup emits a handful of
+// records; anything beyond this means the sink never arrived, and an unbounded
+// buffer would then be a leak rather than a safety net.
+const pendingSinkLimit = 256
 
 type ring struct {
 	mu      sync.RWMutex
@@ -83,9 +100,15 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 		h.buffer.add(entry)
 		var sink func(Entry)
 		if h.sink != nil {
-			h.sink.mu.RLock()
+			h.sink.mu.Lock()
 			sink = h.sink.fn
-			h.sink.mu.RUnlock()
+			// Hold the record only while no sink has ever been attached. Once
+			// one has, a nil sink means it was deliberately removed and the
+			// record is genuinely not wanted.
+			if sink == nil && !h.sink.attached && len(h.sink.pending) < pendingSinkLimit {
+				h.sink.pending = append(h.sink.pending, entry)
+			}
+			h.sink.mu.Unlock()
 		}
 		if sink != nil {
 			sink(entry)
@@ -109,13 +132,24 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{next: h.next.WithGroup(name), buffer: h.buffer, attrs: h.attrs, sink: h.sink}
 }
 
+// SetSink attaches the persistent sink and replays anything logged before it
+// existed, in order. Replay happens outside the lock so a sink that logs cannot
+// deadlock against the handler.
 func (h *Handler) SetSink(sink func(Entry)) {
 	if h.sink == nil {
 		h.sink = &sinkState{}
 	}
 	h.sink.mu.Lock()
 	h.sink.fn = sink
+	var replay []Entry
+	if sink != nil && !h.sink.attached {
+		h.sink.attached = true
+		replay, h.sink.pending = h.sink.pending, nil
+	}
 	h.sink.mu.Unlock()
+	for _, entry := range replay {
+		sink(entry)
+	}
 }
 
 func (h *Handler) Snapshot() []Entry {
