@@ -278,6 +278,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 		"compactCount":        compactCount,
 		"followDeliveryLabel": followDeliveryLabel,
 		"followRuleSummary":   followRuleSummary,
+		"followRulePaused":    followRulePaused,
 		"calendarStatus":      calendarReleaseStatus,
 		"calendarStatusClass": func(release store.CalendarRelease) string {
 			status := calendarReleaseStatus(release)
