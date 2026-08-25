@@ -1076,7 +1076,6 @@ func (a *App) loadSettingsData(r *http.Request, d *PageData) bool {
 	}
 	failed = a.pageStoreError(r, d, "Settings", "calendar feed token", feedErr) || failed
 	if feedErr == nil {
-		d.CalendarFeedCreatedAt = &feed.CreatedAt
 		d.CalendarFeedExpiresAt = &feed.ExpiresAt
 		d.CalendarFeedActive = feed.Active
 	}
@@ -1117,13 +1116,12 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	if page > pages {
 		page = pages
 	}
-	d.ArtistPage, d.ArtistPages = page, pages
+	// Only the URLs and the page links are rendered; the bare page numbers were
+	// computed and never referenced by any template.
 	if page > 1 {
-		d.ArtistPrevPage = page - 1
 		d.ArtistPrevURL = artistsPageURL(r, page-1)
 	}
 	if page < pages {
-		d.ArtistNextPage = page + 1
 		d.ArtistNextURL = artistsPageURL(r, page+1)
 	}
 	if d.FilteredArtistCount > 0 {

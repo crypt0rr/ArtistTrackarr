@@ -33,12 +33,11 @@ func (a *App) coverage(w http.ResponseWriter, r *http.Request) {
 		page = pages
 	}
 	d.CoveragePage, d.CoveragePages = page, pages
+	// Only the URLs are rendered; the bare page numbers had no template reader.
 	if page > 1 {
-		d.CoveragePrevPage = page - 1
 		d.CoveragePrevURL = coveragePageURL(page - 1)
 	}
 	if page < pages {
-		d.CoverageNextPage = page + 1
 		d.CoverageNextURL = coveragePageURL(page + 1)
 	}
 	if d.CoverageSummary.Artists > 0 {

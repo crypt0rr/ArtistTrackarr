@@ -37,8 +37,6 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "delivery history", err) || pageFailed
 	d.Resolutions, err = a.store.ArtistResolutions(r.Context(), session.User.ID)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist resolutions", err) || pageFailed
-	d.Preferences, err = a.store.NotificationPreferences(r.Context(), session.User.ID)
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification preferences", err) || pageFailed
 	d.NotificationHolds, err = a.store.NotificationHolds(r.Context(), session.User.ID, 20)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification holds", err) || pageFailed
 	d.ListenBrainzArtists, err = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)

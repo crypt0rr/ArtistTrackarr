@@ -61,10 +61,6 @@ type PageDiscovery struct {
 	GenreFilter         string
 	CountryFilter       string
 	TypeFilter          string
-	ArtistPage          int
-	ArtistPages         int
-	ArtistPrevPage      int
-	ArtistNextPage      int
 	ArtistPrevURL       string
 	ArtistNextURL       string
 	ArtistPageLinks     []PaginationLink
@@ -83,7 +79,6 @@ type PageRelease struct {
 	CalendarICSURL           string
 	CalendarNotice           string
 	CalendarFeedURL          string
-	CalendarFeedCreatedAt    *time.Time
 	CalendarFeedExpiresAt    *time.Time
 	CalendarFeedActive       bool
 	NotificationHolds        []store.NotificationHold
@@ -139,8 +134,6 @@ type PageCoverage struct {
 	CoverageArtists          []store.ArtistCoverage
 	CoveragePage             int
 	CoveragePages            int
-	CoveragePrevPage         int
-	CoverageNextPage         int
 	CoveragePrevURL          string
 	CoverageNextURL          string
 	CoveragePageLinks        []PaginationLink

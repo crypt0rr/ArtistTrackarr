@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -346,7 +347,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 			SpotifyResults: []catalog.SpotifyArtist{{ID: "spotify-template", Name: artist.Name, URL: "https://open.spotify.com/artist/template"}},
 			ITunesResults:  []catalog.ITunesArtist{{ID: "123", Name: artist.Name, URL: "https://music.apple.com/us/artist/template/123"}}, UpcomingReleases: []store.Release{release}, RecentReleases: []store.Release{release},
 			ReleaseCount: 1, FollowCount: 1, ListenBrainzArtists: []store.Artist{artist}, GenreBreakdown: []store.ArtistBreakdown{{Label: "Pop", Count: 1}}, CountryBreakdown: []store.ArtistBreakdown{{Label: "NL", Count: 1}}, TypeBreakdown: []store.ArtistBreakdown{{Label: "Person", Count: 1}},
-			ArtistPage: 1, ArtistPages: 1, ArtistPageStart: 1, ArtistPageEnd: 1, FilteredArtistCount: 1,
+			ArtistPageStart: 1, ArtistPageEnd: 1, FilteredArtistCount: 1,
 		},
 		PageRelease: PageRelease{
 			CalendarDays: []CalendarDay{{Date: "2026-09-01", Label: "September 1", Today: false, Releases: []store.CalendarRelease{{Release: release, CalendarDate: "2026-09-01"}}}}, CalendarMonth: "September 2026", CalendarPrevMonth: "2026-08", CalendarNextMonth: "2026-10", CalendarICSURL: "/calendar.ics",
@@ -370,7 +371,7 @@ func TestTemplatesRenderRepresentativePageData(t *testing.T) {
 			InboxItems: []store.ReleaseInboxItem{{Release: release, EventType: "release_day", EventTitle: "Template", EventCreatedAt: now, State: "unread"}}, InboxUnreadCount: 1, InboxCount: 1, InboxState: "unread", InboxPage: 1, InboxPages: 1, InboxPageStart: 1, InboxPageEnd: 1, InboxURL: "/inbox",
 		},
 	}
-	for _, name := range []string{"login", "setup", "token", "admin", "admin_delivery", "artists", "calendar", "coverage", "evidence_issues", "dashboard", "inbox", "release", "resolution", "settings", "destinations", "import"} {
+	for _, name := range []string{"login", "setup", "token", "admin", "admin_delivery", "artists", "calendar", "coverage", "evidence_issues", "dashboard", "inbox", "release", "resolution", "settings", "import"} {
 		var output bytes.Buffer
 		if err := app.templates.ExecuteTemplate(&output, name+".html", data); err != nil {
 			t.Errorf("template %s failed: %v", name, err)
@@ -565,5 +566,39 @@ func TestArtistsPageOffersPauseAfterAPauseLapses(t *testing.T) {
 	}
 	if !strings.Contains(page, "/notification-rule/pause") {
 		t.Fatalf("the Pause control is missing after the pause lapsed: %s", page)
+	}
+}
+
+// TestEveryParsedTemplateIsRendered is #288. destinations.html sat in the
+// template set, parsed on every start, with no handler rendering it - its route
+// is a pure redirect to /settings. A template nobody renders is a maintenance
+// cost that looks like a feature.
+func TestEveryParsedTemplateIsRendered(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join(".", "templates"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers, err := os.ReadFile(filepath.Join(".", "core.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := string(handlers)
+	for _, file := range []string{"dashboard.go", "artists.go", "admin.go", "settings.go", "calendar.go",
+		"inbox.go", "evidence.go", "coverage.go", "auth.go", "import.go", "truth.go"} {
+		data, err := os.ReadFile(filepath.Join(".", file))
+		if err != nil {
+			continue
+		}
+		sources += string(data)
+	}
+	for _, entry := range entries {
+		name := strings.TrimSuffix(entry.Name(), ".html")
+		if name == "partials" {
+			// Definitions only; included by name from other templates.
+			continue
+		}
+		if !strings.Contains(sources, `"`+name+`"`) {
+			t.Errorf("templates/%s is parsed but no handler renders it", entry.Name())
+		}
 	}
 }
