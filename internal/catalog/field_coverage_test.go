@@ -325,3 +325,95 @@ func TestResponseStructsMatchTheirOwnEndpointsPayload(t *testing.T) {
 		})
 	}
 }
+
+// namedTypeContracts bind a package-level response type to every capture the
+// endpoints that decode it produce.
+//
+// endpointContracts covers only structs declared inside a function body, so it
+// reaches MusicBrainz and nothing else: iTunes and ListenBrainz decode through
+// shared package-level types. That left the strongest check in this file bound
+// entirely to one provider, while the testdata README names an iTunes instance
+// of exactly the class it exists to catch.
+//
+// The comparison is against the union of that provider's captures rather than a
+// single endpoint's, because a shared type legitimately spans endpoints -
+// collectionArtistName is real on the song search and absent from the album
+// lookup. That is narrower than the all-provider union check and catches the
+// case that matters here: a tag that appears in no capture of its own provider.
+var namedTypeContracts = []struct {
+	typeName string
+	captures []string
+}{
+	{typeName: "itunesResult", captures: []string{
+		"itunes_artist_albums.json",
+		"itunes_artist_search.json",
+		"itunes_song_search.json",
+		"itunes_compilation_song_search.json",
+	}},
+	{typeName: "ListenBrainzArtistStats", captures: []string{"listenbrainz_popularity_artist.json"}},
+}
+
+// TestNamedResponseTypesMatchTheirProviderPayloads closes the provider gap in
+// the endpoint contract check.
+func TestNamedResponseTypesMatchTheirProviderPayloads(t *testing.T) {
+	for _, contract := range namedTypeContracts {
+		t.Run(contract.typeName, func(t *testing.T) {
+			tags := namedStructTags(t, contract.typeName)
+			if len(tags) == 0 {
+				t.Fatalf("%s declares no JSON tags; the contract would pass vacuously", contract.typeName)
+			}
+			keys := captureKeys(t, contract.captures)
+			var missing []string
+			for _, tag := range tags {
+				if !keys[tag] {
+					missing = append(missing, tag)
+				}
+			}
+			if len(missing) > 0 {
+				t.Fatalf("%s decodes %v, which appear in none of its provider's captured payloads %v",
+					contract.typeName, missing, contract.captures)
+			}
+		})
+	}
+}
+
+// namedStructTags collects the JSON tags of a package-level struct type.
+func namedStructTags(t *testing.T, typeName string) []string {
+	t.Helper()
+	paths, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tags []string
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			spec, ok := node.(*ast.TypeSpec)
+			if !ok || spec.Name == nil || spec.Name.Name != typeName {
+				return true
+			}
+			structType, ok := spec.Type.(*ast.StructType)
+			if !ok {
+				return true
+			}
+			for _, field := range structType.Fields.List {
+				if field.Tag == nil {
+					continue
+				}
+				tag := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Get("json")
+				name := strings.Split(tag, ",")[0]
+				if name != "" && name != "-" {
+					tags = append(tags, name)
+				}
+			}
+			return false
+		})
+	}
+	return tags
+}
