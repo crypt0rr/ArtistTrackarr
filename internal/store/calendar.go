@@ -191,6 +191,12 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 	}
 
 	queued := 0
+	// One member's failure must not starve the rest of the household. The sweep
+	// used to abandon every remaining member in the slice, and the member list
+	// comes from a query with no ORDER BY, so the same members were consistently
+	// the ones that never got their digest. Failures are collected and returned
+	// together; a cancelled context still stops the whole sweep.
+	var memberErrs []error
 	for _, user := range users {
 		location, err := time.LoadLocation(user.Timezone)
 		if err != nil {
@@ -233,7 +239,11 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		// writer that user-facing writes also need.
 		settled, err := s.digestPeriodSettled(ctx, user, periodKey, periodStart, periodEnd)
 		if err != nil {
-			return queued, err
+			if ctx.Err() != nil {
+				return queued, err
+			}
+			memberErrs = append(memberErrs, fmt.Errorf("digest for user %d: %w", user.ID, err))
+			continue
 		}
 		if settled {
 			continue
@@ -242,7 +252,11 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 		to := windowEnd.AddDate(0, 0, -1).Format("2006-01-02")
 		rules, err := s.FollowNotificationRules(ctx, user.ID, nil)
 		if err != nil {
-			return queued, err
+			if ctx.Err() != nil {
+				return queued, err
+			}
+			memberErrs = append(memberErrs, fmt.Errorf("digest for user %d: %w", user.ID, err))
+			continue
 		}
 		// Scan in pages and filter as we go. Fetching a single fixed page and
 		// only then applying the member's type preferences and per-follow digest
@@ -354,13 +368,17 @@ func (s *Store) QueueDueReleaseDigests(ctx context.Context, now time.Time) (int,
 			return nil
 		})
 		if err != nil {
-			return queued, err
+			if ctx.Err() != nil {
+				return queued, err
+			}
+			memberErrs = append(memberErrs, fmt.Errorf("digest for user %d: %w", user.ID, err))
+			continue
 		}
 		if queuedRun {
 			queued++
 		}
 	}
-	return queued, nil
+	return queued, errors.Join(memberErrs...)
 }
 
 // periodLookback covers how far a digest period boundary can move when a
