@@ -109,9 +109,19 @@ artists_page=$(curl --fail --silent --cookie "$jar" "$base/artists")
 grep -q 'CI Smoke Artist' <<<"$artists_page"
 artists_csrf=$(printf '%s' "$artists_page" | csrf_from)
 test -n "$artists_csrf"
-curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
+# Follow the redirect and read the flash message. syncArtist answers 303 on BOTH
+# branches - queued and "could not be queued" - so `curl --fail` without -L
+# treats a failed sync as a pass, and the closing line then claims manual sync
+# passed regardless of what happened.
+sync_result=$(curl --fail --silent --show-error --location \
+	--cookie "$jar" --cookie-jar "$jar" \
 	--request POST "$base/artists/1/sync" \
-	--data-urlencode "_csrf=$artists_csrf" >/dev/null
+	--data-urlencode "_csrf=$artists_csrf")
+if ! grep -q 'Synchronization queued' <<<"$sync_result"; then
+	echo "container smoke: manual sync was not queued" >&2
+	grep -o 'Synchronization[^<]*' <<<"$sync_result" >&2 || true
+	exit 1
+fi
 
 # A second clean restart verifies persisted sessions and followed-artist state,
 # not only unauthenticated readiness.
