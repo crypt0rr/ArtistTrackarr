@@ -351,6 +351,33 @@ CATALOGUE: list[Mutation] = [
         guards="#265 - the audit trail had no behavioural test at all: the old "
                "one emitted the events itself and asserted they came back.",
     ),
+    Mutation(
+        name="sql-bind-arity",
+        file="internal/store/notification_holds.go",
+        # #239 verbatim: a third bind argument for a two-placeholder query.
+        # modernc.org/sqlite ignores surplus arguments, so this executes and
+        # returns rows - it just answers a different question.
+        find="""// NotificationHoldsForRelease returns pending holds for a followed release.
+func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, releaseID int64) ([]NotificationHold, error) {
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT h.id,h.user_id,h.release_group_id,a.name,rg.title,
+		h.event_type,h.title,h.body,h.reason,h.issue_fingerprint,h.planned_at,h.status,h.created_at,h.released_at
+		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
+		JOIN artists a ON a.id=rg.artist_id
+		WHERE h.user_id=? AND h.release_group_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'
+		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID)""",
+        replace="""// NotificationHoldsForRelease returns pending holds for a followed release.
+func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, releaseID int64) ([]NotificationHold, error) {
+	rows, err := s.readerDB().QueryContext(ctx, `SELECT h.id,h.user_id,h.release_group_id,a.name,rg.title,
+		h.event_type,h.title,h.body,h.reason,h.issue_fingerprint,h.planned_at,h.status,h.created_at,h.released_at
+		FROM notification_holds h JOIN release_groups rg ON rg.id=h.release_group_id
+		JOIN artists a ON a.id=rg.artist_id
+		WHERE h.user_id=? AND h.release_group_id=? AND `+followedReleasePredicate("h.user_id")+` AND h.status='held'
+		ORDER BY h.created_at DESC,h.id DESC`, userID, releaseID, userID)""",
+        package="./internal/store/",
+        test="TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders",
+        guards="#239 - a surplus bind argument. Verified that this test is the "
+               "only one in the package that fails when it is reintroduced.",
+    ),
 ]
 
 
