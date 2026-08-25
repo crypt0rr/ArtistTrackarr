@@ -336,6 +336,21 @@ CATALOGUE: list[Mutation] = [
         guards="The reserved-network list used to be written out twice with a "
                "comment on each copy asking the reader to keep them aligned.",
     ),
+    Mutation(
+        name="audit-event-reachability",
+        file="internal/web/settings.go",
+        # Leave the emitter in the source so the grep-based guard stays green.
+        # Only a test that drives the route and reads the server's own log can
+        # tell a live emitter from an unreachable one.
+        find="""		a.logger.Info("calendar feed token issued", "event", "auth.feed_token_issued", "user_id", session.User.ID)""",
+        replace="""		if session.User.ID < 0 {
+			a.logger.Info("calendar feed token issued", "event", "auth.feed_token_issued", "user_id", session.User.ID)
+		}""",
+        package="./internal/web/",
+        test="TestCredentialLifecycleEventsAreRecorded",
+        guards="#265 - the audit trail had no behavioural test at all: the old "
+               "one emitted the events itself and asserted they came back.",
+    ),
 ]
 
 

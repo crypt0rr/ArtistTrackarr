@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
-	"github.com/crypt0rr/artist-tracker/internal/logging"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -123,38 +121,55 @@ func TestCsrfStillRejectsAForgedPost(t *testing.T) {
 // existed and was simply never fed.
 func TestCredentialLifecycleEventsAreRecorded(t *testing.T) {
 	var logs bytes.Buffer
-	database, server, client := authenticatedTestServer(t, nil, nil, nil)
-	_ = database
+	_, server, client := authenticatedTestServerLogging(t, &logs, nil, nil, nil, nil)
 
-	// authenticatedTestServer signs in during setup, so drive the events that
-	// follow it against a recording logger.
-	handler := logging.NewHandler(slog.NewJSONHandler(&logs, nil), 64)
-	app := &App{logger: slog.New(handler)}
-
-	app.logger.Info("sign-in succeeded", "event", "auth.signin", "user_id", int64(1))
-	app.logger.Info("sign-out", "event", "auth.signout", "user_id", int64(1))
-	if !strings.Contains(logs.String(), "auth.signin") || !strings.Contains(logs.String(), "auth.signout") {
-		t.Fatalf("lifecycle events do not survive the redacting handler: %s", logs.String())
-	}
-	// The event key must not be eaten by redaction, and neither must user_id.
-	if strings.Contains(logs.String(), "[redacted]") {
-		t.Fatalf("a lifecycle event field was redacted: %s", logs.String())
-	}
-
-	// And the real sign-out route must emit one.
-	response, err := client.Post(server.URL+"/logout", "application/x-www-form-urlencoded",
-		strings.NewReader("_csrf="+getCSRF(t, client, server.URL+"/settings")))
+	// Drive the real routes and read the server's own log. The previous
+	// version of this test built its own App, called logger.Info with the two
+	// events itself, and asserted they came back - which exercises
+	// logging.NewHandler and never touches auth.go. Deleting the emitter from
+	// the sign-out handler left it green.
+	response, err := client.PostForm(server.URL+"/settings/calendar-feed", url.Values{
+		"_csrf":  {getCSRF(t, client, server.URL+"/settings")},
+		"action": {"generate"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
+
+	response, err = client.PostForm(server.URL+"/logout", url.Values{
+		"_csrf": {getCSRF(t, client, server.URL+"/settings")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	recorded := logs.String()
+	for _, event := range []string{"auth.feed_token_issued", "auth.signout"} {
+		if !strings.Contains(recorded, event) {
+			t.Errorf("the route that should emit %q did not: %s", event, recorded)
+		}
+	}
+
+	// The event key and user_id must survive redaction, or the audit record
+	// reaches the operator with nothing identifying in it.
+	if strings.Contains(recorded, "[redacted]") {
+		t.Errorf("a lifecycle event field was redacted: %s", recorded)
+	}
+	if !strings.Contains(recorded, `"user_id"`) {
+		t.Errorf("lifecycle events carry no user_id: %s", recorded)
+	}
 }
 
 // TestEveryCredentialLifecycleEventHasAnEmitter is a source-level guard: it
 // pins that each named event still has a handler emitting it, so removing one
 // during a refactor fails the build rather than silently deleting an audit
-// record. It deliberately does not assert on rendered output - the behavioural
-// half is covered by TestCredentialLifecycleEventsAreRecorded.
+// record. It deliberately does not assert on rendered output.
+//
+// A source grep cannot tell a live emitter from an unreachable one, so it is
+// only half the story; TestCredentialLifecycleEventsAreRecorded supplies the
+// behavioural half for two events a member session can actually reach.
 func TestEveryCredentialLifecycleEventHasAnEmitter(t *testing.T) {
 	for _, want := range []string{
 		"auth.signin", "auth.signout", "auth.signin_failed",
