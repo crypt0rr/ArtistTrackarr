@@ -597,7 +597,10 @@ func TestEveryParsedTemplateIsRendered(t *testing.T) {
 			// Definitions only; included by name from other templates.
 			continue
 		}
-		if !strings.Contains(sources, `"`+name+`"`) {
+		// Match the render call, not any mention: "destinations" also appears
+		// as a route path, which is what let a template with no renderer look
+		// used.
+		if !strings.Contains(sources, `render(w, "`+name+`"`) {
 			t.Errorf("templates/%s is parsed but no handler renders it", entry.Name())
 		}
 	}
