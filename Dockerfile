@@ -5,24 +5,35 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY go.mod go.sum* ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
+# Go's default per-package test timeout is 10m, and internal/store alone needs
+# ~6m under -race on an idle CI runner. A loaded machine crosses the default
+# and reports a timeout that looks exactly like a deadlock, which is how a
+# green CI run and a red local `make quality` happened at the same commit.
+# Set it well clear of the real figure while still bounding a genuine hang.
+# The Makefile reads this value back out, the way it already does for the Go
+# toolchain, so there is one definition of it.
+ARG GO_TEST_TIMEOUT=30m
+
 FROM dependencies AS test
+ARG GO_TEST_TIMEOUT
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go vet ./... && go test -p 1 ./... -count=1
+    go vet ./... && go test -p 1 -timeout $GO_TEST_TIMEOUT ./... -count=1
 
 # The test stage is intentionally fast and is used by the regular image
 # smoke-build. The quality stage is the reproducible, resource-bounded gate
 # for local release validation: it serializes race tests and runs the same
 # pinned lint and vulnerability tools as CI.
 FROM dependencies AS quality
+ARG GO_TEST_TIMEOUT
 COPY . .
 RUN apk add --no-cache build-base
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go vet ./... && \
-    go test -p 1 ./... -count=1 && \
-    go test -race -p 1 ./... -count=1 && \
+    go test -p 1 -timeout $GO_TEST_TIMEOUT ./... -count=1 && \
+    go test -race -p 1 -timeout $GO_TEST_TIMEOUT ./... -count=1 && \
     go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.0 run ./... && \
     go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
