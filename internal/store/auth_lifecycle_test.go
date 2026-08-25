@@ -287,3 +287,53 @@ func TestSessionsCarryNoCsrfMaterial(t *testing.T) {
 		t.Fatal("sessions still carries csrf_token, so every sign-in mints and stores material nothing reads")
 	}
 }
+
+// TestDeletingAnAccountLeavesNoDeliveryAudit is #284. delivery_attempts
+// references destinations with ON DELETE SET NULL rather than CASCADE and
+// carries no foreign key to deliveries, so deleting a household account
+// cascaded the destinations away but left the audit rows behind - complete with
+// destination_name, the member-authored label. The administration page promises
+// that deleting an account removes its private data.
+func TestDeletingAnAccountLeavesNoDeliveryAudit(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	adminID, err := s.CreateUser(ctx, "audit-admin@example.com", "hash", "admin", "UTC", "audit-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberID, err := s.CreateUser(ctx, "audit-member@example.com", "hash", "member", "UTC", "audit-member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, memberID, "Dad's phone", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, memberID)
+	if err != nil || len(destinations) == 0 {
+		t.Fatalf("destinations=%d err=%v", len(destinations), err)
+	}
+	if _, err := s.StartDeliveryAttempt(ctx, 1, 0, destinations[0], 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The label must not be storable at all any more.
+	var labelColumns int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('delivery_attempts') WHERE name='destination_name'`).Scan(&labelColumns); err != nil {
+		t.Fatal(err)
+	}
+	if labelColumns != 0 {
+		t.Fatal("delivery_attempts still stores the member-authored destination label")
+	}
+
+	if err := s.DeleteUser(ctx, adminID, memberID); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_attempts`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("delivery_attempts rows surviving account deletion=%d, want 0", remaining)
+	}
+}

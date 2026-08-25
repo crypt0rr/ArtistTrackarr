@@ -1,0 +1,11 @@
+-- delivery_attempts.destination_name stored the member-authored label for a
+-- destination ("Dad's phone"). Nothing ever read it: the only queries against
+-- this table are COUNT(*) and MIN(started_at) for the retention dashboard.
+--
+-- It was also a privacy leak. destination_id is ON DELETE SET NULL rather than
+-- CASCADE and delivery_id carries no foreign key, so deleting a household
+-- account cascaded the destinations away but left these rows behind with the
+-- label intact - while the administration page promises that deleting an
+-- account removes its private data. Removing the column closes that by
+-- construction rather than relying on a delete path staying correct.
+ALTER TABLE delivery_attempts DROP COLUMN destination_name;

@@ -255,10 +255,12 @@ func (s *Store) StartDeliveryAttempt(ctx context.Context, deliveryID, digestDeli
 	if attemptNumber < 1 {
 		attemptNumber = 1
 	}
+	// destination_name is deliberately absent: it was never read, and it kept a
+	// member-authored label alive after the account that created it was deleted.
 	result, err := s.execWriteContext(ctx, `INSERT INTO delivery_attempts
-		(delivery_id,digest_delivery_id,destination_id,destination_name,service,attempt_number,status,started_at)
-		VALUES(?,?,?,?,?,?, 'started',?)`, nullableID(deliveryID), nullableID(digestDeliveryID),
-		nullableID(destination.ID), destination.Name, destination.Service, attemptNumber, timeText(started))
+		(delivery_id,digest_delivery_id,destination_id,service,attempt_number,status,started_at)
+		VALUES(?,?,?,?,?, 'started',?)`, nullableID(deliveryID), nullableID(digestDeliveryID),
+		nullableID(destination.ID), destination.Service, attemptNumber, timeText(started))
 	if err != nil {
 		return 0, err
 	}

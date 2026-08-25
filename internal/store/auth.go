@@ -274,6 +274,14 @@ func (s *Store) DeleteUser(ctx context.Context, actingAdminID, userID int64) err
 		if _, err := tx.ExecContext(ctx, `DELETE FROM auth_tokens WHERE email=? OR created_by=?`, email, userID); err != nil {
 			return err
 		}
+		// delivery_attempts references destinations with ON DELETE SET NULL and
+		// carries no foreign key to deliveries, so the cascade below would leave
+		// this member's audit rows behind. Remove them while the destinations
+		// that identify them still exist.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM delivery_attempts WHERE destination_id IN (
+			SELECT id FROM destinations WHERE user_id=?)`, userID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id=?`, userID)
 		if err != nil {
 			return err
