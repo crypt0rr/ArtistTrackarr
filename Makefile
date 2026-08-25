@@ -1,7 +1,7 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
-.PHONY: test docker-quality build run fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
+.PHONY: test docker-quality build run smoke fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
 
 test:
 	docker build --target test .
@@ -15,6 +15,16 @@ build:
 run:
 	$(MAKE) build
 	ARTIST_TRACKARR_IMAGE=artist-trackarr:local docker compose up
+
+# Run the container smoke test against a locally built image, exactly as CI
+# does. Without this target the script was reachable only through CI, so a
+# defect in the harness itself - it is a curl client driving a real container,
+# not Go code - escaped gofmt, vet, the test suite, the race detector, the
+# linters and govulncheck alike. One did: a curl invocation forced POST across a
+# 303 redirect and failed with 405 rather than exercising its assertion.
+smoke:
+	docker build -t artist-trackarr:smoke .
+	scripts/container-smoke.sh artist-trackarr:smoke
 
 fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
