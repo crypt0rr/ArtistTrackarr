@@ -58,5 +58,20 @@ for module in $modules; do
 	fi
 done
 
+# Every script that installs an EXIT trap to undo something - stopping a service,
+# creating a container or a volume - must also trap HUP. In dash and busybox ash
+# an untrapped fatal signal terminates the shell through its default disposition
+# and the EXIT trap never runs, so a dropped SSH session during a backup would
+# leave the application stopped with temporary files behind.
+for script in scripts/*.sh; do
+	if ! grep -q '^trap ' "$script"; then
+		continue
+	fi
+	if ! grep -q '^trap .*\bHUP\b' "$script"; then
+		printf 'renovate-check: %s installs a trap that does not cover HUP, so a dropped session skips its cleanup\n' "$script" >&2
+		exit 1
+	fi
+done
+
 printf '%s\n' "renovate-check: Go toolchain identities are grouped"
 printf 'renovate-check: %s pinned quality tools agree across all call sites\n' "$(printf '%s\n' "$modules" | wc -l | tr -d ' ')"

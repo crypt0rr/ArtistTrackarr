@@ -23,7 +23,9 @@ cleanup() {
 	docker rm -f "$container" >/dev/null 2>&1 || true
 	docker volume rm "$volume" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+# HUP included: an untrapped fatal signal skips the EXIT trap in dash and busybox
+# ash, which would leak the smoke-test container and its volume.
+trap cleanup EXIT INT TERM HUP
 
 docker volume create "$volume" >/dev/null
 docker run -d --name "$container" --network host -v "$volume:/data" \
