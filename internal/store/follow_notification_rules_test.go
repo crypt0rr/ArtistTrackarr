@@ -994,3 +994,98 @@ func TestOrphanSweepDoesNotTouchClaimedWork(t *testing.T) {
 		t.Fatalf("cancelled=%d err=%v, want the claimed row left alone", cancelled, err)
 	}
 }
+
+// TestRetryDoesNotCancelADeliberatePause pins the discriminating field rather
+// than a derived total.
+//
+// RetryFailedDeliveries partitions failed rows into those it makes runnable now
+// and those a pause is still holding back, and the existing fixtures assert
+// stats.Total(). That sum is invariant under the defect: if the partition
+// collapses and every row is requeued, Total() is unchanged, so a mutation
+// removing the deferral check survives every one of them. Recovering a
+// destination must never cancel a pause a member set deliberately.
+func TestRetryDoesNotCancelADeliberatePause(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, _, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// The governing follow is paused, so this delivery is deliberately deferred.
+	until := time.Now().UTC().Add(14 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &until); err != nil {
+		t.Fatal(err)
+	}
+	deferredAt := deliveryNextAttempt(t, s, deliveryID)
+
+	// The destination then fails, so both rows are candidates for recovery.
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) == 0 {
+		t.Fatalf("destinations=%d err=%v", len(destinations), err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='failed' WHERE id=?`, deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := s.RetryFailedDeliveries(ctx, userID, destinations[0].ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The discriminating assertion: this row must be counted as deferred, not
+	// requeued. Total() cannot tell these apart.
+	if stats.Deferred != 1 {
+		t.Fatalf("stats=%+v, want the paused row counted as deferred", stats)
+	}
+	if stats.Requeued != 0 {
+		t.Fatalf("stats=%+v, want no row made runnable while its pause is active", stats)
+	}
+	// And it must still be parked at the pause expiry, not pulled to now.
+	if got := deliveryNextAttempt(t, s, deliveryID); !got.Equal(deferredAt) {
+		t.Fatalf("recovery moved a paused delivery: %s -> %s", deferredAt, got)
+	}
+}
+
+// TestClaimSkipsAPausedDestinationsPendingRows pins the claim query's exclusion
+// of paused destinations. It sets destination_health directly rather than
+// driving five real failures, so it guards the query rather than the whole
+// circuit-breaker - which is the intent.
+func TestClaimSkipsAPausedDestinationsPendingRows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _, _, _, deliveryID := seedTwoFollowScenario(t, s)
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) == 0 {
+		t.Fatalf("destinations=%d err=%v", len(destinations), err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='pending',next_attempt_at=? WHERE id=?`,
+		timeText(now.Add(-time.Hour)), deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: it is claimable while the destination is healthy.
+	claimed, err := s.ClaimDueDeliveries(ctx, now, 10, "worker-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("control: claimed=%d with a healthy destination, want 1", len(claimed))
+	}
+	// Release the claim so the only difference in the next call is the pause.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE id=?`,
+		deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,updated_at)
+		VALUES(?, 'paused',5,?)
+		ON CONFLICT(destination_id) DO UPDATE SET status='paused',consecutive_failures=5,updated_at=excluded.updated_at`,
+		destinations[0].ID, timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = s.ClaimDueDeliveries(ctx, now, 10, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed=%d from a paused destination, want 0", len(claimed))
+	}
+}
