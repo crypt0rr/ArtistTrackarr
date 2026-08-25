@@ -330,40 +330,6 @@ func normalizedCreditRole(value string) string {
 	}
 }
 
-func releaseHasNonPrimaryCredit(release Release) bool {
-	if normalizedCreditRole(release.ArtistCreditRole) != "primary" {
-		return true
-	}
-	for _, credit := range release.Credits {
-		if normalizedCreditRole(credit.Role) != "primary" {
-			return true
-		}
-	}
-	return false
-}
-
-func releaseCreditRoles(release Release, provider string) []string {
-	roles := make(map[string]bool)
-	for _, credit := range release.Credits {
-		if strings.TrimSpace(credit.Provider) != "" && !strings.EqualFold(strings.TrimSpace(credit.Provider), provider) {
-			continue
-		}
-		role := normalizedCreditRole(credit.Role)
-		if role != "primary" {
-			roles[role] = true
-		}
-	}
-	if len(roles) == 0 && releaseHasNonPrimaryCredit(release) {
-		roles[normalizedCreditRole(release.ArtistCreditRole)] = true
-	}
-	result := make([]string, 0, len(roles))
-	for role := range roles {
-		result = append(result, role)
-	}
-	sort.Strings(result)
-	return result
-}
-
 func mergeReleaseCredits(existing, incoming []ReleaseCredit) []ReleaseCredit {
 	result := append([]ReleaseCredit(nil), existing...)
 	seen := make(map[string]bool, len(result))
