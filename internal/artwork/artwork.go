@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/crypt0rr/artist-tracker/internal/netpolicy"
 	"io"
 	"net"
 	"net/http"
@@ -611,35 +612,7 @@ func isBlockedArtworkIP(ip net.IP, allowLoopback bool) bool {
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
-		artworkReservedNetworksContain(ip)
-}
-
-// artworkReservedNetworksContain rejects address space that is not a usable
-// public artwork origin even though net.IP may classify it as global unicast.
-// Keep this list deliberately aligned with the notification target policy so
-// DNS rebinding or transition mechanisms cannot turn an approved CAA hostname
-// into a private or non-routable endpoint.
-func artworkReservedNetworksContain(ip net.IP) bool {
-	for _, cidr := range []string{
-		"0.0.0.0/8",       // this-network/reserved addresses
-		"100.64.0.0/10",   // RFC 6598 shared address space
-		"192.0.0.0/24",    // IETF protocol assignments
-		"192.0.2.0/24",    // TEST-NET-1
-		"198.18.0.0/15",   // benchmarking
-		"198.51.100.0/24", // TEST-NET-2
-		"203.0.113.0/24",  // TEST-NET-3
-		"240.0.0.0/4",     // reserved/future use
-		"2001:db8::/32",   // IPv6 documentation
-		"2001::/32",       // Teredo transition addresses
-		"2002::/16",       // 6to4 transition addresses
-		"64:ff9b::/96",    // well-known NAT64 prefix
-		"64:ff9b:1::/48",  // network-specific NAT64 prefix
-	} {
-		if _, network, err := net.ParseCIDR(cidr); err == nil && network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+		netpolicy.IsReserved(ip)
 }
 
 func artworkBaseURLIsLoopback(value string) bool {

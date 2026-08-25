@@ -309,12 +309,44 @@ CATALOGUE: list[Mutation] = [
         guards="#290 - an ICS deep link dropped the reader on the dashboard "
                "after signing in.",
     ),
+    Mutation(
+        name="schema-downgrade-guard",
+        file="internal/store/schema.go",
+        find="""	if err := s.verifySchemaNotAhead(ctx, highestEmbedded); err != nil {
+		return err
+	}""",
+        replace="""	_ = highestEmbedded""",
+        package="./internal/store/",
+        test="TestADatabaseFromANewerReleaseRefusesToStart",
+        guards="An older binary opening a database a newer release migrated "
+               "starts cleanly and reports ready, then fails on the first "
+               "query touching what 035-037 dropped.",
+    ),
+    Mutation(
+        name="reserved-network-policy",
+        file="internal/netpolicy/netpolicy.go",
+        # Drop one network from the shared policy. Both the webhook and the
+        # artwork fetcher read this list, so a single entry going missing has
+        # to be visible from the package that owns it.
+        find="""	"100.64.0.0/10",   // RFC 6598 shared address space
+""",
+        replace="",
+        package="./internal/netpolicy/",
+        test="TestReservedAddressSpaceIsRejected",
+        guards="The reserved-network list used to be written out twice with a "
+               "comment on each copy asking the reader to keep them aligned.",
+    ),
 ]
 
 
 def run(mutation: Mutation, workdir: Path, verbose: bool) -> tuple[str, str]:
     """Return (status, detail). status is DETECTED, NOT DETECTED or DRIFT."""
     target = workdir / mutation.file
+    if not target.exists():
+        # The working tree is built from `git ls-files`, so a catalogue row
+        # pointing at a file that is new and not yet staged lands here. Say so
+        # instead of raising FileNotFoundError from three frames down.
+        return "DRIFT", f"{mutation.file} is not tracked by git (stage it first)"
     original = target.read_text()
     occurrences = original.count(mutation.find)
     if occurrences != 1:

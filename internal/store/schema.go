@@ -96,10 +96,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	highestEmbedded := 0
 	for _, entry := range entries {
 		version, err := strconv.Atoi(strings.SplitN(entry.Name(), "_", 2)[0])
 		if err != nil {
 			return fmt.Errorf("invalid migration %s", entry.Name())
+		}
+		if version > highestEmbedded {
+			highestEmbedded = version
 		}
 		var exists int
 		if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=?`, version).Scan(&exists); err != nil {
@@ -145,8 +149,44 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.verifySchemaNotAhead(ctx, highestEmbedded); err != nil {
+		return err
+	}
 	if err := s.verifyForeignKeyEnforcement(ctx); err != nil {
 		return fmt.Errorf("verify foreign-key enforcement after migrations: %w", err)
+	}
+	return nil
+}
+
+// verifySchemaNotAhead fails startup when the database has been migrated by a
+// newer build than the one now opening it. Migrations only ever move forward:
+// migrate skips versions already recorded, so an older binary against a newer
+// database starts cleanly, reports ready, and then fails on the first query
+// that touches something a later migration removed.
+//
+// That is not hypothetical here. 035 drops the follow_credit_baselines table,
+// 036 drops sessions.csrf_token - a column the build before it selected on
+// every authenticated request - and 037 drops delivery_attempts.destination_name.
+// Rolling a compose file back one image tag is a single edit, and the operator
+// who does it would otherwise get a container that passes its health check and
+// then breaks sign-in with "no such column".
+//
+// Fail closed, the same way verifyForeignKeyEnforcement does, and name both
+// numbers so the message says what to do about it.
+func (s *Store) verifySchemaNotAhead(ctx context.Context, highestEmbedded int) error {
+	if s == nil || s.DB == nil {
+		return errors.New("database handle is unavailable")
+	}
+	var applied int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&applied); err != nil {
+		return fmt.Errorf("read applied schema version: %w", err)
+	}
+	if applied > highestEmbedded {
+		return fmt.Errorf(
+			"database schema version %d is newer than this build understands (%d): "+
+				"it was migrated by a later release and downgrading is not supported. "+
+				"Run the newer image again, or restore the backup taken before that upgrade",
+			applied, highestEmbedded)
 	}
 	return nil
 }
