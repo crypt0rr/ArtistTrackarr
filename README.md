@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.60.0`; local and published images use the
+footer. The current release is `v0.61.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,38 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.61.0 release is about the gates rather than the features. Five of the
+previous release's forty-four findings were residuals — a fix applied to one of
+several sites, or an invariant asserted in a comment rather than in code — so
+this release closes the ways that keeps happening.
+
+Two operational faults are fixed. Rolling a deployment back to an earlier image
+used to start cleanly and then break sign-in, because migrations only move
+forward and three recent ones drop a table and two columns the older code still
+reads. The application now refuses to start against a database a newer release
+has migrated, names both schema versions, and tells you to restore the backup
+taken before the upgrade — downgrades were never supported, and now they fail
+loudly instead of quietly. Separately, the container smoke test has asserted
+since v0.46.1 that a built image reports the version it was built from; that
+assertion was never switched on, so it had not run once in the sixteen
+releases since. It runs now, and on a tagged build it checks the published image
+against the tag itself.
+
+The credential audit trail added in v0.60.0 had no test that could fail: the
+existing one emitted the events itself and then asserted they came back. It now
+drives the real routes and reads the server's own log. The webhook and artwork
+fetchers no longer keep private copies of the outbound address policy, which
+were held in agreement by a comment asking future readers to keep them aligned.
+The delivery retry schedule, previously written out three times across two
+packages with two different argument conventions, has one definition.
+
+Two new gates catch these classes automatically. Every SQL statement in the
+store is now checked so that its bind arguments match its placeholders — the
+driver silently ignores surplus ones, so a mismatched statement runs and
+answers a different question. And `make mutate` reintroduces each already-fixed
+defect in turn and confirms the test written for it still fails, which turns a
+proof that used to happen once into one that repeats.
+
 The v0.60.0 release finishes the fifth review's backlog, closing the remaining
 twenty-seven findings.
 
@@ -738,7 +770,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.60.0` publishes `0.60.0`, `0.60`, and `latest`.
+- Pushing a tag such as `v0.61.0` publishes `0.61.0`, `0.61`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -752,17 +784,42 @@ language/runtime line.
 `make lint` runs the pinned `golangci-lint` v2.13.0 configuration. The focused
 quality gate covers unchecked errors, Go vet, static analysis, ineffective
 assignments, unused code, row and SQL resource handling, HTTP body closure,
-wrapped errors, and nil-error paths. `make test` builds the fast Docker test
+wrapped errors, nil-error paths, and duplicate code fragments. `make test` builds the fast Docker test
 stage; `make docker-quality` builds the full Docker quality stage, which runs
 serialized tests plus the pinned lint and vulnerability checks. Both Docker
 stages serialize package tests (`-p 1`) so constrained Docker/CI filesystems
 do not report spurious SQLite disk-full failures; the quality stage additionally
 runs the race detector and pinned lint/vulnerability tools.
 
+### Development targets
+
+`make quality` is the pre-release gate: formatting, tooling and version
+checks, `go vet`, the suite with the coverage floor, the race detector, lint,
+and the vulnerability scan. Two further targets are deliberately kept out of it
+because they are slow enough to want running on purpose:
+
+| Target | What it does |
+| --- | --- |
+| `make quality` | The full local gate, matching what CI enforces. |
+| `make coverage` | Suite plus the 80% floor. Included in `make quality`. |
+| `make smoke` | Builds the runtime image and runs `scripts/container-smoke.sh` against it: setup, sign-in, follow, sync, readiness, persistence across a restart, graceful shutdown, and that the container reports the version it was built from. |
+| `make mutate` | Reintroduces each catalogued defect in turn and checks that the test written for it still fails. Rebuilds per mutation, so it takes a few minutes. |
+| `make version-check` | With `VERSION=x.y.z`, checks the version and the README strings agree. |
+| `make backup-smoke` | Runs `scripts/backup.sh` then `scripts/restore-smoke.sh` end to end. Local only: it stops the running app and manipulates the real data volume. |
+| `make benchmark-notify` | Notification hold-time benchmark. |
+
+`make mutate` is how this project keeps its fixes proved. Every fix here is
+verified by reverting it and watching the new test fail; done by hand that
+proof happens once and then decays. `scripts/mutate.py` holds one entry per
+already-fixed defect, naming the issue and the test that must catch it, so the
+proof is repeatable. When a fix lands, add a row at the moment you would have
+done the reintroduction by hand anyway. Patterns must match exactly once, so a
+refactor that moves the code reports `DRIFT` rather than passing quietly.
+
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.60.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.61.0 docker compose up -d
 ```
 
 ## Configuration
@@ -975,6 +1032,14 @@ ArtistTrackarr blocks loopback, private, link-local, multicast, and metadata
 network addresses to prevent an invited user from using notifications as an
 SSRF proxy. Set `ALLOW_PRIVATE_NOTIFICATION_TARGETS=true` only when all
 household members are trusted and local notification services are required.
+
+Take a backup before every upgrade, and keep it until the new version has run
+for a while. Downgrades are not supported: migrations only move forward, and
+several of them drop columns and tables the preceding release still reads. The
+application refuses to start against a database a newer release has migrated,
+naming both schema versions, so a rollback fails loudly at startup instead of
+serving requests and then breaking sign-in. Recovering from that means
+restoring the backup taken before the upgrade.
 
 For a consistent backup, use the repository helper. It stops the app, resolves
 the volume actually mounted at `/data`, refuses missing or empty databases, and

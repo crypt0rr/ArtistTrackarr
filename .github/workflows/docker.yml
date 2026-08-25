@@ -44,7 +44,18 @@ jobs:
         run: docker build --tag artist-trackarr:ci .
 
       - name: Smoke test startup, persistence, and graceful shutdown
-        run: scripts/container-smoke.sh artist-trackarr:ci
+        # SMOKE_EXPECTED_VERSION enables the script's version-identity check.
+        # On a tag build take it from the tag, not from source: that is the
+        # one place anything proves end to end that the image about to be
+        # published reports the version it is published as.
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            expected="${GITHUB_REF_NAME#v}"
+          else
+            expected="$(sed -n 's/^const Current = "\(.*\)"$/\1/p' internal/version/version.go)"
+          fi
+          echo "asserting container reports version ${expected}"
+          SMOKE_EXPECTED_VERSION="${expected}" scripts/container-smoke.sh artist-trackarr:ci
 
   quality:
     name: Native race and vulnerability checks

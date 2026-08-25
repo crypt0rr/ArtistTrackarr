@@ -664,9 +664,11 @@ func (r *Runner) performDelivery(ctx context.Context, now time.Time, target deli
 		}
 	}
 	if attemptID > 0 {
+		// target.attempts is the pre-increment count, so the attempt that
+		// just failed is target.attempts+1. Same schedule the row itself is
+		// put on, from the same function, so the audit cannot drift from it.
 		var nextRetry *time.Time
-		if target.attempts+1 < 5 {
-			next := now.Add(time.Minute * time.Duration(1<<min(target.attempts+1, 6)))
+		if _, next, willRetry := store.DeliveryRetrySchedule(target.attempts+1, now); willRetry {
 			nextRetry = &next
 		}
 		if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, false, redactedError, nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {

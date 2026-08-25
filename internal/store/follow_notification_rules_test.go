@@ -994,3 +994,229 @@ func TestOrphanSweepDoesNotTouchClaimedWork(t *testing.T) {
 		t.Fatalf("cancelled=%d err=%v, want the claimed row left alone", cancelled, err)
 	}
 }
+
+// TestRetryDoesNotCancelADeliberatePause pins the discriminating field rather
+// than a derived total.
+//
+// RetryFailedDeliveries partitions failed rows into those it makes runnable now
+// and those a pause is still holding back, and the existing fixtures assert
+// stats.Total(). That sum is invariant under the defect: if the partition
+// collapses and every row is requeued, Total() is unchanged, so a mutation
+// removing the deferral check survives every one of them. Recovering a
+// destination must never cancel a pause a member set deliberately.
+func TestRetryDoesNotCancelADeliberatePause(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, canonicalID, _, _, deliveryID := seedTwoFollowScenario(t, s)
+
+	// The governing follow is paused, so this delivery is deliberately deferred.
+	until := time.Now().UTC().Add(14 * 24 * time.Hour).Truncate(time.Second)
+	if err := s.PauseFollowNotificationRule(ctx, userID, canonicalID, &until); err != nil {
+		t.Fatal(err)
+	}
+	deferredAt := deliveryNextAttempt(t, s, deliveryID)
+
+	// The destination then fails, so both rows are candidates for recovery.
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) == 0 {
+		t.Fatalf("destinations=%d err=%v", len(destinations), err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='failed' WHERE id=?`, deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := s.RetryFailedDeliveries(ctx, userID, destinations[0].ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The discriminating assertion: this row must be counted as deferred, not
+	// requeued. Total() cannot tell these apart.
+	if stats.Deferred != 1 {
+		t.Fatalf("stats=%+v, want the paused row counted as deferred", stats)
+	}
+	if stats.Requeued != 0 {
+		t.Fatalf("stats=%+v, want no row made runnable while its pause is active", stats)
+	}
+	// And it must still be parked at the pause expiry, not pulled to now.
+	if got := deliveryNextAttempt(t, s, deliveryID); !got.Equal(deferredAt) {
+		t.Fatalf("recovery moved a paused delivery: %s -> %s", deferredAt, got)
+	}
+}
+
+// TestClaimSkipsAPausedDestinationsPendingRows pins the claim query's exclusion
+// of paused destinations. It sets destination_health directly rather than
+// driving five real failures, so it guards the query rather than the whole
+// circuit-breaker - which is the intent.
+func TestClaimSkipsAPausedDestinationsPendingRows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, _, _, _, deliveryID := seedTwoFollowScenario(t, s)
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) == 0 {
+		t.Fatalf("destinations=%d err=%v", len(destinations), err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET status='pending',next_attempt_at=? WHERE id=?`,
+		timeText(now.Add(-time.Hour)), deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: it is claimable while the destination is healthy.
+	claimed, err := s.ClaimDueDeliveries(ctx, now, 10, "worker-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("control: claimed=%d with a healthy destination, want 1", len(claimed))
+	}
+	// Release the claim so the only difference in the next call is the pause.
+	if _, err := s.DB.ExecContext(ctx, `UPDATE deliveries SET claim_owner=NULL,claim_expires_at=NULL WHERE id=?`,
+		deliveryID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,updated_at)
+		VALUES(?, 'paused',5,?)
+		ON CONFLICT(destination_id) DO UPDATE SET status='paused',consecutive_failures=5,updated_at=excluded.updated_at`,
+		destinations[0].ID, timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = s.ClaimDueDeliveries(ctx, now, 10, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed=%d from a paused destination, want 0", len(claimed))
+	}
+}
+
+// The pause predicate is a pure time comparison, and every existing fixture
+// exercises it at now, now+48h or now-1h - never at the instant the pause
+// expires. That leaves `!now.Before(*r.PausedUntil)` and `now.After(...)`
+// indistinguishable, though they disagree on exactly the boundary: at
+// now == PausedUntil the pause is over and the delivery must go out.
+func TestThePauseEndsAtItsExpiryInstantNotAfterIt(t *testing.T) {
+	pausedUntil := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	rule := FollowNotificationRule{
+		DeliveryMode: FollowDeliveryImmediate,
+		PausedUntil:  &pausedUntil,
+	}
+	for _, tc := range []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{"a nanosecond before expiry still defers", pausedUntil.Add(-time.Nanosecond), true},
+		{"the expiry instant itself does not defer", pausedUntil, false},
+		{"a nanosecond after expiry does not defer", pausedUntil.Add(time.Nanosecond), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resumesAt, deferred := rule.pausedDeliveryResumesAt(tc.now)
+			if deferred != tc.want {
+				t.Fatalf("pausedDeliveryResumesAt(%s) deferred=%v, want %v", tc.now, deferred, tc.want)
+			}
+			if deferred && !resumesAt.Equal(pausedUntil) {
+				t.Errorf("resumesAt=%s, want %s", resumesAt, pausedUntil)
+			}
+			if !deferred && !resumesAt.IsZero() {
+				t.Errorf("resumesAt=%s, want the zero time when not deferred", resumesAt)
+			}
+		})
+	}
+}
+
+// A paused follow defers rather than discards, so it will deliver when the
+// pause expires - which means it must still take the conflict hold on the way
+// in. Gating only on queuesImmediate skipped the hold while the deferral
+// queued the delivery anyway, releasing an unreviewed release at pause expiry
+// with no hold row for the member to act on.
+//
+// The sibling half of that fix - `|| deferredDelivery` on the admission return
+// - is covered by TestHeldNotificationsReevaluateCurrentRulesOnApproval. This
+// is the hold half, from the same commit and the same variable, which nothing
+// failed on when reverted.
+func TestDeferredDeliveryStillTakesTheConflictHold(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Now().UTC()
+
+	userID, err := s.CreateUser(ctx, "deferred-hold@example.com", "hash", "member", "UTC", "deferred-hold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "deferred-hold", Name: "Deferred Hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	preferences, err := s.NotificationPreferences(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences.HoldConflictingNotifications = true
+	if err := s.UpdateNotificationPreferences(ctx, preferences); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_id,spotify_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "deferred-hold-release", artist.ID, "Deferred Hold Release",
+		"Album", "[]", "2099-01-01", 3, "", "deferred-hold-spotify",
+		"https://open.spotify.com/album/deferred-hold-spotify", "spotify", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,'open',?,?)`, releaseID, "title_conflict", "warning", "deferred-hold-fingerprint",
+		"Providers disagree", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause the follow, so admission takes the deferral path rather than the
+	// immediate one. Without the pause this test would pass on the strength of
+	// queuesImmediate alone and prove nothing.
+	until := now.Add(48 * time.Hour)
+	if err := s.PauseFollowNotificationRule(ctx, userID, artist.ID, &until); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, deferred := rule.pausedDeliveryResumesAt(now); !deferred {
+		t.Fatal("precondition: the follow is not deferring, so the hold path under test never runs")
+	}
+
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "Deferred hold release", "Review this", now); err != nil {
+		t.Fatal(err)
+	}
+
+	holds, err := s.NotificationHoldsForRelease(ctx, userID, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 1 {
+		t.Fatalf("holds=%d, want 1: a deferred delivery must still be held for review", len(holds))
+	}
+
+	// And the hold must be instead of the event, not alongside it - otherwise
+	// the alert is queued for pause expiry and the review row is decorative.
+	var events int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM notification_events WHERE user_id=? AND release_group_id=?`,
+		userID, releaseID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Errorf("notification_events=%d, want 0 while the release is held", events)
+	}
+}

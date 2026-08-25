@@ -29,6 +29,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
 	"github.com/crypt0rr/artist-tracker/internal/version"
@@ -2409,7 +2410,28 @@ func authenticatedTestServerWithITunes(
 	itunes catalog.ITunesProvider,
 	runnerFactory func(*store.Store) *jobs.Runner,
 ) (*store.Store, *httptest.Server, *http.Client) {
+	return authenticatedTestServerLogging(t, nil, mb, spotify, itunes, runnerFactory)
+}
+
+// authenticatedTestServerLogging is the full form. Pass a non-nil sink to
+// capture what the server's own logger writes, which is the only way to assert
+// that a route emits an audit event: a test that constructs its own App and
+// calls logger.Info itself is asserting on slog, not on the handler.
+//
+// The sink is wrapped exactly as cmd/server/main.go wraps stdout, so anything
+// asserted here has been through the same redaction the operator sees.
+func authenticatedTestServerLogging(
+	t *testing.T,
+	sink io.Writer,
+	mb catalog.CatalogProvider,
+	spotify catalog.SpotifyProvider,
+	itunes catalog.ITunesProvider,
+	runnerFactory func(*store.Store) *jobs.Runner,
+) (*store.Store, *httptest.Server, *http.Client) {
 	t.Helper()
+	if sink == nil {
+		sink = io.Discard
+	}
 	database, err := store.Open(filepath.Join(t.TempDir(), "authenticated.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -2435,7 +2457,7 @@ func authenticatedTestServerWithITunes(
 	}
 	app, err := New(
 		cfg, database, mb, spotify, fakeSender{}, cipher, fakeArtwork{}, runner,
-		slog.New(slog.NewTextHandler(io.Discard, nil)), itunes,
+		slog.New(logging.NewHandler(slog.NewJSONHandler(sink, nil), 64)), itunes,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -2534,6 +2556,36 @@ func TestNoTemplateRendersARawClockTime(t *testing.T) {
 		// machine-readable RFC3339 attributes are deliberate and stay.
 		if strings.Contains(string(data), `.Format "2006-01-02 15:04"`) {
 			t.Errorf("%s renders a raw clock time; use formatTime with $.User.Timezone", filepath.Base(path))
+		}
+	}
+
+	// #261 was not in a template. followRuleSummary printed a raw UTC clock
+	// from Go, and this guard - globbing templates only - could not see it.
+	// Fixing the instance without widening the glob left the class open, so
+	// the Go half is checked here too.
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no Go sources found; the check would pass vacuously")
+	}
+	for _, path := range sources {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		// core.go owns the layout: formatTime and providerHealthTime are the
+		// functions everything else is required to go through, and they append
+		// the zone abbreviation themselves.
+		if filepath.Base(path) == "core.go" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), `"2006-01-02 15:04"`) {
+			t.Errorf("%s formats a raw clock time; call formatTime so the member's zone and its abbreviation are applied", path)
 		}
 	}
 }

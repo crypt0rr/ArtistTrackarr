@@ -888,18 +888,46 @@ func (s *Store) FinalizeDeliverySent(ctx context.Context, id int64, now time.Tim
 	})
 }
 
+// Delivery retry policy. attempts always means the number of attempts made
+// INCLUDING the one that just failed, so a caller holding a pre-increment
+// count passes attempts+1.
+const (
+	deliveryMaxAttempts     = 5
+	deliveryBackoffShiftCap = 6
+)
+
+// DeliveryRetrySchedule reports what happens to a delivery after a failed
+// attempt: the status it moves to, when the next attempt is due, and whether
+// there will be one.
+//
+// This was written out three times - here, in MarkDigestDeliveryFailedOwned,
+// and again in the jobs runner where it feeds the next_retry_at column of the
+// delivery_attempts audit. The jobs copy passed attempts+1 where these two
+// passed attempts, so the three agreed only because the caller compensated;
+// editing any one of them in isolation would have made the audit disagree with
+// the schedule the row was actually on. #237 called this "the retry policy
+// written out four times"; consolidating deliverOne and deliverDigestOne
+// removed one copy and left three.
+//
+// nextAttempt is returned even when there will be no retry, because the row
+// still records it.
+func DeliveryRetrySchedule(attempts int, now time.Time) (status string, nextAttempt time.Time, willRetry bool) {
+	willRetry = attempts < deliveryMaxAttempts
+	status = "failed"
+	if willRetry {
+		status = "pending"
+	}
+	return status, now.Add(time.Minute * time.Duration(1<<min(attempts, deliveryBackoffShiftCap))), willRetry
+}
+
 func (s *Store) MarkDeliveryFailedOwned(ctx context.Context, id int64, attempts int, message, owner string, now time.Time) error {
 	message = safeDeliveryError(message)
-	status := "pending"
-	if attempts >= 5 {
-		status = "failed"
-	}
-	delay := time.Minute * time.Duration(1<<min(attempts, 6))
+	status, nextAttempt, _ := DeliveryRetrySchedule(attempts, now)
 	if len(message) > 500 {
 		message = message[:500]
 	}
 	query := `UPDATE deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-	args := []any{status, attempts, timeText(now.Add(delay)), message, id}
+	args := []any{status, attempts, timeText(nextAttempt), message, id}
 	if strings.TrimSpace(owner) != "" {
 		query += ` AND claim_owner=?`
 		args = append(args, owner)
@@ -989,18 +1017,14 @@ func (s *Store) FinalizeDigestDeliverySent(ctx context.Context, id int64, now ti
 
 func (s *Store) MarkDigestDeliveryFailedOwned(ctx context.Context, id int64, attempts int, message, owner string, now time.Time) error {
 	message = safeDeliveryError(message)
-	status := "pending"
-	if attempts >= 5 {
-		status = "failed"
-	}
-	delay := time.Minute * time.Duration(1<<min(attempts, 6))
+	status, nextAttempt, _ := DeliveryRetrySchedule(attempts, now)
 	if len(message) > 500 {
 		message = message[:500]
 	}
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		query := `UPDATE release_digest_deliveries
 		SET status=?,attempts=?,next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-		args := []any{status, attempts, timeText(now.Add(delay)), message, id}
+		args := []any{status, attempts, timeText(nextAttempt), message, id}
 		if strings.TrimSpace(owner) != "" {
 			query += ` AND claim_owner=?`
 			args = append(args, owner)
@@ -1448,37 +1472,47 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 	return result, rows.Err()
 }
 
-func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+// scanAdminDeliveryDetail projects one admin delivery-detail row. The normal
+// and digest queues are separate tables with separate ID spaces, so they need
+// separate statements - but everything after the scan is the same work, and
+// keeping two copies of it meant a fix to one projection could miss the other.
+// kind is the delivery kind reported to the caller; label prefixes the
+// timestamp parse errors so a malformed row still says which queue it came
+// from.
+func scanAdminDeliveryDetail(row *sql.Row, kind, label string) (AdminDeliveryHistory, error) {
 	var h AdminDeliveryHistory
 	var destination, service, status, lastError sql.NullString
 	var attempts sql.NullInt64
 	var created, nextAttempt, sent sql.NullString
-	err := s.readerDB().QueryRowContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
-		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
-		FROM deliveries d JOIN notification_events e ON e.id=d.event_id
-		JOIN users u ON u.id=e.user_id LEFT JOIN destinations dst ON dst.id=d.destination_id
-		WHERE d.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+	err := row.Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
 		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
 	if err != nil {
 		return h, err
 	}
-	h.DeliveryKind = "notification"
+	h.DeliveryKind = kind
 	h.Destination, h.Service = destination.String, service.String
 	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
 	if h.Destination == "" {
 		h.Destination, h.Status = "No destination configured", "not sent"
 	}
-	h.CreatedAt, err = parseStoredTime(created.String, "delivery detail created_at")
-	if err != nil {
+	if h.CreatedAt, err = parseStoredTime(created.String, label+" created_at"); err != nil {
 		return h, err
 	}
-	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "delivery detail next_attempt_at"); err != nil {
+	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, label+" next_attempt_at"); err != nil {
 		return h, err
 	}
-	if h.SentAt, err = parseStoredNullableTime(sent, "delivery detail sent_at"); err != nil {
+	if h.SentAt, err = parseStoredNullableTime(sent, label+" sent_at"); err != nil {
 		return h, err
 	}
 	return h, nil
+}
+
+func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+	return scanAdminDeliveryDetail(s.readerDB().QueryRowContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
+		FROM deliveries d JOIN notification_events e ON e.id=d.event_id
+		JOIN users u ON u.id=e.user_id LEFT JOIN destinations dst ON dst.id=d.destination_id
+		WHERE d.id=?`, deliveryID), "notification", "delivery detail")
 }
 
 // AdminDigestDeliveryDetail returns the explicit detail view for a digest
@@ -1486,37 +1520,13 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 // web layer uses a distinct route to avoid ambiguous links when both tables
 // contain the same numeric ID.
 func (s *Store) AdminDigestDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
-	var h AdminDeliveryHistory
-	var destination, service, status, lastError sql.NullString
-	var attempts sql.NullInt64
-	var created, nextAttempt, sent sql.NullString
-	err := s.readerDB().QueryRowContext(ctx, `SELECT dd.id,u.email,r.title,r.body,'digest',
+	return scanAdminDeliveryDetail(s.readerDB().QueryRowContext(ctx, `SELECT dd.id,u.email,r.title,r.body,'digest',
 		dst.name,dst.service,dd.status,dd.attempts,dd.last_error,r.created_at,dd.next_attempt_at,dd.sent_at
 		FROM release_digest_deliveries dd JOIN release_digest_runs r ON r.id=dd.run_id
 		JOIN users u ON u.id=r.user_id LEFT JOIN destinations dst ON dst.id=dd.destination_id
-		WHERE dd.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
-		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
-	if err != nil {
-		return h, err
-	}
-	h.DeliveryKind = "digest"
-	h.Destination, h.Service = destination.String, service.String
-	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
-	if h.Destination == "" {
-		h.Destination, h.Status = "No destination configured", "not sent"
-	}
-	h.CreatedAt, err = parseStoredTime(created.String, "digest delivery detail created_at")
-	if err != nil {
-		return h, err
-	}
-	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "digest delivery detail next_attempt_at"); err != nil {
-		return h, err
-	}
-	if h.SentAt, err = parseStoredNullableTime(sent, "digest delivery detail sent_at"); err != nil {
-		return h, err
-	}
-	return h, nil
+		WHERE dd.id=?`, deliveryID), "digest", "digest delivery detail")
 }
+
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences
 	p.UserID = userID

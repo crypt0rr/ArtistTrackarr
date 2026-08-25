@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3033,5 +3034,53 @@ func TestWriteContentionIsCounted(t *testing.T) {
 	}
 	if !slices.Contains(reasons, "database write contention") {
 		t.Fatalf("operational reasons=%v, want a write contention reason", reasons)
+	}
+}
+
+// A binary older than its database starts cleanly without this guard: migrate
+// skips every version already recorded, so nothing in the sequence notices
+// that 035-037 have already dropped a table and two columns the older code
+// still selects. The failure surfaces later, on the first authenticated
+// request, which is the worst possible place for it.
+func TestADatabaseFromANewerReleaseRefusesToStart(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+
+	// Baseline: a database this build migrated itself is accepted, and stays
+	// accepted on re-open. Without this the test could pass by never starting.
+	if err := s.migrate(ctx); err != nil {
+		t.Fatalf("migrate on an up-to-date database: %v", err)
+	}
+
+	var applied int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for a future release having migrated this file.
+	ahead := applied + 1
+	if _, err := s.DB.ExecContext(ctx,
+		`INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`, ahead, nowText()); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.migrate(ctx)
+	if err == nil {
+		t.Fatal("migrate accepted a database migrated by a newer release, want refusal")
+	}
+	// The operator reading this message needs both numbers and a next step.
+	for _, want := range []string{strconv.Itoa(ahead), strconv.Itoa(applied), "restore"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("migrate error %q does not mention %q", err, want)
+		}
+	}
+
+	// Removing the future row makes it startable again, proving the guard keys
+	// on the recorded version and not on some other side effect of the insert.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version=?`, ahead); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatalf("migrate after the newer row was removed: %v", err)
 	}
 }

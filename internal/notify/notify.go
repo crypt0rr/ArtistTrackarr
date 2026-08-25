@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/crypt0rr/artist-tracker/internal/netpolicy"
 	"html"
 	"io"
 	"net"
@@ -727,7 +728,7 @@ func isBlockedHost(host string, allowPrivate bool) bool {
 		return false
 	}
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
-	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+	if netpolicy.IsLocalhostName(host) {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
@@ -737,76 +738,10 @@ func isBlockedHost(host string, allowPrivate bool) bool {
 	// spellings of IPv4 addresses (for example 2130706433, 0x7f000001, or
 	// 0177.0.0.1). Treat those forms as IP literals before DNS resolution so
 	// an obfuscated loopback/private target cannot pass the hostname check.
-	if ip := parseLegacyIPv4(host); ip != nil {
+	if ip := netpolicy.ParseLegacyIPv4(host); ip != nil {
 		return isBlockedIP(ip, allowPrivate)
 	}
 	return false
-}
-
-// parseLegacyIPv4 recognizes the numeric IPv4 forms accepted by common URL
-// and socket implementations. It deliberately returns nil for ordinary DNS
-// names so they continue through the resolver and are checked again at dial
-// time. Components use the inet_aton bases (decimal, 0x-prefixed hex, or
-// leading-zero octal) and may contain one to four components.
-func parseLegacyIPv4(host string) net.IP {
-	host = strings.TrimSpace(host)
-	if host == "" || strings.HasSuffix(host, ".") {
-		return nil
-	}
-	parts := strings.Split(host, ".")
-	if len(parts) < 1 || len(parts) > 4 {
-		return nil
-	}
-	values := make([]uint64, len(parts))
-	for i, part := range parts {
-		if part == "" {
-			return nil
-		}
-		base := 10
-		digits := part
-		if strings.HasPrefix(strings.ToLower(part), "0x") {
-			base, digits = 16, part[2:]
-		} else if len(part) > 1 && strings.HasPrefix(part, "0") {
-			base = 8
-		}
-		if digits == "" {
-			return nil
-		}
-		value, err := strconv.ParseUint(digits, base, 32)
-		if err != nil {
-			// A leading-zero component containing 8 or 9 is not valid octal,
-			// but it may still be a decimal hostname label. Do not classify it
-			// as an IP literal in that case.
-			return nil
-		}
-		values[i] = value
-	}
-	var value uint64
-	switch len(values) {
-	case 1:
-		value = values[0]
-	case 2:
-		if values[0] > 0xff || values[1] > 0xffffff {
-			return nil
-		}
-		value = values[0]<<24 | values[1]
-	case 3:
-		if values[0] > 0xff || values[1] > 0xff || values[2] > 0xffff {
-			return nil
-		}
-		value = values[0]<<24 | values[1]<<16 | values[2]
-	case 4:
-		for _, part := range values {
-			if part > 0xff {
-				return nil
-			}
-		}
-		value = values[0]<<24 | values[1]<<16 | values[2]<<8 | values[3]
-	}
-	if value > 0xffffffff {
-		return nil
-	}
-	return net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value))
 }
 
 func isBlockedIP(ip net.IP, allowPrivate bool) bool {
@@ -827,26 +762,8 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	// Go deliberately treats shared, documentation, benchmarking, and
 	// reserved address blocks as global-unicast. They are not public service
 	// destinations, however, and should not be reachable through a webhook.
-	for _, cidr := range []string{
-		"0.0.0.0/8",       // this-network/reserved addresses
-		"100.64.0.0/10",   // RFC 6598 shared address space
-		"192.0.0.0/24",    // IETF protocol assignments
-		"192.0.2.0/24",    // TEST-NET-1
-		"198.18.0.0/15",   // benchmarking
-		"198.51.100.0/24", // TEST-NET-2
-		"203.0.113.0/24",  // TEST-NET-3
-		"240.0.0.0/4",     // reserved/future use
-		"2001:db8::/32",   // IPv6 documentation
-		"2001::/32",       // Teredo transition addresses
-		"2002::/16",       // 6to4 transition addresses
-		"64:ff9b::/96",    // well-known NAT64 prefix
-		"64:ff9b:1::/48",  // network-specific NAT64 prefix
-	} {
-		if _, network, err := net.ParseCIDR(cidr); err == nil && network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	// The artwork fetcher enforces the same policy from the same list.
+	return netpolicy.IsReserved(ip)
 }
 
 // DestinationInput is the form a member fills in to add a destination.

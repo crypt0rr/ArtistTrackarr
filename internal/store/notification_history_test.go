@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1028,5 +1029,120 @@ func TestReconcileStaleDeliveryAttemptsMarksOnlyExpiredAttempts(t *testing.T) {
 	}
 	if freshStatus != "started" {
 		t.Fatalf("fresh attempt status=%q, want started", freshStatus)
+	}
+}
+
+// The retry ladder had no test pinning where it stops. Fixtures asserted a
+// lower bound on the next attempt time ("at least 59 seconds out") and never
+// that attempt 5 is the last one, so moving the cutoff from 5 to 6 - one more
+// delivery attempt against a destination that has already failed five times -
+// passed the entire suite.
+func TestTheRetryLadderStopsAtTheFifthAttempt(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		attempts      int
+		wantStatus    string
+		wantRetry     bool
+		wantNextDelay time.Duration
+	}{
+		{attempts: 1, wantStatus: "pending", wantRetry: true, wantNextDelay: 2 * time.Minute},
+		{attempts: 2, wantStatus: "pending", wantRetry: true, wantNextDelay: 4 * time.Minute},
+		{attempts: 3, wantStatus: "pending", wantRetry: true, wantNextDelay: 8 * time.Minute},
+		// The boundary: four failures still retry, five give up.
+		{attempts: 4, wantStatus: "pending", wantRetry: true, wantNextDelay: 16 * time.Minute},
+		{attempts: 5, wantStatus: "failed", wantRetry: false, wantNextDelay: 32 * time.Minute},
+		{attempts: 6, wantStatus: "failed", wantRetry: false, wantNextDelay: 64 * time.Minute},
+		// The shift is capped, so the backoff stops doubling rather than
+		// running away into days.
+		{attempts: 7, wantStatus: "failed", wantRetry: false, wantNextDelay: 64 * time.Minute},
+		{attempts: 99, wantStatus: "failed", wantRetry: false, wantNextDelay: 64 * time.Minute},
+	} {
+		t.Run(strconv.Itoa(tc.attempts), func(t *testing.T) {
+			status, next, willRetry := DeliveryRetrySchedule(tc.attempts, now)
+			if status != tc.wantStatus {
+				t.Errorf("status=%q, want %q", status, tc.wantStatus)
+			}
+			if willRetry != tc.wantRetry {
+				t.Errorf("willRetry=%v, want %v", willRetry, tc.wantRetry)
+			}
+			if got := next.Sub(now); got != tc.wantNextDelay {
+				t.Errorf("next attempt in %s, want %s", got, tc.wantNextDelay)
+			}
+		})
+	}
+}
+
+// The stored next_attempt_at is what the claim query reads, and the jobs
+// runner writes the same schedule into the delivery_attempts audit as
+// next_retry_at. Both now come from DeliveryRetrySchedule, so this pins the
+// concrete timestamps the store actually writes rather than re-deriving them
+// from the function under test - otherwise a change to the schedule would move
+// the expectation with it and assert nothing.
+func TestAFailedDeliveryIsStoredOnTheScheduledBackoff(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+
+	userID, err := s.CreateUser(ctx, "retry-backoff@example.com", "hash", "member", "UTC", "retry-backoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "retry-backoff", Name: "Retry Backoff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseResult, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, "retry-backoff-release", artist.ID, "Backoff Album", "Album", "[]",
+		"2026-08-01", 3, "https://musicbrainz.org/release-group/backoff", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := releaseResult.LastInsertId()
+	eventResult, err := s.DB.ExecContext(ctx,
+		`INSERT INTO notification_events(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", "Backoff Album announced", "The body", nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, _ := eventResult.LastInsertId()
+	if err := s.AddDestination(ctx, userID, "Primary", "generic", []byte("encrypted-url")); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := s.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	deliveryResult, err := s.DB.ExecContext(ctx,
+		`INSERT INTO deliveries(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinations[0].ID, "pending", 0, timeText(now.Add(-time.Minute)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, _ := deliveryResult.LastInsertId()
+
+	for _, tc := range []struct {
+		attempts   int
+		wantStatus string
+		wantDelay  time.Duration
+	}{
+		{attempts: 1, wantStatus: "pending", wantDelay: 2 * time.Minute},
+		{attempts: 4, wantStatus: "pending", wantDelay: 16 * time.Minute},
+		{attempts: 5, wantStatus: "failed", wantDelay: 32 * time.Minute},
+	} {
+		if err := s.MarkDeliveryFailed(ctx, deliveryID, tc.attempts, "upstream refused", now); err != nil {
+			t.Fatal(err)
+		}
+		var status, next string
+		if err := s.DB.QueryRowContext(ctx,
+			`SELECT status,next_attempt_at FROM deliveries WHERE id=?`, deliveryID).Scan(&status, &next); err != nil {
+			t.Fatal(err)
+		}
+		if status != tc.wantStatus {
+			t.Errorf("attempt %d: status=%q, want %q", tc.attempts, status, tc.wantStatus)
+		}
+		if want := timeText(now.Add(tc.wantDelay)); next != want {
+			t.Errorf("attempt %d: next_attempt_at=%s, want %s", tc.attempts, next, want)
+		}
 	}
 }
