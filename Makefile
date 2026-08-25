@@ -1,7 +1,7 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
-.PHONY: test docker-quality build run smoke fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
+.PHONY: test docker-quality build run smoke mutate fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
 
 test:
 	docker build --target test .
@@ -25,6 +25,15 @@ run:
 smoke:
 	docker build -t artist-trackarr:smoke .
 	scripts/container-smoke.sh artist-trackarr:smoke
+
+# Reintroduce every catalogued defect and confirm its guard still fails. This
+# project proves each fix by reverting it and watching the test fail; done by
+# hand that proof happens once and then decays, which is how six of the
+# forty-four v0.58.0 findings turned out to be residuals of earlier fixes.
+# Slower than the unit suite because it rebuilds per mutation, so it is a
+# deliberate step rather than part of `quality`.
+mutate:
+	python3 scripts/mutate.py
 
 fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
