@@ -399,6 +399,17 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
         guards="#261 - a raw UTC clock with no zone label. The original guard "
                "globbed templates only, so the Go instance was invisible to it.",
     ),
+    Mutation(
+        name="retry-ladder-cutoff",
+        file="internal/store/notifications.go",
+        find="""	deliveryMaxAttempts     = 5""",
+        replace="""	deliveryMaxAttempts     = 6""",
+        package="./internal/store/",
+        test="TestTheRetryLadderStopsAtTheFifthAttempt",
+        guards="One extra delivery attempt against a destination that has "
+               "already failed five times. Fixtures asserted a lower bound on "
+               "the retry time and never where the ladder stops.",
+    ),
 ]
 
 

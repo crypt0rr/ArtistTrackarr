@@ -888,18 +888,46 @@ func (s *Store) FinalizeDeliverySent(ctx context.Context, id int64, now time.Tim
 	})
 }
 
+// Delivery retry policy. attempts always means the number of attempts made
+// INCLUDING the one that just failed, so a caller holding a pre-increment
+// count passes attempts+1.
+const (
+	deliveryMaxAttempts     = 5
+	deliveryBackoffShiftCap = 6
+)
+
+// DeliveryRetrySchedule reports what happens to a delivery after a failed
+// attempt: the status it moves to, when the next attempt is due, and whether
+// there will be one.
+//
+// This was written out three times - here, in MarkDigestDeliveryFailedOwned,
+// and again in the jobs runner where it feeds the next_retry_at column of the
+// delivery_attempts audit. The jobs copy passed attempts+1 where these two
+// passed attempts, so the three agreed only because the caller compensated;
+// editing any one of them in isolation would have made the audit disagree with
+// the schedule the row was actually on. #237 called this "the retry policy
+// written out four times"; consolidating deliverOne and deliverDigestOne
+// removed one copy and left three.
+//
+// nextAttempt is returned even when there will be no retry, because the row
+// still records it.
+func DeliveryRetrySchedule(attempts int, now time.Time) (status string, nextAttempt time.Time, willRetry bool) {
+	willRetry = attempts < deliveryMaxAttempts
+	status = "failed"
+	if willRetry {
+		status = "pending"
+	}
+	return status, now.Add(time.Minute * time.Duration(1<<min(attempts, deliveryBackoffShiftCap))), willRetry
+}
+
 func (s *Store) MarkDeliveryFailedOwned(ctx context.Context, id int64, attempts int, message, owner string, now time.Time) error {
 	message = safeDeliveryError(message)
-	status := "pending"
-	if attempts >= 5 {
-		status = "failed"
-	}
-	delay := time.Minute * time.Duration(1<<min(attempts, 6))
+	status, nextAttempt, _ := DeliveryRetrySchedule(attempts, now)
 	if len(message) > 500 {
 		message = message[:500]
 	}
 	query := `UPDATE deliveries SET status=?,attempts=?,next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-	args := []any{status, attempts, timeText(now.Add(delay)), message, id}
+	args := []any{status, attempts, timeText(nextAttempt), message, id}
 	if strings.TrimSpace(owner) != "" {
 		query += ` AND claim_owner=?`
 		args = append(args, owner)
@@ -989,18 +1017,14 @@ func (s *Store) FinalizeDigestDeliverySent(ctx context.Context, id int64, now ti
 
 func (s *Store) MarkDigestDeliveryFailedOwned(ctx context.Context, id int64, attempts int, message, owner string, now time.Time) error {
 	message = safeDeliveryError(message)
-	status := "pending"
-	if attempts >= 5 {
-		status = "failed"
-	}
-	delay := time.Minute * time.Duration(1<<min(attempts, 6))
+	status, nextAttempt, _ := DeliveryRetrySchedule(attempts, now)
 	if len(message) > 500 {
 		message = message[:500]
 	}
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		query := `UPDATE release_digest_deliveries
 		SET status=?,attempts=?,next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
-		args := []any{status, attempts, timeText(now.Add(delay)), message, id}
+		args := []any{status, attempts, timeText(nextAttempt), message, id}
 		if strings.TrimSpace(owner) != "" {
 			query += ` AND claim_owner=?`
 			args = append(args, owner)
