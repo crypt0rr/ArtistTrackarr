@@ -22,9 +22,24 @@ import (
 // and a reviewer cannot. Measured on this package: 59 statements carry four or
 // more placeholders and one carries 21.
 
+// The database/sql entry points, plus this package's own write wrapper.
+//
+// execWriteContext matters more than the rest: it is the house-preferred write
+// path, with 31 call sites, and leaving it out meant this test asserted a
+// package-wide invariant while skipping the statements the codebase is
+// actively being steered towards. A guard that covers some of the sites and
+// claims all of them is the exact defect shape this file exists to catch, so
+// it is worth naming here - any future wrapper of the same shape belongs in
+// this map on the day it is written.
+//
+// Prepare and PrepareContext are deliberately absent. They take the SQL and no
+// bind arguments at all, so a prepared statement with placeholders would be
+// reported as a mismatch on completely correct code. Their arguments are bound
+// later through the returned *sql.Stmt, which this walker does not follow.
 var bindMethods = map[string]bool{
 	"Query": true, "QueryContext": true, "QueryRow": true, "QueryRowContext": true,
-	"Exec": true, "ExecContext": true, "Prepare": true, "PrepareContext": true,
+	"Exec": true, "ExecContext": true,
+	"execWriteContext": true,
 }
 
 // stringFunc is a helper of the shape `func(a, b string) string { return ... }`.
@@ -166,31 +181,53 @@ func collectStringFuncs(files []*ast.File) map[string]*stringFunc {
 	return funcs
 }
 
-func collectStringConsts(files []*ast.File, base *sqlResolver) map[string]string {
-	consts := map[string]string{}
-	for _, file := range files {
-		for _, decl := range file.Decls {
-			gen, ok := decl.(*ast.GenDecl)
-			if !ok || gen.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range gen.Specs {
-				value, ok := spec.(*ast.ValueSpec)
-				if !ok {
+// collectStringDeclarations folds package-level string declarations.
+//
+// Both const and var are collected: this package already keeps SQL in vars
+// (evidenceIssueSelect, releaseInboxFrom), and skipping them would mean a
+// one-token difference between `const` and `var` silently decided whether a
+// statement was checked at all.
+//
+// It iterates to a fixed point because a declaration may be built from another
+// one, and Go does not require them to appear in dependency order. Resolving
+// in a single pass with an empty scope quietly dropped every such statement -
+// including the ones interpolating followedReleasePredicate, which is where
+// #239 lived.
+func collectStringDeclarations(files []*ast.File, funcs map[string]*stringFunc) map[string]string {
+	declared := map[string]string{}
+	for {
+		found := 0
+		r := &sqlResolver{scope: declared, funcs: funcs}
+		for _, file := range files {
+			for _, decl := range file.Decls {
+				gen, ok := decl.(*ast.GenDecl)
+				if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
 					continue
 				}
-				for i, name := range value.Names {
-					if i >= len(value.Values) {
+				for _, spec := range gen.Specs {
+					value, ok := spec.(*ast.ValueSpec)
+					if !ok {
 						continue
 					}
-					if resolved, ok := base.resolve(value.Values[i]); ok {
-						consts[name.Name] = resolved
+					for i, name := range value.Names {
+						if i >= len(value.Values) {
+							continue
+						}
+						if _, already := declared[name.Name]; already {
+							continue
+						}
+						if resolved, ok := r.resolve(value.Values[i]); ok {
+							declared[name.Name] = resolved
+							found++
+						}
 					}
 				}
 			}
 		}
+		if found == 0 {
+			return declared
+		}
 	}
-	return consts
 }
 
 // localStringVars folds function-local `x := "..."` assignments, dropping any
@@ -226,6 +263,40 @@ func localStringVars(body *ast.BlockStmt, r *sqlResolver) {
 	}
 }
 
+// executesSQL reports whether fn has the shape of a statement-executing
+// helper: a string parameter followed by a final variadic one, which is how
+// database/sql spells it and how this package's own wrapper does too.
+func executesSQL(fn *ast.FuncDecl) bool {
+	if fn.Type.Params == nil || len(fn.Type.Params.List) < 2 {
+		return false
+	}
+	params := fn.Type.Params.List
+	last := params[len(params)-1]
+	ellipsis, ok := last.Type.(*ast.Ellipsis)
+	if !ok {
+		return false
+	}
+	// `...any` parses as an Ident, `...interface{}` as an InterfaceType. Match
+	// both: accepting only the latter made this check silently vacuous, since
+	// the wrapper it was written for is spelled `args ...any`.
+	switch elt := ellipsis.Elt.(type) {
+	case *ast.Ident:
+		if elt.Name != "any" {
+			return false
+		}
+	case *ast.InterfaceType:
+		if elt.Methods != nil && len(elt.Methods.List) != 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	// The parameter before the variadic one carries the statement.
+	previous := params[len(params)-2]
+	id, ok := previous.Type.(*ast.Ident)
+	return ok && id.Name == "string"
+}
+
 func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) {
 	fset := token.NewFileSet()
 	// Walk the directory rather than using parser.ParseDir, which is
@@ -253,10 +324,11 @@ func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) 
 
 	var total, checked, dynamic, variadic int
 	histogram := map[int]int{}
+	seenMethod := map[string]int{}
 
 	{
 		funcs := collectStringFuncs(files)
-		consts := collectStringConsts(files, &sqlResolver{scope: map[string]string{}, funcs: funcs})
+		consts := collectStringDeclarations(files, funcs)
 
 		for _, file := range files {
 			for _, decl := range file.Decls {
@@ -289,6 +361,7 @@ func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) 
 						return true
 					}
 					total++
+					seenMethod[sel.Sel.Name]++
 					if call.Ellipsis.IsValid() {
 						variadic++
 						return true
@@ -315,6 +388,27 @@ func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) 
 	if checked == 0 {
 		t.Fatal("no SQL call sites were resolved; the walker has stopped working")
 	}
+
+	// Any wrapper this package defines that takes SQL and a variadic argument
+	// list must be listed in bindMethods.
+	//
+	// This is the assertion that was missing. execWriteContext - the
+	// house-preferred write path, 31 call sites - was absent from the map, so
+	// a test named "every SQL statement" skipped every statement written the
+	// way the codebase is being steered towards, and nothing said so. Listing a
+	// method that has no call sites yet is fine and deliberate (Query and
+	// QueryRow are there for the day someone uses them); defining one and
+	// forgetting to list it is the failure that matters.
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || !executesSQL(fn) || bindMethods[fn.Name.Name] {
+				continue
+			}
+			t.Errorf("%s: %s takes SQL and a variadic argument list but is not in bindMethods, so its call sites go unchecked",
+				fset.Position(fn.Pos()), fn.Name.Name)
+		}
+	}
 	// Report the blind spot rather than leaving it implicit. If a refactor
 	// pushes many sites into the dynamic or variadic buckets, this test
 	// quietly stops covering them, and the numbers are how that becomes
@@ -329,5 +423,8 @@ func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) 
 		shape.WriteString(strconv.Itoa(k) + ":" + strconv.Itoa(histogram[k]) + " ")
 	}
 	t.Logf("db call sites: %d total, %d checked, %d dynamic SQL, %d variadic spread", total, checked, dynamic, variadic)
+	for method := range bindMethods {
+		t.Logf("  %-18s %d call sites", method, seenMethod[method])
+	}
 	t.Logf("placeholders per checked statement: %s", strings.TrimSpace(shape.String()))
 }

@@ -29,6 +29,11 @@ run:
 SOURCE_VERSION = $(shell sed -n 's/^const Current = "\(.*\)"$$/\1/p' internal/version/version.go)
 
 smoke:
+	@test -n "$(SOURCE_VERSION)" || { \
+		echo "could not read const Current from internal/version/version.go" >&2; \
+		echo "an empty value would silently switch the version check back off" >&2; \
+		exit 1; \
+	}
 	docker build -t artist-trackarr:smoke .
 	SMOKE_EXPECTED_VERSION=$(SOURCE_VERSION) scripts/container-smoke.sh artist-trackarr:smoke
 
