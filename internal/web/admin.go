@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -747,6 +748,8 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user could not be deleted", http.StatusInternalServerError)
 		return
 	}
+	a.logger.Info("household member deleted", "event", "auth.user_deleted",
+		"acting_user_id", session.User.ID, "user_id", userID)
 	http.Redirect(w, r, "/admin?"+a.statusQuery("User deleted"), http.StatusSeeOther)
 }
 func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
@@ -769,6 +772,12 @@ func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create invitation", http.StatusBadRequest)
 		return
 	}
+	// The fingerprint is a truncated SHA-256 prefix, not the token: enough to
+	// correlate a link an operator issued with the acceptance or failure it later
+	// produces, without the persisted log carrying anything usable.
+	inviteDigest := sha256.Sum256([]byte(raw))
+	a.logger.Info("invitation link issued", "event", "auth.invite_issued",
+		"acting_user_id", session.User.ID, "token_fingerprint", fmt.Sprintf("%x", inviteDigest[:6]))
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/invite/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Invitation", strings.TrimSpace(r.FormValue("email"))
@@ -795,6 +804,10 @@ func (a *App) createReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create reset", http.StatusBadRequest)
 		return
 	}
+	resetDigest := sha256.Sum256([]byte(raw))
+	a.logger.Info("password reset link issued", "event", "auth.reset_issued",
+		"acting_user_id", session.User.ID, "user_id", user.ID,
+		"token_fingerprint", fmt.Sprintf("%x", resetDigest[:6]))
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/reset/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Password reset", user.Email

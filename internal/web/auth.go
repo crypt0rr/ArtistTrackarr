@@ -145,6 +145,10 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 			_ = a.store.RecordLoginFailure(r.Context(), key)
 		}
 		d := a.data(r, "Sign in")
+		// One line per rejected attempt. The only behavioural signal before this
+		// fired once the account bucket was already saturated, so a slow trickle
+		// of attempts against one account left no record at all.
+		a.logger.Info("sign-in rejected", "event", "auth.signin_failed", "page", "Sign in")
 		d.Error = "Email or password is incorrect."
 		a.render(w, "login", d, http.StatusUnauthorized)
 		return
@@ -163,9 +167,20 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true, Secure: a.cfg.PublicURL.Scheme == "https", SameSite: http.SameSiteLaxMode,
 		MaxAge: int(sessionLifetime.Seconds()),
 	})
+	// Credential-lifecycle events are recorded so a household administrator can
+	// answer "who signed in, and when" from the diagnostics page. Every logger
+	// call on this path used to be an infrastructure failure line, so a normal
+	// sign-in left no trace at all - and the generic HTTP access log is emitted
+	// at Debug while the default level is info, so there was no request record
+	// either. Identify by user id rather than address: these lines are persisted
+	// and rendered, and the id is what the rest of the admin view keys on.
+	a.logger.Info("sign-in succeeded", "event", "auth.signin", "user_id", user.ID)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
+	if session, ok := currentSession(r); ok {
+		a.logger.Info("sign-out", "event", "auth.signout", "user_id", session.User.ID)
+	}
 	if cookie, err := r.Cookie("artist_session"); err == nil {
 		if raw, ok := security.VerifySignedToken(a.cfg.SessionSecret, cookie.Value); ok {
 			_ = a.store.DeleteSession(r.Context(), raw)
