@@ -238,3 +238,47 @@ func TestCalendarFeedThrottlesByCallerNotByToken(t *testing.T) {
 		t.Fatal("an unrelated caller was throttled by another caller's budget")
 	}
 }
+
+// TestTruncationNoticeMatchesTheExportWindow is #278. The month grid chose its
+// truncation message with a single "is this month in the past" test, which
+// covers only one end of the export window. The ICS export is fixed to
+// [today, today+1 year], so a month more than a year ahead falls outside it just
+// as surely as a past month does - yet it was told the feed "covers the next
+// year of releases" and pointed at an export that comes back without those
+// releases. This is the residual half of #187, which fixed only the past
+// direction.
+func TestTruncationNoticeMatchesTheExportWindow(t *testing.T) {
+	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		month      time.Time
+		wantOffer  bool
+		wantReason string
+	}{
+		{
+			name:  "a past month says the export does not include it",
+			month: now.AddDate(0, -2, 0), wantOffer: false, wantReason: "upcoming releases only",
+		},
+		{
+			name:  "a month inside the window offers the export",
+			month: now.AddDate(0, 2, 0), wantOffer: true, wantReason: "cover the next year of releases",
+		},
+		{
+			name:  "a month beyond the window says the export does not reach it",
+			month: now.AddDate(1, 2, 0), wantOffer: false, wantReason: "do not reach this month",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			from := time.Date(test.month.Year(), test.month.Month(), 1, 0, 0, 0, 0, time.UTC)
+			to := from.AddDate(0, 1, 0).Add(-time.Second)
+			notice := calendarTruncationNotice(from, to, now)
+			if !strings.Contains(notice, test.wantReason) {
+				t.Fatalf("notice=%q, want it to mention %q", notice, test.wantReason)
+			}
+			offers := strings.Contains(notice, "Subscribe to the calendar feed")
+			if offers != test.wantOffer {
+				t.Fatalf("notice offers the export=%v, want %v: %q", offers, test.wantOffer, notice)
+			}
+		})
+	}
+}

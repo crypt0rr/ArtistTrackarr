@@ -27,6 +27,30 @@ const (
 
 var errCalendarExportTooLarge = errors.New("calendar export exceeds the safety limit")
 
+// calendarTruncationNotice explains a truncated month and, only when the ICS
+// export actually covers that month, offers it.
+//
+// The export window is [today, today+1 year]. A single "is this month in the
+// past" test covered only one end of it, so a month more than a year ahead was
+// told the feed "covers the next year of releases" while falling outside it just
+// as surely as a past month does.
+func calendarTruncationNotice(from, to, now time.Time) string {
+	switch {
+	case to.Before(now):
+		return fmt.Sprintf(
+			"This month has more than %d dated releases and only the first %d are shown. The calendar feed and ICS export cover upcoming releases only, so they do not include this month.",
+			calendarMonthLimit, calendarMonthLimit)
+	case from.After(now.AddDate(1, 0, 0)):
+		return fmt.Sprintf(
+			"This month has more than %d dated releases and only the first %d are shown. The calendar feed and ICS export cover the next year only, so they do not reach this month.",
+			calendarMonthLimit, calendarMonthLimit)
+	default:
+		return fmt.Sprintf(
+			"This month has more than %d dated releases and only the first %d are shown. Subscribe to the calendar feed or download the ICS file, which cover the next year of releases.",
+			calendarMonthLimit, calendarMonthLimit)
+	}
+}
+
 func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	d := a.data(r, "Release calendar")
@@ -56,15 +80,7 @@ func (a *App) calendar(w http.ResponseWriter, r *http.Request) {
 		// actually falls inside that window; otherwise say plainly that the rest
 		// of the month is not shown rather than sending the member to an export
 		// that would come back without those releases.
-		if toTime.Before(now) {
-			d.CalendarNotice = fmt.Sprintf(
-				"This month has more than %d dated releases and only the first %d are shown. The calendar feed and ICS export cover upcoming releases only, so they do not include this month.",
-				calendarMonthLimit, calendarMonthLimit)
-		} else {
-			d.CalendarNotice = fmt.Sprintf(
-				"This month has more than %d dated releases and only the first %d are shown. Subscribe to the calendar feed or download the ICS file, which cover the next year of releases.",
-				calendarMonthLimit, calendarMonthLimit)
-		}
+		d.CalendarNotice = calendarTruncationNotice(fromTime, toTime, now)
 	}
 	d.CalendarMonth = fromTime.Format("January 2006")
 	d.CalendarPrevMonth = fromTime.AddDate(0, -1, 0).Format("2006-01")
