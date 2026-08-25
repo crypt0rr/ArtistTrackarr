@@ -1,7 +1,12 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
+# Read back from the Dockerfile so the timeout has one definition, the same way
+# GO_TOOLCHAIN does. Go's 10m default is too tight: internal/store needs ~6m
+# under -race on an idle runner and ~13m on a loaded workstation, so the
+# default turns ordinary CPU contention into a failure that reads as a deadlock.
+GO_TEST_TIMEOUT ?= $(shell sed -n 's/^ARG GO_TEST_TIMEOUT=\(.*\)$$/\1/p' Dockerfile | head -1)
 
-.PHONY: test docker-quality build run smoke mutate backup-smoke fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
+.PHONY: test docker-quality build run smoke mutate backup-smoke fmt-check tooling-check version-check lint vuln coverage race benchmark-notify quality
 
 test:
 	docker build --target test .
@@ -88,7 +93,7 @@ vuln:
 	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 coverage:
-	go test ./internal/... -p 1 -count=1 -coverprofile=coverage.out
+	go test ./internal/... -p 1 -timeout $(GO_TEST_TIMEOUT) -count=1 -coverprofile=coverage.out
 	@coverage="$$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $$NF); print $$NF}')"; \
 	if [ -z "$$coverage" ]; then \
 		echo "could not determine test coverage" >&2; \
@@ -98,15 +103,18 @@ coverage:
 	awk -v coverage="$$coverage" -v minimum="$(COVERAGE_MIN)" 'BEGIN { exit !(coverage >= minimum) }'
 
 benchmark-notify:
-	GOTOOLCHAIN=$(GO_TOOLCHAIN) go test ./internal/notify -run '^$$' -bench '^BenchmarkShoutrrrSendSerialization$$' -benchmem -count=1
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go test ./internal/notify -timeout $(GO_TEST_TIMEOUT) -run '^$$' -bench '^BenchmarkShoutrrrSendSerialization$$' -benchmem -count=1
 
 # The 80% coverage floor used to run in CI and nowhere else, so a local
 # `make quality` could pass on a change CI would reject. `make coverage` runs
 # the suite exactly as the plain `go test` step did, and then checks the floor,
 # so this costs no extra suite run. It scopes to ./internal/..., which leaves
 # cmd/server to the -race step below rather than dropping it.
+race:
+	go test -race -p 1 -timeout $(GO_TEST_TIMEOUT) ./... -count=1
+
 quality: fmt-check tooling-check version-check
 	go vet ./...
 	$(MAKE) coverage
-	go test -race -p 1 ./... -count=1
+	$(MAKE) race
 	$(MAKE) lint vuln

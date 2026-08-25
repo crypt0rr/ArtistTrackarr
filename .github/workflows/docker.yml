@@ -78,7 +78,10 @@ jobs:
       - name: Run race detector
         # Serialize package execution and disable the test cache so the
         # resource-bounded signal is reproducible on the shared runner.
-        run: go test -race -p 1 ./... -count=1
+        # Via make so the timeout is not a third copy: this step had the same
+        # 10m default that made a loaded local run fail where CI passed, and
+        # a slow runner would have hit it here too - on a release build.
+        run: make race
 
       - name: Report test coverage
         run: make coverage
