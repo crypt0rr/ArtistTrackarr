@@ -171,9 +171,6 @@ func (s *Store) CreateManualSyncRequest(ctx context.Context, userID int64, scope
 		return ManualSyncRequest{ID: id, RequestedBy: userID, Scope: scope, ArtistID: artistID, Status: "queued", CreatedAt: created}, nil
 	})
 }
-func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]ManualSyncRequest, error) {
-	return s.ClaimManualSyncRequestsWithLease(ctx, limit, "legacy-worker", 5*time.Minute)
-}
 
 // ClaimManualSyncRequestsWithLease atomically claims queued work and recovers
 // running rows whose lease expired. The owner token prevents two runner
@@ -249,9 +246,6 @@ func (s *Store) ClaimManualSyncRequestsWithLease(ctx context.Context, limit int,
 		}
 		return out, nil
 	})
-}
-func (s *Store) CompleteManualSyncRequest(ctx context.Context, id int64, syncErr error) error {
-	return s.CompleteManualSyncRequestOwned(ctx, id, "", syncErr)
 }
 
 func (s *Store) CompleteManualSyncRequestOwned(ctx context.Context, id int64, owner string, syncErr error) error {

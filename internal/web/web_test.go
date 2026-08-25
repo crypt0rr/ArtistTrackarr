@@ -1664,14 +1664,18 @@ func TestAdminDeliveryAuditAndAuthorization(t *testing.T) {
 	}}, time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
 	}
-	deliveries, err := database.DueDeliveries(context.Background(), time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC), 10)
+	// Use the claiming variant the runner actually runs, so this fixture
+	// exercises the production selection shape - including the per-user
+	// fairness ceiling that the non-claiming helper does not apply.
+	deliveries, err := database.ClaimDueDeliveries(context.Background(),
+		time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC), 10, "web-test-worker", time.Minute)
 	if err != nil || len(deliveries) != 1 {
 		t.Fatalf("due deliveries=%#v err=%v", deliveries, err)
 	}
-	if err := database.MarkDeliveryFailed(
+	if err := database.MarkDeliveryFailedOwned(
 		context.Background(), deliveries[0].ID, 5,
 		"provider rejected https://ntfy.example/secret-topic token=abcd1234",
-		time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+		"web-test-worker", time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
 	); err != nil {
 		t.Fatal(err)
 	}
