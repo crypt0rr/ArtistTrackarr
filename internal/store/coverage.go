@@ -187,6 +187,15 @@ func (s *Store) CoverageSummary(ctx context.Context, userID int64) (CoverageSumm
 // CoverageOverview returns the summary used by the dashboard and Trust
 // Center in one batched projection. This avoids repeating the followed-artist,
 // provider-status, and release-stat queries when both views are rendered.
+//
+// It classifies every followed artist rather than aggregating in SQL, and that
+// is deliberate. summarizeCoverage buckets on AssuranceStatus and OverallStatus,
+// which are derived per artist in Go from provider statuses and release stats;
+// expressing those totals as a SQL aggregate would mean a second implementation
+// of that classification in another language, which then has to be kept in step
+// by hand. That is the failure this project keeps paying for elsewhere, and a
+// whole-watchlist total genuinely needs every artist classified, so the work is
+// inherent rather than wasted.
 func (s *Store) CoverageOverview(ctx context.Context, userID int64, limit int) (CoverageSummary, AssuranceSummary, error) {
 	artists, err := s.followedArtistsForCoverage(ctx, userID)
 	if err != nil {
@@ -197,14 +206,6 @@ func (s *Store) CoverageOverview(ctx context.Context, userID int64, limit int) (
 		return CoverageSummary{}, AssuranceSummary{}, err
 	}
 	return summarizeCoverage(coverage), summarizeAssurance(coverage, limit), nil
-}
-
-// WatchlistAssurance returns the complete owner-scoped assurance counts and a
-// small severity-ranked list for dashboard use. The underlying projections
-// are batched, matching the Trust Center's query behavior.
-func (s *Store) WatchlistAssurance(ctx context.Context, userID int64, limit int) (AssuranceSummary, error) {
-	_, summary, err := s.CoverageOverview(ctx, userID, limit)
-	return summary, err
 }
 
 func summarizeCoverage(coverage []ArtistCoverage) CoverageSummary {

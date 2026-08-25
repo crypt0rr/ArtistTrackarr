@@ -162,3 +162,11 @@ func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email s
 	}
 	return result.email, userID, nil
 }
+
+// WatchlistAssurance returns the complete owner-scoped assurance counts and a
+// small severity-ranked list for dashboard use. The underlying projections
+// are batched, matching the Trust Center's query behavior.
+func (s *Store) WatchlistAssurance(ctx context.Context, userID int64, limit int) (AssuranceSummary, error) {
+	_, summary, err := s.CoverageOverview(ctx, userID, limit)
+	return summary, err
+}
