@@ -1016,7 +1016,7 @@ func (s *Store) DueITunesArtworkArtist(ctx context.Context, now time.Time) (ITun
 	err := s.readerDB().QueryRowContext(ctx, `SELECT a.id,a.mbid,a.name,MAX(rg.itunes_artwork_attempts)
 		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
 		WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
-			AND (rg.itunes_artwork_next_check_at IS NULL OR rg.itunes_artwork_next_check_at<=?)
+			AND COALESCE(rg.itunes_artwork_next_check_at,'')<=?
 		GROUP BY a.id,a.mbid,a.name
 		ORDER BY MIN(COALESCE(rg.itunes_artwork_next_check_at,'')),a.id LIMIT 1`, timeText(now)).Scan(
 		&artist.ID, &artist.MBID, &artist.Name, &artist.Attempts)
