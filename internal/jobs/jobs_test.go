@@ -2955,6 +2955,14 @@ func TestListenBrainzNullCountsDoNotOverwriteKnownTotals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Eligibility requires a follow.
+	userID, err := database.CreateUser(ctx, "lb-null@example.com", "hash", "member", "UTC", "lb-null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	// A real total is already known.
 	if err := database.SaveListenBrainzStats(ctx, map[int64]store.ListenBrainzStats{
@@ -2969,8 +2977,16 @@ func TestListenBrainzNullCountsDoNotOverwriteKnownTotals(t *testing.T) {
 	}}
 	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), WithListenBrainz(provider))
-	if _, err := runner.refreshListenBrainz(ctx, now.Add(2*time.Hour)); err != nil {
+	refreshed, err := runner.refreshListenBrainz(ctx, now.Add(2*time.Hour))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The artist must actually have been considered, or this proves nothing.
+	if provider.calls.Load() == 0 {
+		t.Fatal("precondition: the provider was never called, so the artist was not eligible for refresh")
+	}
+	if refreshed != 0 {
+		t.Fatalf("refreshed=%d, want 0 written for an artist with no data", refreshed)
 	}
 
 	var listens int64
