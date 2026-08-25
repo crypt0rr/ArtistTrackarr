@@ -175,7 +175,9 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	// either. Identify by user id rather than address: these lines are persisted
 	// and rendered, and the id is what the rest of the admin view keys on.
 	a.logger.Info("sign-in succeeded", "event", "auth.signin", "user_id", user.ID)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Return to whatever the member originally asked for, re-validated here
+	// rather than trusted from the form.
+	http.Redirect(w, r, localReturnPath(r.FormValue("next"), "", "/"), http.StatusSeeOther)
 }
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	if session, ok := currentSession(r); ok {

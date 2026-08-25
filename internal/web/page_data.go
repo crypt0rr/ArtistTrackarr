@@ -49,7 +49,11 @@ type PageDiscovery struct {
 	ImportJobs       []store.ImportJob
 	// ArtistListQuery is the current pagination and filter state, echoed into
 	// action forms so a redirect can return to the same view.
-	ArtistListQuery     string
+	ArtistListQuery string
+	// ReturnPath is the local path an unauthenticated request was trying to
+	// reach, carried through the login form so the member lands where they meant
+	// to rather than on the dashboard.
+	ReturnPath          string
 	ListenBrainzArtists []store.Artist
 	GenreBreakdown      []store.ArtistBreakdown
 	CountryBreakdown    []store.ArtistBreakdown

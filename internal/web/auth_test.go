@@ -180,3 +180,49 @@ func TestEveryCredentialLifecycleEventHasAnEmitter(t *testing.T) {
 		}
 	}
 }
+
+// TestUnauthenticatedDeepLinkReturnsAfterSignIn is #290. requireUser redirected
+// to a bare "/login" and login always went to "/", so the application had no
+// post-authentication return path. That matters because it publishes an external
+// deep link: every ICS event carries a URL: property resolving to
+// {PublicURL}/releases/{id}, and the point of the revocable feed token is that
+// the calendar is read on devices separate from the browser session - so
+// following one of those links landed on the dashboard with no route back.
+func TestUnauthenticatedDeepLinkReturnsAfterSignIn(t *testing.T) {
+	_, server, _ := authenticatedTestServer(t, nil, nil, nil)
+	bare := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	response, err := bare.Get(server.URL + "/releases/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	location := response.Header.Get("Location")
+	if !strings.HasPrefix(location, "/login") {
+		t.Fatalf("unauthenticated request went to %q, want the login page", location)
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := target.Query().Get("next"); got != "/releases/7" {
+		t.Fatalf("the requested path was not carried to login: next=%q", got)
+	}
+}
+
+// TestReturnPathRejectsOffsiteAndUnsafeTargets keeps the new parameter from
+// becoming an open redirect. It goes through the same allowlisting helper the
+// rest of the application uses.
+func TestReturnPathRejectsOffsiteAndUnsafeTargets(t *testing.T) {
+	for _, hostile := range []string{
+		"https://evil.example/steal", "//evil.example/steal", "/\\evil.example",
+		"http://evil.example", "\r\nSet-Cookie: x=1", "",
+	} {
+		if got := localReturnPath(hostile, "", "/"); got != "/" {
+			t.Fatalf("localReturnPath(%q)=%q, want the safe fallback", hostile, got)
+		}
+	}
+	if got := localReturnPath("/releases/7?tab=evidence", "", "/"); got != "/releases/7?tab=evidence" {
+		t.Fatalf("a legitimate local path was rejected: %q", got)
+	}
+}

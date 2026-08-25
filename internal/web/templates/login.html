@@ -5,6 +5,7 @@
   <h1>Sign in</h1>
   {{if .SetupNeeded}}<p>No administrator exists yet. <a href="/setup">Complete first-run setup</a>.</p>{{else}}
   <form method="post" action="/login" class="stack">
+    {{if .ReturnPath}}<input type="hidden" name="next" value="{{.ReturnPath}}">{{end}}
     {{template "csrf" .}}
     <label>Email<input name="email" type="email" required autocomplete="email"></label>
     <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
