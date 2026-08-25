@@ -72,7 +72,14 @@ curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
 
 login_page=$(curl --fail --silent --cookie-jar "$jar" "$base/login")
 if [[ -n "$EXPECTED_VERSION" ]]; then
-	grep -q "v${EXPECTED_VERSION}" <<<"$login_page"
+	if ! grep -q "v${EXPECTED_VERSION}" <<<"$login_page"; then
+		# A bare `grep -q` here would exit silently under `set -e`, leaving
+		# CI with a failed step and no reason. Report what the container
+		# actually rendered instead.
+		echo "container smoke: expected the UI to report v${EXPECTED_VERSION}" >&2
+		echo "container smoke: found $(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+|vdev[^<]*' <<<"$login_page" | head -1 | sed 's/^$/no version string at all/')" >&2
+		exit 1
+	fi
 	if grep -qE 'vdev(-|</|<)' <<<"$login_page"; then
 		echo "container smoke: development version leaked into the UI" >&2
 		exit 1

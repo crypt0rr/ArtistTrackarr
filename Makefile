@@ -22,9 +22,15 @@ run:
 # not Go code - escaped gofmt, vet, the test suite, the race detector, the
 # linters and govulncheck alike. One did: a curl invocation forced POST across a
 # 303 redirect and failed with 405 rather than exercising its assertion.
+# SMOKE_EXPECTED_VERSION turns on the smoke script's version-identity check,
+# which asserts the running container renders the version it was built from and
+# that no "vdev" build leaked into the UI. That block shipped with #102 and
+# had never once executed, because no caller ever set the variable.
+SOURCE_VERSION = $(shell sed -n 's/^const Current = "\(.*\)"$$/\1/p' internal/version/version.go)
+
 smoke:
 	docker build -t artist-trackarr:smoke .
-	scripts/container-smoke.sh artist-trackarr:smoke
+	SMOKE_EXPECTED_VERSION=$(SOURCE_VERSION) scripts/container-smoke.sh artist-trackarr:smoke
 
 # Reintroduce every catalogued defect and confirm its guard still fails. This
 # project proves each fix by reverting it and watching the test fail; done by

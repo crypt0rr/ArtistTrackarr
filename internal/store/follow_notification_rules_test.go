@@ -1089,3 +1089,38 @@ func TestClaimSkipsAPausedDestinationsPendingRows(t *testing.T) {
 		t.Fatalf("claimed=%d from a paused destination, want 0", len(claimed))
 	}
 }
+
+// The pause predicate is a pure time comparison, and every existing fixture
+// exercises it at now, now+48h or now-1h - never at the instant the pause
+// expires. That leaves `!now.Before(*r.PausedUntil)` and `now.After(...)`
+// indistinguishable, though they disagree on exactly the boundary: at
+// now == PausedUntil the pause is over and the delivery must go out.
+func TestThePauseEndsAtItsExpiryInstantNotAfterIt(t *testing.T) {
+	pausedUntil := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	rule := FollowNotificationRule{
+		DeliveryMode: FollowDeliveryImmediate,
+		PausedUntil:  &pausedUntil,
+	}
+	for _, tc := range []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{"a nanosecond before expiry still defers", pausedUntil.Add(-time.Nanosecond), true},
+		{"the expiry instant itself does not defer", pausedUntil, false},
+		{"a nanosecond after expiry does not defer", pausedUntil.Add(time.Nanosecond), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resumesAt, deferred := rule.pausedDeliveryResumesAt(tc.now)
+			if deferred != tc.want {
+				t.Fatalf("pausedDeliveryResumesAt(%s) deferred=%v, want %v", tc.now, deferred, tc.want)
+			}
+			if deferred && !resumesAt.Equal(pausedUntil) {
+				t.Errorf("resumesAt=%s, want %s", resumesAt, pausedUntil)
+			}
+			if !deferred && !resumesAt.IsZero() {
+				t.Errorf("resumesAt=%s, want the zero time when not deferred", resumesAt)
+			}
+		})
+	}
+}
