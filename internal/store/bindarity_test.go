@@ -129,9 +129,9 @@ func countPlaceholders(sql string) int {
 	return count
 }
 
-func collectStringFuncs(pkg *ast.Package) map[string]*stringFunc {
+func collectStringFuncs(files []*ast.File) map[string]*stringFunc {
 	funcs := map[string]*stringFunc{}
-	for _, file := range pkg.Files {
+	for _, file := range files {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Recv != nil || fn.Body == nil || len(fn.Body.List) != 1 {
@@ -166,9 +166,9 @@ func collectStringFuncs(pkg *ast.Package) map[string]*stringFunc {
 	return funcs
 }
 
-func collectStringConsts(pkg *ast.Package, base *sqlResolver) map[string]string {
+func collectStringConsts(files []*ast.File, base *sqlResolver) map[string]string {
 	consts := map[string]string{}
-	for _, file := range pkg.Files {
+	for _, file := range files {
 		for _, decl := range file.Decls {
 			gen, ok := decl.(*ast.GenDecl)
 			if !ok || gen.Tok != token.CONST {
@@ -228,21 +228,37 @@ func localStringVars(body *ast.BlockStmt, r *sqlResolver) {
 
 func TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders(t *testing.T) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, parser.SkipObjectResolution)
+	// Walk the directory rather than using parser.ParseDir, which is
+	// deprecated, and go/packages, which would add a dependency to a test
+	// whose whole point is to need no tooling.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse package: %v", err)
+		t.Fatalf("read package directory: %v", err)
+	}
+	var files []*ast.File
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, parsed)
+	}
+	if len(files) == 0 {
+		t.Fatal("no non-test Go files found; the walker has stopped working")
 	}
 
 	var total, checked, dynamic, variadic int
 	histogram := map[int]int{}
 
-	for _, pkg := range pkgs {
-		funcs := collectStringFuncs(pkg)
-		consts := collectStringConsts(pkg, &sqlResolver{scope: map[string]string{}, funcs: funcs})
+	{
+		funcs := collectStringFuncs(files)
+		consts := collectStringConsts(files, &sqlResolver{scope: map[string]string{}, funcs: funcs})
 
-		for _, file := range pkg.Files {
+		for _, file := range files {
 			for _, decl := range file.Decls {
 				fn, ok := decl.(*ast.FuncDecl)
 				if !ok || fn.Body == nil {

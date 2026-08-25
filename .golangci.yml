@@ -13,6 +13,25 @@ linters:
     - bodyclose
     - errorlint
     - nilerr
+    # dupl earns its place on measured history, not on principle: at this
+    # threshold it reports issue #237 (deliverOne and deliverDigestOne, 85
+    # line-for-line duplicate state machines) on the exact tree that a review
+    # round found it on by hand. Hand-synchronised copies are the single
+    # largest source of residuals in this repo.
+    - dupl
+
+  settings:
+    dupl:
+      # Measured over ~26k lines of production Go: 150 reports 1 pair, 100
+      # reports 4, 75 reports 7. Set where the signal is still all real.
+      threshold: 150
+
+  exclusions:
+    rules:
+      # Test bodies are repetitive by nature - fixtures, table setup, and
+      # assertion blocks - and would swamp the signal.
+      - path: _test\.go
+        linters: [dupl]
 
 run:
   timeout: 5m

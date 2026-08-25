@@ -1448,37 +1448,47 @@ func (s *Store) AdminDeliveryHistorySummary(ctx context.Context, limit, offset i
 	return result, rows.Err()
 }
 
-func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+// scanAdminDeliveryDetail projects one admin delivery-detail row. The normal
+// and digest queues are separate tables with separate ID spaces, so they need
+// separate statements - but everything after the scan is the same work, and
+// keeping two copies of it meant a fix to one projection could miss the other.
+// kind is the delivery kind reported to the caller; label prefixes the
+// timestamp parse errors so a malformed row still says which queue it came
+// from.
+func scanAdminDeliveryDetail(row *sql.Row, kind, label string) (AdminDeliveryHistory, error) {
 	var h AdminDeliveryHistory
 	var destination, service, status, lastError sql.NullString
 	var attempts sql.NullInt64
 	var created, nextAttempt, sent sql.NullString
-	err := s.readerDB().QueryRowContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
-		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
-		FROM deliveries d JOIN notification_events e ON e.id=d.event_id
-		JOIN users u ON u.id=e.user_id LEFT JOIN destinations dst ON dst.id=d.destination_id
-		WHERE d.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
+	err := row.Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
 		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
 	if err != nil {
 		return h, err
 	}
-	h.DeliveryKind = "notification"
+	h.DeliveryKind = kind
 	h.Destination, h.Service = destination.String, service.String
 	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
 	if h.Destination == "" {
 		h.Destination, h.Status = "No destination configured", "not sent"
 	}
-	h.CreatedAt, err = parseStoredTime(created.String, "delivery detail created_at")
-	if err != nil {
+	if h.CreatedAt, err = parseStoredTime(created.String, label+" created_at"); err != nil {
 		return h, err
 	}
-	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "delivery detail next_attempt_at"); err != nil {
+	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, label+" next_attempt_at"); err != nil {
 		return h, err
 	}
-	if h.SentAt, err = parseStoredNullableTime(sent, "delivery detail sent_at"); err != nil {
+	if h.SentAt, err = parseStoredNullableTime(sent, label+" sent_at"); err != nil {
 		return h, err
 	}
 	return h, nil
+}
+
+func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
+	return scanAdminDeliveryDetail(s.readerDB().QueryRowContext(ctx, `SELECT d.id,u.email,e.title,e.body,e.event_type,
+		dst.name,dst.service,d.status,d.attempts,d.last_error,e.created_at,d.next_attempt_at,d.sent_at
+		FROM deliveries d JOIN notification_events e ON e.id=d.event_id
+		JOIN users u ON u.id=e.user_id LEFT JOIN destinations dst ON dst.id=d.destination_id
+		WHERE d.id=?`, deliveryID), "notification", "delivery detail")
 }
 
 // AdminDigestDeliveryDetail returns the explicit detail view for a digest
@@ -1486,37 +1496,13 @@ func (s *Store) AdminDeliveryDetail(ctx context.Context, deliveryID int64) (Admi
 // web layer uses a distinct route to avoid ambiguous links when both tables
 // contain the same numeric ID.
 func (s *Store) AdminDigestDeliveryDetail(ctx context.Context, deliveryID int64) (AdminDeliveryHistory, error) {
-	var h AdminDeliveryHistory
-	var destination, service, status, lastError sql.NullString
-	var attempts sql.NullInt64
-	var created, nextAttempt, sent sql.NullString
-	err := s.readerDB().QueryRowContext(ctx, `SELECT dd.id,u.email,r.title,r.body,'digest',
+	return scanAdminDeliveryDetail(s.readerDB().QueryRowContext(ctx, `SELECT dd.id,u.email,r.title,r.body,'digest',
 		dst.name,dst.service,dd.status,dd.attempts,dd.last_error,r.created_at,dd.next_attempt_at,dd.sent_at
 		FROM release_digest_deliveries dd JOIN release_digest_runs r ON r.id=dd.run_id
 		JOIN users u ON u.id=r.user_id LEFT JOIN destinations dst ON dst.id=dd.destination_id
-		WHERE dd.id=?`, deliveryID).Scan(&h.DeliveryID, &h.UserEmail, &h.Title, &h.Body, &h.EventType,
-		&destination, &service, &status, &attempts, &lastError, &created, &nextAttempt, &sent)
-	if err != nil {
-		return h, err
-	}
-	h.DeliveryKind = "digest"
-	h.Destination, h.Service = destination.String, service.String
-	h.Status, h.Attempts, h.LastError = status.String, int(attempts.Int64), safeDeliveryError(lastError.String)
-	if h.Destination == "" {
-		h.Destination, h.Status = "No destination configured", "not sent"
-	}
-	h.CreatedAt, err = parseStoredTime(created.String, "digest delivery detail created_at")
-	if err != nil {
-		return h, err
-	}
-	if h.NextAttempt, err = parseStoredNullableTime(nextAttempt, "digest delivery detail next_attempt_at"); err != nil {
-		return h, err
-	}
-	if h.SentAt, err = parseStoredNullableTime(sent, "digest delivery detail sent_at"); err != nil {
-		return h, err
-	}
-	return h, nil
+		WHERE dd.id=?`, deliveryID), "digest", "digest delivery detail")
 }
+
 func (s *Store) NotificationPreferences(ctx context.Context, userID int64) (NotificationPreferences, error) {
 	var p NotificationPreferences
 	p.UserID = userID
