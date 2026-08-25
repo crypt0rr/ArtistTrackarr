@@ -68,3 +68,61 @@ func TestAMalformedCIDRPanicsRatherThanSilentlyDroppingIt(t *testing.T) {
 	}()
 	mustParseCIDRs("192.0.2.0/33")
 }
+
+func TestLegacyIPv4SpellingsResolveToTheirAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		host string
+		want string
+	}{
+		{"decimal loopback", "2130706433", "127.0.0.1"},
+		{"hex loopback", "0x7f000001", "127.0.0.1"},
+		{"octal loopback", "0177.0.0.1", "127.0.0.1"},
+		{"decimal RFC 1918", "3232235777", "192.168.1.1"},
+		{"two component", "127.1", "127.0.0.1"},
+		{"three component", "127.0.1", "127.0.0.1"},
+		{"ordinary dotted quad", "10.0.0.1", "10.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ParseLegacyIPv4(tc.host)
+			if got == nil {
+				t.Fatalf("ParseLegacyIPv4(%q) = nil, want %s", tc.host, tc.want)
+			}
+			if !got.Equal(net.ParseIP(tc.want)) {
+				t.Errorf("ParseLegacyIPv4(%q) = %s, want %s", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+// The other half matters just as much: classifying an ordinary DNS name as an
+// IP literal would block legitimate hosts, so these must come back nil and
+// continue on to the resolver.
+func TestOrdinaryHostnamesAreNotLegacyIPv4Literals(t *testing.T) {
+	for _, host := range []string{
+		"example.test",
+		"0177.example.test",
+		"127.0.0.1.", // trailing dot: a rooted DNS name
+		"",
+		"coverartarchive.org",
+		"08.09.10.11", // leading zero but not valid octal
+		"1.2.3.4.5",   // too many components
+	} {
+		if ip := ParseLegacyIPv4(host); ip != nil {
+			t.Errorf("ParseLegacyIPv4(%q) = %s, want nil", host, ip)
+		}
+	}
+}
+
+func TestLocalhostNamesAreRecognised(t *testing.T) {
+	for _, host := range []string{"localhost", "LOCALHOST", "app.localhost", "[localhost]"} {
+		if !IsLocalhostName(host) {
+			t.Errorf("IsLocalhostName(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"localhost.example.test", "notlocalhost", "example.test", ""} {
+		if IsLocalhostName(host) {
+			t.Errorf("IsLocalhostName(%q) = true, want false", host)
+		}
+	}
+}

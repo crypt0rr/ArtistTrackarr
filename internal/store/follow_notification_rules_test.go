@@ -1124,3 +1124,99 @@ func TestThePauseEndsAtItsExpiryInstantNotAfterIt(t *testing.T) {
 		})
 	}
 }
+
+// A paused follow defers rather than discards, so it will deliver when the
+// pause expires - which means it must still take the conflict hold on the way
+// in. Gating only on queuesImmediate skipped the hold while the deferral
+// queued the delivery anyway, releasing an unreviewed release at pause expiry
+// with no hold row for the member to act on.
+//
+// The sibling half of that fix - `|| deferredDelivery` on the admission return
+// - is covered by TestHeldNotificationsReevaluateCurrentRulesOnApproval. This
+// is the hold half, from the same commit and the same variable, which nothing
+// failed on when reverted.
+func TestDeferredDeliveryStillTakesTheConflictHold(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	now := time.Now().UTC()
+
+	userID, err := s.CreateUser(ctx, "deferred-hold@example.com", "hash", "member", "UTC", "deferred-hold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "deferred-hold", Name: "Deferred Hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	preferences, err := s.NotificationPreferences(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferences.HoldConflictingNotifications = true
+	if err := s.UpdateNotificationPreferences(ctx, preferences); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,spotify_id,spotify_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "deferred-hold-release", artist.ID, "Deferred Hold Release",
+		"Album", "[]", "2099-01-01", 3, "", "deferred-hold-spotify",
+		"https://open.spotify.com/album/deferred-hold-spotify", "spotify", nowText(), nowText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_evidence_issues
+		(release_group_id,issue_type,severity,fingerprint,summary,status,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,'open',?,?)`, releaseID, "title_conflict", "warning", "deferred-hold-fingerprint",
+		"Providers disagree", nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause the follow, so admission takes the deferral path rather than the
+	// immediate one. Without the pause this test would pass on the strength of
+	// queuesImmediate alone and prove nothing.
+	until := now.Add(48 * time.Hour)
+	if err := s.PauseFollowNotificationRule(ctx, userID, artist.ID, &until); err != nil {
+		t.Fatal(err)
+	}
+	rule, err := s.FollowNotificationRule(ctx, userID, artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, deferred := rule.pausedDeliveryResumesAt(now); !deferred {
+		t.Fatal("precondition: the follow is not deferring, so the hold path under test never runs")
+	}
+
+	if err := s.EnqueueEvent(ctx, userID, releaseID, "announcement", "Deferred hold release", "Review this", now); err != nil {
+		t.Fatal(err)
+	}
+
+	holds, err := s.NotificationHoldsForRelease(ctx, userID, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 1 {
+		t.Fatalf("holds=%d, want 1: a deferred delivery must still be held for review", len(holds))
+	}
+
+	// And the hold must be instead of the event, not alongside it - otherwise
+	// the alert is queued for pause expiry and the review row is decorative.
+	var events int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM notification_events WHERE user_id=? AND release_group_id=?`,
+		userID, releaseID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Errorf("notification_events=%d, want 0 while the release is held", events)
+	}
+}

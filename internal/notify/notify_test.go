@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/crypt0rr/artist-tracker/internal/netpolicy"
 	"time"
 
 	"github.com/containrrr/shoutrrr/pkg/util/jsonclient"
@@ -108,7 +110,7 @@ func TestBlockedHostRecognizesObfuscatedIPv4Literals(t *testing.T) {
 		t.Fatal("private-target opt-in rejected an obfuscated address")
 	}
 	for _, host := range []string{"example.test", "0177.example.test", "127.0.0.1."} {
-		if parseLegacyIPv4(host) != nil {
+		if netpolicy.ParseLegacyIPv4(host) != nil {
 			t.Fatalf("ordinary hostname %q was parsed as a legacy IPv4 literal", host)
 		}
 	}

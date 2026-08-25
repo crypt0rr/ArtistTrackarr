@@ -378,6 +378,27 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
         guards="#239 - a surplus bind argument. Verified that this test is the "
                "only one in the package that fails when it is reintroduced.",
     ),
+    Mutation(
+        name="deferred-conflict-hold",
+        file="internal/store/release_helpers.go",
+        find="""	if p.HoldConflictingNotifications && (selected.rule.queuesImmediate(now) || deferredDelivery) && !bypassConflictHold {""",
+        replace="""	if p.HoldConflictingNotifications && selected.rule.queuesImmediate(now) && !bypassConflictHold {""",
+        package="./internal/store/",
+        test="TestDeferredDeliveryStillTakesTheConflictHold",
+        guards="A paused follow defers rather than discards, so it must still "
+               "take the conflict hold - otherwise an unreviewed release is "
+               "released at pause expiry with no hold row.",
+    ),
+    Mutation(
+        name="raw-clock-time-in-go",
+        file="internal/web/web.go",
+        find="""		return "Paused until " + formatTime(*rule.PausedUntil, timezones...)""",
+        replace="""		return "Paused until " + rule.PausedUntil.Format("2006-01-02 15:04")""",
+        package="./internal/web/",
+        test="TestNoTemplateRendersARawClockTime",
+        guards="#261 - a raw UTC clock with no zone label. The original guard "
+               "globbed templates only, so the Go instance was invisible to it.",
+    ),
 ]
 
 

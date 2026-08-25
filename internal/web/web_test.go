@@ -2558,4 +2558,34 @@ func TestNoTemplateRendersARawClockTime(t *testing.T) {
 			t.Errorf("%s renders a raw clock time; use formatTime with $.User.Timezone", filepath.Base(path))
 		}
 	}
+
+	// #261 was not in a template. followRuleSummary printed a raw UTC clock
+	// from Go, and this guard - globbing templates only - could not see it.
+	// Fixing the instance without widening the glob left the class open, so
+	// the Go half is checked here too.
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no Go sources found; the check would pass vacuously")
+	}
+	for _, path := range sources {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		// core.go owns the layout: formatTime and providerHealthTime are the
+		// functions everything else is required to go through, and they append
+		// the zone abbreviation themselves.
+		if filepath.Base(path) == "core.go" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), `"2006-01-02 15:04"`) {
+			t.Errorf("%s formats a raw clock time; call formatTime so the member's zone and its abbreviation are applied", path)
+		}
+	}
 }

@@ -8,7 +8,11 @@
 // build rather than a promise in a comment.
 package netpolicy
 
-import "net"
+import (
+	"net"
+	"strconv"
+	"strings"
+)
 
 // reserved is the address space Go classifies as global unicast but which is
 // not a usable public destination. Parsed once at init: the list is a
@@ -60,4 +64,78 @@ func IsReserved(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// ParseLegacyIPv4 recognizes the numeric IPv4 forms accepted by common URL
+// and socket implementations. It deliberately returns nil for ordinary DNS
+// names so they continue through the resolver and are checked again at dial
+// time. Components use the inet_aton bases (decimal, 0x-prefixed hex, or
+// leading-zero octal) and may contain one to four components.
+func ParseLegacyIPv4(host string) net.IP {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.HasSuffix(host, ".") {
+		return nil
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return nil
+	}
+	values := make([]uint64, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			return nil
+		}
+		base := 10
+		digits := part
+		if strings.HasPrefix(strings.ToLower(part), "0x") {
+			base, digits = 16, part[2:]
+		} else if len(part) > 1 && strings.HasPrefix(part, "0") {
+			base = 8
+		}
+		if digits == "" {
+			return nil
+		}
+		value, err := strconv.ParseUint(digits, base, 32)
+		if err != nil {
+			// A leading-zero component containing 8 or 9 is not valid octal,
+			// but it may still be a decimal hostname label. Do not classify it
+			// as an IP literal in that case.
+			return nil
+		}
+		values[i] = value
+	}
+	var value uint64
+	switch len(values) {
+	case 1:
+		value = values[0]
+	case 2:
+		if values[0] > 0xff || values[1] > 0xffffff {
+			return nil
+		}
+		value = values[0]<<24 | values[1]
+	case 3:
+		if values[0] > 0xff || values[1] > 0xff || values[2] > 0xffff {
+			return nil
+		}
+		value = values[0]<<24 | values[1]<<16 | values[2]
+	case 4:
+		for _, part := range values {
+			if part > 0xff {
+				return nil
+			}
+		}
+		value = values[0]<<24 | values[1]<<16 | values[2]<<8 | values[3]
+	}
+	if value > 0xffffffff {
+		return nil
+	}
+	return net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value))
+}
+
+// IsLocalhostName reports whether host is the localhost name or a subdomain of
+// it. Resolvers answer these without touching DNS, so a hostname check has to
+// catch them before the resolved-address check ever gets a chance.
+func IsLocalhostName(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	return strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost")
 }

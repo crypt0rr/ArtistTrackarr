@@ -593,6 +593,17 @@ func isBlockedArtworkHost(host string, allowLoopback bool) bool {
 	if ip := net.ParseIP(host); ip != nil {
 		return isBlockedArtworkIP(ip, allowLoopback)
 	}
+	// The same hostname pre-check the webhook policy applies. No such host can
+	// currently reach here - allowedArtworkHost admits only coverartarchive.org
+	// and archive.org, and re-checks on every redirect - so this is depth, not
+	// a fix. It is here because two functions implementing one policy with two
+	// different bodies is how the divergence started.
+	if !allowLoopback && netpolicy.IsLocalhostName(host) {
+		return true
+	}
+	if ip := netpolicy.ParseLegacyIPv4(host); ip != nil {
+		return isBlockedArtworkIP(ip, allowLoopback)
+	}
 	return false
 }
 
