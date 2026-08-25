@@ -1204,6 +1204,13 @@ func (r *Runner) resolveArtistResolutions(ctx context.Context, now time.Time) (r
 		return summary, err
 	}
 	for _, resolution := range resolutions {
+		// Same reason as the artist loop: a cancelled runner must not report
+		// untouched resolutions as failures.
+		if ctx.Err() != nil {
+			r.logger.Info("artist resolution stopped for shutdown",
+				"remaining", len(resolutions)-summary.Processed)
+			break
+		}
 		summary.Processed++
 		status, err := r.resolveArtistResolution(ctx, resolution, now)
 		if err != nil {
@@ -1436,6 +1443,16 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, err
 	}
 	summary.Due = len(artists)
 	for _, artist := range artists {
+		// Stop rather than counting untouched work as failures. Once the runner
+		// context is cancelled every remaining artist fails on its first store
+		// call, so a graceful shutdown wrote a burst of "artist sync failed"
+		// warnings and inflated summary.Failed for artists nothing had tried.
+		// The delivery path already skips instead of failing for this reason.
+		if ctx.Err() != nil {
+			r.logger.Info("artist synchronization stopped for shutdown",
+				"remaining", summary.Due-(summary.Succeeded+summary.Failed))
+			break
+		}
 		outcome, err := r.syncOne(ctx, artist, now)
 		if err != nil {
 			summary.Failed++

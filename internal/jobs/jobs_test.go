@@ -2998,3 +2998,42 @@ func TestListenBrainzNullCountsDoNotOverwriteKnownTotals(t *testing.T) {
 		t.Fatalf("known listen total was overwritten with %d by a null response, want 4242 retained", listens)
 	}
 }
+
+// TestShutdownDoesNotCountUntouchedSyncsAsFailures is #273. syncArtists iterates
+// a batch of due artists with no cancellation check, so once the runner context
+// was cancelled every remaining artist failed on its first store call, was
+// counted in summary.Failed and emitted a Warn — a graceful shutdown looked like
+// a burst of synchronisation failures for artists nothing had attempted. The
+// delivery path already skips rather than fails for exactly this reason.
+func TestShutdownDoesNotCountUntouchedSyncsAsFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "sync-shutdown@example.com", "hash", "member", "UTC", "sync-shutdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		artist, err := database.UpsertArtist(ctx, store.Artist{
+			MBID: fmt.Sprintf("shutdown-artist-%d", i), Name: fmt.Sprintf("Shutdown Artist %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := New(database, &cancellingCatalog{cancel: cancel}, catalog.AlbumEPNormalizer{}, nil, nil,
+		time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	summary, _ := runner.syncArtists(ctx, time.Now().UTC())
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the runner context should have been cancelled during the batch")
+	}
+	if summary.Due < 2 {
+		t.Fatalf("precondition: only %d artists were due, so there is no remainder to protect", summary.Due)
+	}
+	if summary.Failed > 1 {
+		t.Fatalf("a shutdown reported %d artist syncs as failed; only the one interrupted mid-work may count", summary.Failed)
+	}
+}
