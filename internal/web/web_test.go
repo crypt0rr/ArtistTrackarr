@@ -974,7 +974,7 @@ func TestCalendarPageAndICSExportAreOwnerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherRawSession, _, err := database.CreateSession(context.Background(), otherUserID, time.Hour)
+	otherRawSession, err := database.CreateSession(context.Background(), otherUserID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2249,7 +2249,7 @@ func TestReleaseDetailUnavailableIsStyledAndOwnerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherRaw, _, err := database.CreateSession(context.Background(), otherID, time.Hour)
+	otherRaw, err := database.CreateSession(context.Background(), otherID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2295,7 +2295,7 @@ func TestAdminProviderHealthRefreshUsesLatestFailureAndLiveRetryData(t *testing.
 	if _, err := database.DB.Exec(`UPDATE users SET role='admin' WHERE id=?`, user.ID); err != nil {
 		t.Fatal(err)
 	}
-	raw, _, err := database.CreateSession(context.Background(), user.ID, time.Hour)
+	raw, err := database.CreateSession(context.Background(), user.ID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2425,7 +2425,7 @@ func authenticatedTestServerWithITunes(
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _, err := database.CreateSession(context.Background(), userID, time.Hour)
+	raw, err := database.CreateSession(context.Background(), userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

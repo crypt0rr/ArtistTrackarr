@@ -868,11 +868,11 @@ func TestPruneExpiredStateKeepsActiveAndQueuedState(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	old := now.Add(-31 * 24 * time.Hour)
-	activeSession, _, err := s.CreateSession(ctx, userID, time.Hour)
+	activeSession, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, userID, -time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, userID, -time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "invite", "old@example.com", nil, userID, -time.Hour); err != nil {
@@ -2081,7 +2081,7 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, csrf, err := s.CreateSession(ctx, userID, time.Hour)
+	raw, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2089,7 +2089,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.User.ID != userID || session.CSRFToken != csrf {
+	// Per-session CSRF material is gone: the live implementation is an
+	// independent signed double-submit cookie that never consulted it.
+	if session.User.ID != userID {
 		t.Fatalf("unexpected session: %#v", session)
 	}
 }
@@ -2475,7 +2477,7 @@ func TestAdminUsersAndDeleteUser(t *testing.T) {
 	if err := s.AddDestination(ctx, memberID, "Phone", "ntfy", []byte("encrypted")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "invite", "member@example.com", nil, adminID, time.Hour); err != nil {
@@ -2551,7 +2553,7 @@ func TestDeleteUserCascadesEveryOwnerScopedTable(t *testing.T) {
 	if err := s.AddDestination(ctx, memberID, "Cascade destination", "ntfy", []byte("encrypted")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "reset", "cascade-member@example.com", &memberID, adminID, time.Hour); err != nil {
@@ -2801,7 +2803,7 @@ func TestResetPasswordWithTokenIsAtomicAndRevokesSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	token, err := s.CreateAuthToken(ctx, "reset", "reset@example.com", &userID, userID, time.Hour)

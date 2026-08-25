@@ -156,7 +156,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	for _, key := range keys {
 		a.store.ClearLoginFailures(r.Context(), key)
 	}
-	raw, _, err := a.store.CreateSession(r.Context(), user.ID, sessionLifetime)
+	raw, err := a.store.CreateSession(r.Context(), user.ID, sessionLifetime)
 	if err != nil {
 		a.logger.Error("create session", "user_id", user.ID, "error", err)
 		http.Error(w, "could not create session", http.StatusInternalServerError)

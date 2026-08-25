@@ -21,7 +21,7 @@ func TestRetentionReportAndCleanupPreserveNotificationHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at) VALUES(?,?,?,?,?)`, []byte("expired"), userID, "csrf", old, old); err != nil {
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)`, []byte("expired"), userID, old, old); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `INSERT INTO login_attempts(key_hash,failures,first_at) VALUES(?,?,?)`, []byte("attempt"), 1, old); err != nil {

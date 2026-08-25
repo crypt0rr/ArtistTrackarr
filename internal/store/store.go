@@ -400,7 +400,6 @@ var (
 
 type Session struct {
 	User      User
-	CSRFToken string
 	ExpiresAt time.Time
 }
 

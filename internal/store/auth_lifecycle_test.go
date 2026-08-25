@@ -18,7 +18,7 @@ func TestAuthSessionTokenAndLoginLifecycle(t *testing.T) {
 	if count, err := s.UserCount(ctx); err != nil || count != 1 {
 		t.Fatalf("user count=%d err=%v", count, err)
 	}
-	raw, _, err := s.CreateSession(ctx, userID, time.Hour)
+	raw, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestAuthSessionTokenAndLoginLifecycle(t *testing.T) {
 	if err != nil || updatedUser.PasswordHash != "new-hash" {
 		t.Fatalf("canceled password update changed hash=%q err=%v", updatedUser.PasswordHash, err)
 	}
-	newRaw, _, err := s.CreateSession(ctx, userID, time.Hour)
+	newRaw, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,5 +260,30 @@ func TestCredentialChangeRevokesTheCalendarFeedToken(t *testing.T) {
 				t.Fatalf("the calendar feed token still resolves after a credential change: err=%v", err)
 			}
 		})
+	}
+}
+
+// TestSessionsCarryNoCsrfMaterial is #287. CreateSession minted a second random
+// token per sign-in and Session selected it back on the hot path of every
+// authenticated request, but nothing outside this package ever read it: the live
+// CSRF implementation is an independent signed double-submit cookie that never
+// consults the session.
+func TestSessionsCarryNoCsrfMaterial(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "csrf-free@example.com", "hash", "member", "UTC", "csrf-free")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var columns int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='csrf_token'`).Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns != 0 {
+		t.Fatal("sessions still carries csrf_token, so every sign-in mints and stores material nothing reads")
 	}
 }

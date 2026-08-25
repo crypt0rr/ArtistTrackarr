@@ -17,6 +17,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"github.com/crypt0rr/artist-tracker/internal/security"
 )
 
 func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
@@ -131,4 +133,32 @@ func (s *Store) ClaimManualSyncRequests(ctx context.Context, limit int) ([]Manua
 
 func (s *Store) CompleteManualSyncRequest(ctx context.Context, id int64, syncErr error) error {
 	return s.CompleteManualSyncRequestOwned(ctx, id, "", syncErr)
+}
+
+func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email string, userID *int64, err error) {
+	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (struct {
+		email string
+		id    sql.NullInt64
+	}, error) {
+		var result struct {
+			email string
+			id    sql.NullInt64
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT email,user_id FROM auth_tokens
+			WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>?`,
+			security.Digest(raw), kind, nowText()).Scan(&result.email, &result.id); err != nil {
+			return result, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=?`, nowText(), security.Digest(raw)); err != nil {
+			return result, err
+		}
+		return result, nil
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if result.id.Valid {
+		userID = &result.id.Int64
+	}
+	return result.email, userID, nil
 }

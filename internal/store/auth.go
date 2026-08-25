@@ -382,28 +382,30 @@ func (s *Store) CreateUserFromInvite(ctx context.Context, raw, hash, username, t
 		return err
 	})
 }
-func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (raw, csrf string, err error) {
-	raw, err = security.Token(32)
+
+// CreateSession issues a session token. It no longer mints per-session CSRF
+// material: the live CSRF implementation is an independent signed double-submit
+// cookie that never consults the session, so the second token was generated on
+// every sign-in, stored, and read back on the hot path of every authenticated
+// request without a single consumer outside this package.
+func (s *Store) CreateSession(ctx context.Context, userID int64, ttl time.Duration) (string, error) {
+	raw, err := security.Token(32)
 	if err != nil {
-		return "", "", err
-	}
-	csrf, err = security.Token(24)
-	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	now := time.Now().UTC()
-	_, err = s.execWriteContext(ctx, `INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at,created_at)
-		VALUES(?,?,?,?,?)`, security.Digest(raw), userID, csrf, timeText(now.Add(ttl)), timeText(now))
-	return raw, csrf, err
+	_, err = s.execWriteContext(ctx, `INSERT INTO sessions(token_hash,user_id,expires_at,created_at)
+		VALUES(?,?,?,?)`, security.Digest(raw), userID, timeText(now.Add(ttl)), timeText(now))
+	return raw, err
 }
 func (s *Store) Session(ctx context.Context, raw string) (Session, error) {
 	var session Session
 	var expires, created string
 	err := s.readerDB().QueryRowContext(ctx, `SELECT u.id,u.email,u.username,u.password_hash,u.role,u.timezone,u.reminder_time,u.created_at,
-		s.csrf_token,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
+		s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
 		WHERE s.token_hash=? AND s.expires_at>?`, security.Digest(raw), nowText()).Scan(
 		&session.User.ID, &session.User.Email, &session.User.Username, &session.User.PasswordHash, &session.User.Role,
-		&session.User.Timezone, &session.User.ReminderTime, &created, &session.CSRFToken, &expires)
+		&session.User.Timezone, &session.User.ReminderTime, &created, &expires)
 	if err != nil {
 		return session, err
 	}
@@ -431,33 +433,6 @@ func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID 
 		VALUES(?,?,?,?,?,?,?)`, security.Digest(raw), kind, strings.ToLower(strings.TrimSpace(email)), userID,
 		timeText(now.Add(ttl)), creator, timeText(now))
 	return raw, err
-}
-func (s *Store) ConsumeAuthToken(ctx context.Context, raw, kind string) (email string, userID *int64, err error) {
-	result, err := withWriteTxResult(s, ctx, func(tx *sql.Tx) (struct {
-		email string
-		id    sql.NullInt64
-	}, error) {
-		var result struct {
-			email string
-			id    sql.NullInt64
-		}
-		if err := tx.QueryRowContext(ctx, `SELECT email,user_id FROM auth_tokens
-			WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>?`,
-			security.Digest(raw), kind, nowText()).Scan(&result.email, &result.id); err != nil {
-			return result, err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=? WHERE token_hash=?`, nowText(), security.Digest(raw)); err != nil {
-			return result, err
-		}
-		return result, nil
-	})
-	if err != nil {
-		return "", nil, err
-	}
-	if result.id.Valid {
-		userID = &result.id.Int64
-	}
-	return result.email, userID, nil
 }
 
 // ResetPasswordWithToken updates the password, revokes existing sessions, and
