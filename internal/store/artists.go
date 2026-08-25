@@ -1011,14 +1011,26 @@ func (s *Store) LatestSpotifyReleaseDate(ctx context.Context, artistID int64) (s
 
 // DueITunesArtworkArtist returns at most one artist per call so the background
 // runner can spread artwork requests over time and respect Apple's limiter.
+// dueITunesArtworkQuery selects the next artist whose iTunes artwork is due.
+//
+// The due predicate is COALESCE(...)<=? rather than the disjunction
+// (col IS NULL OR col<=?) it used to be: a disjunction gives an index keyed on
+// that column no usable range constraint, so this full-scanned release_groups on
+// every sixty-second tick. release_groups_itunes_artwork_due is keyed on the
+// same expression, which is what lets the planner use it.
+//
+// It is a named constant so the regression test can assert the query plan of the
+// statement production actually runs, rather than a copy of it that can drift.
+const dueITunesArtworkQuery = `SELECT a.id,a.mbid,a.name,MAX(rg.itunes_artwork_attempts)
+	FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
+	WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
+		AND COALESCE(rg.itunes_artwork_next_check_at,'')<=?
+	GROUP BY a.id,a.mbid,a.name
+	ORDER BY MIN(COALESCE(rg.itunes_artwork_next_check_at,'')),a.id LIMIT 1`
+
 func (s *Store) DueITunesArtworkArtist(ctx context.Context, now time.Time) (ITunesArtworkArtist, bool, error) {
 	var artist ITunesArtworkArtist
-	err := s.readerDB().QueryRowContext(ctx, `SELECT a.id,a.mbid,a.name,MAX(rg.itunes_artwork_attempts)
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-		WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
-			AND COALESCE(rg.itunes_artwork_next_check_at,'')<=?
-		GROUP BY a.id,a.mbid,a.name
-		ORDER BY MIN(COALESCE(rg.itunes_artwork_next_check_at,'')),a.id LIMIT 1`, timeText(now)).Scan(
+	err := s.readerDB().QueryRowContext(ctx, dueITunesArtworkQuery, timeText(now)).Scan(
 		&artist.ID, &artist.MBID, &artist.Name, &artist.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ITunesArtworkArtist{}, false, nil

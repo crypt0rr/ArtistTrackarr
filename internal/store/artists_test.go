@@ -44,12 +44,7 @@ func TestArtworkDueQueryUsesItsIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := s.DB.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT a.id,a.mbid,a.name,MAX(rg.itunes_artwork_attempts)
-		FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-		WHERE rg.itunes_id IS NOT NULL AND rg.itunes_id<>'' AND rg.itunes_artwork_url=''
-			AND COALESCE(rg.itunes_artwork_next_check_at,'')<=?
-		GROUP BY a.id,a.mbid,a.name
-		ORDER BY MIN(COALESCE(rg.itunes_artwork_next_check_at,'')),a.id LIMIT 1`, timeText(now))
+	rows, err := s.DB.QueryContext(ctx, `EXPLAIN QUERY PLAN `+dueITunesArtworkQuery, timeText(now))
 	if err != nil {
 		t.Fatal(err)
 	}
