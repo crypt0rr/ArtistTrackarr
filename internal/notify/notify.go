@@ -849,17 +849,19 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	return false
 }
 
+// DestinationInput is the form a member fills in to add a destination.
+//
+// Port, From and To were removed with the Gotify and SMTP transports: BuildURL
+// reads none of them, its accepted set is exactly the set the transport policy
+// accepts, and keeping them invited a caller to supply values nothing consumes.
 type DestinationInput struct {
 	Service  string
 	RawURL   string
 	Host     string
-	Port     string
 	Username string
 	Password string
 	Token    string
 	Target   string
-	From     string
-	To       string
 	Topic    string
 }
 

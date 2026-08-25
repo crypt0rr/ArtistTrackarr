@@ -64,9 +64,8 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	input := notify.DestinationInput{
 		Service: r.FormValue("service"), RawURL: r.FormValue("raw_url"), Host: r.FormValue("host"),
-		Port: r.FormValue("port"), Username: r.FormValue("username"), Password: r.FormValue("password"),
-		Token: r.FormValue("token"), Target: r.FormValue("target"), From: r.FormValue("from"),
-		To: r.FormValue("to"), Topic: r.FormValue("topic"),
+		Username: r.FormValue("username"), Password: r.FormValue("password"),
+		Token: r.FormValue("token"), Target: r.FormValue("target"), Topic: r.FormValue("topic"),
 	}
 	serviceURL, err := notify.BuildURL(input)
 	if err == nil {
