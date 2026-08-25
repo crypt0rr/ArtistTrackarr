@@ -1860,7 +1860,16 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 // cannot wait indefinitely on a locked database.
 // deliveryStateBudget bounds each durable state transition. It is a variable so
 // tests can shrink it; nothing outside tests reassigns it.
-var deliveryStateBudget = 5 * time.Second
+// It must exceed store.BusyTimeout by enough to cover the bounded retry loop,
+// or that loop is unreachable in both directions: a genuine SQLITE_BUSY only
+// surfaces after the busy timeout has already burned the whole budget, and
+// in-process contention on the single writer connection queues in database/sql
+// and surfaces as a deadline error, which the retry loop treats as settled. The
+// caller then records a notification the provider already accepted as failed.
+//
+// Four retries back off 25+50+100+200ms, so the headroom is one further busy
+// timeout plus that, rounded up.
+var deliveryStateBudget = 2*store.BusyTimeout + time.Second
 
 func deliveryStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.Background()

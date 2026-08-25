@@ -2915,3 +2915,25 @@ func TestPersistedSnapshotRecordsLogLoss(t *testing.T) {
 		t.Fatalf("persisted status=%q with active log loss, want degraded - the history cannot record what the banner shows", status)
 	}
 }
+
+// TestDeliveryStateBudgetExceedsTheBusyTimeout is #271. The durable-state budget
+// was exactly the SQLite busy_timeout, which made the bounded write-retry loop
+// unreachable in both directions: a genuine SQLITE_BUSY can only surface after
+// the busy timeout has already burned the whole budget, and in-process
+// contention on the single writer connection queues inside database/sql and
+// surfaces as a deadline error, which the retry loop treats as settled rather
+// than retrying. performDelivery then recorded a notification the provider had
+// already accepted as failed, leaving the row untouched with its claim set.
+func TestDeliveryStateBudgetExceedsTheBusyTimeout(t *testing.T) {
+	if deliveryStateBudget <= store.BusyTimeout {
+		t.Fatalf("deliveryStateBudget=%s does not exceed the SQLite busy timeout %s, so the write-retry loop can never run",
+			deliveryStateBudget, store.BusyTimeout)
+	}
+	// It needs room for the retry backoffs on top, not merely one nanosecond
+	// more, or the loop still cannot complete an attempt.
+	const retryBackoffs = 25*time.Millisecond + 50*time.Millisecond + 100*time.Millisecond + 200*time.Millisecond
+	if deliveryStateBudget < store.BusyTimeout+retryBackoffs {
+		t.Fatalf("deliveryStateBudget=%s leaves no room for the %s of retry backoffs after a busy timeout",
+			deliveryStateBudget, retryBackoffs)
+	}
+}
