@@ -752,12 +752,37 @@ language/runtime line.
 `make lint` runs the pinned `golangci-lint` v2.13.0 configuration. The focused
 quality gate covers unchecked errors, Go vet, static analysis, ineffective
 assignments, unused code, row and SQL resource handling, HTTP body closure,
-wrapped errors, and nil-error paths. `make test` builds the fast Docker test
+wrapped errors, nil-error paths, and duplicate code fragments. `make test` builds the fast Docker test
 stage; `make docker-quality` builds the full Docker quality stage, which runs
 serialized tests plus the pinned lint and vulnerability checks. Both Docker
 stages serialize package tests (`-p 1`) so constrained Docker/CI filesystems
 do not report spurious SQLite disk-full failures; the quality stage additionally
 runs the race detector and pinned lint/vulnerability tools.
+
+### Development targets
+
+`make quality` is the pre-release gate: formatting, tooling and version
+checks, `go vet`, the suite with the coverage floor, the race detector, lint,
+and the vulnerability scan. Two further targets are deliberately kept out of it
+because they are slow enough to want running on purpose:
+
+| Target | What it does |
+| --- | --- |
+| `make quality` | The full local gate, matching what CI enforces. |
+| `make coverage` | Suite plus the 80% floor. Included in `make quality`. |
+| `make smoke` | Builds the runtime image and runs `scripts/container-smoke.sh` against it: setup, sign-in, follow, sync, readiness, persistence across a restart, graceful shutdown, and that the container reports the version it was built from. |
+| `make mutate` | Reintroduces each catalogued defect in turn and checks that the test written for it still fails. Rebuilds per mutation, so it takes a few minutes. |
+| `make version-check` | With `VERSION=x.y.z`, checks the version and the README strings agree. |
+| `make backup-smoke` | Runs `scripts/backup.sh` then `scripts/restore-smoke.sh` end to end. Local only: it stops the running app and manipulates the real data volume. |
+| `make benchmark-notify` | Notification hold-time benchmark. |
+
+`make mutate` is how this project keeps its fixes proved. Every fix here is
+verified by reverting it and watching the new test fail; done by hand that
+proof happens once and then decays. `scripts/mutate.py` holds one entry per
+already-fixed defect, naming the issue and the test that must catch it, so the
+proof is repeatable. When a fix lands, add a row at the moment you would have
+done the reintroduction by hand anyway. Patterns must match exactly once, so a
+refactor that moves the code reports `DRIFT` rather than passing quietly.
 
 Pin a deployment to a release by setting the Compose image before starting:
 
@@ -975,6 +1000,14 @@ ArtistTrackarr blocks loopback, private, link-local, multicast, and metadata
 network addresses to prevent an invited user from using notifications as an
 SSRF proxy. Set `ALLOW_PRIVATE_NOTIFICATION_TARGETS=true` only when all
 household members are trusted and local notification services are required.
+
+Take a backup before every upgrade, and keep it until the new version has run
+for a while. Downgrades are not supported: migrations only move forward, and
+several of them drop columns and tables the preceding release still reads. The
+application refuses to start against a database a newer release has migrated,
+naming both schema versions, so a rollback fails loudly at startup instead of
+serving requests and then breaking sign-in. Recovering from that means
+restoring the backup taken before the upgrade.
 
 For a consistent backup, use the repository helper. It stops the app, resolves
 the volume actually mounted at `/data`, refuses missing or empty databases, and

@@ -1,7 +1,7 @@
 COVERAGE_MIN ?= 80.0
 GO_TOOLCHAIN ?= $(shell sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/go\1/p' Dockerfile | head -1)
 
-.PHONY: test docker-quality build run smoke mutate fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
+.PHONY: test docker-quality build run smoke mutate backup-smoke fmt-check tooling-check version-check lint vuln coverage benchmark-notify quality
 
 test:
 	docker build --target test .
@@ -40,6 +40,17 @@ smoke:
 # deliberate step rather than part of `quality`.
 mutate:
 	python3 scripts/mutate.py
+
+# The disaster-recovery scripts are 279 lines executed by no gate. Both #266
+# and #231 were bugs in them, and both fixes were locked in by grepping the
+# shell source rather than running it. Local only and not wired into CI: it
+# stops the running app and manipulates the real data volume, which is not
+# something a CI job should be doing to a developer machine or a runner.
+backup-smoke:
+	scripts/backup.sh $(BACKUP_ARCHIVE)
+	scripts/restore-smoke.sh $(BACKUP_ARCHIVE)
+
+BACKUP_ARCHIVE ?= artist-trackarr-backup.tgz
 
 fmt-check:
 	@test -z "$$(gofmt -l internal cmd)"
@@ -89,8 +100,13 @@ coverage:
 benchmark-notify:
 	GOTOOLCHAIN=$(GO_TOOLCHAIN) go test ./internal/notify -run '^$$' -bench '^BenchmarkShoutrrrSendSerialization$$' -benchmem -count=1
 
+# The 80% coverage floor used to run in CI and nowhere else, so a local
+# `make quality` could pass on a change CI would reject. `make coverage` runs
+# the suite exactly as the plain `go test` step did, and then checks the floor,
+# so this costs no extra suite run. It scopes to ./internal/..., which leaves
+# cmd/server to the -race step below rather than dropping it.
 quality: fmt-check tooling-check version-check
 	go vet ./...
-	go test ./... -count=1
+	$(MAKE) coverage
 	go test -race -p 1 ./... -count=1
 	$(MAKE) lint vuln
