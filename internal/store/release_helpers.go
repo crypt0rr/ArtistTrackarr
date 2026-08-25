@@ -601,7 +601,31 @@ func creditTrackSuffix(trackTitle string) string {
 	}
 	return fmt.Sprintf(" on the track %q", trackTitle)
 }
-func releaseExternalURL(release Release) string {
+
+// ReleaseLink is the single definition of "the link for a release".
+//
+// It honours a confirmed truth decision before falling back to the provider
+// preference order. There were three copies of this: the web template helper was
+// truth-aware, while the ICS description and the digest and notification bodies
+// were the same fallback chain with the TruthProvider switch missing - so a
+// household that had explicitly confirmed which source represents a release
+// still had every alert and calendar entry link somewhere else. TruthProvider is
+// populated on the rows all three receive, so the data was present and ignored.
+func ReleaseLink(release Release) string {
+	switch release.TruthProvider {
+	case "spotify":
+		if release.SpotifyURL != "" {
+			return release.SpotifyURL
+		}
+	case "itunes":
+		if release.ITunesURL != "" {
+			return release.ITunesURL
+		}
+	case "musicbrainz":
+		if release.MusicBrainzURL != "" {
+			return release.MusicBrainzURL
+		}
+	}
 	if release.SpotifyURL != "" {
 		return release.SpotifyURL
 	}
@@ -609,6 +633,10 @@ func releaseExternalURL(release Release) string {
 		return release.ITunesURL
 	}
 	return release.MusicBrainzURL
+}
+
+func releaseExternalURL(release Release) string {
+	return ReleaseLink(release)
 }
 func comparableReleaseDate(value string) (time.Time, bool) {
 	layout := ""

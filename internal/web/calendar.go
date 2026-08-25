@@ -368,13 +368,7 @@ func writeICSLine(builder *strings.Builder, line string) {
 }
 
 func releaseExternalLink(release store.CalendarRelease) string {
-	if release.SpotifyURL != "" {
-		return release.SpotifyURL
-	}
-	if release.ITunesURL != "" {
-		return release.ITunesURL
-	}
-	return release.MusicBrainzURL
+	return store.ReleaseLink(release.Release)
 }
 
 func calendarReleaseStatus(release store.CalendarRelease) string {

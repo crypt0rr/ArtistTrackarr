@@ -472,29 +472,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "pending"
 			}
 		},
-		"releaseURL": func(r store.Release) string {
-			switch r.TruthProvider {
-			case "spotify":
-				if r.SpotifyURL != "" {
-					return r.SpotifyURL
-				}
-			case "itunes":
-				if r.ITunesURL != "" {
-					return r.ITunesURL
-				}
-			case "musicbrainz":
-				if r.MusicBrainzURL != "" {
-					return r.MusicBrainzURL
-				}
-			}
-			if r.SpotifyURL != "" {
-				return r.SpotifyURL
-			}
-			if r.ITunesURL != "" {
-				return r.ITunesURL
-			}
-			return r.MusicBrainzURL
-		},
+		"releaseURL": func(r store.Release) string { return store.ReleaseLink(r) },
 		"releaseArtwork": func(r store.Release) string {
 			if strings.TrimSpace(r.SpotifyImageURL) != "" {
 				return r.SpotifyImageURL

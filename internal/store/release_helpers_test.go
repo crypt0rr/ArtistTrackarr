@@ -44,3 +44,48 @@ func TestReleaseIdentityRejectsBlankTitles(t *testing.T) {
 		t.Fatal("the same symbol title from two providers no longer matches")
 	}
 }
+
+// TestReleaseLinkHonoursTheConfirmedProvider is #272. There were three separate
+// definitions of "the link for a release": the web template helper honoured a
+// confirmed truth decision, while the ICS description and the digest and
+// notification bodies used the same fallback chain with the TruthProvider switch
+// missing. A household that had explicitly confirmed which source represents a
+// release still had every alert and calendar entry link somewhere else.
+func TestReleaseLinkHonoursTheConfirmedProvider(t *testing.T) {
+	full := Release{
+		SpotifyURL:     "https://open.spotify.com/album/x",
+		ITunesURL:      "https://music.apple.com/us/album/x",
+		MusicBrainzURL: "https://musicbrainz.org/release-group/x",
+	}
+	for _, test := range []struct {
+		name     string
+		provider string
+		want     string
+	}{
+		{name: "confirmed iTunes wins over the default order", provider: "itunes", want: full.ITunesURL},
+		{name: "confirmed MusicBrainz wins over the default order", provider: "musicbrainz", want: full.MusicBrainzURL},
+		{name: "confirmed Spotify", provider: "spotify", want: full.SpotifyURL},
+		{name: "no decision falls back to the preference order", provider: "", want: full.SpotifyURL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			release := full
+			release.TruthProvider = test.provider
+			if got := ReleaseLink(release); got != test.want {
+				t.Fatalf("ReleaseLink=%q, want %q", got, test.want)
+			}
+		})
+	}
+
+	// A decision whose provider has no URL must not produce an empty link.
+	missing := Release{TruthProvider: "itunes", MusicBrainzURL: "https://musicbrainz.org/release-group/y"}
+	if got := ReleaseLink(missing); got != missing.MusicBrainzURL {
+		t.Fatalf("ReleaseLink=%q for a confirmed provider with no URL, want the fallback", got)
+	}
+
+	// The notification and digest bodies must agree with it.
+	release := full
+	release.TruthProvider = "itunes"
+	if got := releaseExternalURL(release); got != release.ITunesURL {
+		t.Fatalf("notification body link=%q, want the confirmed provider %q", got, release.ITunesURL)
+	}
+}
