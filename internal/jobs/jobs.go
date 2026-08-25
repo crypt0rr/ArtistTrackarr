@@ -1067,14 +1067,16 @@ func (r *Runner) refreshListenBrainz(ctx context.Context, now time.Time) (int, e
 	missingIDs := make([]int64, 0)
 	for _, artist := range eligible {
 		stats, ok := values[strings.ToLower(strings.TrimSpace(artist.MBID))]
-		if !ok {
-			// ListenBrainz may legitimately omit an MBID from a successful
-			// response. Do not overwrite known totals with zeros; just move the
+		if !ok || !stats.HasData() {
+			// ListenBrainz echoes back every MBID it was asked about and uses
+			// JSON null for the counts when it has no data. Both shapes mean the
+			// same thing: do not overwrite known totals with zeros, just move the
 			// next refresh forward while retaining the previous row.
 			missingIDs = append(missingIDs, artist.ID)
 			continue
 		}
-		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: stats.TotalListenCount, TotalUserCount: stats.TotalUserCount}
+		listens, users := stats.Counts()
+		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: listens, TotalUserCount: users}
 	}
 	if err := r.store.SaveListenBrainzStats(ctx, byID, now, now.Add(24*time.Hour)); err != nil {
 		return 0, err

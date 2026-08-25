@@ -2316,7 +2316,7 @@ func TestRefreshListenBrainzSuccessFiltersUndatedArtists(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &listenBrainzStatsProvider{values: map[string]catalog.ListenBrainzArtistStats{
-		"lb-one": {MBID: "LB-ONE", TotalListenCount: 123456, TotalUserCount: 789},
+		"lb-one": {MBID: "LB-ONE", TotalListenCount: lbCount(123456), TotalUserCount: lbCount(789)},
 	}}
 	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
 	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
@@ -2935,5 +2935,50 @@ func TestDeliveryStateBudgetExceedsTheBusyTimeout(t *testing.T) {
 	if deliveryStateBudget < store.BusyTimeout+retryBackoffs {
 		t.Fatalf("deliveryStateBudget=%s leaves no room for the %s of retry backoffs after a busy timeout",
 			deliveryStateBudget, retryBackoffs)
+	}
+}
+
+// lbCount builds a pointer count for the ListenBrainz stub, matching the shape
+// the real API uses so a null response stays distinguishable from a real zero.
+func lbCount(v int64) *int64 { return &v }
+
+// TestListenBrainzNullCountsDoNotOverwriteKnownTotals is #274. ListenBrainz
+// echoes back every MBID it was asked about and uses JSON null for the counts
+// when it has no data - verified live on 2026-08-25. With int64 targets those
+// decoded to 0, so the map entry always existed, the "may legitimately omit an
+// MBID" guard was unreachable, and a known listener total was overwritten with
+// zero on the next refresh.
+func TestListenBrainzNullCountsDoNotOverwriteKnownTotals(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "lb-null-artist", Name: "LB Null Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// A real total is already known.
+	if err := database.SaveListenBrainzStats(ctx, map[int64]store.ListenBrainzStats{
+		artist.ID: {ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: 4242, TotalUserCount: 99},
+	}, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The provider now answers with nulls, the shape the real API uses.
+	provider := &listenBrainzStatsProvider{values: map[string]catalog.ListenBrainzArtistStats{
+		"lb-null-artist": {MBID: "lb-null-artist"},
+	}}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithListenBrainz(provider))
+	if _, err := runner.refreshListenBrainz(ctx, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	var listens int64
+	if err := database.DB.QueryRowContext(ctx,
+		`SELECT total_listen_count FROM artist_listenbrainz_stats WHERE artist_id=?`, artist.ID).Scan(&listens); err != nil {
+		t.Fatal(err)
+	}
+	if listens != 4242 {
+		t.Fatalf("known listen total was overwritten with %d by a null response, want 4242 retained", listens)
 	}
 }
