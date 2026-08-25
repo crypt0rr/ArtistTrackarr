@@ -56,6 +56,24 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 	if updated.IsZero() {
 		updated = time.Now().UTC()
 	}
+	// A negative ReleaseCount is the caller's "no batch this time, keep whatever
+	// was observed before" sentinel. It is decoded only by the ON CONFLICT
+	// clauses, so on the FIRST row for an (artist, provider) pair it used to be
+	// written into the column verbatim - and every later upsert then took the
+	// preserve branch and kept -1 forever, until that provider first returned a
+	// healthy batch. On a deployment with no Spotify credentials that is never,
+	// so the Trust Center read "-1 releases returned" permanently.
+	//
+	// Bind the stored value clamped, and carry the sentinel separately for the
+	// branch that needs it.
+	storedCount := status.ReleaseCount
+	if storedCount < 0 {
+		storedCount = 0
+	}
+	preservePreviousCount := 0
+	if status.ReleaseCount < 0 {
+		preservePreviousCount = 1
+	}
 	// A not-contacted result must update the current per-artist state without
 	// erasing the last meaningful failure, success, error, or retry deadline.
 	// Replacing a previous failure with an empty status would make the Trust
@@ -76,7 +94,7 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 			 updated_at=excluded.updated_at`,
 			status.ArtistID, provider, status.Status, nullableTime(status.LastAttemptAt),
 			nullableTime(status.LastSuccessAt), nullableTime(status.LastFailureAt), nullableTime(status.NextCheckAt),
-			status.ReleaseCount, status.LastError, timeText(updated))
+			storedCount, status.LastError, timeText(updated))
 		return err
 	}
 	_, err := s.execWriteContext(ctx, `INSERT INTO artist_provider_status
@@ -89,12 +107,14 @@ func (s *Store) RecordArtistProviderStatus(ctx context.Context, status ArtistPro
 		 last_success_at=COALESCE(excluded.last_success_at,artist_provider_status.last_success_at),
 		 last_failure_at=COALESCE(excluded.last_failure_at,artist_provider_status.last_failure_at),
 		 next_check_at=excluded.next_check_at,
-		 release_count=CASE WHEN excluded.release_count>=0 THEN excluded.release_count ELSE artist_provider_status.release_count END,
+		 release_count=CASE WHEN ?=1 THEN artist_provider_status.release_count ELSE excluded.release_count END,
 		 last_error=excluded.last_error,
 		 updated_at=excluded.updated_at`,
 		status.ArtistID, provider, status.Status, nullableTime(status.LastAttemptAt),
 		nullableTime(status.LastSuccessAt), nullableTime(status.LastFailureAt), nullableTime(status.NextCheckAt),
-		status.ReleaseCount, status.LastError, timeText(updated))
+		// Positional binds: the CASE placeholder appears after every VALUES
+		// placeholder in the statement text, so it is bound last.
+		storedCount, status.LastError, timeText(updated), preservePreviousCount)
 	return err
 }
 
