@@ -383,25 +383,6 @@ func mergeReleaseCredits(existing, incoming []ReleaseCredit) []ReleaseCredit {
 	return result
 }
 
-// ensureCreditBaselineTx returns true when this call created the baseline.
-// Baselines are owner-scoped and provider/role-specific so one provider's
-// historical backlog cannot suppress a newly observed credit from another.
-func ensureCreditBaselineTx(ctx context.Context, tx *sql.Tx, userID, artistID int64,
-	provider, role string, observed time.Time) (bool, error) {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	role = normalizedCreditRole(role)
-	if role == "primary" || (provider != "spotify" && provider != "itunes" && provider != "musicbrainz") {
-		return false, nil
-	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_credit_baselines
-		(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`,
-		userID, artistID, provider, role, timeText(observed))
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	return affected > 0, err
-}
 func validITunesArtworkURL(value string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.Path == "" || parsed.Port() != "" ||

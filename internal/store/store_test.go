@@ -1637,10 +1637,10 @@ func TestGuestCreditBaselineAndReleaseDetail(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEventCount(t, s, userID, "announcement", 0)
-	var baseline string
-	if err := s.DB.QueryRow(`SELECT baseline_synced_at FROM follow_credit_baselines WHERE user_id=? AND artist_id=? AND provider='itunes' AND role='guest'`, userID, artist.ID).Scan(&baseline); err != nil || baseline == "" {
-		t.Fatalf("guest baseline=%q err=%v", baseline, err)
-	}
+	// The follow_credit_baselines write this used to assert is gone: the table
+	// had no reader anywhere, so the row it stored could not affect anything.
+	// What actually suppresses the flood is asserted directly above and below -
+	// no announcement for the historical credit, one for the later one.
 	future := historical
 	future.MBID, future.ITunesID, future.ITunesURL = "itunes:future-guest", "future-guest", "https://music.apple.com/us/album/future"
 	future.Title, future.FirstReleaseDate = "Future collaboration", "2026-08-05"
@@ -2626,9 +2626,6 @@ func TestDeleteUserCascadesEveryOwnerScopedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`, runID, destinationID, "pending", timeText(observed)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO follow_credit_baselines(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`, memberID, artist.ID, "spotify", "featured", timeText(observed)); err != nil {
 		t.Fatal(err)
 	}
 
