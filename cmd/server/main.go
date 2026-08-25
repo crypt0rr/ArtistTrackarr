@@ -155,9 +155,14 @@ func main() {
 	// only during a clean shutdown meant a SIGKILL, a panic or a stalled drain
 	// reported nothing - and the queue fills during exactly the incidents an
 	// operator is looking at the log history to understand.
-	app.SetLogHealth(func() appweb.LogSinkHealth {
-		return appweb.LogSinkHealth{Dropped: applicationLogs.Dropped(), Errors: applicationLogs.Errors()}
-	})
+	// Both the admin banner and the hourly persisted snapshot derive operational
+	// status from these counters, so both must see them. When only the web layer
+	// was wired, the banner could read degraded while the 24-hour history shown
+	// directly above it reported healthy for the very same moment.
+	app.SetLogHealth(applicationLogs.Health)
+	if runner != nil {
+		runner.SetLogHealth(applicationLogs.Health)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

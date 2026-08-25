@@ -260,6 +260,16 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 	// it is carried alongside them rather than replacing the observation.
 	creditFailure := ""
 	releases, err := r.itunesReleasesForArtist(ctx, artist)
+	// Apple's lookup endpoint hard-caps at 200 collections and ignores offset,
+	// so a prolific artist's catalogue comes back as an arbitrary subset. The
+	// releases found are still worth importing, but this is not a clean healthy
+	// check: reporting it as one set succeeded, which suppressed the MusicBrainz
+	// fallback that would have supplied the missing releases.
+	truncated := &catalog.ITunesCatalogTruncatedError{}
+	catalogTruncated := errors.As(err, &truncated)
+	if catalogTruncated {
+		err = nil
+	}
 	if err == nil {
 		r.clearITunesProviderCooldown()
 		if creditProvider, ok := r.itunes.(catalog.ReleaseCreditProvider); ok {
@@ -283,13 +293,23 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 			}
 		}
 		observation.healthy = true
-		observation.succeeded = len(releases) > 0
+		// A truncated catalogue must not count as success, or the fallback that
+		// would fill the gap never runs.
+		observation.succeeded = len(releases) > 0 && !catalogTruncated
 		observation.empty = len(releases) == 0
 		observation.releases = releases
 		observation.status = "healthy"
 		if creditFailure != "" {
 			observation.status = "degraded"
 			observation.lastError = creditFailure
+		}
+		if catalogTruncated {
+			observation.status = "degraded"
+			if observation.lastError == "" {
+				observation.lastError = truncated.Error()
+			}
+			r.logger.Warn("iTunes catalogue truncated at the provider maximum; falling back to MusicBrainz",
+				"artist_id", artist.ID, "limit", truncated.Limit)
 		}
 		observation.nextCheckAt = timePtr(now.Add(r.interval))
 		_ = r.store.UpsertProviderHealth(ctx, "itunes", true, nil, false, false, creditFailure)

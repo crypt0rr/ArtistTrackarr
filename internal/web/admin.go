@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -126,6 +127,10 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
+	if !logHealth.LastLossAt.IsZero() {
+		lossAt := logHealth.LastLossAt
+		snapshot.LastLogLossAt = &lossAt
+	}
 	retention, err := a.store.RetentionReport(r.Context(), now)
 	if err != nil {
 		a.logger.Error("retention diagnostics JSON failed", "path", r.URL.Path, "error", err)
@@ -446,7 +451,12 @@ func (a *App) adminData(r *http.Request) PageData {
 	d.ProviderHealth, err = a.store.ProviderHealth(r.Context())
 	failed = a.pageStoreError(r, &d, "Household administration", "provider health", err) || failed
 	d.Diagnostics, err = a.store.Diagnostics(r.Context())
-	d.Diagnostics.DroppedLogEntries, d.Diagnostics.LogWriteFailures = a.logSinkHealth().Dropped, a.logSinkHealth().Errors
+	health := a.logSinkHealth()
+	d.Diagnostics.DroppedLogEntries, d.Diagnostics.LogWriteFailures = health.Dropped, health.Errors
+	if !health.LastLossAt.IsZero() {
+		lossAt := health.LastLossAt
+		d.Diagnostics.LastLogLossAt = &lossAt
+	}
 	failed = a.pageStoreError(r, &d, "Household administration", "system diagnostics", err) || failed
 	d.Retention, err = a.store.RetentionReport(r.Context(), time.Now().UTC())
 	failed = a.pageStoreError(r, &d, "Household administration", "retention report", err) || failed
@@ -540,6 +550,10 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 	// The sink counters do not come from the diagnostics query; fold them in
 	// before deriving status so log loss can contribute a degraded reason.
 	snapshot.DroppedLogEntries, snapshot.LogWriteFailures = logHealth.Dropped, logHealth.Errors
+	if !logHealth.LastLossAt.IsZero() {
+		lossAt := logHealth.LastLossAt
+		snapshot.LastLogLossAt = &lossAt
+	}
 	var report strings.Builder
 	runnerState := "stopped"
 	if runner.Running {
@@ -734,6 +748,8 @@ func (a *App) deleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "user could not be deleted", http.StatusInternalServerError)
 		return
 	}
+	a.logger.Info("household member deleted", "event", "auth.user_deleted",
+		"acting_user_id", session.User.ID, "user_id", userID)
 	http.Redirect(w, r, "/admin?"+a.statusQuery("User deleted"), http.StatusSeeOther)
 }
 func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
@@ -756,6 +772,12 @@ func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create invitation", http.StatusBadRequest)
 		return
 	}
+	// The fingerprint is a truncated SHA-256 prefix, not the token: enough to
+	// correlate a link an operator issued with the acceptance or failure it later
+	// produces, without the persisted log carrying anything usable.
+	inviteDigest := sha256.Sum256([]byte(raw))
+	a.logger.Info("invitation link issued", "event", "auth.invite_issued",
+		"acting_user_id", session.User.ID, "token_fingerprint", fmt.Sprintf("%x", inviteDigest[:6]))
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/invite/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Invitation", strings.TrimSpace(r.FormValue("email"))
@@ -782,6 +804,10 @@ func (a *App) createReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create reset", http.StatusBadRequest)
 		return
 	}
+	resetDigest := sha256.Sum256([]byte(raw))
+	a.logger.Info("password reset link issued", "event", "auth.reset_issued",
+		"acting_user_id", session.User.ID, "user_id", user.ID,
+		"token_fingerprint", fmt.Sprintf("%x", resetDigest[:6]))
 	d := a.adminData(r)
 	d.GeneratedURL = a.cfg.PublicURL.ResolveReference(&url.URL{Path: "/reset/" + raw}).String()
 	d.TokenKind, d.TokenEmail = "Password reset", user.Email

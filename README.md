@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.59.0`; local and published images use the
+footer. The current release is `v0.60.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,50 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.60.0 release finishes the fifth review's backlog, closing the remaining
+twenty-seven findings.
+
+Notifications get several corrections. A daily digest is no longer silently
+skipped for a whole day after you change your profile timezone — the previous
+fix repaired weekly digests and, for daily ones, made the problem slightly worse.
+An interrupted shutdown no longer marks queued "Sync now" requests as permanently
+failed, and no longer reports artists it never attempted as synchronisation
+failures. A notification the provider already accepted is no longer recorded as
+failed because the database write ran out of time.
+
+Apple/iTunes discovery improves in three ways. A prolific artist's catalogue is
+capped at 200 albums by Apple; that truncation is now detected, so the
+MusicBrainz fallback still runs and fills the gap instead of being suppressed by
+an apparently successful check. Guest credits are found when the feature is named
+in the track title rather than the artist field, which is how Apple expresses most
+of them — for one artist, thirty-one of fifty results were previously discarded.
+And compilations are now recognised, so the per-artist Compilations toggle works
+on an iTunes deployment as it already did on a Spotify one.
+
+Links now follow your decision. When a household confirms which source represents
+a release, the calendar export, the digest and the notification bodies all link
+there — previously only the release page did.
+
+Elsewhere in the interface: an expired calendar month is told plainly that the
+export does not reach it, rather than being pointed at a feed that would come back
+without those releases; and following an ICS event link while signed out now
+returns you to that release after signing in, instead of dropping you on the
+dashboard.
+
+For operators: sign-ins, sign-outs, rejected attempts, password changes, invite
+and reset links, feed tokens and account deletions are all recorded in the
+application log, which previously held only failures. Log-loss and database
+contention warnings clear once they stop recurring instead of pinning the instance
+to degraded until it restarts, and the persisted health history can finally record
+them at all. A dropped SSH session during a backup no longer leaves the
+application stopped, and provider counts no longer display as "-1 releases
+returned".
+
+Deleting a household account now removes its delivery audit rows, which retained
+the member-authored destination label. Several tables, columns and code paths that
+were written but never read are gone, and the artwork sweep's index is now
+actually used by the query it was created for.
+
 The v0.59.0 release starts on the fifth review's backlog, and rebuilds the part
 of the notification engine that backlog kept pointing at.
 
@@ -694,7 +738,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.59.0` publishes `0.59.0`, `0.59`, and `latest`.
+- Pushing a tag such as `v0.60.0` publishes `0.60.0`, `0.60`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -718,7 +762,7 @@ runs the race detector and pinned lint/vulnerability tools.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.59.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.60.0 docker compose up -d
 ```
 
 ## Configuration

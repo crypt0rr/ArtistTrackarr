@@ -1017,3 +1017,227 @@ func restoreReleaseGroups(t *testing.T, s *Store) {
 		t.Fatal(err)
 	}
 }
+
+// TestTimezoneChangeDoesNotSuppressTheNextDailyDigest is the daily half of the
+// same class. A weekly period is 168h, so the 26h tolerance cannot reach the
+// previous week's run - which is all the original fix was verified against. A
+// daily period is 24h, and yesterday's run is created at the member's reminder
+// time, so it falls inside [periodStart-26h, ...) at every reminder time. The
+// first tick after any timezone change therefore found yesterday's run, saw a
+// non-pending status and skipped the whole day: no run row, no delivery, no log
+// line, and a return value of 0 rather than an error.
+//
+// The reminder offset is the reason a wider or narrower window cannot fix this
+// on its own - at 23:00 the previous run sits an hour before the current period
+// even begins - so the previous period is excluded by key instead.
+func TestTimezoneChangeDoesNotSuppressTheNextDailyDigest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	userID, err := s.CreateUser(ctx, "tz-daily@example.com", "hash", "member", "UTC", "tz-daily")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "tz-daily-artist", Name: "TZ Daily Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	releaseDate := now.AddDate(0, 0, 1).Format("2006-01-02")
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "tz-daily-release", artist.ID, "TZ Daily Release", "EP", "[]",
+		releaseDate, 3, "https://musicbrainz.org/release-group/tz-daily-release", "musicbrainz",
+		timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	// Control: with no prior run, a daily digest must be created.
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	var control int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&control); err != nil {
+		t.Fatal(err)
+	}
+	if control != 1 {
+		t.Fatalf("control: a daily digest was not created at all (runs=%d)", control)
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM release_digest_runs WHERE user_id=?`, userID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Yesterday's run, recorded under the member's previous timezone and created
+	// at their reminder time - the shape the scheduler actually writes.
+	today := now.Truncate(24 * time.Hour)
+	yesterday := today.AddDate(0, 0, -1)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_runs
+		(user_id,frequency,period_start,timezone,title,body,release_count,status,created_at)
+		VALUES(?,?,?,?,?,?,?, 'sent',?)`, userID, "daily",
+		yesterday.Format("2006-01-02"), "America/New_York", "Yesterday", "body", 1,
+		timeText(yesterday.Add(9*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	var runs int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=? AND created_at>=?`,
+		userID, timeText(now.Add(-time.Hour))).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("today's daily digest runs=%d after a timezone change, want 1", runs)
+	}
+}
+
+// TestSameTimezoneDailyDigestIsStillDeduplicated keeps the exclusion from
+// reopening the duplicate it exists to prevent: a member who did NOT change
+// timezone must still get exactly one digest per period.
+func TestSameTimezoneDailyDigestIsStillDeduplicated(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+	userID, err := s.CreateUser(ctx, "tz-dedup@example.com", "hash", "member", "UTC", "tz-dedup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "tz-dedup-artist", Name: "TZ Dedup Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "tz-dedup-release", artist.ID, "TZ Dedup Release", "EP", "[]",
+		now.AddDate(0, 0, 1).Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/tz-dedup-release",
+		"musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueueDueReleaseDigests(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	// A second tick in the same period must not create another run.
+	if _, err := s.QueueDueReleaseDigests(ctx, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	var runs int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, userID).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("daily digest runs=%d in one period, want exactly 1", runs)
+	}
+}
+
+// TestOneMemberDigestFailureDoesNotStarveTheRest is #277. The sweep isolated
+// exactly one per-member failure - an unloadable timezone - and propagated every
+// other one, abandoning all remaining members in the slice. The member list
+// comes from a query with no ORDER BY, so SQLite returns it in a stable rowid
+// order and the same members were consistently the ones that never got a digest.
+func TestOneMemberDigestFailureDoesNotStarveTheRest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := testStore(t)
+	s.Reader.SetMaxOpenConns(1)
+
+	now := time.Now().UTC()
+	if now.Hour() < 10 {
+		now = time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	} else {
+		now = now.Truncate(time.Minute)
+	}
+
+	// The first member carries an unloadable timezone, which the sweep already
+	// skips; the second must still be served. Both are created in order, so the
+	// broken one is reached first.
+	broken, err := s.CreateUser(ctx, "broken-tz@example.com", "hash", "member", "UTC", "broken-tz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := s.CreateUser(ctx, "healthy-tz@example.com", "hash", "member", "UTC", "healthy-tz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "starve-artist", Name: "Starve Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{broken, healthy} {
+		if _, err := s.Follow(ctx, id, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+			UserID: id, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+			DigestEnabled: true, DigestFrequency: "daily",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A malformed stored paused_until makes FollowNotificationRules fail for this
+	// member alone - a failure that previously propagated and abandoned every
+	// remaining member in the slice.
+	if _, err := s.DB.ExecContext(ctx,
+		`UPDATE follow_notification_rules SET paused_until='not-a-timestamp' WHERE user_id=?`, broken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,
+		 musicbrainz_url,source,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, "starve-release", artist.ID, "Starve Release", "EP", "[]",
+		now.AddDate(0, 0, 1).Format("2006-01-02"), 3, "https://musicbrainz.org/release-group/starve-release",
+		"musicbrainz", timeText(now), timeText(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The failure is reported rather than swallowed...
+	_, err = s.QueueDueReleaseDigests(ctx, now)
+	if err == nil {
+		t.Fatal("the per-member failure was swallowed entirely")
+	}
+	if !strings.Contains(err.Error(), "digest for user") {
+		t.Fatalf("the error does not identify the failing member: %v", err)
+	}
+	// ...and every other member is still served.
+	var runs int
+	if err := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM release_digest_runs WHERE user_id=?`, healthy).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 {
+		t.Fatalf("the healthy member's digest runs=%d after another member failed, want 1", runs)
+	}
+}

@@ -3,6 +3,7 @@ package logging
 import (
 	"context"
 	"sync/atomic"
+	"time"
 )
 
 // AsyncSink decouples application-log persistence from the caller that emits
@@ -19,6 +20,11 @@ type AsyncSink struct {
 	closed  atomic.Bool
 	dropped atomic.Uint64
 	errors  atomic.Uint64
+	// lastLossAt is the unix-nano instant of the most recent drop or write
+	// failure. The counters are cumulative for the process lifetime, so the
+	// operational status needs to know whether loss is still happening rather
+	// than whether it ever happened.
+	lastLossAt atomic.Int64
 }
 
 func NewAsyncSink(buffer int, sink func(Entry) error) *AsyncSink {
@@ -63,6 +69,7 @@ func (s *AsyncSink) write(entry Entry) {
 	}
 	if err := s.sink(entry); err != nil {
 		s.errors.Add(1)
+		s.lastLossAt.Store(time.Now().UTC().UnixNano())
 	}
 }
 
@@ -78,9 +85,11 @@ func (s *AsyncSink) Enqueue(entry Entry) {
 			// writer drains entries already queued, but this one may arrive
 			// after it has finished; count it as dropped for observability.
 			s.dropped.Add(1)
+			s.lastLossAt.Store(time.Now().UTC().UnixNano())
 		}
 	default:
 		s.dropped.Add(1)
+		s.lastLossAt.Store(time.Now().UTC().UnixNano())
 	}
 }
 
@@ -108,3 +117,32 @@ func (s *AsyncSink) Done() <-chan struct{} { return s.done }
 func (s *AsyncSink) Dropped() uint64 { return s.dropped.Load() }
 
 func (s *AsyncSink) Errors() uint64 { return s.errors.Load() }
+
+// SinkHealth is the application-log sink's runtime loss counters, shared by
+// every consumer that needs them: the admin diagnostics rendered by the web
+// layer and the hourly snapshot persisted by the scheduler. It lives here
+// because both must report the same numbers - when only the web layer could see
+// them, the persisted history could never record log loss at all.
+type SinkHealth struct {
+	Dropped uint64
+	Errors  uint64
+	// LastLossAt is when loss most recently occurred. The counters are
+	// cumulative for the process lifetime, so without this a single dropped
+	// record pins the operational status to degraded until a restart.
+	LastLossAt time.Time
+}
+
+// Health reports the sink's current loss counters.
+func (s *AsyncSink) Health() SinkHealth {
+	return SinkHealth{Dropped: s.Dropped(), Errors: s.Errors(), LastLossAt: s.LastLossAt()}
+}
+
+// LastLossAt reports when a record was most recently dropped or failed to
+// persist, or the zero time if neither has happened.
+func (s *AsyncSink) LastLossAt() time.Time {
+	nanos := s.lastLossAt.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos).UTC()
+}

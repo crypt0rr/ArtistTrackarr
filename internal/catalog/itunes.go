@@ -381,10 +381,14 @@ func (i *ITunes) ArtistReleasesForCanonical(ctx context.Context, canonicalID, ar
 	}
 	key := "canonical:" + canonicalID + "\x00" + artist.ID
 	releases, err := i.artistReleasesCached(ctx, key, artistName, artist.ID)
-	if err != nil {
+	// A truncation signal accompanies usable releases rather than replacing
+	// them, so it must not discard the catalogue on its way out. Every other
+	// error still does.
+	truncated := &ITunesCatalogTruncatedError{}
+	if err != nil && !errors.As(err, &truncated) {
 		return nil, "", "", err
 	}
-	return releases, artist.ID, artist.URL, nil
+	return releases, artist.ID, artist.URL, err
 }
 
 func (i *ITunes) resolveExactArtist(ctx context.Context, artistName string) (ITunesArtist, error) {
@@ -461,6 +465,26 @@ func (i *ITunes) artistReleasesCached(ctx context.Context, key, artistName, arti
 	return result, err
 }
 
+// ITunesCatalogTruncatedError reports that Apple's lookup endpoint returned its
+// hard maximum of collections, so the catalogue it produced is an arbitrary
+// subset of the artist's real catalogue rather than all of it.
+//
+// It is returned ALONGSIDE the releases that were found, not instead of them:
+// the partial catalogue is still worth importing, but the caller must know not
+// to treat the result as a complete healthy answer. Verified live against the
+// endpoint on 2026-08-24 - limit=150 returns 150 collections, while limit=200,
+// 250 and 300 all return exactly 200, so this is a server-side ceiling and not
+// an effect of the limit value. The endpoint also ignores offset, which is why
+// paging it was removed and cannot simply be restored.
+type ITunesCatalogTruncatedError struct {
+	ArtistID string
+	Limit    int
+}
+
+func (e *ITunesCatalogTruncatedError) Error() string {
+	return fmt.Sprintf("iTunes returned its maximum of %d collections for artist %s, so the catalogue is incomplete", e.Limit, e.ArtistID)
+}
+
 func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID string) ([]store.Release, error) {
 	// Apple's lookup endpoint ignores offset: every request returns the same
 	// first page. Paging it meant that any artist with a full page of
@@ -472,6 +496,7 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 	const lookupPageSize = 200
 	result := make([]store.Release, 0)
 	seen := make(map[string]bool)
+	collections := 0
 	{
 		endpoint := i.baseURL + "/lookup?id=" + url.QueryEscape(artistID) +
 			"&country=" + url.QueryEscape(i.country) + "&entity=album&limit=" + strconv.Itoa(lookupPageSize)
@@ -494,6 +519,13 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 			}
 		}
 		for _, item := range response.Results {
+			// Count every collection row the endpoint returned, not just the
+			// ones that survive the filters: the cap applies to what Apple sends,
+			// so a page filtered down to fewer usable releases is still a page
+			// that hit the ceiling.
+			if item.WrapperType == "collection" {
+				collections++
+			}
 			if item.WrapperType != "collection" || item.CollectionType != "Album" ||
 				item.CollectionID <= 0 || strings.TrimSpace(item.CollectionName) == "" ||
 				strings.TrimSpace(item.ReleaseDate) == "" {
@@ -521,7 +553,7 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 			if date == "" {
 				continue
 			}
-			primaryType := iTunesReleaseType(item.CollectionName, item.TrackCount)
+			primaryType, secondaryTypes := iTunesReleaseType(item.CollectionName, item.TrackCount, item.ArtistName)
 			releaseURL := strings.TrimSpace(item.CollectionViewURL)
 			if releaseURL == "" {
 				releaseURL = "https://itunes.apple.com/album/id" + id
@@ -531,6 +563,7 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 				MBID:             "itunes:" + id,
 				Title:            strings.TrimSpace(item.CollectionName),
 				PrimaryType:      primaryType,
+				SecondaryTypes:   secondaryTypes,
 				FirstReleaseDate: date,
 				DatePrecision:    precision,
 				ITunesID:         id,
@@ -542,7 +575,13 @@ func (i *ITunes) artistReleasesByID(ctx context.Context, artistName, artistID st
 	}
 	// The endpoint cannot return more than one page, so a full page is the
 	// natural bound rather than an error: returning what was found keeps a
-	// prolific artist's catalogue usable instead of discarding it.
+	// prolific artist's catalogue usable instead of discarding it. But a full
+	// page also means the catalogue is incomplete, and that must not be reported
+	// as a clean healthy check - it suppressed the MusicBrainz fallback that
+	// would have supplied the missing releases.
+	if collections >= lookupPageSize {
+		return result, &ITunesCatalogTruncatedError{ArtistID: artistID, Limit: lookupPageSize}
+	}
 	return result, nil
 }
 
@@ -576,8 +615,8 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 	for _, item := range response.Results {
 		if item.WrapperType != "track" || item.CollectionID <= 0 || item.TrackID <= 0 ||
 			strings.TrimSpace(item.TrackName) == "" || strings.TrimSpace(item.CollectionName) == "" ||
-			strings.TrimSpace(item.ReleaseDate) == "" || !creditIncludesArtist(item.ArtistName, artistName) ||
-			strings.EqualFold(strings.TrimSpace(item.ArtistName), artistName) {
+			strings.TrimSpace(item.ReleaseDate) == "" ||
+			!creditsFollowedArtist(item.ArtistName, item.TrackName, artistName) {
 			continue
 		}
 		collectionID := strconv.FormatInt(item.CollectionID, 10)
@@ -597,9 +636,19 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 			if releaseURL == "" {
 				releaseURL = "https://itunes.apple.com/album/id" + collectionID
 			}
+			// Song rows carry collectionArtistName, which names the album's
+			// artist rather than the track's - the cleaner compilation signal,
+			// and the only place Apple exposes it. Fall back to the track's
+			// artist when it is absent.
+			collectionArtist := strings.TrimSpace(item.CollectionArtistName)
+			if collectionArtist == "" {
+				collectionArtist = item.ArtistName
+			}
+			creditPrimaryType, creditSecondaryTypes := iTunesReleaseType(item.CollectionName, item.TrackCount, collectionArtist)
 			release = store.Release{
 				MBID: "itunes:" + collectionID, Title: strings.TrimSpace(item.CollectionName),
-				PrimaryType:      iTunesReleaseType(item.CollectionName, item.TrackCount),
+				PrimaryType:      creditPrimaryType,
+				SecondaryTypes:   creditSecondaryTypes,
 				FirstReleaseDate: date, DatePrecision: precision, ITunesID: collectionID, ITunesURL: releaseURL,
 				ITunesArtworkURL: normalizeITunesArtworkURL(firstNonEmpty(item.ArtworkURL100, item.ArtworkURL60)),
 			}
@@ -612,6 +661,27 @@ func (i *ITunes) ArtistReleaseCredits(ctx context.Context, artistName string, kn
 		result = append(result, release)
 	}
 	return result, nil
+}
+
+// creditsFollowedArtist reports whether an iTunes song row is a GUEST credit for
+// the followed artist.
+//
+// Apple expresses a feature two ways, and only the first was ever checked:
+// inside artistName ("Ariana Grande, Normani & Nicki Minaj"), or - far more
+// commonly - by leaving artistName as the lead artist and putting the feature in
+// trackName ("Side To Side (feat. Nicki Minaj)"). Measured against the live
+// endpoint on 2026-08-24 for one artist, 50 returned rows contained 31 whose
+// credit appears only in trackName; every one of them was discarded even though
+// the search had already paid for it.
+//
+// A row whose artistName IS the followed artist is still excluded: those are the
+// artist's own releases and ArtistReleases already returns them, so admitting
+// them here would duplicate the catalogue rather than extend it.
+func creditsFollowedArtist(artistNameField, trackName, artist string) bool {
+	if strings.EqualFold(strings.TrimSpace(artistNameField), strings.TrimSpace(artist)) {
+		return false
+	}
+	return creditIncludesArtist(artistNameField, artist) || creditIncludesArtist(trackName, artist)
 }
 
 func creditIncludesArtist(credit, artist string) bool {
@@ -780,12 +850,73 @@ func iTunesDate(value string) (string, int) {
 	return "", 0
 }
 
-func iTunesReleaseType(title string, trackCount int) string {
-	primaryType, _, ok := classifyReleaseType("album", "", title, trackCount)
-	if !ok {
-		return "Album"
+// variousArtistsLabels are the storefront-localised names Apple uses for the
+// compilation pseudo-artist, in the form normalizeCreditText produces. That
+// normaliser keeps only ASCII letters and digits, so accented labels appear here
+// already mangled ("Multi-interprètes" -> "multi interpr tes"); the values are
+// taken from its actual output rather than written by hand.
+//
+// The album-lookup payload carries no compilation flag - no collectionType
+// distinction, no collectionArtistName on collection rows - so the artist label
+// is the only signal it offers, and it is localised per storefront. Verified
+// live on 2026-08-24 against one compilation across five storefronts: US and GB
+// return "Various Artists", DE and FR "Multi-interprètes", JP the katakana form
+// below.
+//
+// This is best-effort by construction: a storefront whose label is absent here
+// classifies its compilations as plain albums, which is what every storefront
+// did before. It cannot produce a false positive, because no real artist is
+// named any of these.
+var variousArtistsLabels = map[string]struct{}{
+	"various artists":          {},
+	"various artist":           {},
+	"multi interpr tes":        {},
+	"verschiedene interpreten": {},
+	"varios artistas":          {},
+	"artisti vari":             {},
+	"diversos artistas":        {},
+	"olika artister":           {},
+	"forskellige kunstnere":    {},
+	"eri esitt ji":             {},
+}
+
+// variousArtistsRawMarkers cover labels the ASCII-only normaliser reduces to the
+// empty string, so they must be matched before normalisation.
+var variousArtistsRawMarkers = []string{"ヴァリアス"}
+
+// isVariousArtists reports whether an iTunes artist label denotes a compilation.
+func isVariousArtists(name string) bool {
+	for _, marker := range variousArtistsRawMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
 	}
-	return primaryType
+	normalized := normalizeCreditText(name)
+	if normalized == "" {
+		return false
+	}
+	_, ok := variousArtistsLabels[normalized]
+	return ok
+}
+
+// iTunesReleaseType classifies an iTunes collection, returning any secondary
+// types alongside the primary one.
+//
+// The secondary types used to be discarded, and the kind was hard-coded to
+// "album", so the single branch that emits "Compilation" could never fire for an
+// iTunes release. store.Release.SecondaryTypes was therefore always nil and the
+// per-follow Compilations toggle had nothing to match: it worked on a Spotify
+// deployment and silently did nothing on an iTunes one.
+func iTunesReleaseType(title string, trackCount int, artistName string) (string, []string) {
+	kind := "album"
+	if isVariousArtists(artistName) {
+		kind = "compilation"
+	}
+	primaryType, secondary, ok := classifyReleaseType(kind, "", title, trackCount)
+	if !ok {
+		return "Album", nil
+	}
+	return primaryType, secondary
 }
 
 func validITunesID(value string) bool {

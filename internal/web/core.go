@@ -472,29 +472,7 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 				return "pending"
 			}
 		},
-		"releaseURL": func(r store.Release) string {
-			switch r.TruthProvider {
-			case "spotify":
-				if r.SpotifyURL != "" {
-					return r.SpotifyURL
-				}
-			case "itunes":
-				if r.ITunesURL != "" {
-					return r.ITunesURL
-				}
-			case "musicbrainz":
-				if r.MusicBrainzURL != "" {
-					return r.MusicBrainzURL
-				}
-			}
-			if r.SpotifyURL != "" {
-				return r.SpotifyURL
-			}
-			if r.ITunesURL != "" {
-				return r.ITunesURL
-			}
-			return r.MusicBrainzURL
-		},
+		"releaseURL": func(r store.Release) string { return store.ReleaseLink(r) },
 		"releaseArtwork": func(r store.Release) string {
 			if strings.TrimSpace(r.SpotifyImageURL) != "" {
 				return r.SpotifyImageURL
@@ -911,7 +889,24 @@ func (a *App) session(next http.Handler) http.Handler {
 func (a *App) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := currentSession(r); !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			// Remember what was asked for. The application publishes an external
+			// deep link - every ICS event carries a URL: property resolving to
+			// {PublicURL}/releases/{id} - and the whole point of the revocable
+			// feed token is that the calendar is read on devices separate from
+			// the browser session, so following one of those links from a phone
+			// used to land on the dashboard with no way back to the release.
+			//
+			// Only safe local paths are carried, through the same allowlisting
+			// helper the rest of the app uses, and only for GET: replaying a POST
+			// after a login prompt would repeat a side effect the member never
+			// re-confirmed.
+			target := "/login"
+			if r.Method == http.MethodGet {
+				if next := localReturnPath(r.URL.RequestURI(), "", ""); next != "" && next != "/" {
+					target += "?next=" + url.QueryEscape(next)
+				}
+			}
+			http.Redirect(w, r, target, http.StatusSeeOther)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -955,6 +950,7 @@ func localReturnPath(value, prefix, fallback string) string {
 
 func (a *App) data(r *http.Request, title string) PageData {
 	csrf, _ := r.Context().Value(csrfKey).(string)
+	returnPath := localReturnPath(r.URL.Query().Get("next"), "", "")
 	message := ""
 	if raw := r.URL.Query().Get("message"); raw != "" {
 		if value, ok := security.VerifySignedToken(a.cfg.SessionSecret, raw); ok {
@@ -965,6 +961,7 @@ func (a *App) data(r *http.Request, title string) PageData {
 		Title: title, Version: version.Current, CSRF: csrf,
 		Message: message, SpotifyOn: a.spotify != nil,
 	}}
+	d.ReturnPath = returnPath
 	if session, ok := currentSession(r); ok {
 		d.User = &UserView{
 			ID: session.User.ID, Email: session.User.Email, Username: session.User.Username,
@@ -1079,7 +1076,6 @@ func (a *App) loadSettingsData(r *http.Request, d *PageData) bool {
 	}
 	failed = a.pageStoreError(r, d, "Settings", "calendar feed token", feedErr) || failed
 	if feedErr == nil {
-		d.CalendarFeedCreatedAt = &feed.CreatedAt
 		d.CalendarFeedExpiresAt = &feed.ExpiresAt
 		d.CalendarFeedActive = feed.Active
 	}
@@ -1120,13 +1116,12 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	if page > pages {
 		page = pages
 	}
-	d.ArtistPage, d.ArtistPages = page, pages
+	// Only the URLs and the page links are rendered; the bare page numbers were
+	// computed and never referenced by any template.
 	if page > 1 {
-		d.ArtistPrevPage = page - 1
 		d.ArtistPrevURL = artistsPageURL(r, page-1)
 	}
 	if page < pages {
-		d.ArtistNextPage = page + 1
 		d.ArtistNextURL = artistsPageURL(r, page+1)
 	}
 	if d.FilteredArtistCount > 0 {

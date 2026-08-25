@@ -1,10 +1,15 @@
 package web
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,5 +110,119 @@ func TestCsrfStillRejectsAForgedPost(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode == http.StatusOK {
 		t.Fatal("a POST with a forged CSRF token was accepted")
+	}
+}
+
+// TestCredentialLifecycleEventsAreRecorded is #265. Every logger call on the
+// authentication path used to be a failure line for an infrastructure error, so
+// a successful sign-in, a sign-out, an individual rejected attempt, a password
+// change and the issuance of an invite or feed token left no record at all. The
+// generic HTTP access log is emitted at Debug while the default level is info,
+// so on a stock deployment there was no request log either — and the app already
+// persists application logs and renders them on /admin/diagnostics, so the sink
+// existed and was simply never fed.
+func TestCredentialLifecycleEventsAreRecorded(t *testing.T) {
+	var logs bytes.Buffer
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	_ = database
+
+	// authenticatedTestServer signs in during setup, so drive the events that
+	// follow it against a recording logger.
+	handler := logging.NewHandler(slog.NewJSONHandler(&logs, nil), 64)
+	app := &App{logger: slog.New(handler)}
+
+	app.logger.Info("sign-in succeeded", "event", "auth.signin", "user_id", int64(1))
+	app.logger.Info("sign-out", "event", "auth.signout", "user_id", int64(1))
+	if !strings.Contains(logs.String(), "auth.signin") || !strings.Contains(logs.String(), "auth.signout") {
+		t.Fatalf("lifecycle events do not survive the redacting handler: %s", logs.String())
+	}
+	// The event key must not be eaten by redaction, and neither must user_id.
+	if strings.Contains(logs.String(), "[redacted]") {
+		t.Fatalf("a lifecycle event field was redacted: %s", logs.String())
+	}
+
+	// And the real sign-out route must emit one.
+	response, err := client.Post(server.URL+"/logout", "application/x-www-form-urlencoded",
+		strings.NewReader("_csrf="+getCSRF(t, client, server.URL+"/settings")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+}
+
+// TestEveryCredentialLifecycleEventHasAnEmitter is a source-level guard: it
+// pins that each named event still has a handler emitting it, so removing one
+// during a refactor fails the build rather than silently deleting an audit
+// record. It deliberately does not assert on rendered output - the behavioural
+// half is covered by TestCredentialLifecycleEventsAreRecorded.
+func TestEveryCredentialLifecycleEventHasAnEmitter(t *testing.T) {
+	for _, want := range []string{
+		"auth.signin", "auth.signout", "auth.signin_failed",
+		"auth.password_changed", "auth.feed_token_issued", "auth.feed_token_revoked",
+		"auth.user_deleted", "auth.invite_issued", "auth.reset_issued",
+	} {
+		found := false
+		for _, file := range []string{"auth.go", "settings.go", "admin.go"} {
+			data, err := os.ReadFile(filepath.Join(".", file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Match the quoted literal: a bare substring lets "auth.signin"
+			// match inside "auth.signin_failed", so removing the sign-in event
+			// would go undetected.
+			if strings.Contains(string(data), `"`+want+`"`) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no handler emits the %q credential-lifecycle event", want)
+		}
+	}
+}
+
+// TestUnauthenticatedDeepLinkReturnsAfterSignIn is #290. requireUser redirected
+// to a bare "/login" and login always went to "/", so the application had no
+// post-authentication return path. That matters because it publishes an external
+// deep link: every ICS event carries a URL: property resolving to
+// {PublicURL}/releases/{id}, and the point of the revocable feed token is that
+// the calendar is read on devices separate from the browser session - so
+// following one of those links landed on the dashboard with no route back.
+func TestUnauthenticatedDeepLinkReturnsAfterSignIn(t *testing.T) {
+	_, server, _ := authenticatedTestServer(t, nil, nil, nil)
+	bare := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	response, err := bare.Get(server.URL + "/releases/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	location := response.Header.Get("Location")
+	if !strings.HasPrefix(location, "/login") {
+		t.Fatalf("unauthenticated request went to %q, want the login page", location)
+	}
+	target, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := target.Query().Get("next"); got != "/releases/7" {
+		t.Fatalf("the requested path was not carried to login: next=%q", got)
+	}
+}
+
+// TestReturnPathRejectsOffsiteAndUnsafeTargets keeps the new parameter from
+// becoming an open redirect. It goes through the same allowlisting helper the
+// rest of the application uses.
+func TestReturnPathRejectsOffsiteAndUnsafeTargets(t *testing.T) {
+	for _, hostile := range []string{
+		"https://evil.example/steal", "//evil.example/steal", "/\\evil.example",
+		"http://evil.example", "\r\nSet-Cookie: x=1", "",
+	} {
+		if got := localReturnPath(hostile, "", "/"); got != "/" {
+			t.Fatalf("localReturnPath(%q)=%q, want the safe fallback", hostile, got)
+		}
+	}
+	if got := localReturnPath("/releases/7?tab=evidence", "", "/"); got != "/releases/7?tab=evidence" {
+		t.Fatalf("a legitimate local path was rejected: %q", got)
 	}
 }

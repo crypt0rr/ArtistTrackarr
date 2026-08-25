@@ -64,9 +64,8 @@ func (a *App) addDestination(w http.ResponseWriter, r *http.Request) {
 	session, _ := currentSession(r)
 	input := notify.DestinationInput{
 		Service: r.FormValue("service"), RawURL: r.FormValue("raw_url"), Host: r.FormValue("host"),
-		Port: r.FormValue("port"), Username: r.FormValue("username"), Password: r.FormValue("password"),
-		Token: r.FormValue("token"), Target: r.FormValue("target"), From: r.FormValue("from"),
-		To: r.FormValue("to"), Topic: r.FormValue("topic"),
+		Username: r.FormValue("username"), Password: r.FormValue("password"),
+		Token: r.FormValue("token"), Target: r.FormValue("target"), Topic: r.FormValue("topic"),
 	}
 	serviceURL, err := notify.BuildURL(input)
 	if err == nil {
@@ -259,6 +258,7 @@ func (a *App) calendarFeedAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := a.data(r, "Settings")
+		a.logger.Info("calendar feed token issued", "event", "auth.feed_token_issued", "user_id", session.User.ID)
 		d.Message = "Calendar feed created. Copy this URL now; it will not be shown again."
 		d.CalendarFeedURL = a.calendarFeedURL(raw)
 		status := http.StatusOK
@@ -274,6 +274,7 @@ func (a *App) calendarFeedAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "calendar feed could not be revoked", http.StatusInternalServerError)
 			return
 		}
+		a.logger.Info("calendar feed token revoked", "event", "auth.feed_token_revoked", "user_id", session.User.ID)
 		http.Redirect(w, r, "/settings?"+a.statusQuery("Calendar feed revoked"), http.StatusSeeOther)
 	default:
 		http.Error(w, "invalid calendar feed action", http.StatusBadRequest)
@@ -345,6 +346,7 @@ func (a *App) settingsPassword(w http.ResponseWriter, r *http.Request) {
 	// UpdatePassword revokes every session, including the one used for this
 	// request. Send the user through the normal login flow rather than leaving
 	// a stale cookie that appears authenticated until its next request.
+	a.logger.Info("password changed", "event", "auth.password_changed", "user_id", session.User.ID)
 	http.Redirect(w, r, "/login?"+a.statusQuery("Password updated"), http.StatusSeeOther)
 }
 

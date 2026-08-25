@@ -15,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/metrics"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
@@ -24,8 +25,13 @@ import (
 type Runner struct {
 	// genreBackfillEmpty records artists MusicBrainz reports no genres for, so
 	// the backfill lookup is not repeated on every scheduled sync.
-	genreBackfillEmpty        map[int64]time.Time
-	genreBackfillMu           sync.Mutex
+	genreBackfillEmpty map[int64]time.Time
+	genreBackfillMu    sync.Mutex
+	// logHealth reports the application-log sink's loss counters. It is set
+	// after construction and read from the maintenance goroutine, so it is
+	// guarded rather than assumed immutable.
+	logHealth                 func() logging.SinkHealth
+	logHealthMu               sync.RWMutex
 	store                     *store.Store
 	catalog                   catalog.CatalogProvider
 	spotify                   catalog.SpotifyReleaseProvider
@@ -844,6 +850,27 @@ func (r *Runner) runSyncCadence(ctx context.Context) {
 	}
 }
 
+// SetLogHealth wires the application-log sink's counters into the hourly
+// operational snapshot. It mirrors the web App's hook because both derive the
+// same status from the same numbers, and is set after construction because the
+// sink is built around the store this Runner already holds.
+func (r *Runner) SetLogHealth(report func() logging.SinkHealth) {
+	r.logHealthMu.Lock()
+	r.logHealth = report
+	r.logHealthMu.Unlock()
+}
+
+// logSinkHealth reports the sink counters, or zeroes when nothing is wired.
+func (r *Runner) logSinkHealth() logging.SinkHealth {
+	r.logHealthMu.RLock()
+	report := r.logHealth
+	r.logHealthMu.RUnlock()
+	if report == nil {
+		return logging.SinkHealth{}
+	}
+	return report()
+}
+
 func (r *Runner) runMaintenance(ctx context.Context) {
 	r.metrics.RecordMaintenance()
 	now := time.Now().UTC()
@@ -908,6 +935,17 @@ func (r *Runner) runMaintenance(ctx context.Context) {
 	if snapshot, err := r.store.Diagnostics(ctx); err != nil {
 		r.logger.Warn("operational snapshot capture failed", "error", err)
 	} else {
+		// The sink counters live in the process, not the database, so
+		// Store.Diagnostics cannot see them. Without this the persisted history
+		// could never record log loss at all: the admin banner would say
+		// degraded while the 24-hour history it sits above said healthy for the
+		// same moment.
+		health := r.logSinkHealth()
+		snapshot.DroppedLogEntries, snapshot.LogWriteFailures = health.Dropped, health.Errors
+		if !health.LastLossAt.IsZero() {
+			lossAt := health.LastLossAt
+			snapshot.LastLogLossAt = &lossAt
+		}
 		status, _ := store.OperationalStatus(snapshot, "running", now)
 		if err := r.store.RecordOperationalSnapshot(ctx, snapshot, status, "running"); err != nil {
 			r.logger.Warn("operational snapshot persistence failed", "error", err)
@@ -1029,14 +1067,16 @@ func (r *Runner) refreshListenBrainz(ctx context.Context, now time.Time) (int, e
 	missingIDs := make([]int64, 0)
 	for _, artist := range eligible {
 		stats, ok := values[strings.ToLower(strings.TrimSpace(artist.MBID))]
-		if !ok {
-			// ListenBrainz may legitimately omit an MBID from a successful
-			// response. Do not overwrite known totals with zeros; just move the
+		if !ok || !stats.HasData() {
+			// ListenBrainz echoes back every MBID it was asked about and uses
+			// JSON null for the counts when it has no data. Both shapes mean the
+			// same thing: do not overwrite known totals with zeros, just move the
 			// next refresh forward while retaining the previous row.
 			missingIDs = append(missingIDs, artist.ID)
 			continue
 		}
-		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: stats.TotalListenCount, TotalUserCount: stats.TotalUserCount}
+		listens, users := stats.Counts()
+		byID[artist.ID] = store.ListenBrainzStats{ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: listens, TotalUserCount: users}
 	}
 	if err := r.store.SaveListenBrainzStats(ctx, byID, now, now.Add(24*time.Hour)); err != nil {
 		return 0, err
@@ -1054,7 +1094,20 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 		r.logger.Warn("manual synchronization queue failed", "error", err)
 		return 0
 	}
+	processed := 0
 	for _, req := range requests {
+		// Do not start new work once the runner is shutting down. This covers
+		// cancellation observed BETWEEN requests, where the previous one
+		// finished cleanly and so produced no error to react to; a request
+		// interrupted mid-work is handled by the check before the completion
+		// write below. Leaving a claimed request untouched lets its lease lapse
+		// so the next run picks it up intact, which is what the delivery path
+		// already does.
+		if err := ctx.Err(); err != nil {
+			r.logger.Info("manual synchronization stopped for shutdown; claimed requests will be retried",
+				"remaining", len(requests)-processed)
+			break
+		}
 		var syncErr error
 		if req.Scope == "artist" && req.ArtistID != nil {
 			var artist store.Artist
@@ -1090,14 +1143,27 @@ func (r *Runner) processManualSyncRequests(ctx context.Context, now time.Time) i
 		// Completion must remain durable even when the runner context was
 		// cancelled during shutdown. Keep it bounded while allowing the write
 		// to finish independently of the cancelled work context.
+		// A request interrupted by shutdown is not a failed request. The
+		// completion write detaches from cancellation on purpose, so writing a
+		// terminal state here would durably record "failed" and clear the lease
+		// - which is precisely what stops RecoverExpiredWork re-queueing it.
+		// Leaving the lease to lapse is what makes the interruption heal.
+		if errors.Is(syncErr, context.Canceled) || errors.Is(syncErr, context.DeadlineExceeded) {
+			r.logger.Info("manual synchronization interrupted; request will be retried",
+				"request_id", req.ID)
+			break
+		}
 		completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		completionErr := r.store.CompleteManualSyncRequestOwned(completionCtx, req.ID, r.workerID, syncErr)
 		cancel()
 		if completionErr != nil {
 			r.logger.Warn("manual synchronization completion failed", "request_id", req.ID, "error", completionErr)
 		}
+		processed++
 	}
-	return len(requests)
+	// Report what was actually retired, not what was claimed: after a shutdown
+	// break the remainder keep their lease and are picked up by the next run.
+	return processed
 }
 
 func (r *Runner) ResolveArtistResolutionNow(ctx context.Context, resolution store.ArtistResolution) (string, error) {
@@ -1138,6 +1204,13 @@ func (r *Runner) resolveArtistResolutions(ctx context.Context, now time.Time) (r
 		return summary, err
 	}
 	for _, resolution := range resolutions {
+		// Same reason as the artist loop: a cancelled runner must not report
+		// untouched resolutions as failures.
+		if ctx.Err() != nil {
+			r.logger.Info("artist resolution stopped for shutdown",
+				"remaining", len(resolutions)-summary.Processed)
+			break
+		}
 		summary.Processed++
 		status, err := r.resolveArtistResolution(ctx, resolution, now)
 		if err != nil {
@@ -1340,15 +1413,20 @@ func (r *Runner) itunesReleasesForArtist(ctx context.Context, artist store.Artis
 	releases, resolvedID, resolvedURL, err := canonical.ArtistReleasesForCanonical(
 		ctx, artist.MBID, artist.Name, providerID,
 	)
-	if err != nil {
+	// A truncated catalogue is reported alongside usable releases rather than
+	// instead of them, so it must not discard them here either. The identity is
+	// still worth saving: the lookup succeeded, it was only incomplete.
+	truncated := &catalog.ITunesCatalogTruncatedError{}
+	catalogTruncated := errors.As(err, &truncated)
+	if err != nil && !catalogTruncated {
 		return nil, err
 	}
 	if strings.TrimSpace(resolvedID) != "" && (!found || identity.ProviderID != resolvedID) {
-		if err := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); err != nil {
-			return nil, fmt.Errorf("persist iTunes artist identity: %w", err)
+		if saveErr := r.store.SaveArtistProviderIdentity(ctx, artist.ID, "itunes", resolvedID, resolvedURL); saveErr != nil {
+			return nil, fmt.Errorf("persist iTunes artist identity: %w", saveErr)
 		}
 	}
-	return releases, nil
+	return releases, err
 }
 
 func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, error) {
@@ -1365,6 +1443,16 @@ func (r *Runner) syncArtists(ctx context.Context, now time.Time) (syncStats, err
 	}
 	summary.Due = len(artists)
 	for _, artist := range artists {
+		// Stop rather than counting untouched work as failures. Once the runner
+		// context is cancelled every remaining artist fails on its first store
+		// call, so a graceful shutdown wrote a burst of "artist sync failed"
+		// warnings and inflated summary.Failed for artists nothing had tried.
+		// The delivery path already skips instead of failing for this reason.
+		if ctx.Err() != nil {
+			r.logger.Info("artist synchronization stopped for shutdown",
+				"remaining", summary.Due-(summary.Succeeded+summary.Failed))
+			break
+		}
 		outcome, err := r.syncOne(ctx, artist, now)
 		if err != nil {
 			summary.Failed++
@@ -1791,7 +1879,16 @@ func (r *Runner) deliver(ctx context.Context, now time.Time) (deliveryStats, err
 // cannot wait indefinitely on a locked database.
 // deliveryStateBudget bounds each durable state transition. It is a variable so
 // tests can shrink it; nothing outside tests reassigns it.
-var deliveryStateBudget = 5 * time.Second
+// It must exceed store.BusyTimeout by enough to cover the bounded retry loop,
+// or that loop is unreachable in both directions: a genuine SQLITE_BUSY only
+// surfaces after the busy timeout has already burned the whole budget, and
+// in-process contention on the single writer connection queues in database/sql
+// and surfaces as a deadline error, which the retry loop treats as settled. The
+// caller then records a notification the provider already accepted as failed.
+//
+// Four retries back off 25+50+100+200ms, so the headroom is one further busy
+// timeout plus that, rounded up.
+var deliveryStateBudget = 2*store.BusyTimeout + time.Second
 
 func deliveryStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.Background()

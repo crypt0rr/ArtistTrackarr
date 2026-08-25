@@ -102,3 +102,86 @@ func TestProviderNotContactedCoversEveryEmittedStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestFirstProviderObservationNeverStoresTheSentinel is #268. The jobs layer
+// passes ReleaseCount = -1 to mean "no batch this time, keep whatever was
+// observed before". That sentinel is decoded only by the ON CONFLICT clauses, so
+// on the FIRST row for an (artist, provider) pair it was written into the column
+// verbatim - and every later upsert then took the preserve branch and kept -1
+// forever, until that provider first returned a healthy batch. With no Spotify
+// credentials configured that never happens, so the Trust Center rendered
+// "-1 releases returned" permanently.
+func TestFirstProviderObservationNeverStoresTheSentinel(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "sentinel-artist", Name: "Sentinel Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+
+	stored := func(provider string) int {
+		t.Helper()
+		var count int
+		if err := s.DB.QueryRowContext(ctx,
+			`SELECT release_count FROM artist_provider_status WHERE artist_id=? AND provider=?`,
+			artist.ID, provider).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	// A first observation that contacted nothing - the not_configured path a
+	// deployment without Spotify credentials takes on every single sync.
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "spotify", Status: "not_configured",
+		ReleaseCount: -1, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored("spotify"); got < 0 {
+		t.Fatalf("first observation stored the sentinel verbatim: release_count=%d", got)
+	}
+
+	// A first observation on the contacted path must not store it either.
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "failed",
+		ReleaseCount: -1, LastError: "upstream unavailable", UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored("musicbrainz"); got < 0 {
+		t.Fatalf("first contacted observation stored the sentinel: release_count=%d", got)
+	}
+
+	// The sentinel must still PRESERVE a real count once one exists.
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "healthy",
+		ReleaseCount: 17, UpdatedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored("musicbrainz"); got != 17 {
+		t.Fatalf("a healthy observation did not store its count: release_count=%d", got)
+	}
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "failed",
+		ReleaseCount: -1, LastError: "upstream unavailable", UpdatedAt: now.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored("musicbrainz"); got != 17 {
+		t.Fatalf("the sentinel failed to preserve the previous count: release_count=%d, want 17", got)
+	}
+	// And a genuine zero must still overwrite, or a provider that legitimately
+	// returns nothing would report a stale count forever.
+	if err := s.RecordArtistProviderStatus(ctx, ArtistProviderStatus{
+		ArtistID: artist.ID, Provider: "musicbrainz", Status: "healthy",
+		ReleaseCount: 0, UpdatedAt: now.Add(3 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored("musicbrainz"); got != 0 {
+		t.Fatalf("a genuine zero did not overwrite: release_count=%d", got)
+	}
+}

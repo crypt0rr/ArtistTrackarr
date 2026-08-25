@@ -39,20 +39,31 @@ func TestListenBrainzPopularityParsesAndCaches(t *testing.T) {
 	provider.requestEvery = 0
 	provider.cacheTTL = time.Hour
 	first, err := provider.Popularity(context.Background(), []string{"abc"})
-	if err != nil || first["abc"].TotalListenCount != 1234 || first["abc"].TotalUserCount != 56 {
+	if err != nil || derefCount(first["abc"].TotalListenCount) != 1234 || derefCount(first["abc"].TotalUserCount) != 56 {
 		t.Fatalf("first stats=%#v err=%v", first, err)
 	}
 	second, err := provider.Popularity(context.Background(), []string{"ABC"})
-	if err != nil || second["abc"].TotalListenCount != 1234 || requests.Load() != 1 {
+	if err != nil || derefCount(second["abc"].TotalListenCount) != 1234 || requests.Load() != 1 {
 		t.Fatalf("cached stats=%#v requests=%d err=%v", second, requests.Load(), err)
 	}
 }
 
 func TestMergeListenBrainzStatsPrefersFreshValues(t *testing.T) {
-	base := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: 1}}
-	extra := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: 2}, "other": {MBID: "other"}}
+	base := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: countPtr(1)}}
+	extra := map[string]ListenBrainzArtistStats{"artist": {MBID: "artist", TotalListenCount: countPtr(2)}, "other": {MBID: "other"}}
 	merged := mergeListenBrainzStats(base, extra)
-	if len(merged) != 2 || merged["artist"].TotalListenCount != 2 || merged["other"].MBID != "other" {
+	if len(merged) != 2 || derefCount(merged["artist"].TotalListenCount) != 2 || merged["other"].MBID != "other" {
 		t.Fatalf("merged stats=%#v", merged)
 	}
+}
+
+// countPtr and derefCount keep these tests readable now that the counts are
+// pointers, which is what lets a null response be told apart from a real zero.
+func countPtr(v int64) *int64 { return &v }
+
+func derefCount(v *int64) int64 {
+	if v == nil {
+		return -1
+	}
+	return *v
 }

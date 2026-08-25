@@ -140,3 +140,31 @@ func TestArtistsPageListContextOmitsTheSearchTerm(t *testing.T) {
 		t.Fatalf("list parameters missing from the page context: %q", got)
 	}
 }
+
+// TestManualSyncRedirectShowsAQueuedMessage backs the container smoke test's new
+// assertion. syncArtist answers 303 on both branches - queued and "could not be
+// queued" - so the smoke test's `curl --fail` without -L treated a failed sync
+// as a pass and then printed that manual sync passed. It now follows the
+// redirect and greps for this text, which only holds if the text really renders.
+func TestManualSyncRedirectShowsAQueuedMessage(t *testing.T) {
+	database, server, client := authenticatedTestServer(t, nil, nil, nil)
+	ctx := context.Background()
+	user, err := database.UserByEmail(ctx, "member@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "smoke-sync-artist", Name: "Smoke Sync Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, user.ID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	csrf := getCSRF(t, client, server.URL+"/artists")
+	response := postForm(t, client, fmt.Sprintf("%s/artists/%d/sync", server.URL, artist.ID), url.Values{"_csrf": {csrf}})
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !strings.Contains(string(body), "Synchronization queued") {
+		t.Fatalf("the followed redirect does not render the queued message the smoke test greps for: %s", body)
+	}
+}

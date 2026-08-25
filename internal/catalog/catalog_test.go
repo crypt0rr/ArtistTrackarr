@@ -432,7 +432,7 @@ func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
 				if provider == "spotify" {
 					got, _, _ = spotifyReleaseType("single", "single", "", tracks)
 				} else {
-					got = iTunesReleaseType("", tracks)
+					got, _ = iTunesReleaseType("", tracks, "Solo Artist")
 				}
 				if got != "EP" {
 					t.Fatalf("%s %d-track release=%q, want EP", provider, tracks, got)
@@ -455,7 +455,7 @@ func TestSharedReleaseTypeHeuristicAcrossProviders(t *testing.T) {
 				if provider == "spotify" {
 					got, _, ok = spotifyReleaseType("album", "", test.title, 0)
 				} else {
-					got = iTunesReleaseType(test.title, 0)
+					got, _ = iTunesReleaseType(test.title, 0, "Solo Artist")
 					ok = got != ""
 				}
 				if !ok || got != test.want {
@@ -1710,14 +1710,50 @@ func TestITunesAlbumLookupIssuesOneRequestBecauseOffsetIsIgnored(t *testing.T) {
 	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
 	releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
 		"11111111-1111-4111-8111-111111111111", "Prolific Artist", "42")
-	if err != nil {
-		t.Fatalf("a full page was reported as an error instead of a bound: %v", err)
+	// The releases must still be returned - discarding a prolific artist's
+	// catalogue is what #186 fixed - but a full page also means Apple truncated
+	// it, and that is now reported alongside them rather than passed off as a
+	// clean result. Verified live: limit=150 yields 150 collections while 200,
+	// 250 and 300 all yield exactly 200.
+	truncated := &ITunesCatalogTruncatedError{}
+	if !errors.As(err, &truncated) {
+		t.Fatalf("a full page was not reported as truncated: %v", err)
+	}
+	if truncated.Limit != 200 {
+		t.Fatalf("truncation limit=%d, want 200", truncated.Limit)
 	}
 	if len(releases) != 200 {
-		t.Fatalf("releases=%d, want the full page of 200", len(releases))
+		t.Fatalf("releases=%d, want the full page of 200 kept despite the truncation signal", len(releases))
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("upstream requests=%d, want exactly 1", got)
+	}
+}
+
+// TestITunesShortPageIsNotReportedAsTruncated keeps the signal off the ordinary
+// case: an artist whose catalogue fits under the cap must produce no truncation
+// error, or every sync would degrade the provider and force a pointless fallback.
+func TestITunesShortPageIsNotReportedAsTruncated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rows := []string{`{"wrapperType":"artist","artistType":"Artist","artistId":43,"artistName":"Modest Artist"}`}
+		for id := 1; id <= 12; id++ {
+			rows = append(rows, fmt.Sprintf(
+				`{"wrapperType":"collection","collectionType":"Album","collectionId":%d,"collectionName":"Album %d","artistName":"Modest Artist","releaseDate":"2026-09-01T00:00:00Z","trackCount":10}`,
+				2000+id, id))
+		}
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"resultCount":%d,"results":[`, len(rows))+strings.Join(rows, ",")+`]}`)
+	}))
+	defer server.Close()
+	itunes := NewITunes("US")
+	itunes.baseURL, itunes.client, itunes.requestInterval = server.URL, server.Client(), 0
+	releases, _, _, err := itunes.ArtistReleasesForCanonical(context.Background(),
+		"22222222-2222-4222-8222-222222222222", "Modest Artist", "43")
+	if err != nil {
+		t.Fatalf("a short page reported an error: %v", err)
+	}
+	if len(releases) != 12 {
+		t.Fatalf("releases=%d, want 12", len(releases))
 	}
 }
 
@@ -1746,6 +1782,94 @@ func TestPreferredSpotifyImagePicksADisplayableRendition(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := preferredSpotifyImage(test.images); got != test.want {
 				t.Fatalf("preferredSpotifyImage=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestITunesGuestCreditsReadTheTrackTitle is #257. Apple expresses a feature two
+// ways: inside artistName ("Ariana Grande, Normani & Nicki Minaj") or - far more
+// commonly - by leaving artistName as the lead artist and putting the feature in
+// trackName ("Side To Side (feat. Nicki Minaj)"). Only the first was checked, so
+// the second was discarded even though the search had already returned and paid
+// for it. Measured against the live endpoint on 2026-08-24, 31 of 50 rows for
+// one artist carried the credit only in the track title.
+func TestITunesGuestCreditsReadTheTrackTitle(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		artistName string
+		trackName  string
+		followed   string
+		want       bool
+	}{
+		{
+			name: "feature in the track title", artistName: "Justin Bieber",
+			trackName: "Beauty and a Beat (feat. Nicki Minaj)", followed: "Nicki Minaj", want: true,
+		},
+		{
+			name: "feature in the artist string", artistName: "Ariana Grande, Normani & Nicki Minaj",
+			trackName: "Bad To You", followed: "Nicki Minaj", want: true,
+		},
+		{
+			name: "the artist's own release is not a guest credit", artistName: "Nicki Minaj",
+			trackName: "Super Bass", followed: "Nicki Minaj", want: false,
+		},
+		{
+			name: "an unrelated track", artistName: "Justin Bieber",
+			trackName: "Sorry", followed: "Nicki Minaj", want: false,
+		},
+		{
+			name: "a different artist with a similar-looking title", artistName: "Drake",
+			trackName: "Nice For What", followed: "Nicki Minaj", want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := creditsFollowedArtist(test.artistName, test.trackName, test.followed); got != test.want {
+				t.Fatalf("creditsFollowedArtist(%q, %q, %q)=%v, want %v",
+					test.artistName, test.trackName, test.followed, got, test.want)
+			}
+		})
+	}
+}
+
+// TestITunesCompilationsCarryTheSecondaryType is #258. iTunesReleaseType
+// hard-coded its kind to "album" and discarded the secondary types, so the one
+// branch that emits "Compilation" could never fire and store.Release.
+// SecondaryTypes was always nil for iTunes releases. The per-follow Compilations
+// toggle therefore had nothing to match: it worked on a Spotify deployment and
+// silently did nothing on an iTunes one.
+//
+// Apple's album-lookup payload carries no compilation flag at all - verified
+// live on 2026-08-24, no collectionType distinction and no collectionArtistName
+// on collection rows - so the artist label is the only available signal, and it
+// is localised per storefront.
+func TestITunesCompilationsCarryTheSecondaryType(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		artist     string
+		trackCount int
+		want       []string
+	}{
+		{name: "US and GB label", artist: "Various Artists", trackCount: 14, want: []string{"Compilation"}},
+		{name: "German and French label", artist: "Multi-interprètes", trackCount: 12, want: []string{"Compilation"}},
+		{name: "Japanese label", artist: "ヴァリアス・アーティスト", trackCount: 18, want: []string{"Compilation"}},
+		{name: "a real artist is never a compilation", artist: "Nicki Minaj", trackCount: 14, want: nil},
+		{name: "an empty artist is not a compilation", artist: "", trackCount: 14, want: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary, secondary := iTunesReleaseType("Jazz Loves Disney", test.trackCount, test.artist)
+			if len(secondary) != len(test.want) {
+				t.Fatalf("secondary types=%v for artist %q, want %v", secondary, test.artist, test.want)
+			}
+			for i := range test.want {
+				if secondary[i] != test.want[i] {
+					t.Fatalf("secondary types=%v, want %v", secondary, test.want)
+				}
+			}
+			// A compilation stays an Album regardless of track count, which is
+			// what the shared heuristic already guarantees.
+			if len(test.want) > 0 && primary != "Album" {
+				t.Fatalf("compilation primary type=%q, want Album", primary)
 			}
 		})
 	}

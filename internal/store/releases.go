@@ -130,14 +130,6 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 						return fmt.Errorf("enqueue initial release event: %w", err)
 					}
 				}
-				for _, item := range savedReleases {
-					for _, role := range releaseCreditRoles(item.release, item.provider) {
-						if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
-							_ = tx.Rollback()
-							return err
-						}
-					}
-				}
 				if _, err := tx.ExecContext(ctx, `UPDATE follows SET baseline_synced_at=? WHERE user_id=? AND artist_id=?`,
 					timeText(observed), follower.id, artist.ID); err != nil {
 					_ = tx.Rollback()
@@ -160,12 +152,6 @@ func (s *Store) ApplyReleaseBatches(ctx context.Context, artist Artist, batches 
 			for _, item := range savedReleases {
 				if item.provider == "spotify" && !follower.spotifyBaseline {
 					continue
-				}
-				for _, role := range releaseCreditRoles(item.release, item.provider) {
-					if _, err := ensureCreditBaselineTx(ctx, tx, follower.id, artist.ID, item.provider, role, observed); err != nil {
-						_ = tx.Rollback()
-						return err
-					}
 				}
 				date, full := releaseDate(item.release.FirstReleaseDate)
 				// Keep the seven-day discovery window for normal polling, but

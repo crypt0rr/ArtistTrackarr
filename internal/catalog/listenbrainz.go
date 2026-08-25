@@ -18,9 +18,30 @@ import (
 // ListenBrainzArtistStats contains only public aggregate statistics. No user
 // identity, token, or private listening history is retained.
 type ListenBrainzArtistStats struct {
-	MBID             string `json:"artist_mbid"`
-	TotalListenCount int64  `json:"total_listen_count"`
-	TotalUserCount   int64  `json:"total_user_count"`
+	MBID string `json:"artist_mbid"`
+	// Pointers because ListenBrainz echoes back every MBID it was asked about and
+	// uses JSON null for the counts when it has no data for one - verified live
+	// on 2026-08-25. With int64 targets encoding/json leaves the field at zero, so
+	// "no data" was indistinguishable from "genuinely zero listeners" and the
+	// caller's guard against overwriting known totals could never fire.
+	TotalListenCount *int64 `json:"total_listen_count"`
+	TotalUserCount   *int64 `json:"total_user_count"`
+}
+
+// HasData reports whether ListenBrainz actually returned counts for this artist.
+func (s ListenBrainzArtistStats) HasData() bool {
+	return s.TotalListenCount != nil || s.TotalUserCount != nil
+}
+
+// Counts returns the reported totals, with absent values as zero.
+func (s ListenBrainzArtistStats) Counts() (listens, users int64) {
+	if s.TotalListenCount != nil {
+		listens = *s.TotalListenCount
+	}
+	if s.TotalUserCount != nil {
+		users = *s.TotalUserCount
+	}
+	return listens, users
 }
 
 type ListenBrainz struct {

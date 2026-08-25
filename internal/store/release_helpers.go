@@ -330,40 +330,6 @@ func normalizedCreditRole(value string) string {
 	}
 }
 
-func releaseHasNonPrimaryCredit(release Release) bool {
-	if normalizedCreditRole(release.ArtistCreditRole) != "primary" {
-		return true
-	}
-	for _, credit := range release.Credits {
-		if normalizedCreditRole(credit.Role) != "primary" {
-			return true
-		}
-	}
-	return false
-}
-
-func releaseCreditRoles(release Release, provider string) []string {
-	roles := make(map[string]bool)
-	for _, credit := range release.Credits {
-		if strings.TrimSpace(credit.Provider) != "" && !strings.EqualFold(strings.TrimSpace(credit.Provider), provider) {
-			continue
-		}
-		role := normalizedCreditRole(credit.Role)
-		if role != "primary" {
-			roles[role] = true
-		}
-	}
-	if len(roles) == 0 && releaseHasNonPrimaryCredit(release) {
-		roles[normalizedCreditRole(release.ArtistCreditRole)] = true
-	}
-	result := make([]string, 0, len(roles))
-	for role := range roles {
-		result = append(result, role)
-	}
-	sort.Strings(result)
-	return result
-}
-
 func mergeReleaseCredits(existing, incoming []ReleaseCredit) []ReleaseCredit {
 	result := append([]ReleaseCredit(nil), existing...)
 	seen := make(map[string]bool, len(result))
@@ -383,25 +349,6 @@ func mergeReleaseCredits(existing, incoming []ReleaseCredit) []ReleaseCredit {
 	return result
 }
 
-// ensureCreditBaselineTx returns true when this call created the baseline.
-// Baselines are owner-scoped and provider/role-specific so one provider's
-// historical backlog cannot suppress a newly observed credit from another.
-func ensureCreditBaselineTx(ctx context.Context, tx *sql.Tx, userID, artistID int64,
-	provider, role string, observed time.Time) (bool, error) {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	role = normalizedCreditRole(role)
-	if role == "primary" || (provider != "spotify" && provider != "itunes" && provider != "musicbrainz") {
-		return false, nil
-	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO follow_credit_baselines
-		(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`,
-		userID, artistID, provider, role, timeText(observed))
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	return affected > 0, err
-}
 func validITunesArtworkURL(value string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.Path == "" || parsed.Port() != "" ||
@@ -654,7 +601,31 @@ func creditTrackSuffix(trackTitle string) string {
 	}
 	return fmt.Sprintf(" on the track %q", trackTitle)
 }
-func releaseExternalURL(release Release) string {
+
+// ReleaseLink is the single definition of "the link for a release".
+//
+// It honours a confirmed truth decision before falling back to the provider
+// preference order. There were three copies of this: the web template helper was
+// truth-aware, while the ICS description and the digest and notification bodies
+// were the same fallback chain with the TruthProvider switch missing - so a
+// household that had explicitly confirmed which source represents a release
+// still had every alert and calendar entry link somewhere else. TruthProvider is
+// populated on the rows all three receive, so the data was present and ignored.
+func ReleaseLink(release Release) string {
+	switch release.TruthProvider {
+	case "spotify":
+		if release.SpotifyURL != "" {
+			return release.SpotifyURL
+		}
+	case "itunes":
+		if release.ITunesURL != "" {
+			return release.ITunesURL
+		}
+	case "musicbrainz":
+		if release.MusicBrainzURL != "" {
+			return release.MusicBrainzURL
+		}
+	}
 	if release.SpotifyURL != "" {
 		return release.SpotifyURL
 	}
@@ -662,6 +633,10 @@ func releaseExternalURL(release Release) string {
 		return release.ITunesURL
 	}
 	return release.MusicBrainzURL
+}
+
+func releaseExternalURL(release Release) string {
+	return ReleaseLink(release)
 }
 func comparableReleaseDate(value string) (time.Time, bool) {
 	layout := ""

@@ -69,6 +69,13 @@ func Open(path string) (*Store, error) {
 // '?' and '#' to become URI query/fragment delimiters. Keep path separators
 // unescaped so SQLite preserves absolute and relative path semantics while
 // escaping every other path component character.
+// BusyTimeout is how long SQLite waits for a lock before returning SQLITE_BUSY.
+// It is exported because callers that bound a write with their own deadline must
+// allow for it: a budget equal to this value leaves no room for the bounded
+// retry loop to run, so a genuine contention error can only ever surface as an
+// expired context.
+const BusyTimeout = 5 * time.Second
+
 func sqliteDSN(path string, readOnly bool) string {
 	escapedPath := strings.ReplaceAll(url.PathEscape(filepath.ToSlash(path)), "%2F", "/")
 	query := url.Values{}

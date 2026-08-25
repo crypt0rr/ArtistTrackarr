@@ -15,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/artist-tracker/internal/artwork"
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -2315,7 +2316,7 @@ func TestRefreshListenBrainzSuccessFiltersUndatedArtists(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &listenBrainzStatsProvider{values: map[string]catalog.ListenBrainzArtistStats{
-		"lb-one": {MBID: "LB-ONE", TotalListenCount: 123456, TotalUserCount: 789},
+		"lb-one": {MBID: "LB-ONE", TotalListenCount: lbCount(123456), TotalUserCount: lbCount(789)},
 	}}
 	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
 	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
@@ -2710,5 +2711,329 @@ func TestDigestDeliveryOutcomeIsRecordedAfterCancellation(t *testing.T) {
 	})
 	if result.failed || !result.sent {
 		t.Fatalf("a digest the provider accepted was not recorded during shutdown: %#v", result)
+	}
+}
+
+// cancellingCatalog cancels the runner context while the first request of a
+// batch is being processed, which is what a SIGTERM landing after the claim but
+// during the loop actually looks like. Cancelling before the call instead makes
+// the claim itself fail, so no request is ever touched and the defect cannot
+// appear - which is why an already-cancelled context proves nothing here.
+type cancellingCatalog struct {
+	cancel context.CancelFunc
+	calls  atomic.Int32
+}
+
+func (c *cancellingCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
+	return nil, nil
+}
+
+func (c *cancellingCatalog) ResolveArtist(context.Context, string) (catalog.ArtistResult, error) {
+	return catalog.ArtistResult{}, nil
+}
+
+func (c *cancellingCatalog) ResolveExternalArtist(context.Context, string) ([]catalog.ArtistResult, error) {
+	return nil, nil
+}
+
+func (c *cancellingCatalog) ArtistReleases(context.Context, string) ([]store.Release, error) {
+	if c.calls.Add(1) == 1 && c.cancel != nil {
+		c.cancel()
+	}
+	return nil, nil
+}
+
+// TestShutdownLeavesManualSyncRequestsRetryable is #255. The manual-sync loop
+// claimed up to three requests with a five-minute lease and iterated them with
+// no cancellation guard. When a shutdown landed mid-batch the first store call
+// failed with context.Canceled, and because the completion write deliberately
+// detaches from cancellation it then SUCCEEDED - durably writing status='failed'
+// and clearing the lease, which is exactly what stops RecoverExpiredWork healing
+// the interruption. Requests still claimed but never touched were retired the
+// same way, so a member's "Sync now" came back as a permanent failure that never
+// actually happened.
+func TestShutdownLeavesManualSyncRequestsRetryable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	now := time.Now().UTC()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "manual-sync@example.com", "hash", "member", "UTC", "manual-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three requests, so the batch has work left after the shutdown lands.
+	for i := 0; i < 3; i++ {
+		artist, err := database.UpsertArtist(ctx, store.Artist{
+			MBID: fmt.Sprintf("manual-sync-artist-%d", i), Name: fmt.Sprintf("Manual Sync Artist %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.CreateManualSyncRequest(ctx, userID, "artist", &artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The claim succeeds on a live context; cancellation lands while the first
+	// request is being processed.
+	runner := New(database, &cancellingCatalog{cancel: cancel}, catalog.AlbumEPNormalizer{}, nil, nil,
+		time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	runner.processManualSyncRequests(ctx, now)
+
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the runner context should have been cancelled during the batch")
+	}
+	var failed int
+	if err := database.DB.QueryRow(
+		`SELECT COUNT(*) FROM manual_sync_requests WHERE requested_by=? AND status='failed'`, userID).
+		Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed > 0 {
+		t.Fatalf("%d queued Sync now requests were durably marked failed by a shutdown, so RecoverExpiredWork cannot heal them", failed)
+	}
+	// The untouched requests must keep a lease that can lapse, so the next run
+	// picks them up intact.
+	var retryable int
+	if err := database.DB.QueryRow(
+		`SELECT COUNT(*) FROM manual_sync_requests WHERE requested_by=? AND status IN ('queued','running')`, userID).
+		Scan(&retryable); err != nil {
+		t.Fatal(err)
+	}
+	if retryable == 0 {
+		t.Fatal("no manual sync request survived the shutdown in a retryable state")
+	}
+}
+
+// TestTruncatedITunesCatalogueDoesNotSuppressTheFallback is #256. Apple's lookup
+// endpoint hard-caps at 200 collections and ignores offset, so a prolific
+// artist's catalogue arrives as an arbitrary, non-chronological subset. The
+// releases found are still worth importing, but reporting the fetch as a clean
+// success set observation.succeeded, and succeeded is exactly what suppresses
+// the MusicBrainz observation that would have supplied the missing releases —
+// so the gap was never filled and the provider status read healthy.
+//
+// Verified live on 2026-08-24: limit=150 returns 150 collections while
+// limit=200, 250 and 300 all return exactly 200.
+func TestTruncatedITunesCatalogueDoesNotSuppressTheFallback(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "trunc-artist", Name: "Trunc Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := []store.Release{{MBID: "trunc-release", ArtistID: artist.ID, Title: "Trunc Release",
+		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes"}}
+	provider := &canonicalITunesReleaseCatalog{
+		releases: found,
+		err:      &catalog.ITunesCatalogTruncatedError{ArtistID: "42", Limit: 200},
+	}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+
+	observation, err := runner.observeITunes(ctx, artist, now, true)
+	if err != nil {
+		t.Fatalf("a truncated catalogue was reported as a failure: %v", err)
+	}
+	// The partial catalogue is still imported.
+	if len(observation.releases) != 1 {
+		t.Fatalf("releases=%d, want the partial catalogue kept", len(observation.releases))
+	}
+	// But it must not count as success, or MusicBrainz never runs.
+	if observation.succeeded {
+		t.Fatal("a truncated iTunes catalogue counted as success, so the MusicBrainz fallback that would fill the gap is suppressed")
+	}
+	if observation.status != "degraded" {
+		t.Fatalf("status=%q for a truncated catalogue, want degraded", observation.status)
+	}
+	if observation.lastError == "" {
+		t.Fatal("truncation was not recorded as a provider reason, so an operator sees a healthy check")
+	}
+}
+
+// TestCompleteITunesCatalogueStillCountsAsSuccess keeps the change off the
+// ordinary path: an artist under the cap must still short-circuit the fallback,
+// or every sync would make a pointless MusicBrainz request.
+func TestCompleteITunesCatalogueStillCountsAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "whole-artist", Name: "Whole Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &canonicalITunesReleaseCatalog{releases: []store.Release{{
+		MBID: "whole-release", ArtistID: artist.ID, Title: "Whole Release",
+		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes",
+	}}}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+	observation, err := runner.observeITunes(ctx, artist, time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observation.succeeded || observation.status != "healthy" {
+		t.Fatalf("a complete catalogue observation=%#v, want succeeded and healthy", observation)
+	}
+}
+
+// TestPersistedSnapshotRecordsLogLoss is #276, the other half of #267. The sink
+// counters live in the process rather than the database, so Store.Diagnostics
+// cannot see them and the hourly snapshot persisted by the scheduler could never
+// record log loss - the admin banner could read "degraded" while the 24-hour
+// history shown directly above it reported "healthy" for the same moment.
+func TestPersistedSnapshotRecordsLogLoss(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// No hook wired: the snapshot is healthy.
+	runner.runMaintenance(ctx)
+	var status string
+	if err := database.DB.QueryRow(
+		`SELECT status FROM operational_snapshots ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "degraded" {
+		t.Fatalf("baseline snapshot is already degraded (%q), so this test cannot show the difference", status)
+	}
+
+	// With loss reported, the persisted status must follow.
+	runner.SetLogHealth(func() logging.SinkHealth {
+		return logging.SinkHealth{Dropped: 5, LastLossAt: time.Now().UTC()}
+	})
+	runner.runMaintenance(ctx)
+	if err := database.DB.QueryRow(
+		`SELECT status FROM operational_snapshots ORDER BY id DESC LIMIT 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "degraded" {
+		t.Fatalf("persisted status=%q with active log loss, want degraded - the history cannot record what the banner shows", status)
+	}
+}
+
+// TestDeliveryStateBudgetExceedsTheBusyTimeout is #271. The durable-state budget
+// was exactly the SQLite busy_timeout, which made the bounded write-retry loop
+// unreachable in both directions: a genuine SQLITE_BUSY can only surface after
+// the busy timeout has already burned the whole budget, and in-process
+// contention on the single writer connection queues inside database/sql and
+// surfaces as a deadline error, which the retry loop treats as settled rather
+// than retrying. performDelivery then recorded a notification the provider had
+// already accepted as failed, leaving the row untouched with its claim set.
+func TestDeliveryStateBudgetExceedsTheBusyTimeout(t *testing.T) {
+	if deliveryStateBudget <= store.BusyTimeout {
+		t.Fatalf("deliveryStateBudget=%s does not exceed the SQLite busy timeout %s, so the write-retry loop can never run",
+			deliveryStateBudget, store.BusyTimeout)
+	}
+	// It needs room for the retry backoffs on top, not merely one nanosecond
+	// more, or the loop still cannot complete an attempt.
+	const retryBackoffs = 25*time.Millisecond + 50*time.Millisecond + 100*time.Millisecond + 200*time.Millisecond
+	if deliveryStateBudget < store.BusyTimeout+retryBackoffs {
+		t.Fatalf("deliveryStateBudget=%s leaves no room for the %s of retry backoffs after a busy timeout",
+			deliveryStateBudget, retryBackoffs)
+	}
+}
+
+// lbCount builds a pointer count for the ListenBrainz stub, matching the shape
+// the real API uses so a null response stays distinguishable from a real zero.
+func lbCount(v int64) *int64 { return &v }
+
+// TestListenBrainzNullCountsDoNotOverwriteKnownTotals is #274. ListenBrainz
+// echoes back every MBID it was asked about and uses JSON null for the counts
+// when it has no data - verified live on 2026-08-25. With int64 targets those
+// decoded to 0, so the map entry always existed, the "may legitimately omit an
+// MBID" guard was unreachable, and a known listener total was overwritten with
+// zero on the next refresh.
+func TestListenBrainzNullCountsDoNotOverwriteKnownTotals(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "lb-null-artist", Name: "LB Null Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Eligibility requires a follow.
+	userID, err := database.CreateUser(ctx, "lb-null@example.com", "hash", "member", "UTC", "lb-null")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// A real total is already known.
+	if err := database.SaveListenBrainzStats(ctx, map[int64]store.ListenBrainzStats{
+		artist.ID: {ArtistID: artist.ID, MBID: artist.MBID, TotalListenCount: 4242, TotalUserCount: 99},
+	}, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The provider now answers with nulls, the shape the real API uses.
+	provider := &listenBrainzStatsProvider{values: map[string]catalog.ListenBrainzArtistStats{
+		"lb-null-artist": {MBID: "lb-null-artist"},
+	}}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithListenBrainz(provider))
+	refreshed, err := runner.refreshListenBrainz(ctx, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The artist must actually have been considered, or this proves nothing.
+	if provider.calls.Load() == 0 {
+		t.Fatal("precondition: the provider was never called, so the artist was not eligible for refresh")
+	}
+	if refreshed != 0 {
+		t.Fatalf("refreshed=%d, want 0 written for an artist with no data", refreshed)
+	}
+
+	var listens int64
+	if err := database.DB.QueryRowContext(ctx,
+		`SELECT total_listen_count FROM artist_listenbrainz_stats WHERE artist_id=?`, artist.ID).Scan(&listens); err != nil {
+		t.Fatal(err)
+	}
+	if listens != 4242 {
+		t.Fatalf("known listen total was overwritten with %d by a null response, want 4242 retained", listens)
+	}
+}
+
+// TestShutdownDoesNotCountUntouchedSyncsAsFailures is #273. syncArtists iterates
+// a batch of due artists with no cancellation check, so once the runner context
+// was cancelled every remaining artist failed on its first store call, was
+// counted in summary.Failed and emitted a Warn — a graceful shutdown looked like
+// a burst of synchronisation failures for artists nothing had attempted. The
+// delivery path already skips rather than fails for exactly this reason.
+func TestShutdownDoesNotCountUntouchedSyncsAsFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "sync-shutdown@example.com", "hash", "member", "UTC", "sync-shutdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		artist, err := database.UpsertArtist(ctx, store.Artist{
+			MBID: fmt.Sprintf("shutdown-artist-%d", i), Name: fmt.Sprintf("Shutdown Artist %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := New(database, &cancellingCatalog{cancel: cancel}, catalog.AlbumEPNormalizer{}, nil, nil,
+		time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	summary, _ := runner.syncArtists(ctx, time.Now().UTC())
+	if ctx.Err() == nil {
+		t.Fatal("precondition: the runner context should have been cancelled during the batch")
+	}
+	if summary.Due < 2 {
+		t.Fatalf("precondition: only %d artists were due, so there is no remainder to protect", summary.Due)
+	}
+	if summary.Failed > 1 {
+		t.Fatalf("a shutdown reported %d artist syncs as failed; only the one interrupted mid-work may count", summary.Failed)
 	}
 }

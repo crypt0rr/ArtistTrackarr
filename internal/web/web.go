@@ -11,6 +11,7 @@ import (
 	"github.com/crypt0rr/artist-tracker/internal/catalog"
 	"github.com/crypt0rr/artist-tracker/internal/config"
 	"github.com/crypt0rr/artist-tracker/internal/jobs"
+	"github.com/crypt0rr/artist-tracker/internal/logging"
 	"github.com/crypt0rr/artist-tracker/internal/notify"
 	"github.com/crypt0rr/artist-tracker/internal/security"
 	"github.com/crypt0rr/artist-tracker/internal/store"
@@ -57,13 +58,10 @@ type App struct {
 	logHealth func() LogSinkHealth
 }
 
-// LogSinkHealth is the application-log sink's runtime loss counters.
-type LogSinkHealth struct {
-	// Dropped counts records discarded because the sink queue was full, and
-	// Errors counts records the sink accepted but failed to persist.
-	Dropped uint64
-	Errors  uint64
-}
+// LogSinkHealth is the application-log sink's runtime loss counters. It is an
+// alias of the logging package's type so the web layer and the scheduler, which
+// both derive operational status from it, cannot report different numbers.
+type LogSinkHealth = logging.SinkHealth
 
 // SetLogHealth wires the application-log sink's counters into diagnostics.
 // Both were previously read only on the clean-shutdown path, strictly after an

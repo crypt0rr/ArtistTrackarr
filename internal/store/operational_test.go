@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 )
@@ -233,4 +234,67 @@ func TestOperationalSnapshotsAreRedactedAndBounded(t *testing.T) {
 	if count != operationalSnapshotLimit {
 		t.Fatalf("snapshot count=%d, want %d", count, operationalSnapshotLimit)
 	}
+}
+
+// TestLogLossAndContentionReasonsClearOnceTheyStop is #267. Both reasons added
+// in v0.58.0 are driven by counters that only ever increase for the lifetime of
+// the process, with no reset and no age window - unlike every other reason in
+// OperationalStatus, which is either current state or age-thresholded. One
+// dropped log record at 03:00 therefore left the instance reading degraded until
+// someone restarted it, which teaches an operator to ignore the banner.
+func TestLogLossAndContentionReasonsClearOnceTheyStop(t *testing.T) {
+	now := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-5 * time.Minute)
+	old := now.Add(-8 * time.Hour)
+
+	t.Run("recent loss still degrades", func(t *testing.T) {
+		status, reasons := OperationalStatus(DiagnosticsSnapshot{
+			CheckedAt: now, DatabaseHealthy: true,
+			DroppedLogEntries: 7, LastLogLossAt: &recent,
+		}, "running", now)
+		if status != "degraded" || !slices.Contains(reasons, "application log loss") {
+			t.Fatalf("status=%q reasons=%v, want degraded with a log loss reason", status, reasons)
+		}
+	})
+
+	t.Run("stale loss no longer degrades", func(t *testing.T) {
+		_, reasons := OperationalStatus(DiagnosticsSnapshot{
+			CheckedAt: now, DatabaseHealthy: true,
+			DroppedLogEntries: 7, LastLogLossAt: &old,
+		}, "running", now)
+		if slices.Contains(reasons, "application log loss") {
+			t.Fatal("a log drop from eight hours ago still pins the instance to degraded")
+		}
+	})
+
+	t.Run("recent contention still degrades", func(t *testing.T) {
+		status, reasons := OperationalStatus(DiagnosticsSnapshot{
+			CheckedAt: now, DatabaseHealthy: true,
+			WriteRetryExhaustions: 1, LastWriteContentionAt: &recent,
+		}, "running", now)
+		if status != "degraded" || !slices.Contains(reasons, "database write contention") {
+			t.Fatalf("status=%q reasons=%v, want degraded with a contention reason", status, reasons)
+		}
+	})
+
+	t.Run("stale contention no longer degrades", func(t *testing.T) {
+		_, reasons := OperationalStatus(DiagnosticsSnapshot{
+			CheckedAt: now, DatabaseHealthy: true,
+			WriteRetryExhaustions: 1, LastWriteContentionAt: &old,
+		}, "running", now)
+		if slices.Contains(reasons, "database write contention") {
+			t.Fatal("a refused write from eight hours ago still pins the instance to degraded")
+		}
+	})
+
+	// A snapshot assembled before the timestamps existed must not silently hide
+	// a real problem.
+	t.Run("a counter with no instant is treated as current", func(t *testing.T) {
+		_, reasons := OperationalStatus(DiagnosticsSnapshot{
+			CheckedAt: now, DatabaseHealthy: true, DroppedLogEntries: 3,
+		}, "running", now)
+		if !slices.Contains(reasons, "application log loss") {
+			t.Fatal("a loss counter with no recorded instant was ignored")
+		}
+	})
 }

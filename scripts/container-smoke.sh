@@ -23,7 +23,9 @@ cleanup() {
 	docker rm -f "$container" >/dev/null 2>&1 || true
 	docker volume rm "$volume" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+# HUP included: an untrapped fatal signal skips the EXIT trap in dash and busybox
+# ash, which would leak the smoke-test container and its volume.
+trap cleanup EXIT INT TERM HUP
 
 docker volume create "$volume" >/dev/null
 docker run -d --name "$container" --network host -v "$volume:/data" \
@@ -107,9 +109,23 @@ artists_page=$(curl --fail --silent --cookie "$jar" "$base/artists")
 grep -q 'CI Smoke Artist' <<<"$artists_page"
 artists_csrf=$(printf '%s' "$artists_page" | csrf_from)
 test -n "$artists_csrf"
-curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
-	--request POST "$base/artists/1/sync" \
-	--data-urlencode "_csrf=$artists_csrf" >/dev/null
+# Follow the redirect and read the flash message. syncArtist answers 303 on BOTH
+# branches - queued and "could not be queued" - so `curl --fail` without -L
+# treats a failed sync as a pass, and the closing line then claims manual sync
+# passed regardless of what happened.
+# No --request POST here: curl already uses POST for --data-urlencode, and
+# forcing the method makes --location re-issue POST against the redirect target
+# instead of downgrading to GET on the 303, which answers 405 and fails the
+# request rather than the assertion.
+sync_result=$(curl --fail --silent --show-error --location \
+	--cookie "$jar" --cookie-jar "$jar" \
+	--data-urlencode "_csrf=$artists_csrf" \
+	"$base/artists/1/sync")
+if ! grep -q 'Synchronization queued' <<<"$sync_result"; then
+	echo "container smoke: manual sync was not queued" >&2
+	grep -o 'Synchronization[^<]*' <<<"$sync_result" >&2 || true
+	exit 1
+fi
 
 # A second clean restart verifies persisted sessions and followed-artist state,
 # not only unauthenticated readiness.

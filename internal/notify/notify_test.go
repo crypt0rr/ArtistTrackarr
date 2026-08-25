@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -72,7 +74,7 @@ func TestBuildURLOnlyProducesTransportsThePolicyAccepts(t *testing.T) {
 	}
 	// A service the policy cannot accept must not be buildable at all.
 	for _, service := range []string{"gotify", "email"} {
-		if _, err := BuildURL(DestinationInput{Service: service, Host: "h", Token: "t", From: "f@e", To: "t@e"}); err == nil {
+		if _, err := BuildURL(DestinationInput{Service: service, Host: "h", Token: "t"}); err == nil {
 			t.Fatalf("BuildURL still constructs %q, which the transport policy always rejects", service)
 		}
 	}
@@ -734,4 +736,39 @@ func TestQueuedSendStopsWaitingWhenItsCallerGivesUp(t *testing.T) {
 	}
 	close(release)
 	<-holder
+}
+
+// TestDestinationInputCarriesOnlyConsumedFields is #289. #243 removed Gotify and
+// SMTP as selectable transports but left their inputs behind: the Port control
+// was hidden by app.js on first paint and could never be shown again, because no
+// service's field set includes it — yet with JavaScript unavailable every field
+// rendered, offering a control BuildURL has no service left to consume. In the
+// mirror direction the handler read `from` and `to` form values that no template
+// emits.
+//
+// This pins the struct to what BuildURL actually reads, so the next transport
+// removal cannot leave the same residue.
+func TestDestinationInputCarriesOnlyConsumedFields(t *testing.T) {
+	fields := reflect.TypeOf(DestinationInput{})
+	source, err := os.ReadFile("notify.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	start := strings.Index(body, "func BuildURL(")
+	if start < 0 {
+		t.Fatal("BuildURL not found")
+	}
+	end := strings.Index(body[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("BuildURL body not delimited")
+	}
+	buildURL := body[start : start+end]
+
+	for i := 0; i < fields.NumField(); i++ {
+		name := fields.Field(i).Name
+		if !strings.Contains(buildURL, "input."+name) {
+			t.Errorf("DestinationInput.%s is never read by BuildURL, so the form collects a value nothing consumes", name)
+		}
+	}
 }

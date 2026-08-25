@@ -868,11 +868,11 @@ func TestPruneExpiredStateKeepsActiveAndQueuedState(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	old := now.Add(-31 * 24 * time.Hour)
-	activeSession, _, err := s.CreateSession(ctx, userID, time.Hour)
+	activeSession, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, userID, -time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, userID, -time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "invite", "old@example.com", nil, userID, -time.Hour); err != nil {
@@ -1637,10 +1637,10 @@ func TestGuestCreditBaselineAndReleaseDetail(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEventCount(t, s, userID, "announcement", 0)
-	var baseline string
-	if err := s.DB.QueryRow(`SELECT baseline_synced_at FROM follow_credit_baselines WHERE user_id=? AND artist_id=? AND provider='itunes' AND role='guest'`, userID, artist.ID).Scan(&baseline); err != nil || baseline == "" {
-		t.Fatalf("guest baseline=%q err=%v", baseline, err)
-	}
+	// The follow_credit_baselines write this used to assert is gone: the table
+	// had no reader anywhere, so the row it stored could not affect anything.
+	// What actually suppresses the flood is asserted directly above and below -
+	// no announcement for the historical credit, one for the later one.
 	future := historical
 	future.MBID, future.ITunesID, future.ITunesURL = "itunes:future-guest", "future-guest", "https://music.apple.com/us/album/future"
 	future.Title, future.FirstReleaseDate = "Future collaboration", "2026-08-05"
@@ -2081,7 +2081,7 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, csrf, err := s.CreateSession(ctx, userID, time.Hour)
+	raw, err := s.CreateSession(ctx, userID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2089,7 +2089,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.User.ID != userID || session.CSRFToken != csrf {
+	// Per-session CSRF material is gone: the live implementation is an
+	// independent signed double-submit cookie that never consulted it.
+	if session.User.ID != userID {
 		t.Fatalf("unexpected session: %#v", session)
 	}
 }
@@ -2475,7 +2477,7 @@ func TestAdminUsersAndDeleteUser(t *testing.T) {
 	if err := s.AddDestination(ctx, memberID, "Phone", "ntfy", []byte("encrypted")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "invite", "member@example.com", nil, adminID, time.Hour); err != nil {
@@ -2551,7 +2553,7 @@ func TestDeleteUserCascadesEveryOwnerScopedTable(t *testing.T) {
 	if err := s.AddDestination(ctx, memberID, "Cascade destination", "ntfy", []byte("encrypted")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, memberID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateAuthToken(ctx, "reset", "cascade-member@example.com", &memberID, adminID, time.Hour); err != nil {
@@ -2626,9 +2628,6 @@ func TestDeleteUserCascadesEveryOwnerScopedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `INSERT INTO release_digest_deliveries(run_id,destination_id,status,next_attempt_at) VALUES(?,?,?,?)`, runID, destinationID, "pending", timeText(observed)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO follow_credit_baselines(user_id,artist_id,provider,role,baseline_synced_at) VALUES(?,?,?,?,?)`, memberID, artist.ID, "spotify", "featured", timeText(observed)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2804,7 +2803,7 @@ func TestResetPasswordWithTokenIsAtomicAndRevokesSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
+	if _, err := s.CreateSession(ctx, userID, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	token, err := s.CreateAuthToken(ctx, "reset", "reset@example.com", &userID, userID, time.Hour)
