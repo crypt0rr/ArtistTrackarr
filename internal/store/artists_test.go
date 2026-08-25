@@ -58,6 +58,9 @@ func TestArtworkDueQueryUsesItsIndex(t *testing.T) {
 		}
 		plan += detail + "\n"
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(plan, "release_groups_itunes_artwork_due") {
 		t.Fatalf("the artwork due query does not use its index:\n%s", plan)
 	}
