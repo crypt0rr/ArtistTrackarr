@@ -410,6 +410,20 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
                "already failed five times. Fixtures asserted a lower bound on "
                "the retry time and never where the ladder stops.",
     ),
+    Mutation(
+        name="unlisted-sql-wrapper",
+        file="internal/store/bindarity_test.go",
+        # The bind-arity guard shipped without the package's own preferred
+        # write path in its method list, so it skipped 31 statements while
+        # claiming to cover every one.
+        find="""	"execWriteContext": true,
+""",
+        replace="",
+        package="./internal/store/",
+        test="TestEverySQLStatementBindsAsManyArgumentsAsItHasPlaceholders",
+        guards="A SQL-executing wrapper defined in the package but missing "
+               "from bindMethods, which narrows the guard without saying so.",
+    ),
 ]
 
 

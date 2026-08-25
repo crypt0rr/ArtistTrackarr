@@ -76,8 +76,13 @@ if [[ -n "$EXPECTED_VERSION" ]]; then
 		# A bare `grep -q` here would exit silently under `set -e`, leaving
 		# CI with a failed step and no reason. Report what the container
 		# actually rendered instead.
+		# sed cannot rescue an empty pipeline: with no match, grep emits zero
+		# lines and `s/^$/.../` never runs, so the message used to end in
+		# "found " with nothing after it - the same no-reason failure this
+		# block exists to prevent. Capture first, then test the variable.
+		found=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+|vdev[^<]*' <<<"$login_page" | head -1 || true)
 		echo "container smoke: expected the UI to report v${EXPECTED_VERSION}" >&2
-		echo "container smoke: found $(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+|vdev[^<]*' <<<"$login_page" | head -1 | sed 's/^$/no version string at all/')" >&2
+		echo "container smoke: found ${found:-no version string at all}" >&2
 		exit 1
 	fi
 	if grep -qE 'vdev(-|</|<)' <<<"$login_page"; then

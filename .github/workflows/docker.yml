@@ -54,6 +54,12 @@ jobs:
           else
             expected="$(sed -n 's/^const Current = "\(.*\)"$/\1/p' internal/version/version.go)"
           fi
+          # An empty value switches the check back off silently, which is the
+          # state this guard spent sixteen releases in. Fail instead.
+          if [ -z "${expected}" ]; then
+            echo "could not determine the expected version; refusing to skip the check" >&2
+            exit 1
+          fi
           echo "asserting container reports version ${expected}"
           SMOKE_EXPECTED_VERSION="${expected}" scripts/container-smoke.sh artist-trackarr:ci
 

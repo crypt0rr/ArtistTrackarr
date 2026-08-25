@@ -34,4 +34,11 @@ if ! grep -Fq "Pushing a tag such as \`v$tag\` publishes \`$tag\`" README.md; th
 	echo "version-check: README.md release image example is not v$tag" >&2
 	exit 1
 fi
+# The Compose pin is the string a reader copies and runs. It was the one
+# version reference in the README that no gate checked, so a release could bump
+# everything else and leave users a command pinning the previous image.
+if ! grep -Fq "ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:$tag" README.md; then
+	echo "version-check: README.md Compose image pin is not $tag" >&2
+	exit 1
+fi
 echo "version-check: documentation matches v$tag"
