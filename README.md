@@ -53,7 +53,7 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.61.0`; local and published images use the
+footer. The current release is `v0.61.1`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
@@ -483,6 +483,30 @@ artist was stranded: never synchronized, absent from the backlog figure, and
 unreachable from the interface. An explicit sync now clears it, which is what
 the message always promised.
 
+The v0.61.1 patch fixes the gates v0.61.0 added, after an adversarial review of
+that release found eight faults in them. None was a live bug — every one was a
+check that was narrower than its name, or a diagnostic that printed nothing.
+
+The bind-argument check introduced in v0.61.0 did not cover this project's own
+preferred database write path, so a test named for every SQL statement was
+skipping thirty-one of them. It now covers 316 statements rather than 287, and
+refuses to start if a future write helper is added without being listed. Two
+smaller gaps in the same check are closed: a statement stored in one kind of Go
+declaration was silently skipped, and statements assembled from other constants
+were never resolved at all.
+
+Three release-mechanic faults are fixed. The container check that reports a
+version mismatch printed the expected version and then nothing at all where the
+actual one belonged. The Compose command in this README — the one a reader
+copies and runs — was the only version reference no check verified, so a release
+could leave it pinned to the previous image. And an unreadable version constant
+silently switched the version check back off rather than failing, which is the
+state that check spent sixteen releases in.
+
+Separately, the test suite now sets an explicit timeout. Go's ten-minute default
+sits close enough to the real figure that ordinary load on a developer machine
+produced a failure that looked exactly like a hang.
+
 The v0.61.0 release is about the gates rather than the features. Five of the
 previous release's forty-four findings were residuals — a fix applied to one of
 several sites, or an invariant asserted in a comment rather than in code — so
@@ -770,7 +794,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.61.0` publishes `0.61.0`, `0.61`, and `latest`.
+- Pushing a tag such as `v0.61.1` publishes `0.61.1`, `0.61`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -819,7 +843,7 @@ refactor that moves the code reports `DRIFT` rather than passing quietly.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.61.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.61.1 docker compose up -d
 ```
 
 ## Configuration
