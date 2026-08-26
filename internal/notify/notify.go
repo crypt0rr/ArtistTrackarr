@@ -47,6 +47,44 @@ func (e *MessageLimitError) Error() string {
 	return fmt.Sprintf("%s notification message exceeds the %d %s transport limit (got %d)", e.Service, e.Limit, e.Unit, e.Length)
 }
 
+// RateLimitError reports a provider-side request limit without retaining the
+// destination URL or any credentials.  RetryAfter is also used by the sender
+// to cool down its shared request limiter so a burst of queued deliveries does
+// not immediately repeat the rejected request.
+type RateLimitError struct {
+	Service    string
+	StatusCode int
+	RetryAfter time.Duration
+	Reason     string
+}
+
+func (e *RateLimitError) Error() string {
+	if e == nil {
+		return "notification provider rate limit exceeded"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "rate limit exceeded"
+	}
+	if e.RetryAfter > 0 && !strings.Contains(strings.ToLower(reason), "retry after") {
+		return fmt.Sprintf("%s API error %d: %s (retry after %s)", strings.ToLower(e.Service), e.StatusCode, reason, formatRetryAfter(e.RetryAfter))
+	}
+	return fmt.Sprintf("%s API error %d: %s", strings.ToLower(e.Service), e.StatusCode, reason)
+}
+
+func formatRetryAfter(delay time.Duration) string {
+	if delay <= 0 {
+		return "0s"
+	}
+	// Providers express retry windows in whole seconds. Keep the error stable
+	// and easy to scan even when a test or a future provider supplies a shorter
+	// duration.
+	if delay%time.Second == 0 {
+		return fmt.Sprintf("%ds", delay/time.Second)
+	}
+	return delay.Round(time.Millisecond).String()
+}
+
 const (
 	telegramMessageLimit   = 4096 // Telegram counts Unicode characters.
 	discordMessageLimit    = 6000 // Shoutrrr chunks Discord messages up to this total.
@@ -56,7 +94,69 @@ const (
 	// unbounded memory or request bandwidth. This is above every application-
 	// generated digest and release message.
 	genericMessageLimitBytes = 64 << 10
+	// Telegram documents roughly one message per second per chat. A shared,
+	// conservative interval also protects other supported transports when a
+	// delivery burst fans out across the four background workers.
+	defaultNotificationRequestInterval = time.Second
+	maxNotificationCooldown            = time.Hour
 )
+
+// requestLimiter reserves request slots process-wide. Reservation happens
+// before the network call, so concurrent delivery workers cannot all observe
+// the same idle instant and issue a burst. Waiting always honours the caller's
+// context; an abandoned reservation simply leaves a harmless gap.
+type requestLimiter struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
+func (l *requestLimiter) wait(ctx context.Context) error {
+	if l == nil || l.interval <= 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	l.mu.Lock()
+	slot := l.next
+	if slot.Before(now) {
+		slot = now
+	}
+	l.next = slot.Add(l.interval)
+	l.mu.Unlock()
+
+	delay := time.Until(slot)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *requestLimiter) cooldown(delay time.Duration) {
+	if l == nil || delay <= 0 {
+		return
+	}
+	if delay > maxNotificationCooldown {
+		delay = maxNotificationCooldown
+	}
+	target := time.Now().Add(delay)
+	l.mu.Lock()
+	if target.After(l.next) {
+		l.next = target
+	}
+	l.mu.Unlock()
+}
+
+var notificationRequestLimiter = &requestLimiter{interval: defaultNotificationRequestInterval}
 
 func validateNotificationMessage(serviceURL, title, body string) error {
 	scheme := strings.ToLower(parsedScheme(serviceURL))
@@ -147,6 +247,7 @@ type ShoutrrrSender struct {
 	client   *http.Client
 	lookupIP func(context.Context, string, string) ([]net.IP, error)
 	dial     func(context.Context, string, string) (net.Conn, error)
+	limiter  *requestLimiter
 }
 
 // Shoutrrr's router uses a ten-second per-send timeout. Keeping the
@@ -175,6 +276,7 @@ func NewShoutrrrSender(allowPrivateTargets bool, timeout time.Duration) Shoutrrr
 		AllowPrivateTargets: allowPrivateTargets,
 		SendTimeout:         timeout,
 		client:              newHTTPClient(timeout, allowPrivateTargets, nil, nil),
+		limiter:             notificationRequestLimiter,
 	}
 }
 
@@ -420,6 +522,13 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 		return ctx.Err()
 	}
 	queueWait := time.Since(queueStarted)
+	// Reserve the request slot while the compatibility gate is held. Waiting
+	// before the gate would allow a send delayed by another Shoutrrr operation
+	// to issue immediately after a later reservation, defeating the spacing.
+	if err := s.waitForRateLimit(ctx); err != nil {
+		<-notificationHTTPClientGate
+		return err
+	}
 	// The transport budget starts here, not when this call entered the queue.
 	// Previously one context covered both, so with the gate held by another
 	// send for the full send timeout, the next send in line reached the
@@ -500,9 +609,14 @@ type telegramSendPayload struct {
 }
 
 type telegramSendResponse struct {
-	OK          bool   `json:"ok"`
-	ErrorCode   int    `json:"error_code"`
-	Description string `json:"description"`
+	OK          bool                        `json:"ok"`
+	ErrorCode   int                         `json:"error_code"`
+	Description string                      `json:"description"`
+	Parameters  *telegramResponseParameters `json:"parameters"`
+}
+
+type telegramResponseParameters struct {
+	RetryAfter int `json:"retry_after"`
 }
 
 func parsedScheme(rawURL string) string {
@@ -613,6 +727,9 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 			return err
 		}
 		request.Header.Set("Content-Type", "application/json")
+		if err := s.waitForRateLimit(ctx); err != nil {
+			return err
+		}
 		response, err := client.Do(request)
 		if err != nil {
 			return err
@@ -625,11 +742,33 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 		var result telegramSendResponse
 		if err := json.Unmarshal(responseBody, &result); err != nil {
 			if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+				if response.StatusCode == http.StatusTooManyRequests {
+					retryAfter := parseRetryAfterHeader(response.Header.Get("Retry-After"))
+					s.limiter.cooldown(retryAfter)
+					return &RateLimitError{Service: "Telegram", StatusCode: response.StatusCode, RetryAfter: retryAfter, Reason: response.Status}
+				}
 				return fmt.Errorf("telegram API returned %s", response.Status)
 			}
 			return fmt.Errorf("telegram API returned an invalid response")
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || !result.OK {
+			if response.StatusCode == http.StatusTooManyRequests || result.ErrorCode == http.StatusTooManyRequests {
+				var retryAfter time.Duration
+				if result.Parameters != nil && result.Parameters.RetryAfter > 0 {
+					retryAfter = boundedRetryAfter(int64(result.Parameters.RetryAfter))
+				} else {
+					retryAfter = parseRetryAfterHeader(response.Header.Get("Retry-After"))
+					if retryAfter <= 0 {
+						retryAfter = parseRetryAfterDescription(result.Description)
+					}
+				}
+				s.limiter.cooldown(retryAfter)
+				reason := result.Description
+				if reason == "" {
+					reason = response.Status
+				}
+				return &RateLimitError{Service: "Telegram", StatusCode: http.StatusTooManyRequests, RetryAfter: retryAfter, Reason: reason}
+			}
 			if result.Description != "" {
 				return fmt.Errorf("telegram API error %d: %s", result.ErrorCode, result.Description)
 			}
@@ -637,6 +776,48 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 		}
 	}
 	return nil
+}
+
+func (s ShoutrrrSender) waitForRateLimit(ctx context.Context) error {
+	if s.limiter == nil {
+		return nil
+	}
+	return s.limiter.wait(ctx)
+}
+
+func parseRetryAfterHeader(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return boundedRetryAfter(seconds)
+}
+
+func parseRetryAfterDescription(value string) time.Duration {
+	matches := telegramRetryAfterPattern.FindStringSubmatch(value)
+	if len(matches) != 2 {
+		return 0
+	}
+	seconds, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return boundedRetryAfter(seconds)
+}
+
+func boundedRetryAfter(seconds int64) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := int64(maxNotificationCooldown / time.Second)
+	if seconds > maxSeconds {
+		return maxNotificationCooldown
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func telegramOptionDisabled(value string) bool {
@@ -649,12 +830,13 @@ func telegramOptionDisabled(value string) bool {
 }
 
 var (
-	destinationURLPattern    = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
-	credentialPattern        = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
-	bearerPattern            = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
-	telegramTokenPattern     = regexp.MustCompile(`^[0-9]+:[a-zA-Z0-9_-]+$`)
-	telegramParseModePattern = regexp.MustCompile(`(?i)^(markdown|markdownv2|html)$`)
-	telegramOptionPattern    = regexp.MustCompile(`(?i)^(0|1|true|false|yes|no|on|off)$`)
+	destinationURLPattern     = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+	credentialPattern         = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
+	bearerPattern             = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+	telegramTokenPattern      = regexp.MustCompile(`^[0-9]+:[a-zA-Z0-9_-]+$`)
+	telegramParseModePattern  = regexp.MustCompile(`(?i)^(markdown|markdownv2|html)$`)
+	telegramOptionPattern     = regexp.MustCompile(`(?i)^(0|1|true|false|yes|no|on|off)$`)
+	telegramRetryAfterPattern = regexp.MustCompile(`(?i)\bretry\s+after\s+([0-9]+)`)
 )
 
 // RedactError removes service URLs and common credential query parameters from

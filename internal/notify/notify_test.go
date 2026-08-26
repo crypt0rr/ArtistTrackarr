@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -363,6 +364,117 @@ func TestTelegramDirectClientBuildsBoundedPayload(t *testing.T) {
 	}
 }
 
+func TestTelegramRateLimitErrorParsesRetryAfter(t *testing.T) {
+	var requests atomic.Int32
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":24}}`)),
+			Request:    req,
+		}, nil
+	})}
+	limiter := &requestLimiter{interval: time.Millisecond}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second, limiter: limiter}
+	err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123", "title", "body")
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("Telegram error=%v, want RateLimitError", err)
+	}
+	if rateLimitErr.Service != "Telegram" || rateLimitErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate limit error=%#v", rateLimitErr)
+	}
+	if rateLimitErr.RetryAfter != 24*time.Second {
+		t.Fatalf("retry-after=%s, want 24s", rateLimitErr.RetryAfter)
+	}
+	if !strings.Contains(err.Error(), "retry after 24s") {
+		t.Fatalf("rate limit error=%q, want retry-after detail", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("Telegram requests=%d, want 1", requests.Load())
+	}
+	limiter.mu.Lock()
+	next := limiter.next
+	limiter.mu.Unlock()
+	if time.Until(next) < 23*time.Second {
+		t.Fatalf("limiter cooldown=%s, want at least 23s", time.Until(next))
+	}
+}
+
+func TestTelegramRateLimitErrorParsesRetryAfterDescription(t *testing.T) {
+	var gotRateLimit *RateLimitError
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     "429 Too Many Requests",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 24"}`)),
+			Request:    req,
+		}, nil
+	})}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second, limiter: &requestLimiter{interval: time.Millisecond}}
+	err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123", "title", "body")
+	if !errors.As(err, &gotRateLimit) || gotRateLimit.RetryAfter != 24*time.Second {
+		t.Fatalf("Telegram error=%#v, want retry-after parsed from description", err)
+	}
+}
+
+func TestNotificationRequestLimiterSpacesTelegramRequests(t *testing.T) {
+	var mu sync.Mutex
+	var requestTimes []time.Time
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		requestTimes = append(requestTimes, time.Now())
+		mu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+			Request:    req,
+		}, nil
+	})}
+	const interval = 20 * time.Millisecond
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second, limiter: &requestLimiter{interval: interval}}
+	if err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123,-100456", "title", "body"); err != nil {
+		t.Fatalf("Telegram send failed: %v", err)
+	}
+	mu.Lock()
+	times := append([]time.Time(nil), requestTimes...)
+	mu.Unlock()
+	if len(times) != 2 {
+		t.Fatalf("Telegram requests=%d, want 2", len(times))
+	}
+	if gap := times[1].Sub(times[0]); gap < interval-5*time.Millisecond {
+		t.Fatalf("Telegram request gap=%s, want at least %s", gap, interval-5*time.Millisecond)
+	}
+}
+
+func TestRequestLimiterWaitHonorsCancellationAndBoundsCooldown(t *testing.T) {
+	limiter := &requestLimiter{interval: time.Hour}
+	if err := limiter.wait(context.Background()); err != nil {
+		t.Fatalf("first limiter wait failed: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := limiter.wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("canceled limiter wait=%v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled limiter wait took %s", elapsed)
+	}
+	cooldownLimiter := &requestLimiter{interval: time.Second}
+	cooldownLimiter.cooldown(2 * time.Hour)
+	cooldownLimiter.mu.Lock()
+	next := cooldownLimiter.next
+	cooldownLimiter.mu.Unlock()
+	if remaining := time.Until(next); remaining > maxNotificationCooldown+time.Second || remaining < maxNotificationCooldown-time.Second {
+		t.Fatalf("cooldown=%s, want bounded to %s", remaining, maxNotificationCooldown)
+	}
+}
+
 func TestObservedHTTPClientCompletesAndClearsInflightRequest(t *testing.T) {
 	base := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -621,6 +733,7 @@ func BenchmarkShoutrrrSendSerialization(b *testing.B) {
 	// value sender intentionally creates a fallback client for unit tests, but
 	// that would hide transport reuse in this benchmark.
 	sender := NewShoutrrrSender(true, time.Second)
+	sender.limiter = &requestLimiter{}
 	defer sender.CloseIdleConnections()
 	serviceURL := "generic+" + server.URL + "/hook"
 	b.ReportAllocs()
