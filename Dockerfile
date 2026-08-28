@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go vet ./... && \
     go test -p 1 -timeout $GO_TEST_TIMEOUT ./... -count=1 && \
     go test -race -p 1 -timeout $GO_TEST_TIMEOUT ./... -count=1 && \
-    go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1 run ./... && \
+    go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run ./... && \
     go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
 FROM dependencies AS build
