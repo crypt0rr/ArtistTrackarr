@@ -52,6 +52,7 @@ type App struct {
 	untrustedForwardingWarned atomic.Bool
 	passwordChangeLimiter     *fixedWindowLimiter
 	loginSlots                chan struct{}
+	readyProbe                readinessProbe
 	// logHealth reports the application-log sink's drop and write-failure
 	// counters. It is set after construction rather than passed to New because
 	// the sink is created around the same store this App is built from.

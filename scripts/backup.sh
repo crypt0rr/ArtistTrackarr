@@ -28,11 +28,13 @@ cleanup() {
 # SIGHUP is trapped alongside INT and TERM because a dropped SSH session is the
 # realistic way this is interrupted, and it arrives during the longest step: the
 # whole /data volume streaming through the operator's shell while the service is
-# stopped. In dash and busybox ash an untrapped fatal signal terminates the shell
-# through its default disposition and the EXIT trap never runs - verified here as
-# exit 129 with no cleanup - which would leave the service stopped and .tmp files
-# behind.
-trap cleanup EXIT INT TERM HUP
+# stopped. Signal handlers exit through the EXIT trap instead of merely running
+# cleanup and resuming the script; an interrupted archive must never be reported
+# as a successful backup.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Resolve the exact Compose container before stopping it.  Do not choose an
 # arbitrary replica: a backup is only safe when the service has one known

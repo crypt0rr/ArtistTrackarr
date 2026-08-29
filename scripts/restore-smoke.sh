@@ -20,22 +20,23 @@ fi
 
 image=${ARTIST_TRACKARR_IMAGE:-}
 if [ -z "$image" ]; then
-	echo "restore: set ARTIST_TRACKARR_IMAGE to an immutable image digest (for example ghcr.io/crypt0rr/artist-trackarr@sha256:...)" >&2
+	echo "restore: set ARTIST_TRACKARR_IMAGE to an immutable image digest (for example ghcr.io/crypt0rr/artist-trackarr@sha256:... or sha256:... for a local image)" >&2
 	exit 1
 fi
 case "$image" in
-	*@sha256:*) ;;
+	*@sha256:*|sha256:*) ;;
 	*)
 		if [ "${RESTORE_ALLOW_MUTABLE_IMAGE:-false}" != "true" ]; then
-			echo "restore: image must use an immutable @sha256 digest (set RESTORE_ALLOW_MUTABLE_IMAGE=true only for local rehearsal)" >&2
+			echo "restore: image must use an immutable @sha256 digest or local sha256 image ID (set RESTORE_ALLOW_MUTABLE_IMAGE=true only for local rehearsal)" >&2
 			exit 1
 		fi
 		echo "restore: warning: mutable image explicitly allowed" >&2
 		;;
 esac
 port=${RESTORE_SMOKE_PORT:-18080}
-volume="artist-trackarr-restore-$$"
-container="artist-trackarr-restore-$$"
+name_prefix=${RESTORE_SMOKE_NAME_PREFIX:-artist-trackarr-restore}
+volume="$name_prefix-$$"
+container="$name_prefix-$$"
 archive_path=$(cd -- "$(dirname -- "$archive")" && pwd)/$(basename -- "$archive")
 checksum_path="$archive_path.sha256"
 
@@ -44,8 +45,13 @@ cleanup() {
 	docker volume rm "$volume" >/dev/null 2>&1 || true
 }
 # HUP included: an untrapped fatal signal skips the EXIT trap in dash and busybox
-# ash, which would leak the rehearsal container and its volume.
-trap cleanup EXIT INT TERM HUP
+# ash, which would leak the rehearsal container and its volume. Signal handlers
+# exit through the EXIT trap so cleanup runs and the interrupted rehearsal is
+# still reported as a failure.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 docker volume create "$volume" >/dev/null
 if [ -s "$checksum_path" ]; then
@@ -102,6 +108,11 @@ wait_ready() {
 	while [ "$i" -lt 60 ]; do
 		if wget -q -O /dev/null "http://127.0.0.1:$port/readyz"; then
 			return 0
+		fi
+		if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" != "true" ]; then
+			echo "restore: application exited before becoming ready" >&2
+			docker logs "$container" >&2 || true
+			return 1
 		fi
 		i=$((i + 1))
 		sleep 1

@@ -51,11 +51,10 @@ smoke:
 mutate:
 	python3 scripts/mutate.py
 
-# The disaster-recovery scripts are 279 lines executed by no gate. Both #266
-# and #231 were bugs in them, and both fixes were locked in by grepping the
-# shell source rather than running it. Local only and not wired into CI: it
-# stops the running app and manipulates the real data volume, which is not
-# something a CI job should be doing to a developer machine or a runner.
+# This remains an operator-facing local target: it stops the configured app and
+# manipulates its real data volume. CI uses scripts/disaster-recovery-smoke.sh
+# instead, which creates an isolated Compose project and runs these same helpers
+# as a release gate without touching a developer or production volume.
 backup-smoke:
 	scripts/backup.sh $(BACKUP_ARCHIVE)
 	scripts/restore-smoke.sh $(BACKUP_ARCHIVE)

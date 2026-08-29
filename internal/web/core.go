@@ -1215,7 +1215,7 @@ func (a *App) render(w http.ResponseWriter, name string, data PageData, status i
 	}
 }
 func (a *App) ready(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.Ready(r.Context()); err != nil {
+	if err := a.readyCheck(r.Context()); err != nil {
 		var healthErr *store.DatabaseHealthError
 		state := store.DatabaseUnavailable
 		if errors.As(err, &healthErr) && healthErr != nil && healthErr.State != "" {
