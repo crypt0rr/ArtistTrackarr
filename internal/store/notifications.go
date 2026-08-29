@@ -13,11 +13,19 @@ import (
 )
 
 // destinationAdmissionPredicate is shared by event/digest fan-out and both
-// due-delivery readers. A destination's historical failures are informational;
-// only the explicit persisted paused state blocks new work. Transport policy
-// is applied alongside it so legacy Gotify/SMTP/unknown advanced destinations
-// remain visible but cannot initiate network activity.
+// due-delivery readers. A destination's historical failures are informational
+// for event admission; only the explicit persisted paused state blocks new
+// work. Due readers add destinationRetryPredicate below so a temporary
+// provider cooldown delays, rather than blocks, runnable work. Transport
+// policy is applied alongside it so legacy Gotify/SMTP/unknown advanced
+// destinations remain visible but cannot initiate network activity.
 const destinationAdmissionPredicate = `COALESCE(dh.status,'healthy')<>'paused'`
+
+// destinationRetryPredicate is applied only when selecting runnable delivery
+// rows. A temporary provider cooldown must leave newly-created work pending so
+// it can be delivered automatically after the cooldown, rather than turning it
+// into a blocked row that requires manual recovery.
+const destinationRetryPredicate = `(dh.next_retry_at IS NULL OR dh.next_retry_at<=?)`
 
 // Keep member-owned destinations bounded so fan-out, settings rendering, and
 // delivery admission remain predictable. Existing rows are preserved; the
@@ -268,9 +276,22 @@ func (s *Store) StartDeliveryAttempt(ctx context.Context, deliveryID, digestDeli
 }
 
 // FinishDeliveryAttempt updates the attempt and destination circuit state in
-// one writer transaction. Five consecutive failures pause the destination;
-// a successful send clears the failure streak.
+// one writer transaction. Five consecutive ordinary failures pause the
+// destination; a successful send clears the failure streak.
 func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinationID int64, success bool, message string, nextRetry *time.Time, finished time.Time) error {
+	return s.finishDeliveryAttempt(ctx, attemptID, destinationID, success, message, nextRetry, finished, false)
+}
+
+// FinishDeliveryRateLimitedAttempt records a provider cooldown without
+// consuming the destination's consecutive-failure circuit-breaker budget.
+// Rate limiting is a temporary scheduling condition, not evidence that the
+// destination is broken, and must never convert the remaining queue to blocked
+// work.
+func (s *Store) FinishDeliveryRateLimitedAttempt(ctx context.Context, attemptID, destinationID int64, message string, nextRetry *time.Time, finished time.Time) error {
+	return s.finishDeliveryAttempt(ctx, attemptID, destinationID, false, message, nextRetry, finished, true)
+}
+
+func (s *Store) finishDeliveryAttempt(ctx context.Context, attemptID, destinationID int64, success bool, message string, nextRetry *time.Time, finished time.Time, rateLimited bool) error {
 	if attemptID < 1 || destinationID < 1 {
 		return errors.New("delivery attempt and destination are required")
 	}
@@ -287,6 +308,18 @@ func (s *Store) FinishDeliveryAttempt(ctx context.Context, attemptID, destinatio
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status=?,finished_at=?,last_error=? WHERE id=?`,
 			status, timeText(finished), message, attemptID); err != nil {
 			return err
+		}
+		if rateLimited {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_failure_at,next_retry_at,last_error,updated_at)
+			VALUES(?,'degraded',0,?,?,?,?)
+			ON CONFLICT(destination_id) DO UPDATE SET
+			status=CASE WHEN destination_health.status='paused' THEN 'paused' ELSE 'degraded' END,
+			consecutive_failures=destination_health.consecutive_failures,
+			last_failure_at=excluded.last_failure_at,next_retry_at=excluded.next_retry_at,last_error=excluded.last_error,updated_at=excluded.updated_at`,
+				destinationID, timeText(finished), nullableTime(nextRetry), message, timeText(finished)); err != nil {
+				return err
+			}
+			return nil
 		}
 		if success {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO destination_health(destination_id,status,consecutive_failures,last_success_at,next_retry_at,last_error,updated_at)
@@ -654,6 +687,7 @@ func (s *Store) ClaimDueDeliveries(ctx context.Context, now time.Time, limit int
 			WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1
 			AND (d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
 			AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
+			AND `+destinationRetryPredicate+`
 		), eligible_user_count AS (
 			SELECT COUNT(DISTINCT user_id) AS users FROM eligible
 		), ranked AS (
@@ -663,7 +697,7 @@ func (s *Store) ClaimDueDeliveries(ctx context.Context, now time.Time, limit int
 		SELECT ranked.id FROM ranked CROSS JOIN eligible_user_count
 		WHERE user_rank<=CASE WHEN users>1 THEN ? ELSE ? END
 		ORDER BY next_attempt_at,id LIMIT ?`,
-			timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
+			timeText(now), timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -753,6 +787,7 @@ func (s *Store) ClaimDueDigestDeliveries(ctx context.Context, now time.Time, lim
 			WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
 			AND (dd.claim_expires_at IS NULL OR dd.claim_expires_at<=?)
 			AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
+			AND `+destinationRetryPredicate+`
 		), eligible_user_count AS (
 			SELECT COUNT(DISTINCT user_id) AS users FROM eligible
 		), ranked AS (
@@ -762,7 +797,7 @@ func (s *Store) ClaimDueDigestDeliveries(ctx context.Context, now time.Time, lim
 		SELECT ranked.id FROM ranked CROSS JOIN eligible_user_count
 		WHERE user_rank<=CASE WHEN users>1 THEN ? ELSE ? END
 		ORDER BY next_attempt_at,id LIMIT ?`,
-			timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
+			timeText(now), timeText(now), timeText(now), maxDeliveryClaimsPerUser, limit, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -949,6 +984,42 @@ func (s *Store) MarkDeliveryFailedOwned(ctx context.Context, id int64, attempts 
 	return nil
 }
 
+// MarkDeliveryRateLimitedOwned keeps a provider-rate-limited delivery pending
+// at the provider's requested retry time. It deliberately does not increment
+// attempts: a rate limit is not a failed delivery and must not exhaust the
+// normal retry budget.
+func (s *Store) MarkDeliveryRateLimitedOwned(ctx context.Context, id int64, message, owner string, nextAttempt time.Time) error {
+	return s.markDeliveryRateLimitedOwned(ctx, `deliveries`, id, message, owner, nextAttempt)
+}
+
+func (s *Store) markDeliveryRateLimitedOwned(ctx context.Context, table string, id int64, message, owner string, nextAttempt time.Time) error {
+	if table != "deliveries" && table != "release_digest_deliveries" {
+		return errors.New("invalid delivery table")
+	}
+	message = safeDeliveryError(message)
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	query := `UPDATE ` + table + ` SET status='pending',next_attempt_at=?,last_error=?,claim_owner=NULL,claim_expires_at=NULL WHERE id=?`
+	args := []any{timeText(nextAttempt), message, id}
+	if strings.TrimSpace(owner) != "" {
+		query += ` AND claim_owner=?`
+		args = append(args, owner)
+	}
+	result, err := s.execWriteContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 && strings.TrimSpace(owner) != "" {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) MarkDigestDeliverySentOwned(ctx context.Context, id int64, owner string, now time.Time) error {
 	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		query := `UPDATE release_digest_deliveries
@@ -979,6 +1050,12 @@ func (s *Store) MarkDigestDeliverySentOwned(ctx context.Context, id int64, owner
 			AND NOT EXISTS (SELECT 1 FROM release_digest_deliveries WHERE run_id=release_digest_runs.id AND status IN ('pending','blocked'))`, id)
 		return err
 	})
+}
+
+// MarkDigestDeliveryRateLimitedOwned is the digest counterpart of
+// MarkDeliveryRateLimitedOwned.
+func (s *Store) MarkDigestDeliveryRateLimitedOwned(ctx context.Context, id int64, message, owner string, nextAttempt time.Time) error {
+	return s.markDeliveryRateLimitedOwned(ctx, `release_digest_deliveries`, id, message, owner, nextAttempt)
 }
 
 // FinalizeDigestDeliverySent is the digest counterpart of

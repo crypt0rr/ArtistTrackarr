@@ -451,6 +451,36 @@ func TestNotificationRequestLimiterSpacesTelegramRequests(t *testing.T) {
 	}
 }
 
+// A Telegram send must not spend its transport timeout waiting for the
+// process-wide pacing slot. With a burst of queued deliveries, charging that
+// wait to the per-request budget turns healthy queued messages into deadline
+// failures before they ever reach Telegram.
+func TestTelegramQueueWaitDoesNotConsumeTransportBudget(t *testing.T) {
+	const interval = 80 * time.Millisecond
+	const transportBudget = 10 * time.Millisecond
+	var requests atomic.Int32
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+			Request:    req,
+		}, nil
+	})}
+	limiter := &requestLimiter{interval: interval}
+	if err := limiter.wait(context.Background()); err != nil {
+		t.Fatalf("priming limiter: %v", err)
+	}
+	sender := ShoutrrrSender{client: client, SendTimeout: transportBudget, limiter: limiter}
+	if err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123", "title", "body"); err != nil {
+		t.Fatalf("queued Telegram send failed after reaching its transport slot: %v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("Telegram requests=%d, want 1", requests.Load())
+	}
+}
+
 func TestRequestLimiterWaitHonorsCancellationAndBoundsCooldown(t *testing.T) {
 	limiter := &requestLimiter{interval: time.Hour}
 	if err := limiter.wait(context.Background()); err != nil {
@@ -472,6 +502,12 @@ func TestRequestLimiterWaitHonorsCancellationAndBoundsCooldown(t *testing.T) {
 	cooldownLimiter.mu.Unlock()
 	if remaining := time.Until(next); remaining > maxNotificationCooldown+time.Second || remaining < maxNotificationCooldown-time.Second {
 		t.Fatalf("cooldown=%s, want bounded to %s", remaining, maxNotificationCooldown)
+	}
+	ctxCooldown, cancelCooldown := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelCooldown()
+	var cooldownErr *RateLimitError
+	if err := cooldownLimiter.wait(ctxCooldown); !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter <= 0 {
+		t.Fatalf("active cooldown wait=%v, want RateLimitError", err)
 	}
 }
 

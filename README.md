@@ -53,12 +53,18 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.63.0`; local and published images use the
+footer. The current release is `v0.63.1`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
 remain RFC3339 UTC. Existing databases are normalized automatically during the
 v0.20.0 migration.
+
+The v0.63.1 reliability patch keeps Telegram rate-limited deliveries pending
+until the provider retry window, rather than consuming ordinary failure
+attempts or flooding the provider with the rest of the backlog. Queued Telegram
+sends also reserve their transport timeout only after waiting for the shared
+pacing slot, so healthy messages are not lost to queue timeouts.
 
 The v0.63.0 reliability release bounds unauthenticated readiness writer probes
 with a single-flight, short-lived result cache and a strict probe deadline.
@@ -777,7 +783,10 @@ not subject to that compatibility lock.
 
 Delivery assurance records every normal and digest attempt, keeps a durable
 health state for each destination, and pauses destinations after five
-consecutive failures. Settings shows the latest failure and provides an
+consecutive ordinary failures. Provider rate limits are temporary cooldowns:
+pending rows remain retryable, honor the provider's retry window, and do not
+consume that circuit-breaker budget; a one-minute fallback is used when no
+retry window is supplied. Settings shows the latest failure and provides an
 owner-scoped retry action; administrators can see household-wide destination
 health and pending/failed queue counts. HTTP notification transports use a
 bounded timeout and re-check every redirect against the outbound-target safety
@@ -808,7 +817,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.63.0` publishes `0.63.0`, `0.63`, and `latest`.
+- Pushing a tag such as `v0.63.1` publishes `0.63.1`, `0.63`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -865,7 +874,7 @@ its project, volume, containers, and temporary archives on success or signal.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.1 docker compose up -d
 ```
 
 ## Configuration
