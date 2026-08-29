@@ -54,7 +54,6 @@ type PageDiscovery struct {
 	// reach, carried through the login form so the member lands where they meant
 	// to rather than on the dashboard.
 	ReturnPath          string
-	ListenBrainzArtists []store.Artist
 	GenreBreakdown      []store.ArtistBreakdown
 	CountryBreakdown    []store.ArtistBreakdown
 	TypeBreakdown       []store.ArtistBreakdown

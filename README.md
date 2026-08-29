@@ -53,12 +53,16 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.63.1`; local and published images use the
+footer. The current release is `v0.63.2`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
 remain RFC3339 UTC. Existing databases are normalized automatically during the
 v0.20.0 migration.
+
+The v0.63.2 performance patch removes the dashboard's Watchlist insights panel
+and its dashboard-only popularity and artist-breakdown queries. The Artists page
+continues to provide its own filters and per-artist metadata.
 
 The v0.63.1 reliability patch keeps Telegram rate-limited deliveries pending
 until the provider retry window, rather than consuming ordinary failure
@@ -249,7 +253,7 @@ bounded cache to avoid duplicate concurrent lookups. The v0.51.0 reliability
 patch widens release discovery after a prolonged provider outage to the last
 successful catalog check, validates timezones before persistence, invalidates
 Spotify release caches for scheduled observations, and keeps a direct artist
-management action visible when the dashboard has no insight data.
+management action visible on the dashboard.
 The v0.52.0 hardening patch keeps readiness reads off the serialized writer,
 prevents authenticated pages from being cached after logout, resumes provider
 health refreshes after back-forward-cache restores, adds a plain-HTTP clipboard
@@ -817,7 +821,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.63.1` publishes `0.63.1`, `0.63`, and `latest`.
+- Pushing a tag such as `v0.63.2` publishes `0.63.2`, `0.63`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -874,7 +878,7 @@ its project, volume, containers, and temporary archives on success or signal.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.1 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.2 docker compose up -d
 ```
 
 ## Configuration
@@ -996,9 +1000,9 @@ deterministic username during the v0.16.0 migration and can change it later.
 Public [ListenBrainz popularity](https://listenbrainz.readthedocs.io/en/latest/users/api/popularity.html) is refreshed once per day for followed canonical
 artists. Artist pages show aggregate listen and listener counts when available;
 these statistics are informational only and never create release observations
-or notifications. The dashboard and Artists page also provide compact
-breakdowns by genre, country, and artist type with owner-scoped drill-down
-filters. Genres come from MusicBrainz tags and are normalized locally.
+or notifications. The Artists page also provides compact breakdowns by genre,
+country, and artist type with owner-scoped drill-down filters. Genres come from
+MusicBrainz tags and are normalized locally.
 
 ## Notification destinations
 

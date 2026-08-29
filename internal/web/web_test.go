@@ -1395,6 +1395,9 @@ func TestMusicBrainzBatchFollowAndArtistsPage(t *testing.T) {
 	if !strings.Contains(string(body), "<strong>2</strong>") || !strings.Contains(string(body), "Watchlist assurance") || !strings.Contains(string(body), "First Artist") {
 		t.Fatalf("dashboard count/list body=%q", body)
 	}
+	if strings.Contains(string(body), "Watchlist insights") || strings.Contains(string(body), "ListenBrainz popularity") {
+		t.Fatalf("dashboard still renders removed watchlist insights: %q", body)
+	}
 
 	response = postForm(t, client, server.URL+"/artists/follow/batch", url.Values{
 		"_csrf": {csrf}, "mbids": {firstMBID, secondMBID},
