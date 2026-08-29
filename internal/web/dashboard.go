@@ -39,14 +39,6 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist resolutions", err) || pageFailed
 	d.NotificationHolds, err = a.store.NotificationHolds(r.Context(), session.User.ID, 20)
 	pageFailed = a.pageStoreError(r, &d, "Dashboard", "notification holds", err) || pageFailed
-	d.ListenBrainzArtists, err = a.store.TopListenBrainzArtists(r.Context(), session.User.ID, 5)
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "ListenBrainz popularity", err) || pageFailed
-	d.GenreBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "genre")
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "genre breakdown", err) || pageFailed
-	d.CountryBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "country")
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "country breakdown", err) || pageFailed
-	d.TypeBreakdown, err = a.store.FollowedBreakdown(r.Context(), session.User.ID, "type")
-	pageFailed = a.pageStoreError(r, &d, "Dashboard", "artist type breakdown", err) || pageFailed
 	status := http.StatusOK
 	if pageFailed {
 		status = http.StatusInternalServerError

@@ -85,10 +85,6 @@ func TestArtistMetadataFiltersStatsAndScheduling(t *testing.T) {
 	if _, err := s.FollowedBreakdown(ctx, userID, "unsupported"); err == nil {
 		t.Fatal("unsupported breakdown was accepted")
 	}
-	top, err := s.TopListenBrainzArtists(ctx, userID, 0)
-	if err != nil || len(top) != 1 || top[0].ID != first.ID {
-		t.Fatalf("top ListenBrainz artists=%#v err=%v", top, err)
-	}
 	due, err := s.DueListenBrainzArtists(ctx, now.Add(time.Hour), 0)
 	if err != nil || len(due) != 1 || due[0].ID != second.ID {
 		t.Fatalf("due ListenBrainz artists=%#v err=%v", due, err)

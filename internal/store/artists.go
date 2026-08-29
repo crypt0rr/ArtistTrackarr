@@ -760,32 +760,6 @@ func (s *Store) ScheduleListenBrainzRetry(ctx context.Context, artistIDs []int64
 		return nil
 	})
 }
-func (s *Store) TopListenBrainzArtists(ctx context.Context, userID int64, limit int) ([]Artist, error) {
-	if limit < 1 || limit > 20 {
-		limit = 5
-	}
-	rows, err := s.readerDB().QueryContext(ctx, `SELECT DISTINCT a.id,a.mbid,a.name,a.sort_name,a.artist_type,a.country,a.disambiguation,a.spotify_id,a.spotify_url,a.spotify_image_url,ls.total_listen_count,ls.total_user_count,ls.checked_at
-		FROM follows f JOIN artists a ON a.id=f.artist_id JOIN artist_listenbrainz_stats ls ON ls.artist_id=a.id WHERE f.user_id=? ORDER BY ls.total_listen_count DESC,a.name LIMIT ?`, userID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var result []Artist
-	for rows.Next() {
-		var artist Artist
-		var sid, surl, image, checked sql.NullString
-		if err := rows.Scan(&artist.ID, &artist.MBID, &artist.Name, &artist.SortName, &artist.Type, &artist.Country, &artist.Disambiguation, &sid, &surl, &image, &artist.ListenCount, &artist.ListenUsers, &checked); err != nil {
-			return nil, err
-		}
-		artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL = sid.String, surl.String, image.String
-		var parseErr error
-		if artist.ListenCheckedAt, parseErr = parseStoredNullableTime(checked, "ListenBrainz checked_at"); parseErr != nil {
-			return nil, parseErr
-		}
-		result = append(result, artist)
-	}
-	return result, rows.Err()
-}
 func (s *Store) FollowedBreakdown(ctx context.Context, userID int64, dimension string) ([]ArtistBreakdown, error) {
 	var query string
 	switch dimension {
