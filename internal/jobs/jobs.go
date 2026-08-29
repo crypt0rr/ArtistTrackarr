@@ -544,10 +544,11 @@ type deliveryTarget struct {
 	title       string
 	body        string
 
-	startAttempt func(ctx context.Context, attempt int, at time.Time) (int64, error)
-	markSent     func(ctx context.Context, owner string, at time.Time) error
-	finalizeSent func(ctx context.Context, at time.Time) error
-	markFailed   func(ctx context.Context, attempt int, reason, owner string, at time.Time) error
+	startAttempt    func(ctx context.Context, attempt int, at time.Time) (int64, error)
+	markSent        func(ctx context.Context, owner string, at time.Time) error
+	finalizeSent    func(ctx context.Context, at time.Time) error
+	markFailed      func(ctx context.Context, attempt int, reason, owner string, at time.Time) error
+	markRateLimited func(ctx context.Context, reason, owner string, next time.Time) error
 }
 
 func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.Delivery) deliveryResult {
@@ -566,6 +567,9 @@ func (r *Runner) deliverOne(ctx context.Context, now time.Time, delivery store.D
 		},
 		markFailed: func(ctx context.Context, attempt int, reason, owner string, at time.Time) error {
 			return r.store.MarkDeliveryFailedOwned(ctx, delivery.ID, attempt, reason, owner, at)
+		},
+		markRateLimited: func(ctx context.Context, reason, owner string, next time.Time) error {
+			return r.store.MarkDeliveryRateLimitedOwned(ctx, delivery.ID, reason, owner, next)
 		},
 	})
 }
@@ -587,7 +591,26 @@ func (r *Runner) deliverDigestOne(ctx context.Context, now time.Time, delivery s
 		markFailed: func(ctx context.Context, attempt int, reason, owner string, at time.Time) error {
 			return r.store.MarkDigestDeliveryFailedOwned(ctx, delivery.ID, attempt, reason, owner, at)
 		},
+		markRateLimited: func(ctx context.Context, reason, owner string, next time.Time) error {
+			return r.store.MarkDigestDeliveryRateLimitedOwned(ctx, delivery.ID, reason, owner, next)
+		},
 	})
+}
+
+const notificationRateLimitFallback = time.Minute
+
+func deliveryRateLimitRetryAt(rateLimit *notify.RateLimitError, now time.Time) time.Time {
+	delay := notificationRateLimitFallback
+	if rateLimit != nil && rateLimit.RetryAfter > 0 {
+		delay = rateLimit.RetryAfter
+	}
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > time.Hour {
+		delay = time.Hour
+	}
+	return now.Add(delay)
 }
 
 // performDelivery runs one notification through send and durable state recording. It is
@@ -653,6 +676,31 @@ func (r *Runner) performDelivery(ctx context.Context, now time.Time, target deli
 
 	result.failed = true
 	redactedError := notify.RedactError(err)
+	var rateLimit *notify.RateLimitError
+	if errors.As(err, &rateLimit) {
+		nextRetry := deliveryRateLimitRetryAt(rateLimit, now)
+		r.logger.Warn("notification attempt rate limited",
+			target.logKey, target.id, "destination_id", target.destination.ID,
+			"retry_after", time.Until(nextRetry).Round(time.Second).String())
+		if attemptID > 0 {
+			if finishErr := r.store.FinishDeliveryRateLimitedAttempt(stateCtx, attemptID, target.destination.ID, redactedError, &nextRetry, time.Now().UTC()); finishErr != nil && result.err == nil {
+				result.err = finishErr
+			}
+		}
+		// Persist the destination cooldown before releasing the claimed row.
+		// This closes the small window in which another runner could claim a
+		// newly due row after the provider rejected this one but before health
+		// state recorded the cooldown.
+		if markErr := target.markRateLimited(stateCtx, redactedError, target.claimOwner, nextRetry); markErr != nil {
+			if !errors.Is(markErr, sql.ErrNoRows) && result.err == nil {
+				result.err = markErr
+			}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.err = ctxErr
+		}
+		return result
+	}
 	r.logger.Warn("notification attempt failed",
 		target.logKey, target.id, "destination_id", target.destination.ID, "error", redactedError)
 	if markErr := target.markFailed(stateCtx, target.attempts+1, redactedError, target.claimOwner, now); markErr != nil {

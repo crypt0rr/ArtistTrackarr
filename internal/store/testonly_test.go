@@ -30,8 +30,9 @@ func (s *Store) DueDeliveries(ctx context.Context, now time.Time, limit int) ([]
 		JOIN notification_events e ON e.id=d.event_id JOIN release_groups rg ON rg.id=e.release_group_id
 		WHERE d.status='pending' AND d.next_attempt_at<=? AND dst.enabled=1
 		AND (d.claim_expires_at IS NULL OR d.claim_expires_at<=?)
-		AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+` ORDER BY d.next_attempt_at LIMIT ?`,
-		timeText(now), timeText(now), limit)
+		AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
+		AND `+destinationRetryPredicate+` ORDER BY d.next_attempt_at LIMIT ?`,
+		timeText(now), timeText(now), timeText(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +72,8 @@ func (s *Store) DueDigestDeliveries(ctx context.Context, now time.Time, limit in
 		WHERE dd.status='pending' AND dd.next_attempt_at<=? AND dst.enabled=1
 		AND (dd.claim_expires_at IS NULL OR dd.claim_expires_at<=?)
 		AND `+supportedDestinationServicePredicate("dst")+` AND `+destinationAdmissionPredicate+`
-		ORDER BY dd.next_attempt_at,dd.id LIMIT ?`, timeText(now), timeText(now), limit)
+		AND `+destinationRetryPredicate+`
+		ORDER BY dd.next_attempt_at,dd.id LIMIT ?`, timeText(now), timeText(now), timeText(now), limit)
 	if err != nil {
 		return nil, err
 	}

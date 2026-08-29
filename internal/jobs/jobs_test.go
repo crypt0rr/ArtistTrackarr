@@ -182,6 +182,11 @@ type failingSender struct {
 	err error
 }
 
+type rateLimitedSender struct {
+	err   error
+	calls atomic.Int32
+}
+
 type blockingSender struct {
 	started chan struct{}
 	release chan struct{}
@@ -203,7 +208,15 @@ func (s failingSender) Validate(string) error { return nil }
 
 func (s failingSender) Send(context.Context, string, string, string) error { return s.err }
 
+func (s *rateLimitedSender) Validate(string) error { return nil }
+
+func (s *rateLimitedSender) Send(context.Context, string, string, string) error {
+	s.calls.Add(1)
+	return s.err
+}
+
 var _ notify.NotificationSender = (*parallelTestSender)(nil)
+var _ notify.NotificationSender = (*rateLimitedSender)(nil)
 
 func (s *parallelTestSender) Validate(string) error { return nil }
 
@@ -818,6 +831,108 @@ func TestDeliveryFailureSchedulesRetry(t *testing.T) {
 	next, err := time.Parse(time.RFC3339Nano, nextAttempt)
 	if err != nil || status != "pending" || attempts != 1 || lastError != "temporary delivery failure" || next.Before(before.Add(59*time.Second)) {
 		t.Fatalf("retry row status=%q attempts=%d next=%q last_error=%q parsed=%v err=%v", status, attempts, nextAttempt, lastError, next, err)
+	}
+}
+
+func TestDeliveryRateLimitLeavesBacklogPendingForRetry(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "rate-limit-delivery@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "rate-limit-delivery-artist", Name: "Rate Limit Delivery Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("rate limit delivery secret with at least 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test://rate-limit-destination")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Rate limit", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	destination := destinations[0]
+	now := time.Now().UTC().Add(-time.Minute)
+	for i := 0; i < 6; i++ {
+		releaseResult, err := database.DB.ExecContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`, fmt.Sprintf("rate-limit-delivery-release-%d", i), artist.ID,
+			fmt.Sprintf("Rate Limit Release %d", i), "Album", "[]", "2026-01-01", 3,
+			"https://musicbrainz.org/release-group/rate-limit-delivery", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseID, err := releaseResult.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventResult, err := database.DB.ExecContext(ctx, `INSERT INTO notification_events
+			(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+			userID, releaseID, "announcement", fmt.Sprintf("Rate Limit Release %d", i), "body", now.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventID, err := eventResult.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.DB.ExecContext(ctx, `INSERT INTO deliveries
+			(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+			eventID, destination.ID, "pending", 0, now.Format(time.RFC3339Nano), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const retryAfter = 15 * time.Minute
+	sender := &rateLimitedSender{err: &notify.RateLimitError{
+		Service: "Telegram", StatusCode: 429, RetryAfter: retryAfter, Reason: "Too Many Requests",
+	}}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	summary, err := runner.deliver(ctx, now)
+	if err != nil || summary.Attempted != 6 || summary.Sent != 0 || summary.Failed != 6 {
+		t.Fatalf("delivery summary=%#v err=%v", summary, err)
+	}
+	if sender.calls.Load() != 6 {
+		t.Fatalf("rate-limited sends=%d, want six attempted rows", sender.calls.Load())
+	}
+	var pending, blocked, attempts int
+	if err := database.DB.QueryRowContext(ctx, `SELECT
+		SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END),
+		MAX(attempts) FROM deliveries`).Scan(&pending, &blocked, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 6 || blocked != 0 || attempts != 0 {
+		t.Fatalf("rate-limited queue pending=%d blocked=%d max_attempts=%d, want 6/0/0", pending, blocked, attempts)
+	}
+	health, err := database.DestinationHealthByUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := health[destination.ID]
+	if got.Status != "degraded" || got.ConsecutiveFailures != 0 || got.NextRetryAt == nil || !got.NextRetryAt.After(now.Add(retryAfter-time.Second)) {
+		t.Fatalf("rate-limited destination health=%#v", got)
+	}
+
+	// A newly queued row that is otherwise due must still wait for the
+	// destination cooldown. This is the durable guard that prevents a later
+	// cadence from draining the whole backlog into the same Telegram limit.
+	if _, err := database.DB.ExecContext(ctx, `UPDATE deliveries SET next_attempt_at=? WHERE id=(SELECT MIN(id) FROM deliveries)`, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := database.ClaimDueDeliveries(ctx, now.Add(time.Minute), 10, "cooldown-worker", time.Minute)
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("claimed=%#v err=%v during destination cooldown", claimed, err)
 	}
 }
 

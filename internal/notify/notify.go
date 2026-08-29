@@ -106,13 +106,27 @@ const (
 // the same idle instant and issue a burst. Waiting always honours the caller's
 // context; an abandoned reservation simply leaves a harmless gap.
 type requestLimiter struct {
-	mu       sync.Mutex
-	interval time.Duration
-	next     time.Time
+	mu            sync.Mutex
+	interval      time.Duration
+	next          time.Time
+	cooldownUntil time.Time
+}
+
+func rateLimitCooldownError(until time.Time) *RateLimitError {
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		return nil
+	}
+	return &RateLimitError{
+		Service:    "Telegram",
+		StatusCode: http.StatusTooManyRequests,
+		RetryAfter: remaining,
+		Reason:     "provider cooldown active",
+	}
 }
 
 func (l *requestLimiter) wait(ctx context.Context) error {
-	if l == nil || l.interval <= 0 {
+	if l == nil {
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -120,6 +134,17 @@ func (l *requestLimiter) wait(ctx context.Context) error {
 	}
 	now := time.Now()
 	l.mu.Lock()
+	if err := rateLimitCooldownError(l.cooldownUntil); err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	if !l.cooldownUntil.IsZero() {
+		l.cooldownUntil = time.Time{}
+	}
+	if l.interval <= 0 {
+		l.mu.Unlock()
+		return nil
+	}
 	slot := l.next
 	if slot.Before(now) {
 		slot = now
@@ -135,6 +160,16 @@ func (l *requestLimiter) wait(ctx context.Context) error {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		// A provider response can extend the cooldown while this request is
+		// waiting for its already-reserved pacing slot. Re-check before
+		// issuing the request so queued work is returned to the durable retry
+		// queue instead of sending into an active provider ban.
+		l.mu.Lock()
+		cooldownUntil := l.cooldownUntil
+		l.mu.Unlock()
+		if err := rateLimitCooldownError(cooldownUntil); err != nil {
+			return err
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -150,6 +185,9 @@ func (l *requestLimiter) cooldown(delay time.Duration) {
 	}
 	target := time.Now().Add(delay)
 	l.mu.Lock()
+	if target.After(l.cooldownUntil) {
+		l.cooldownUntil = target
+	}
 	if target.After(l.next) {
 		l.next = target
 	}
@@ -503,10 +541,13 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// carries the caller's cancellation/timeout context all the way to the
 	// sender-owned HTTP client.
 	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
-		sendCtx, cancel := context.WithTimeout(ctx, s.sendTimeout())
-		defer cancel()
 		started := time.Now()
-		err := s.sendTelegram(sendCtx, serviceURL, title, body)
+		// sendTelegram applies the transport timeout to each request after it
+		// obtains a pacing slot. The caller's context remains the queue budget;
+		// otherwise a burst of deliveries can spend the whole ten-second
+		// transport timeout waiting one second per Telegram request and report
+		// deadline failures without issuing a request.
+		err := s.sendTelegram(ctx, serviceURL, title, body)
 		if observer != nil {
 			observer(0, time.Since(started))
 		}
@@ -722,20 +763,24 @@ func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, bod
 			return err
 		}
 		endpoint := "https://api.telegram.org/bot" + token + "/sendMessage"
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
-		if err != nil {
-			return err
-		}
-		request.Header.Set("Content-Type", "application/json")
 		if err := s.waitForRateLimit(ctx); err != nil {
 			return err
 		}
+		requestCtx, cancelRequest := context.WithTimeout(ctx, s.sendTimeout())
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(encoded))
+		if err != nil {
+			cancelRequest()
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
 		response, err := client.Do(request)
 		if err != nil {
+			cancelRequest()
 			return err
 		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 		_ = response.Body.Close()
+		cancelRequest()
 		if readErr != nil {
 			return readErr
 		}
