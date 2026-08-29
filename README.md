@@ -53,12 +53,18 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.62.0`; local and published images use the
+footer. The current release is `v0.63.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
 remain RFC3339 UTC. Existing databases are normalized automatically during the
 v0.20.0 migration.
+
+The v0.63.0 reliability release bounds unauthenticated readiness writer probes
+with a single-flight, short-lived result cache and a strict probe deadline.
+Release validation now also runs an isolated Docker backup/restore rehearsal
+with an encrypted destination, wrong-key rejection, restart persistence, and
+signal-cleanup checks before an image can be published.
 
 Background synchronization and application-log persistence shut down in an
 orderly fashion before SQLite is closed. Routine page loads return a generic
@@ -802,7 +808,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.62.0` publishes `0.62.0`, `0.62`, and `latest`.
+- Pushing a tag such as `v0.63.0` publishes `0.63.0`, `0.63`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -837,7 +843,7 @@ because they are slow enough to want running on purpose:
 | `make smoke` | Builds the runtime image and runs `scripts/container-smoke.sh` against it: setup, sign-in, follow, sync, readiness, persistence across a restart, graceful shutdown, and that the container reports the version it was built from. |
 | `make mutate` | Reintroduces each catalogued defect in turn and checks that the test written for it still fails. Rebuilds per mutation, so it takes a few minutes. |
 | `make version-check` | With `VERSION=x.y.z`, checks the version and the README strings agree. |
-| `make backup-smoke` | Runs `scripts/backup.sh` then `scripts/restore-smoke.sh` end to end. Local only: it stops the running app and manipulates the real data volume. |
+| `make backup-smoke` | Runs `scripts/backup.sh` then `scripts/restore-smoke.sh` end to end against the configured app. Local only: it stops the running app and manipulates the real data volume. The CI release gate uses `scripts/disaster-recovery-smoke.sh` with disposable resources. |
 | `make benchmark-notify` | Notification hold-time benchmark. |
 
 `make mutate` is how this project keeps its fixes proved. Every fix here is
@@ -848,10 +854,18 @@ proof is repeatable. When a fix lands, add a row at the moment you would have
 done the reintroduction by hand anyway. Patterns must match exactly once, so a
 refactor that moves the code reports `DRIFT` rather than passing quietly.
 
+The CI `disaster-recovery` job runs `scripts/disaster-recovery-smoke.sh` on pull
+requests, `main`, and release tags before the image publication job. It builds
+the runtime image locally, refers to that image by its content-addressed
+`sha256:` ID for restore, and uses only disposable Compose resources and
+synthetic setup, session, and encryption keys. The driver creates a real
+encrypted ntfy destination, checks that the wrong key fails closed, and removes
+its project, volume, containers, and temporary archives on success or signal.
+
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.62.0 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.0 docker compose up -d
 ```
 
 ## Configuration
@@ -1099,7 +1113,8 @@ existing notification destinations. Embedded migrations run automatically
 during upgrades; the rehearsal must pass SQLite foreign-key checks and
 `/readyz` before the restored instance is considered usable.
 
-The rehearsal requires an immutable image digest (`@sha256:`), verifies the
+The rehearsal requires an immutable image digest (`@sha256:` for a registry
+image, or a bare `sha256:` image ID for a locally built image), verifies the
 checksum sidecar, runs SQLite `integrity_check` and `foreign_key_check`,
 validates that encrypted destinations can be opened with the original key,
 fingerprints the durable logical database state, and compares that fingerprint
