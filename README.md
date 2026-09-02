@@ -828,7 +828,7 @@ with each release. Local, branch, and release images show that same semantic
 version in the interface and User-Agent. Build provenance remains available
 through image labels and immutable SHA tags.
 
-The module targets Go 1.27; CI and the Docker build use the pinned Go 1.27.0
+The module targets Go 1.27; CI and the Docker build use the pinned Go 1.27.1
 toolchain so local builds and release images share the same supported
 language/runtime line.
 
