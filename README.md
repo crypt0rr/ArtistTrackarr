@@ -53,12 +53,17 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.63.2`; local and published images use the
+footer. The current release is `v0.63.3`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
 remain RFC3339 UTC. Existing databases are normalized automatically during the
 v0.20.0 migration.
+
+The v0.63.3 maintenance release refreshes the Go 1.27.1 toolchain and immutable
+Dockerfile/QEMU pins, updates the SQLite and x/crypto dependencies, and moves
+govulncheck to v1.8.0. The published amd64 and arm64 images remain built from
+the same pinned source and tooling set.
 
 The v0.63.2 performance patch removes the dashboard's Watchlist insights panel
 and its dashboard-only popularity and artist-breakdown queries. The Artists page
@@ -821,7 +826,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.63.2` publishes `0.63.2`, `0.63`, and `latest`.
+- Pushing a tag such as `v0.63.3` publishes `0.63.3`, `0.63`, and `latest`.
 
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
@@ -832,7 +837,7 @@ The module targets Go 1.27; CI and the Docker build use the pinned Go 1.27.1
 toolchain so local builds and release images share the same supported
 language/runtime line.
 
-`make lint` runs the pinned `golangci-lint` v2.13.0 configuration. The focused
+`make lint` runs the pinned `golangci-lint` v2.13.2 configuration. The focused
 quality gate covers unchecked errors, Go vet, static analysis, ineffective
 assignments, unused code, row and SQL resource handling, HTTP body closure,
 wrapped errors, nil-error paths, and duplicate code fragments. `make test` builds the fast Docker test
@@ -878,7 +883,7 @@ its project, volume, containers, and temporary archives on success or signal.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.2 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.3 docker compose up -d
 ```
 
 ## Configuration
