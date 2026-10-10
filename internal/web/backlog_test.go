@@ -66,6 +66,13 @@ func TestAdminDiagnosticsJSONAndRetentionExport(t *testing.T) {
 	if payload["version"] != version.Current || payload["operational_status"] == nil || payload["database"] == nil || payload["retention"] == nil || payload["runner"] == nil {
 		t.Fatalf("unexpected diagnostics payload=%#v", payload)
 	}
+	databaseJSON, ok := payload["database"].(map[string]any)
+	if !ok {
+		t.Fatalf("database diagnostics have unexpected type: %#v", payload["database"])
+	}
+	if _, ok := databaseJSON["migration_snapshots"].([]any); !ok {
+		t.Fatalf("database diagnostics do not expose migration snapshots: %#v", databaseJSON)
+	}
 	jsonBody, _ := json.Marshal(payload)
 	if strings.Contains(string(jsonBody), "example.test") || strings.Contains(string(jsonBody), "secret-token") || strings.Contains(string(jsonBody), "=SUM") {
 		t.Fatalf("diagnostics JSON leaked sensitive content: %s", jsonBody)

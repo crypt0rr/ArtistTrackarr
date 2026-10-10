@@ -156,14 +156,15 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 		OperationalStatus:  status,
 		OperationalReasons: reasons,
 		Database: diagnosticsJSONDatabase{
-			Healthy:       snapshot.DatabaseHealthy,
-			State:         string(snapshot.DatabaseHealthState),
-			Schema:        snapshot.SchemaVersion,
-			SizeBytes:     snapshot.DatabaseBytes,
-			FreeBytes:     snapshot.DatabaseFreeBytes,
-			LastBackupAt:  snapshot.LastBackupAt,
-			LastRestoreAt: snapshot.LastRestoreAt,
-			RestoreResult: snapshot.LastRestoreResult,
+			Healthy:            snapshot.DatabaseHealthy,
+			State:              string(snapshot.DatabaseHealthState),
+			Schema:             snapshot.SchemaVersion,
+			SizeBytes:          snapshot.DatabaseBytes,
+			FreeBytes:          snapshot.DatabaseFreeBytes,
+			LastBackupAt:       snapshot.LastBackupAt,
+			LastRestoreAt:      snapshot.LastRestoreAt,
+			RestoreResult:      snapshot.LastRestoreResult,
+			MigrationSnapshots: make([]diagnosticsJSONMigrationSnapshot, 0, len(snapshot.MigrationSnapshots)),
 		},
 		Inventory: diagnosticsJSONInventory{
 			FollowedArtists:         snapshot.FollowedArtists,
@@ -243,6 +244,15 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 			NextCheckAt: provider.NextCheckAt,
 		})
 	}
+	for _, migrationSnapshot := range snapshot.MigrationSnapshots {
+		payload.Database.MigrationSnapshots = append(payload.Database.MigrationSnapshots, diagnosticsJSONMigrationSnapshot{
+			Name:        migrationSnapshot.Name,
+			FromVersion: migrationSnapshot.FromVersion,
+			ToVersion:   migrationSnapshot.ToVersion,
+			CreatedAt:   migrationSnapshot.CreatedAt,
+			SizeBytes:   migrationSnapshot.SizeBytes,
+		})
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
@@ -267,14 +277,23 @@ type diagnosticsJSONPayload struct {
 }
 
 type diagnosticsJSONDatabase struct {
-	Healthy       bool       `json:"healthy"`
-	State         string     `json:"state"`
-	Schema        int        `json:"schema"`
-	SizeBytes     int64      `json:"size_bytes"`
-	FreeBytes     int64      `json:"free_bytes"`
-	LastBackupAt  *time.Time `json:"last_backup_at,omitempty"`
-	LastRestoreAt *time.Time `json:"last_restore_at,omitempty"`
-	RestoreResult string     `json:"restore_result,omitempty"`
+	Healthy            bool                               `json:"healthy"`
+	State              string                             `json:"state"`
+	Schema             int                                `json:"schema"`
+	SizeBytes          int64                              `json:"size_bytes"`
+	FreeBytes          int64                              `json:"free_bytes"`
+	LastBackupAt       *time.Time                         `json:"last_backup_at,omitempty"`
+	LastRestoreAt      *time.Time                         `json:"last_restore_at,omitempty"`
+	RestoreResult      string                             `json:"restore_result,omitempty"`
+	MigrationSnapshots []diagnosticsJSONMigrationSnapshot `json:"migration_snapshots"`
+}
+
+type diagnosticsJSONMigrationSnapshot struct {
+	Name        string    `json:"name"`
+	FromVersion int       `json:"from_version"`
+	ToVersion   int       `json:"to_version"`
+	CreatedAt   time.Time `json:"created_at"`
+	SizeBytes   int64     `json:"size_bytes"`
 }
 
 type diagnosticsJSONQueue struct {
@@ -579,6 +598,13 @@ func diagnosticReport(snapshot store.DiagnosticsSnapshot, runner jobs.RunnerStat
 		}
 	}
 	fmt.Fprintf(&report, "Database: %s (schema %d)\n", databaseState, snapshot.SchemaVersion)
+	fmt.Fprintf(&report, "Pre-migration snapshots: %d\n", len(snapshot.MigrationSnapshots))
+	for _, migrationSnapshot := range snapshot.MigrationSnapshots {
+		createdAt := migrationSnapshot.CreatedAt
+		fmt.Fprintf(&report, "- %s (schema %d to %d; %s; %d bytes)\n",
+			migrationSnapshot.Name, migrationSnapshot.FromVersion, migrationSnapshot.ToVersion,
+			providerHealthTime(&createdAt, timezone), migrationSnapshot.SizeBytes)
+	}
 	fmt.Fprintf(&report, "Followed artists: %d\n", snapshot.FollowedArtists)
 	fmt.Fprintf(&report, "Known releases: %d\n", snapshot.Releases)
 	fmt.Fprintf(&report, "Queued syncs: %d\n", snapshot.QueuedSyncs)

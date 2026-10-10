@@ -47,7 +47,7 @@ func TestParseLogLevelRejectsInvalidAndEmptyValues(t *testing.T) {
 }
 
 func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
-	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
+	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "MIGRATION_SNAPSHOT_RETENTION", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -74,8 +74,8 @@ func TestLoadDefaultsToInfoLogLevel(t *testing.T) {
 	}
 	t.Setenv("DATABASE_PATH", filepath.Join(t.TempDir(), "artist-tracker.db"))
 	cfg, err := Load()
-	if err != nil || cfg.LogLevel != slog.LevelInfo {
-		t.Fatalf("Load() log level = %v, err=%v; want info", cfg.LogLevel, err)
+	if err != nil || cfg.LogLevel != slog.LevelInfo || cfg.MigrationSnapshotRetention != 2 {
+		t.Fatalf("Load() log level=%v snapshot retention=%d err=%v; want info and default retention 2", cfg.LogLevel, cfg.MigrationSnapshotRetention, err)
 	}
 }
 
@@ -116,7 +116,7 @@ func TestParseBoolAcceptsOnlyExplicitValues(t *testing.T) {
 }
 
 func TestLoadRejectsUntrustedHTTPAndProxyWithoutNetworks(t *testing.T) {
-	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
+	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "MIGRATION_SNAPSHOT_RETENTION", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
 		_ = os.Unsetenv(name)
 		t.Cleanup(func() {
@@ -209,7 +209,7 @@ func TestSecretFileDirectoryIsReturnedAsError(t *testing.T) {
 }
 
 func TestLoadReturnsSecretFileError(t *testing.T) {
-	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
+	for _, name := range []string{"PUBLIC_URL", "LISTEN_ADDR", "DATABASE_PATH", "MIGRATION_SNAPSHOT_RETENTION", "SETUP_TOKEN", "APP_ENCRYPTION_KEY", "SESSION_SECRET", "MUSICBRAINZ_CONTACT", "POLL_INTERVAL", "SPOTIFY_POLL_INTERVAL", "TRUST_PROXY", "TRUSTED_PROXY_CIDRS", "ALLOW_INSECURE_HTTP", "ALLOW_PRIVATE_NOTIFICATION_TARGETS", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_MARKET", "ITUNES_MARKET", "LOG_LEVEL"} {
 		value, present := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -236,6 +236,7 @@ func setLoadBaseline(t *testing.T) {
 	t.Setenv("PUBLIC_URL", "https://tracker.example")
 	t.Setenv("LISTEN_ADDR", ":8080")
 	t.Setenv("DATABASE_PATH", "/tmp/artist-tracker-test.db")
+	t.Setenv("MIGRATION_SNAPSHOT_RETENTION", "2")
 	t.Setenv("SETUP_TOKEN", strings.Repeat("t", 32))
 	t.Setenv("APP_ENCRYPTION_KEY", strings.Repeat("e", 32))
 	t.Setenv("SESSION_SECRET", strings.Repeat("s", 32))
@@ -269,6 +270,9 @@ func TestLoadRejectsInvalidRuntimeConfiguration(t *testing.T) {
 		{name: "trust proxy boolean", set: func() { t.Setenv("TRUST_PROXY", "yes") }, want: "TRUST_PROXY"},
 		{name: "insecure HTTP boolean", set: func() { t.Setenv("ALLOW_INSECURE_HTTP", "enabled") }, want: "ALLOW_INSECURE_HTTP"},
 		{name: "private target boolean", set: func() { t.Setenv("ALLOW_PRIVATE_NOTIFICATION_TARGETS", "1") }, want: "ALLOW_PRIVATE_NOTIFICATION_TARGETS"},
+		{name: "snapshot retention minimum", set: func() { t.Setenv("MIGRATION_SNAPSHOT_RETENTION", "0") }, want: "MIGRATION_SNAPSHOT_RETENTION"},
+		{name: "snapshot retention maximum", set: func() { t.Setenv("MIGRATION_SNAPSHOT_RETENTION", "11") }, want: "MIGRATION_SNAPSHOT_RETENTION"},
+		{name: "snapshot retention integer", set: func() { t.Setenv("MIGRATION_SNAPSHOT_RETENTION", "many") }, want: "MIGRATION_SNAPSHOT_RETENTION"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -288,12 +292,13 @@ func TestLoadAllowsLocalHTTPAndValidOptionalConfiguration(t *testing.T) {
 	t.Setenv("SPOTIFY_CLIENT_SECRET", "client-secret")
 	t.Setenv("SPOTIFY_MARKET", "nl")
 	t.Setenv("ITUNES_MARKET", "ca")
+	t.Setenv("MIGRATION_SNAPSHOT_RETENTION", "5")
 	t.Setenv("LOG_LEVEL", "DEBUG")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SpotifyMarket != "NL" || cfg.ITunesMarket != "CA" || cfg.SpotifyClientID != "client-id" || cfg.LogLevel != slog.LevelDebug {
+	if cfg.SpotifyMarket != "NL" || cfg.ITunesMarket != "CA" || cfg.SpotifyClientID != "client-id" || cfg.LogLevel != slog.LevelDebug || cfg.MigrationSnapshotRetention != 5 {
 		t.Fatalf("optional configuration=%#v", cfg)
 	}
 }

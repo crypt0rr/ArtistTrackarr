@@ -46,6 +46,27 @@ func TestDiagnosticReportExcludesSensitiveProviderDetails(t *testing.T) {
 	}
 }
 
+func TestDiagnosticReportListsPreMigrationSnapshots(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 10, 9, 30, 0, 0, time.UTC)
+	report := diagnosticReport(store.DiagnosticsSnapshot{
+		CheckedAt: createdAt.Add(time.Hour), DatabaseHealthy: true, SchemaVersion: 38,
+		MigrationSnapshots: []store.MigrationSnapshotInfo{{
+			Name:        "pre-migration-v037-to-v038-20261010T093000.000000000Z-a1b2c3.db",
+			FromVersion: 37, ToVersion: 38, CreatedAt: createdAt, SizeBytes: 4096,
+		}},
+	}, jobs.RunnerStatus{}, "UTC", LogSinkHealth{})
+	for _, want := range []string{
+		"Pre-migration snapshots: 1",
+		"pre-migration-v037-to-v038-20261010T093000.000000000Z-a1b2c3.db",
+		"schema 37 to 38",
+		"4096 bytes",
+	} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("diagnostic report missing %q: %q", want, report)
+		}
+	}
+}
+
 // TestLogLossIsVisibleWhileTheProcessRuns pins the application-log loss
 // counters to a runtime surface. Both were previously read only in the
 // clean-shutdown path, strictly after an early return that fires whenever the

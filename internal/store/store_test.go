@@ -299,7 +299,7 @@ func TestITunesMigrationPreservesExistingProviderData(t *testing.T) {
 	if _, _, err := (&Store{DB: db}).CreateArtistResolution(ctx, userID, "spotify", "spotify-id", "Legacy", "https://open.spotify.com/artist/spotify-id", ""); err != nil {
 		t.Fatal(err)
 	}
-	s := &Store{DB: db}
+	s := &Store{DB: db, dataDir: filepath.Dir(path), migrationSnapshotRetention: DefaultMigrationSnapshotRetention}
 	if err := s.migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
