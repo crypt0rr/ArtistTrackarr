@@ -27,6 +27,7 @@ type providerObservation struct {
 	// healthy but intentionally hands control to the next fallback provider.
 	healthy    bool
 	succeeded  bool
+	partial    bool
 	empty      bool
 	suppressed bool
 	deferred   bool
@@ -42,14 +43,17 @@ type providerStrategyResult struct {
 	batches        []store.ReleaseBatch
 	providerErrors []error
 
-	spotifySucceeded  bool
-	spotifyHealthy    bool
-	spotifyAttempted  bool
-	itunesSucceeded   bool
-	itunesHealthy     bool
-	spotifySuppressed bool
-	spotifyDeferred   bool
-	spotifyCooldown   time.Time
+	spotifySucceeded   bool
+	spotifyHealthy     bool
+	spotifyAttempted   bool
+	itunesSucceeded    bool
+	itunesHealthy      bool
+	spotifySuppressed  bool
+	spotifyDeferred    bool
+	spotifyCooldown    time.Time
+	itunesPartial      bool
+	musicBrainzRetryAt time.Time
+	partialFallbackErr error
 
 	spotifyRateLimit *catalog.SpotifyRateLimitError
 	itunesRateLimit  *catalog.ITunesRateLimitError
@@ -99,8 +103,9 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	r.recordProviderStatus(ctx, artist.ID, itunes, now)
 	result.itunesSucceeded = itunes.succeeded
 	result.itunesHealthy = itunes.healthy
+	result.itunesPartial = itunes.partial
 	result.itunesRateLimit = itunes.itunesRateLimit
-	if itunes.succeeded {
+	if itunes.succeeded || itunes.partial {
 		result.batches = append(result.batches, store.ReleaseBatch{
 			Provider: itunes.provider,
 			Releases: r.normalizer.Normalize(itunes.releases),
@@ -117,6 +122,10 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 			return result, err
 		}
 		r.recordProviderStatus(ctx, artist.ID, musicBrainz, now)
+		result.musicBrainzRetryAt = musicBrainz.cooldown
+		if itunes.partial && musicBrainz.cooldown.After(now) {
+			result.partialFallbackErr = musicBrainz.err
+		}
 		if musicBrainz.succeeded {
 			result.batches = append(result.batches, store.ReleaseBatch{
 				Provider: musicBrainz.provider,
@@ -304,6 +313,7 @@ func (r *Runner) observeITunes(ctx context.Context, artist store.Artist, now tim
 			observation.lastError = creditFailure
 		}
 		if catalogTruncated {
+			observation.partial = len(releases) > 0
 			observation.status = "degraded"
 			if observation.lastError == "" {
 				observation.lastError = truncated.Error()
@@ -370,6 +380,7 @@ func (r *Runner) observeMusicBrainz(ctx context.Context, artist store.Artist, no
 	if cooldown.After(now) {
 		r.metrics.RecordProviderCooldown("musicbrainz")
 		observation.status = "cooldown"
+		observation.cooldown = cooldown
 		observation.nextCheckAt = &cooldown
 		r.logger.Debug("MusicBrainz check suppressed by provider cooldown", "artist_id", artist.ID,
 			"retry_after", cooldown.Sub(now).String())

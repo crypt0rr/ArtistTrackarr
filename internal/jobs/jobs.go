@@ -1626,17 +1626,8 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 				return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 			}
-			if spotifyWasDue && strategy.spotifyAttempted {
-				// Empty Spotify results are a healthy request but not an
-				// actionable catalog. They must not enter adaptive backoff;
-				// retry on the bounded failure cadence instead.
-				retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
-				if strategy.spotifyRateLimit != nil {
-					retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
-				}
-				if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
-					return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
-				}
+			if err := r.scheduleEmptySpotifyCheck(ctx, artist.ID, now, spotifyWasDue, strategy); err != nil {
+				return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 			}
 			return outcome, nil
 		}
@@ -1645,16 +1636,10 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			r.logger.Debug("Spotify check retry scheduled", "artist_id", artist.ID,
 				"retry_after", syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval).String(),
 				"quota_exceeded", strategy.spotifyRateLimit.QuotaExceeded)
-			if scheduleErr := r.store.ScheduleSpotifyCheck(ctx, artist.ID,
-				now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))); scheduleErr != nil {
-				strategy.providerErrors = append(strategy.providerErrors,
-					r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, scheduleErr))
-			}
-		} else if strategy.spotifySuppressed {
-			if scheduleErr := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); scheduleErr != nil {
-				strategy.providerErrors = append(strategy.providerErrors,
-					r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, scheduleErr))
-			}
+		}
+		if scheduleErr := r.scheduleEmptySpotifyCheck(ctx, artist.ID, now, spotifyWasDue, strategy); scheduleErr != nil {
+			strategy.providerErrors = append(strategy.providerErrors,
+				r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, scheduleErr))
 		}
 		r.logger.Debug("artist sync retry scheduled", "artist_id", artist.ID,
 			"retry_after", providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval).String())
@@ -1670,11 +1655,16 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 	if err := r.store.MarkArtistChecked(ctx, artist.ID, now, r.interval); err != nil {
 		return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 	}
+	if strategy.itunesPartial && strategy.musicBrainzRetryAt.After(now) {
+		if err := r.store.ScheduleArtistCheck(ctx, artist.ID, strategy.musicBrainzRetryAt); err != nil {
+			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
+		}
+	}
 	if strategy.spotifySuppressed {
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, strategy.spotifyCooldown); err != nil {
 			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
-		return outcome, nil
+		return outcome, strategy.partialFallbackErr
 	}
 	if spotifyWasDue && r.spotify == nil {
 		// The artist carries a Spotify ID but this deployment has no Spotify
@@ -1687,7 +1677,7 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, now.Add(r.spotifyInterval)); err != nil {
 			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
-		return outcome, nil
+		return outcome, strategy.partialFallbackErr
 	}
 	if spotifyWasDue && strategy.spotifySucceeded {
 		if strategy.spotifyRateLimit != nil {
@@ -1728,7 +1718,35 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
 		}
 	}
-	return outcome, nil
+	return outcome, strategy.partialFallbackErr
+}
+
+func (r *Runner) scheduleEmptySpotifyCheck(ctx context.Context, artistID int64, now time.Time,
+	spotifyWasDue bool, strategy providerStrategyResult) error {
+	if !spotifyWasDue {
+		return nil
+	}
+	var retryAt time.Time
+	switch {
+	case strategy.spotifyRateLimit != nil:
+		retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
+	case strategy.spotifySuppressed:
+		retryAt = strategy.spotifyCooldown
+	case strategy.spotifyAttempted:
+		// A failed or empty result stays on bounded retry cadence rather than
+		// adaptive success backoff.
+		retryAt = now.Add(providerFailureRetryDelay(nil, r.interval))
+	case r.spotify == nil:
+		// Imported artist identities can retain a Spotify ID on deployments
+		// without credentials, where no provider attempt can advance the field.
+		retryAt = now.Add(r.spotifyInterval)
+	default:
+		return nil
+	}
+	if retryAt.IsZero() {
+		return nil
+	}
+	return r.store.ScheduleSpotifyCheck(ctx, artistID, retryAt)
 }
 
 const artistIdentityMaxAttempts = 5

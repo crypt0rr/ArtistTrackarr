@@ -213,6 +213,16 @@ CATALOGUE: list[Mutation] = [
                "suppressed the MusicBrainz fallback.",
     ),
     Mutation(
+        name="empty-sync-leaves-spotify-watermark-due",
+        file="internal/jobs/jobs.go",
+        find="\treturn r.store.ScheduleSpotifyCheck(ctx, artistID, retryAt)",
+        replace="\treturn nil",
+        package="./internal/jobs/",
+        test="TestEmptySyncAdvancesSpotifyWatermarkAcrossFallbackOutcomes",
+        guards="#331 - empty or failed provider results left an imported Spotify ID "
+               "due on every scheduler tick and could starve other artists.",
+    ),
+    Mutation(
         name="itunes-credit-artist-only",
         file="internal/catalog/itunes.go",
         find="	return creditIncludesArtist(artistNameField, artist) || creditIncludesArtist(trackName, artist)",
