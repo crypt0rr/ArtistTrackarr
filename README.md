@@ -1034,6 +1034,11 @@ owner can retry after replacing/recovering the destination. A newly added
 destination receives future events only and is not backfilled with historical
 notifications.
 
+Telegram destinations support one chat per URL and plain-text or HTML parse
+modes. Multi-chat and Markdown/MarkdownV2 URLs are rejected before sending so a
+retry cannot duplicate a message already accepted by one chat; text included
+in HTML-mode notifications is escaped automatically.
+
 ### Retention and cleanup
 
 The administrator page includes a retention dry-run with the effective policy
@@ -1102,6 +1107,9 @@ ArtistTrackarr blocks loopback, private, link-local, multicast, and metadata
 network addresses to prevent an invited user from using notifications as an
 SSRF proxy. Set `ALLOW_PRIVATE_NOTIFICATION_TARGETS=true` only when all
 household members are trusted and local notification services are required.
+Notification and artwork transports ignore `HTTP_PROXY` and `HTTPS_PROXY` so
+requests use the application's validated destination and connection policy
+directly.
 
 Take a backup before every upgrade, and keep it until the new version has run
 for a while. Downgrades are not supported: migrations only move forward, and
@@ -1149,9 +1157,13 @@ or `RESTORE_ALLOW_MUTABLE_IMAGE=true`; new backups should always use the
 immutable path. Backup archives and encryption keys are confidential operator
 artifacts.
 
-The rehearsal uses an isolated Docker volume, starts the selected image,
-stops it with the configured grace period, and starts it again to verify that
-the restored data remains usable:
+The rehearsal uses an isolated Docker volume and a container with no Docker
+network and no published host ports. The application listens only on that
+container's loopback interface; readiness is checked from inside the container.
+This keeps pending notification deliveries in the backup from reaching
+configured destinations during a rehearsal. The script starts the selected
+image, stops it with the configured grace period, and starts it again to verify
+that the restored data remains usable:
 
 ```console
 APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
@@ -1170,8 +1182,8 @@ the Compose service (`COMPOSE_SERVICE`, default `app`) exactly as `scripts/backu
 resolves it, writing as UID 10001 through an atomic rename. The timestamp and
 result then appear as `Last restore rehearsal` on the administration page, in the
 support report, in `/admin/diagnostics.json`, and in the hourly operational
-snapshots. It is opt-in because the rehearsal is otherwise fully isolated from
-production:
+snapshots. It is opt-in because recording is the only operation that reaches
+the live instance; the rehearsal container itself stays network-isolated:
 
 ```console
 APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \

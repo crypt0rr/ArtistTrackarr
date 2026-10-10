@@ -12,8 +12,11 @@ suffix="${CI_RUN_ID:-$$}"
 project="${DR_COMPOSE_PROJECT_NAME:-artist-trackarr-dr-${suffix}}"
 port="${DR_COMPOSE_PORT:-8080}"
 restore_prefix="artist-trackarr-dr-restore-${suffix}"
+recorder_port="${DR_RECORDER_PORT:-$((20000 + ($$ % 20000)))}"
+recorder_pid=''
 base="http://127.0.0.1:${port}"
 jar=$(mktemp)
+recorder_root=$(mktemp -d "${TMPDIR:-/tmp}/artist-trackarr-dr-recorder.XXXXXX")
 archive=$(mktemp "${TMPDIR:-/tmp}/artist-trackarr-dr.XXXXXX.tgz")
 legacy_archive="${archive}.legacy.tgz"
 setup_token="${DR_SETUP_TOKEN:-ci-dr-setup-token-123456789012345678901234567890}"
@@ -31,12 +34,18 @@ export APP_ENCRYPTION_KEY="$encryption_key"
 export SESSION_SECRET="$session_secret"
 export SPOTIFY_CLIENT_ID=''
 export SPOTIFY_CLIENT_SECRET=''
+export ALLOW_PRIVATE_NOTIFICATION_TARGETS=true
+export RESTORE_SMOKE_SETTLE_SECONDS=12
 export POLL_INTERVAL=1h
 export SPOTIFY_POLL_INTERVAL=1h
 
 cleanup() {
 	status=$?
 	trap - EXIT INT TERM HUP
+	if [ -n "$recorder_pid" ]; then
+		kill "$recorder_pid" >/dev/null 2>&1 || true
+		wait "$recorder_pid" 2>/dev/null || true
+	fi
 	docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
 	docker ps -aq --filter "name=^/${restore_prefix}-" | xargs -r docker rm -f >/dev/null 2>&1 || true
 	docker volume ls -q --filter "name=^${restore_prefix}-" | xargs -r docker volume rm >/dev/null 2>&1 || true
@@ -46,6 +55,7 @@ cleanup() {
 		"${archive}.HUP.tgz" "${archive}.HUP.tgz.sha256" \
 		"${archive}.stopped.tgz" "${archive}.stopped.tgz.sha256" \
 		"${archive}.INT.tgz."*.tmp "${archive}.TERM.tgz."*.tmp "${archive}.HUP.tgz."*.tmp
+	rm -rf "$recorder_root"
 	exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -94,6 +104,14 @@ restore_volume_created() {
 	[ -n "$(docker volume ls -q --filter "name=^${restore_prefix}-signal-" 2>/dev/null || true)" ]
 }
 
+recorder_request_count() {
+	if [ -s "$recorder_root/requests" ]; then
+		wc -l < "$recorder_root/requests" | tr -d ' '
+	else
+		printf '0\n'
+	fi
+}
+
 # Freeze the helper after it has reached the resource-specific operation, then
 # deliver a real signal. This makes the existing signal traps deterministic
 # without adding test-only sleeps or branches to the operator-facing helpers.
@@ -116,6 +134,43 @@ interrupt_when() {
 	echo "disaster recovery: timed out waiting to interrupt process $pid" >&2
 	return 1
 }
+
+cat > "$recorder_root/server.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import sys
+
+port = int(sys.argv[1])
+request_log = sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+	def do_GET(self):
+		self.send_response(200)
+		self.end_headers()
+
+	def do_POST(self):
+		length = int(self.headers.get("Content-Length", "0"))
+		self.rfile.read(length)
+		with open(request_log, "a", encoding="utf-8") as output:
+			output.write(f"{self.command} {self.path}\n")
+		self.send_response(200)
+		self.send_header("Content-Length", "8")
+		self.end_headers()
+		self.wfile.write(b"accepted")
+
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+PY
+python3 "$recorder_root/server.py" "$recorder_port" "$recorder_root/requests" >/dev/null 2>&1 &
+recorder_pid=$!
+for _ in {1..30}; do
+	if curl --fail --silent "http://127.0.0.1:$recorder_port/healthz" >/dev/null; then
+		break
+	fi
+	sleep 0.1
+done
+if ! kill -0 "$recorder_pid" 2>/dev/null; then
+	echo 'disaster recovery: notification request recorder failed to start' >&2
+	exit 1
+fi
 
 docker compose up -d app >/dev/null
 wait_ready
@@ -152,7 +207,38 @@ curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
 	--data-urlencode 'host=ntfy.sh' \
 	--data-urlencode 'topic=artisttrackarr-ci-disaster-recovery' >/dev/null
 settings_page=$(curl --fail --silent --cookie "$jar" "$base/settings")
+settings_csrf=$(printf '%s' "$settings_page" | csrf_from)
+test -n "$settings_csrf"
+curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
+	--request POST "$base/destinations" \
+	--data-urlencode "_csrf=$settings_csrf" \
+	--data-urlencode 'name=CI restore request recorder' \
+	--data-urlencode 'service=generic' \
+	--data-urlencode "target=http://127.0.0.1:$recorder_port/cgi-bin/notify" >/dev/null
+settings_page=$(curl --fail --silent --cookie "$jar" "$base/settings")
 grep -q 'CI encrypted destination' <<<"$settings_page"
+grep -q 'CI restore request recorder' <<<"$settings_page"
+
+# Seed one due notification delivery while the application is stopped. The
+# immutable backup captures it pending; the running source app may later retry
+# it, but the restore rehearsal below must never reach the loopback recorder.
+docker compose stop app >/dev/null
+fixture_sql=$(cat <<SQL
+INSERT OR IGNORE INTO artists (id, mbid, name, sort_name, artist_type, country, created_at, updated_at, next_check_at)
+VALUES (1, '00000000-0000-4000-8000-000000000001', 'CI Recovery Artist', 'CI Recovery Artist', 'Group', 'US', datetime('now'), datetime('now'), datetime('now', '+1 day'));
+INSERT OR IGNORE INTO release_groups (id, mbid, artist_id, title, primary_type, first_release_date, musicbrainz_url, first_observed_at, updated_at)
+VALUES (1, '00000000-0000-4000-8000-000000000002', 1, 'CI Recovery Release', 'Album', '2026-01-01', 'https://musicbrainz.org/release-group/00000000-0000-4000-8000-000000000002', datetime('now'), datetime('now'));
+INSERT OR IGNORE INTO notification_events (id, user_id, release_group_id, event_type, title, body, created_at)
+VALUES (1, 1, 1, 'announcement', 'CI recovery pending message', 'This due notification must not leave the isolated restore container.', datetime('now'));
+INSERT OR IGNORE INTO deliveries (event_id, destination_id, status, attempts, next_attempt_at, last_error)
+SELECT 1, id, 'pending', 0, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minute'), ''
+FROM destinations WHERE user_id=1 AND name='CI restore request recorder';
+SQL
+)
+docker run --rm --env "FIXTURE_SQL=$fixture_sql" --volumes-from "$(docker compose ps -aq app)" "$HELPER_IMAGE" \
+	sh -ec 'apk add --no-cache sqlite >/dev/null; sqlite3 /data/artist-tracker.db "$FIXTURE_SQL"'
+docker compose start app >/dev/null
+wait_ready
 
 # Exercise every backup signal trap after the running service has actually
 # stopped. The interrupted archive must not become an apparent backup, and the
@@ -182,11 +268,45 @@ for signal in INT TERM HUP; do
 	fi
 done
 
+# The interrupted-backup rehearsal restarted the source app, which may have
+# attempted the seeded webhook. Re-arm its row and health state while stopped
+# so the final archive always contains due, deliverable work.
+docker compose stop app >/dev/null
+reset_sql=$(cat <<'SQL'
+UPDATE deliveries SET status='pending', attempts=0,
+  next_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minute'), last_error=''
+WHERE event_id=1 AND destination_id=(SELECT id FROM destinations WHERE name='CI restore request recorder');
+INSERT OR REPLACE INTO destination_health
+  (destination_id,status,consecutive_failures,last_success_at,last_failure_at,next_retry_at,last_error,updated_at)
+SELECT id,'healthy',0,NULL,NULL,NULL,'',datetime('now')
+FROM destinations WHERE name='CI restore request recorder';
+SQL
+)
+docker run --rm --env "FIXTURE_SQL=$reset_sql" --volumes-from "$(docker compose ps -aq app)" "$HELPER_IMAGE" \
+	sh -ec 'apk add --no-cache sqlite >/dev/null; sqlite3 /data/artist-tracker.db "$FIXTURE_SQL"'
 BACKUP_HELPER_IMAGE="$HELPER_IMAGE" ./scripts/backup.sh "$archive"
 test -s "$archive"
 test -s "$archive.sha256"
 test "$(stat -c '%a' "$archive")" = 600
 test "$(stat -c '%a' "$archive.sha256")" = 600
+docker run --rm \
+	--env "PENDING_QUERY=SELECT COUNT(*) FROM deliveries d JOIN destinations n ON n.id=d.destination_id WHERE d.status='pending' AND d.next_attempt_at<=strftime('%Y-%m-%dT%H:%M:%SZ','now') AND n.name='CI restore request recorder';" \
+	-v "$archive:/backup/restore.tgz:ro" "$HELPER_IMAGE" sh -ec '
+work=$(mktemp -d)
+trap "rm -rf \"$work\"" EXIT
+tar xzf /backup/restore.tgz -C "$work"
+apk add --no-cache sqlite >/dev/null
+pending=$(sqlite3 "$work/artist-tracker.db" "$PENDING_QUERY")
+printf 'disaster recovery: archived due notification deliveries: %s\n' "$pending"
+if [ "$pending" -lt 1 ]; then
+	echo 'disaster recovery: backup did not retain a due pending notification delivery' >&2
+	exit 1
+fi
+'
+# Prevent retries by the original container from affecting the recorder count
+# while the isolated restore rehearsal runs.
+docker compose stop app >/dev/null
+recorder_requests_before=$(recorder_request_count)
 
 # A backup of a service stopped by the operator must stay stopped after both
 # the archive and checksum have been written successfully.
@@ -237,6 +357,12 @@ APP_ENCRYPTION_KEY="$encryption_key" ARTIST_TRACKARR_IMAGE="$image_id" \
 	RESTORE_SMOKE_NAME_PREFIX="$restore_prefix" RESTORE_SMOKE_PORT=18083 \
 	RESTORE_HELPER_IMAGE="$HELPER_IMAGE" ./scripts/restore-smoke.sh "$archive"
 assert_no_restore_resources
+recorder_requests_after=$(recorder_request_count)
+if [ "$recorder_requests_after" -ne "$recorder_requests_before" ]; then
+	echo "disaster recovery: isolated restore sent $((recorder_requests_after - recorder_requests_before)) outbound notification request(s)" >&2
+	cat "$recorder_root/requests" >&2 || true
+	exit 1
+fi
 
 # Exercise the restore trap on SIGTERM as soon as its disposable volume exists.
 # The unique prefix lets this assertion coexist with an operator's unrelated
@@ -254,4 +380,4 @@ fi
 test "$(docker volume ls -q --filter "name=^${restore_prefix}-" || true)" = "$before_restore_volumes"
 assert_no_restore_resources
 
-echo 'disaster recovery: isolated backup, wrong-key rejection, restore persistence, and signal cleanup passed'
+echo 'disaster recovery: isolated backup, wrong-key rejection, outbound-free restore persistence, and signal cleanup passed'

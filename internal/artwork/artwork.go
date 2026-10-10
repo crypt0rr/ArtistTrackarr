@@ -514,6 +514,7 @@ func safeTransport(base http.RoundTripper, allowLoopback bool,
 		return base
 	}
 	transport = transport.Clone()
+	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
