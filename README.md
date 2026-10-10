@@ -956,16 +956,20 @@ newly observed future or recent guest releases are eligible for the normal
 announcement and release-day reminders. Follow rules that include featured
 appearances also include guest credits.
 
-To keep Spotify Development Mode usage low, release observation normally reads
-the newest Spotify artist-albums page and only walks older pages when the stored
-Spotify release history has not yet been reached. Known release IDs, dates, and
-provider observations are retained locally, and successful release responses
-are cached for 24 hours. Artist searches are cached briefly (with identical
-in-flight searches coalesced), and artist metadata is cached for 24 hours; this
-also means selecting an artist directly from a recent search does not trigger a
-second lookup request. Batch follow actions use Spotify's multiple-artist
-endpoint when available. Artists are assigned stable polling offsets so a large
-watch list is spread across the day instead of queried in one burst.
+Spotify release checks page through the primary album, single, and compilation
+catalog up to its reported total, with a 100-page safety limit. If the reported
+primary catalog exceeds that limit, the check stops after the first page and
+retries no sooner than `SPOTIFY_POLL_INTERVAL`. Featured appearances are fetched
+as a separate supplementary stream, so an oversized `appears_on` catalog cannot
+discard the primary releases; incomplete featured results are omitted. Due
+scheduled checks invalidate the 24-hour release cache before fetching, while
+successful release responses remain cached for short discovery and follow
+bursts. Artist searches are cached briefly (with identical in-flight searches
+coalesced), and artist metadata is cached for 24 hours; this also means
+selecting an artist directly from a recent search does not trigger a second
+lookup request. Batch follow actions use Spotify's multiple-artist endpoint
+when available. Artists are assigned stable polling offsets so a large watch
+list is spread across the day instead of queried in one burst.
 Apple/iTunes release observations are best-effort and are matched by canonical artist name. Spotify and Apple/iTunes use the same release-type heuristic: an explicit standalone “Single” or “EP” title wins, followed by one track as Single, two through six tracks as EP, and seven or more tracks as Album; compilations remain Albums. Word-boundary matching avoids treating titles such as “episode”, “epic”, or “epilogue” as EPs. When provider-derived types disagree, a unique normalized title/date match is preferred over creating a duplicate. Apple artwork URLs are accepted only from Apple hosts, loaded directly with attribution, and never downloaded or retained as image bytes. Existing artwork gaps are backfilled one artist at a time using the same conservative limiter. MusicBrainz release polling remains the final fallback and does not override successful Spotify or iTunes observations.
 
 iTunes requests are serialized to approximately one request every three seconds and successful responses are cached. The storefront follows `ITUNES_MARKET` (default `US`) independently of Spotify, and no Apple credentials are required. The [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/Searching.html) recommends keeping usage around 20 requests per minute, so iTunes remains a conservative fallback rather than a high-volume source.

@@ -1713,6 +1713,8 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		retryAt := now.Add(providerFailureRetryDelay(strategy.spotifyRateLimit, r.interval))
 		if strategy.spotifyRateLimit != nil {
 			retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
+		} else if strategy.spotifyCatalogLimit {
+			retryAt = now.Add(r.spotifyInterval)
 		}
 		if err := r.store.ScheduleSpotifyCheck(ctx, artist.ID, retryAt); err != nil {
 			return outcome, r.scheduleSyncPersistenceFailure(ctx, artist.ID, now, err)
@@ -1732,6 +1734,8 @@ func (r *Runner) scheduleEmptySpotifyCheck(ctx context.Context, artistID int64, 
 		retryAt = now.Add(syncRetryDelay(strategy.spotifyRateLimit, r.spotifyInterval))
 	case strategy.spotifySuppressed:
 		retryAt = strategy.spotifyCooldown
+	case strategy.spotifyCatalogLimit:
+		retryAt = now.Add(r.spotifyInterval)
 	case strategy.spotifyAttempted:
 		// A failed or empty result stays on bounded retry cadence rather than
 		// adaptive success backoff.

@@ -1916,6 +1916,51 @@ func TestSpotifyFailureFallsBackToITunesBeforeMusicBrainz(t *testing.T) {
 	}
 }
 
+func TestSpotifyCatalogLimitRetriesAtConfiguredPollIntervalWithFallback(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{
+		MBID: "spotify-catalog-limit-artist", Name: "Catalog Limit Artist", SpotifyID: "spotify-catalog-limit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spotify := &spotifyReleaseCatalog{err: &catalog.CatalogLimitError{Provider: "Spotify", Pages: 100}}
+	itunesRelease := store.Release{
+		MBID: "spotify-catalog-limit-fallback", ITunesID: "spotify-catalog-limit-fallback-id",
+		Title: "iTunes Fallback", PrimaryType: "Album", FirstReleaseDate: "2026-08-18",
+		DatePrecision: 3, Source: "itunes",
+	}
+	itunes := &itunesReleaseCatalog{releases: []store.Release{itunesRelease}}
+	runner := New(database, &resolutionCatalog{}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithSpotify(spotify), WithITunes(itunes), WithSpotifyInterval(2*time.Hour))
+	now := time.Now().UTC()
+	if _, err := runner.syncOne(ctx, artist, now); err != nil {
+		t.Fatalf("fallback sync after Spotify catalog limit: %v", err)
+	}
+	if spotify.calls.Load() != 1 || itunes.calls.Load() != 1 {
+		t.Fatalf("Spotify calls=%d iTunes calls=%d, want one bounded Spotify attempt and one fallback", spotify.calls.Load(), itunes.calls.Load())
+	}
+	var nextSpotifyCheck string
+	if err := database.DB.QueryRowContext(ctx, `SELECT spotify_next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextSpotifyCheck); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextSpotifyCheck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Before(now.Add(2 * time.Hour)) {
+		t.Fatalf("Spotify retry=%v is before configured poll interval %v", next, now.Add(2*time.Hour))
+	}
+	var stored int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=? AND itunes_id=?`, artist.ID, itunesRelease.ITunesID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Fatalf("fallback release rows=%d, want one persisted iTunes release", stored)
+	}
+}
+
 func TestITunesFailureFallsBackToMusicBrainz(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)

@@ -43,17 +43,18 @@ type providerStrategyResult struct {
 	batches        []store.ReleaseBatch
 	providerErrors []error
 
-	spotifySucceeded   bool
-	spotifyHealthy     bool
-	spotifyAttempted   bool
-	itunesSucceeded    bool
-	itunesHealthy      bool
-	spotifySuppressed  bool
-	spotifyDeferred    bool
-	spotifyCooldown    time.Time
-	itunesPartial      bool
-	musicBrainzRetryAt time.Time
-	partialFallbackErr error
+	spotifySucceeded    bool
+	spotifyHealthy      bool
+	spotifyAttempted    bool
+	itunesSucceeded     bool
+	itunesHealthy       bool
+	spotifySuppressed   bool
+	spotifyDeferred     bool
+	spotifyCooldown     time.Time
+	itunesPartial       bool
+	musicBrainzRetryAt  time.Time
+	partialFallbackErr  error
+	spotifyCatalogLimit bool
 
 	spotifyRateLimit *catalog.SpotifyRateLimitError
 	itunesRateLimit  *catalog.ITunesRateLimitError
@@ -80,6 +81,8 @@ func (r *Runner) observeReleaseProviders(ctx context.Context, artist store.Artis
 	result.spotifyDeferred = spotify.deferred
 	result.spotifyCooldown = spotify.cooldown
 	result.spotifyRateLimit = spotify.spotifyRateLimit
+	var spotifyCatalogLimit *catalog.CatalogLimitError
+	result.spotifyCatalogLimit = errors.As(spotify.err, &spotifyCatalogLimit) && spotifyCatalogLimit.Provider == "Spotify"
 	result.spotifyChanged = spotify.spotifyChanged
 	result.spotifyUnchanged = spotify.spotifyUnchanged
 	if spotify.succeeded {
