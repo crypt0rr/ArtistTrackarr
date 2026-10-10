@@ -664,6 +664,53 @@ func TestNonTelegram429ResponsesAreRateLimited(t *testing.T) {
 	}
 }
 
+func TestNonTelegram429CooldownDoesNotBlockOtherDestination(t *testing.T) {
+	var destinationARequests, destinationBRequests atomic.Int32
+	destinationA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		destinationARequests.Add(1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer destinationA.Close()
+	destinationB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		destinationBRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destinationB.Close()
+
+	sender := ShoutrrrSender{
+		AllowPrivateTargets: true,
+		SendTimeout:         time.Second,
+		limiter:             &requestLimiter{interval: time.Millisecond},
+	}
+	destinationAURL := "generic+" + destinationA.URL + "/hook"
+	destinationBURL := "generic+" + destinationB.URL + "/hook"
+
+	err := sender.Send(context.Background(), destinationAURL, "title", "body")
+	var rateLimitErr *RateLimitError
+	if !errors.As(err, &rateLimitErr) || rateLimitErr.Service != "Webhook" || rateLimitErr.RetryAfter != 30*time.Second {
+		t.Fatalf("destination A send error=%#v, want webhook 429 with 30s retry", err)
+	}
+	if err := sender.Send(context.Background(), destinationAURL, "title", "body"); !errors.As(err, &rateLimitErr) {
+		t.Fatalf("destination A retry error=%#v, want its active cooldown", err)
+	}
+
+	started := time.Now()
+	if err := sender.Send(context.Background(), destinationBURL, "title", "body"); err != nil {
+		t.Fatalf("unrelated destination B was blocked by destination A's webhook cooldown: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("destination B waited %s during destination A's cooldown", elapsed)
+	}
+	if got := destinationARequests.Load(); got != 1 {
+		t.Fatalf("destination A HTTP requests=%d, want 1 while its cooldown is active", got)
+	}
+	if got := destinationBRequests.Load(); got != 1 {
+		t.Fatalf("destination B HTTP requests=%d, want one immediate send", got)
+	}
+}
+
 func TestNotificationRequestLimiterSpacesTelegramRequests(t *testing.T) {
 	var mu sync.Mutex
 	var requestTimes []time.Time
