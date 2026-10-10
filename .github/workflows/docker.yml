@@ -164,37 +164,6 @@ jobs:
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
-  query-benchmark:
-    name: Dashboard query baseline and candidate benchmark
-    if: github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[query-benchmark]')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version: '1.27.2'
-          cache: true
-
-      - name: Benchmark base and candidate on the same runner
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GOMAXPROCS: "2"
-          GOFLAGS: -buildvcs=false
-        run: |
-          git worktree add /tmp/query-baseline "$BASE_SHA"
-          cp internal/store/ownership_benchmark_test.go /tmp/query-baseline/internal/store/
-          echo "BASELINE $BASE_SHA"
-          (cd /tmp/query-baseline && go test ./internal/store -run '^$' -bench '^BenchmarkDashboardReleases$' -benchmem -benchtime=3x -count=5)
-          echo "CANDIDATE $GITHUB_SHA"
-          go test ./internal/store -run '^$' -bench '^BenchmarkDashboardReleases$' -benchmem -benchtime=3x -count=5
-
   publish:
     name: Publish Docker image
     if: github.event_name == 'push'
