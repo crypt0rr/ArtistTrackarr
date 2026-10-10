@@ -27,6 +27,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
@@ -43,11 +46,8 @@ jobs:
       - name: Build runtime image
         run: docker build --tag artist-trackarr:ci .
 
-      - name: Smoke test startup, persistence, and graceful shutdown
-        # SMOKE_EXPECTED_VERSION enables the script's version-identity check.
-        # On a tag build take it from the tag, not from source: that is the
-        # one place anything proves end to end that the image about to be
-        # published reports the version it is published as.
+      - name: Resolve expected version identity
+        id: expected-version
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             expected="${GITHUB_REF_NAME#v}"
@@ -60,8 +60,34 @@ jobs:
             echo "could not determine the expected version; refusing to skip the check" >&2
             exit 1
           fi
+          echo "version=${expected}" >> "$GITHUB_OUTPUT"
           echo "asserting container reports version ${expected}"
-          SMOKE_EXPECTED_VERSION="${expected}" scripts/container-smoke.sh artist-trackarr:ci
+
+      - name: Smoke test amd64 startup, persistence, and graceful shutdown
+        env:
+          SMOKE_PLATFORM: linux/amd64
+          SMOKE_EXPECTED_VERSION: ${{ steps.expected-version.outputs.version }}
+          CI_RUN_ID: ${{ github.run_id }}
+        run: scripts/container-smoke.sh artist-trackarr:ci
+
+      - name: Build arm64 runtime image for pull request smoke coverage
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: artist-trackarr:ci-arm64
+          cache-from: type=gha,scope=artist-trackarr-runtime-arm64-smoke
+          cache-to: type=gha,mode=max,scope=artist-trackarr-runtime-arm64-smoke
+
+      - name: Smoke test arm64 startup, persistence, and graceful shutdown
+        env:
+          SMOKE_PLATFORM: linux/arm64
+          SMOKE_EXPECTED_VERSION: ${{ steps.expected-version.outputs.version }}
+          SMOKE_READY_TIMEOUT_SECONDS: 180
+          CI_RUN_ID: ${{ github.run_id }}
+        run: scripts/container-smoke.sh artist-trackarr:ci-arm64
 
   disaster-recovery:
     name: Disaster recovery rehearsal
@@ -180,16 +206,136 @@ jobs:
             org.opencontainers.image.title=ArtistTrackarr
             org.opencontainers.image.description=Self-hosted artist release tracker
 
-      - name: Build and publish image
+      - name: Resolve expected version identity
+        id: expected-version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            expected="${GITHUB_REF_NAME#v}"
+          else
+            expected="$(sed -n 's/^const Current = \"\(.*\)\"$/\1/p' internal/version/version.go)"
+          fi
+          if [ -z "${expected}" ]; then
+            echo "could not determine the expected version; refusing to skip the check" >&2
+            exit 1
+          fi
+          echo "version=${expected}" >> "$GITHUB_OUTPUT"
+          echo "asserting container reports version ${expected}"
+
+      - name: Build multi-arch image by digest
+        id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          # Publish only an immutable digest here. No mutable alias is moved
+          # until both platform-specific smoke tests pass below.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha,scope=artist-trackarr-runtime
           cache-to: type=gha,mode=max,scope=artist-trackarr-runtime
           provenance: mode=max
           sbom: true
+
+      - name: Resolve published platform digests
+        id: platform-digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "build did not return an immutable image digest: ${IMAGE_DIGEST}" >&2
+            exit 1
+          fi
+          manifest="$(docker buildx imagetools inspect --raw "${IMAGE}@${IMAGE_DIGEST}")"
+          for arch in amd64 arm64; do
+            digest="$(jq -er --arg arch "${arch}" '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest]
+              | if length == 1 then .[0] else error("expected exactly one linux/" + $arch + " manifest") end
+            ' <<<"${manifest}")"
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid linux/${arch} manifest digest: ${digest}" >&2
+              exit 1
+            fi
+            echo "${arch}_digest=${digest}" >> "$GITHUB_OUTPUT"
+            echo "linux/${arch} smoke target: ${IMAGE}@${digest}"
+          done
+
+      - name: Smoke-test published amd64 digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          PLATFORM_DIGEST: ${{ steps.platform-digests.outputs.amd64_digest }}
+          SMOKE_PLATFORM: linux/amd64
+          SMOKE_EXPECTED_VERSION: ${{ steps.expected-version.outputs.version }}
+          SMOKE_READY_TIMEOUT_SECONDS: 180
+          CI_RUN_ID: ${{ github.run_id }}
+        run: scripts/container-smoke.sh "${IMAGE}@${PLATFORM_DIGEST}"
+
+      - name: Smoke-test published arm64 digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          PLATFORM_DIGEST: ${{ steps.platform-digests.outputs.arm64_digest }}
+          SMOKE_PLATFORM: linux/arm64
+          SMOKE_EXPECTED_VERSION: ${{ steps.expected-version.outputs.version }}
+          SMOKE_READY_TIMEOUT_SECONDS: 180
+          CI_RUN_ID: ${{ github.run_id }}
+        run: scripts/container-smoke.sh "${IMAGE}@${PLATFORM_DIGEST}"
+
+      - name: Promote verified image digest to release tags
+        if: success()
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IMAGE_TAGS}" ]]; then
+            echo "metadata action produced no image tags; refusing to leave the build unpromoted" >&2
+            exit 1
+          fi
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "promoting ${IMAGE}@${IMAGE_DIGEST} to ${tag}"
+            # A single index source is copied byte-for-byte, retaining its
+            # platform manifests, provenance, and SBOM attestations.
+            docker buildx imagetools create --tag "${tag}" "${IMAGE}@${IMAGE_DIGEST}"
+          done <<<"${IMAGE_TAGS}"
+
+      - name: Verify published tags retain tested digests and attestations
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          AMD64_DIGEST: ${{ steps.platform-digests.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.platform-digests.outputs.arm64_digest }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IMAGE_TAGS}" ]]; then
+            echo "metadata action produced no image tags" >&2
+            exit 1
+          fi
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            actual_digest="$(docker buildx imagetools inspect "${tag}" --format '{{.Manifest.Digest}}')"
+            if [ "${actual_digest}" != "${IMAGE_DIGEST}" ]; then
+              echo "${tag} points to ${actual_digest}; expected tested index ${IMAGE_DIGEST}" >&2
+              exit 1
+            fi
+            manifest="$(docker buildx imagetools inspect --raw "${tag}")"
+            for pair in "amd64:${AMD64_DIGEST}" "arm64:${ARM64_DIGEST}"; do
+              arch="${pair%%:*}"
+              digest="${pair#*:}"
+              jq -e --arg arch "${arch}" --arg digest "${digest}" '
+                any(.manifests[]; .platform.os == "linux" and .platform.architecture == $arch and .digest == $digest)
+              ' <<<"${manifest}" >/dev/null
+              jq -e --arg digest "${digest}" '
+                any(.manifests[]; .annotations["vnd.docker.reference.type"] == "attestation-manifest" and .annotations["vnd.docker.reference.digest"] == $digest)
+              ' <<<"${manifest}" >/dev/null
+            done
+            docker buildx imagetools inspect "${tag}" --format '{{json .Provenance}}' \
+              | jq -e 'has("linux/amd64") and has("linux/arm64") and .["linux/amd64"].SLSA != null and .["linux/arm64"].SLSA != null' >/dev/null
+            docker buildx imagetools inspect "${tag}" --format '{{json .SBOM}}' \
+              | jq -e '.["linux/amd64"].SPDX != null and .["linux/arm64"].SPDX != null' >/dev/null
+            echo "verified ${tag} -> ${IMAGE_DIGEST} (amd64 ${AMD64_DIGEST}, arm64 ${ARM64_DIGEST}, provenance and SBOM present)"
+          done <<<"${IMAGE_TAGS}"

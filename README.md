@@ -828,6 +828,12 @@ GitHub Actions builds and publishes the Docker image to
 - `sha-<commit>` identifies an exact source revision.
 - Pushing a tag such as `v0.63.5` publishes `0.63.5`, `0.63`, and `latest`.
 
+Before those tags move, CI pushes the multi-architecture image by immutable
+digest, smoke-tests the exact amd64 and arm64 manifests with the expected
+version identity, and then promotes and verifies the tested manifest and its
+provenance and SBOM attestations. A failed platform smoke test leaves the
+existing tags unchanged.
+
 The application version is kept in `internal/version/version.go` and is bumped
 with each release. Local, branch, and release images show that same semantic
 version in the interface and User-Agent. Build provenance remains available
