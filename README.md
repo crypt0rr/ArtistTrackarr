@@ -839,6 +839,10 @@ with each release. Local, branch, and release images show that same semantic
 version in the interface and User-Agent. Build provenance remains available
 through image labels and immutable SHA tags.
 
+Compose defaults to the current release image tag (`0.63.5` in this checkout).
+Set `ARTIST_TRACKARR_IMAGE` to select another release, the moving `latest` tag,
+or a locally built image.
+
 The module targets Go 1.27; CI and the Docker build use the pinned Go 1.27.1
 toolchain so local builds and release images share the same supported
 language/runtime line.
@@ -909,6 +913,7 @@ ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.5 docker compose up 
 | `SPOTIFY_MARKET` | no | `US` | Two-letter market used when retrieving Spotify releases. |
 | `ITUNES_MARKET` | no | `US` | Two-letter Apple/iTunes storefront used for fallback searches and release lookups. |
 | `DATABASE_PATH` | no | `/data/artist-tracker.db` | SQLite database location; startup rejects directory paths and missing parent directories. |
+| `MIGRATION_SNAPSHOT_RETENTION` | no | `2` | Number of pre-migration snapshots to retain; startup accepts values from 1 through 10 and stores snapshots privately under `/data/migration-snapshots`. |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address. |
 | `TRUST_PROXY` | no | `false` | Strict boolean (`true`/`false`); trust `X-Forwarded-For` only when the connecting proxy matches `TRUSTED_PROXY_CIDRS`. |
 | `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated proxy networks, for example `127.0.0.1/32,10.0.0.0/8`; required when `TRUST_PROXY=true`. |
@@ -1110,6 +1115,16 @@ application refuses to start against a database a newer release has migrated,
 naming both schema versions, so a rollback fails loudly at startup instead of
 serving requests and then breaking sign-in. Recovering from that means
 restoring the backup taken before the upgrade.
+
+Before applying pending migrations, startup also writes one consistent SQLite
+snapshot of the existing database to the private
+`/data/migration-snapshots` directory. The snapshot is created before both SQL
+and special-case migrations; if it cannot be completed, startup stops before
+changing the schema. Fresh and already-current databases do not create a new
+snapshot. `MIGRATION_SNAPSHOT_RETENTION` controls how many successful upgrade
+snapshots are kept (default `2`, accepted range `1`–`10`); snapshots use
+directory mode `0700` and file mode `0600`. They remain on the same volume and
+are included in later backup archives, so continue keeping an off-host backup.
 
 For a consistent backup, use the repository helper. It stops the app, resolves
 the volume actually mounted at `/data`, refuses missing or empty databases, and

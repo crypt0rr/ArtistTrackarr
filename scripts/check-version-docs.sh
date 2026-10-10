@@ -41,4 +41,9 @@ if ! grep -Fq "ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:$tag" READ
 	echo "version-check: README.md Compose image pin is not $tag" >&2
 	exit 1
 fi
+compose_default=$(sed -n 's/^[[:space:]]*image:[[:space:]]*"${ARTIST_TRACKARR_IMAGE:-ghcr.io\/crypt0rr\/artist-trackarr:\([0-9.]*\)}"$/\1/p' compose.yaml | head -n 1)
+if [ "$compose_default" != "$tag" ]; then
+	echo "version-check: compose.yaml default image is ${compose_default:-missing}, expected $tag" >&2
+	exit 1
+fi
 echo "version-check: documentation matches v$tag"

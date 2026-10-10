@@ -25,18 +25,18 @@ type Store struct {
 	DB     *sql.DB
 	Reader *sql.DB
 	// dataDir is set for stores opened through Open and is intentionally empty
-	// for lightweight test fixtures that wrap an existing *sql.DB. Operational
-	// marker files in this directory contain only non-sensitive backup/recovery
-	// timestamps and status labels.
-	dataDir             string
-	readerMu            sync.RWMutex
-	healthMu            sync.RWMutex
-	retentionMu         sync.RWMutex
-	pollInterval        time.Duration
-	spotifyPollInterval time.Duration
-	retentionPolicy     RetentionPolicy
-	closeOnce           sync.Once
-	closeErr            error
+	// for lightweight test fixtures that wrap an existing *sql.DB. It contains
+	// operational markers and a private directory for full database snapshots.
+	dataDir                    string
+	migrationSnapshotRetention int
+	readerMu                   sync.RWMutex
+	healthMu                   sync.RWMutex
+	retentionMu                sync.RWMutex
+	pollInterval               time.Duration
+	spotifyPollInterval        time.Duration
+	retentionPolicy            RetentionPolicy
+	closeOnce                  sync.Once
+	closeErr                   error
 	// writeRetries counts write attempts replayed after transient SQLite
 	// contention, and writeRetryExhaustions counts bounded retry loops that
 	// gave up. Every write goes through one connection behind a 5s
@@ -799,11 +799,12 @@ type DiagnosticsSnapshot struct {
 	// DatabaseFreeBytes is the SQLite freelist space that can be reused by
 	// future writes. It is intentionally separate from DatabaseBytes because
 	// deleting rows does not necessarily shrink the database file.
-	DatabaseFreeBytes int64
-	LastBackupAt      *time.Time
-	LastRestoreAt     *time.Time
-	LastRestoreResult string
-	Providers         []DiagnosticsProvider
+	DatabaseFreeBytes  int64
+	LastBackupAt       *time.Time
+	LastRestoreAt      *time.Time
+	LastRestoreResult  string
+	MigrationSnapshots []MigrationSnapshotInfo
+	Providers          []DiagnosticsProvider
 }
 
 // ArtistSyncBacklog describes the complete normal/Spotify due queue. It is

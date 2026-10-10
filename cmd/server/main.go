@@ -69,7 +69,9 @@ func main() {
 		logger.Error("create data directory", "error", err)
 		os.Exit(1)
 	}
-	database, err := store.Open(cfg.DatabasePath)
+	database, err := store.OpenWithOptions(cfg.DatabasePath, store.OpenOptions{
+		MigrationSnapshotRetention: cfg.MigrationSnapshotRetention,
+	})
 	if err != nil {
 		logger.Error("open database", "error", err)
 		os.Exit(1)

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,7 @@ type Config struct {
 	ListenAddr                      string
 	PublicURL                       *url.URL
 	DatabasePath                    string
+	MigrationSnapshotRetention      int
 	SetupToken                      string
 	EncryptionKey                   string
 	SessionSecret                   string
@@ -102,10 +104,15 @@ func Load() (Config, error) {
 	if err := validateDatabasePath(databasePath); err != nil {
 		return Config{}, err
 	}
+	migrationSnapshotRetention, err := strconv.Atoi(strings.TrimSpace(env("MIGRATION_SNAPSHOT_RETENTION", "2")))
+	if err != nil || migrationSnapshotRetention < 1 || migrationSnapshotRetention > 10 {
+		return Config{}, errors.New("MIGRATION_SNAPSHOT_RETENTION must be an integer from 1 through 10")
+	}
 	cfg := Config{
 		ListenAddr:                      listenAddr,
 		PublicURL:                       publicURL,
 		DatabasePath:                    databasePath,
+		MigrationSnapshotRetention:      migrationSnapshotRetention,
 		SetupToken:                      setupToken,
 		EncryptionKey:                   encryptionKey,
 		SessionSecret:                   sessionSecret,

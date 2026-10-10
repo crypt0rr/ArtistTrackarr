@@ -26,6 +26,28 @@ func (c ResolutionCandidate) Artist() Artist {
 	}
 }
 func Open(path string) (*Store, error) {
+	return OpenWithOptions(path, OpenOptions{})
+}
+
+// OpenOptions controls filesystem-backed store behavior that must be known
+// before startup migrations run.
+type OpenOptions struct {
+	// MigrationSnapshotRetention is the maximum number of completed pre-migration
+	// snapshots to keep. Zero uses DefaultMigrationSnapshotRetention.
+	MigrationSnapshotRetention int
+}
+
+// OpenWithOptions opens the database and applies migrations using the supplied
+// operational settings. A zero snapshot retention uses the conservative
+// default; non-zero values outside the supported range are rejected.
+func OpenWithOptions(path string, options OpenOptions) (*Store, error) {
+	retention := options.MigrationSnapshotRetention
+	if retention == 0 {
+		retention = DefaultMigrationSnapshotRetention
+	}
+	if retention < MinMigrationSnapshotRetention || retention > MaxMigrationSnapshotRetention {
+		return nil, fmt.Errorf("migration snapshot retention must be between %d and %d", MinMigrationSnapshotRetention, MaxMigrationSnapshotRetention)
+	}
 	dsn := sqliteDSN(path, false)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -41,7 +63,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Store{DB: db, dataDir: filepath.Dir(path)}
+	s := &Store{DB: db, dataDir: filepath.Dir(path), migrationSnapshotRetention: retention}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -97,6 +119,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	highestEmbedded := 0
+	type migration struct {
+		version int
+		body    []byte
+	}
+	var pending []migration
+	appliedVersions := make(map[int]struct{})
 	for _, entry := range entries {
 		version, err := strconv.Atoi(strings.SplitN(entry.Name(), "_", 2)[0])
 		if err != nil {
@@ -105,17 +133,52 @@ func (s *Store) migrate(ctx context.Context) error {
 		if version > highestEmbedded {
 			highestEmbedded = version
 		}
-		var exists int
-		if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=?`, version).Scan(&exists); err != nil {
+	}
+	var appliedCount, appliedMax int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&appliedCount, &appliedMax); err != nil {
+		return fmt.Errorf("read applied migrations: %w", err)
+	}
+	if err := s.verifySchemaNotAhead(ctx, highestEmbedded); err != nil {
+		return err
+	}
+	if err := func() error {
+		rows, err := s.DB.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+		if err != nil {
 			return err
 		}
-		if exists > 0 {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var version int
+			if err := rows.Scan(&version); err != nil {
+				return err
+			}
+			appliedVersions[version] = struct{}{}
+		}
+		return rows.Err()
+	}(); err != nil {
+		return fmt.Errorf("read applied migrations: %w", err)
+	}
+	for _, entry := range entries {
+		version, err := strconv.Atoi(strings.SplitN(entry.Name(), "_", 2)[0])
+		if err != nil {
+			return fmt.Errorf("invalid migration %s", entry.Name())
+		}
+		if _, ok := appliedVersions[version]; ok {
 			continue
 		}
 		body, err := migrations.ReadFile("migrations/" + entry.Name())
 		if err != nil {
 			return err
 		}
+		pending = append(pending, migration{version: version, body: body})
+	}
+	if appliedCount > 0 && len(pending) > 0 {
+		if err := s.createPreMigrationSnapshot(ctx, appliedMax, highestEmbedded); err != nil {
+			return fmt.Errorf("create pre-migration snapshot before applying %d pending migrations: %w", len(pending), err)
+		}
+	}
+	for _, item := range pending {
+		version, body := item.version, item.body
 		if version == 8 {
 			if err := s.migrateITunesFallback(ctx); err != nil {
 				return fmt.Errorf("migration %d: %w", version, err)
@@ -154,6 +217,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.verifyForeignKeyEnforcement(ctx); err != nil {
 		return fmt.Errorf("verify foreign-key enforcement after migrations: %w", err)
+	}
+	if err := s.pruneMigrationSnapshots(); err != nil {
+		return fmt.Errorf("prune pre-migration snapshots after successful migration: %w", err)
 	}
 	return nil
 }

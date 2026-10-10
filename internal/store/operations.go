@@ -549,6 +549,10 @@ func (s *Store) Diagnostics(ctx context.Context) (DiagnosticsSnapshot, error) {
 	snapshot.DatabaseFreeBytes = freePages * pageSize
 	snapshot.LastBackupAt, _ = s.operationalMarker(backupMarkerFile)
 	snapshot.LastRestoreAt, snapshot.LastRestoreResult = s.operationalMarker(restoreMarkerFile)
+	snapshot.MigrationSnapshots, err = s.migrationSnapshots()
+	if err != nil {
+		return DiagnosticsSnapshot{}, err
+	}
 	health, err := s.ProviderHealth(ctx)
 	if err != nil {
 		return DiagnosticsSnapshot{}, err
