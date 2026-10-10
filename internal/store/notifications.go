@@ -291,6 +291,22 @@ func (s *Store) FinishDeliveryRateLimitedAttempt(ctx context.Context, attemptID,
 	return s.finishDeliveryAttempt(ctx, attemptID, destinationID, false, message, nextRetry, finished, true)
 }
 
+// FinishDeliverySentPersistenceErrorAttempt records that the provider accepted
+// a message when the follow-up queue-row update failed. The error belongs to
+// the attempt audit, but it is not evidence that the destination is unhealthy.
+func (s *Store) FinishDeliverySentPersistenceErrorAttempt(ctx context.Context, attemptID int64, message string, finished time.Time) error {
+	if attemptID < 1 {
+		return errors.New("delivery attempt is required")
+	}
+	message = safeDeliveryError(message)
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	_, err := s.execWriteContext(ctx, `UPDATE delivery_attempts SET status='sent',finished_at=?,last_error=? WHERE id=?`,
+		timeText(finished), message, attemptID)
+	return err
+}
+
 func (s *Store) finishDeliveryAttempt(ctx context.Context, attemptID, destinationID int64, success bool, message string, nextRetry *time.Time, finished time.Time, rateLimited bool) error {
 	if attemptID < 1 || destinationID < 1 {
 		return errors.New("delivery attempt and destination are required")

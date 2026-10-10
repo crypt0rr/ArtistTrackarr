@@ -494,6 +494,16 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
         guards="#348 - a multi-token provider charge incremented the bucket by "
                "only one token.",
     ),
+    Mutation(
+        name="notification-response-body-unbounded",
+        file="internal/notify/notify.go",
+        find="Reader: io.LimitReader(response.Body, maxNotificationResponseBodyBytes),",
+        replace="Reader: response.Body,",
+        package="./internal/notify/",
+        test="TestNotificationResponseBodiesAreBounded",
+        guards="#329 - a provider-controlled response body was read without a "
+               "size bound, allowing generic and ntfy responses to exhaust memory.",
+    ),
 ]
 
 

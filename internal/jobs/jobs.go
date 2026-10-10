@@ -661,9 +661,17 @@ func (r *Runner) performDelivery(ctx context.Context, now time.Time, target deli
 				return deliveryResult{sent: true}
 			}
 			if attemptID > 0 {
-				_ = r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, false, markErr.Error(), nil, time.Now().UTC())
+				if finishErr := r.store.FinishDeliverySentPersistenceErrorAttempt(stateCtx, attemptID, markErr.Error(), time.Now().UTC()); finishErr != nil {
+					markErr = errors.Join(markErr, finishErr)
+				}
 			}
-			return deliveryResult{failed: true, err: markErr}
+			// The provider already accepted this notification. A failed local
+			// status write must not count against destination health or the
+			// circuit breaker; the pending queue row will be reconciled later.
+			r.logger.Warn("notification sent but delivery state update failed",
+				target.logKey, target.id, "destination_id", target.destination.ID,
+				"error", notify.RedactError(markErr))
+			return deliveryResult{sent: true, err: markErr}
 		}
 		if attemptID > 0 {
 			if finishErr := r.store.FinishDeliveryAttempt(stateCtx, attemptID, target.destination.ID, true, "", nil, time.Now().UTC()); finishErr != nil {

@@ -158,6 +158,32 @@ func TestCacheAcceptsCustomHTTPClient(t *testing.T) {
 	}
 }
 
+func TestArtworkTransportIgnoresEnvironmentProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+	for _, test := range []struct {
+		name   string
+		client *http.Client
+	}{
+		{name: "default transport", client: &http.Client{}},
+		{name: "caller transport", client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cache, err := NewCache(t.TempDir(), WithHTTPClient(test.client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport, ok := cache.secureClient().Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("artwork transport type=%T, want *http.Transport", cache.secureClient().Transport)
+			}
+			if transport.Proxy != nil {
+				t.Fatal("artwork transport uses the environment proxy")
+			}
+		})
+	}
+}
+
 func TestMissingArtIsNegativelyCached(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

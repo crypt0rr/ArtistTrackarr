@@ -95,18 +95,29 @@ printf '%s\n' \"\$fingerprint_hash\"
 "
 }
 
-docker run -d --name "$container" --network host -v "$volume:/data" \
-	-e LISTEN_ADDR=":$port" -e PUBLIC_URL="http://127.0.0.1:$port" \
+docker run -d --name "$container" --network none -v "$volume:/data" \
+	-e LISTEN_ADDR="127.0.0.1:$port" -e PUBLIC_URL="http://127.0.0.1:$port" \
 	-e ALLOW_INSECURE_HTTP=true -e MUSICBRAINZ_CONTACT="restore-smoke@example.invalid" \
+	-e ALLOW_PRIVATE_NOTIFICATION_TARGETS="${ALLOW_PRIVATE_NOTIFICATION_TARGETS:-false}" \
 	-e APP_ENCRYPTION_KEY="$APP_ENCRYPTION_KEY" \
 	-e SESSION_SECRET="${SESSION_SECRET:-restore-smoke-session-secret-change-me-1234567890}" \
 	-e SETUP_TOKEN="${SETUP_TOKEN:-restore-smoke-setup-token-change-me-1234567890}" \
 	"$image" >/dev/null
 
+network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container")
+if [ "$network_mode" != "none" ]; then
+	echo "restore: expected network mode none, got $network_mode" >&2
+	exit 1
+fi
+if [ "$(docker inspect -f '{{if .HostConfig.PortBindings}}published{{else}}none{{end}}' "$container")" != "none" ]; then
+	echo "restore: rehearsal container unexpectedly publishes a host port" >&2
+	exit 1
+fi
+
 wait_ready() {
 	i=0
 	while [ "$i" -lt 60 ]; do
-		if wget -q -O /dev/null "http://127.0.0.1:$port/readyz"; then
+		if docker exec "$container" wget -q -O /dev/null "http://127.0.0.1:$port/readyz"; then
 			return 0
 		fi
 		if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" != "true" ]; then
@@ -123,6 +134,12 @@ wait_ready() {
 }
 
 wait_ready
+settle_seconds=${RESTORE_SMOKE_SETTLE_SECONDS:-0}
+if [ "$settle_seconds" -gt 0 ]; then
+	# CI gives due work one scheduler tick so the no-network assertion proves
+	# that a real delivery attempt could not reach its configured destination.
+	sleep "$settle_seconds"
+fi
 docker stop --time 60 "$container" >/dev/null
 if [ "$(docker inspect -f '{{.State.ExitCode}}' "$container")" != "0" ]; then
 	echo "restore: application did not shut down cleanly" >&2

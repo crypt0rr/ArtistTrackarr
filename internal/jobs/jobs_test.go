@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -894,7 +896,7 @@ func TestDeliveryRateLimitLeavesBacklogPendingForRetry(t *testing.T) {
 
 	const retryAfter = 15 * time.Minute
 	sender := &rateLimitedSender{err: &notify.RateLimitError{
-		Service: "Telegram", StatusCode: 429, RetryAfter: retryAfter, Reason: "Too Many Requests",
+		Service: "Webhook", StatusCode: 429, RetryAfter: retryAfter, Reason: "Too Many Requests",
 	}}
 	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -933,6 +935,164 @@ func TestDeliveryRateLimitLeavesBacklogPendingForRetry(t *testing.T) {
 	claimed, err := database.ClaimDueDeliveries(ctx, now.Add(time.Minute), 10, "cooldown-worker", time.Minute)
 	if err != nil || len(claimed) != 0 {
 		t.Fatalf("claimed=%#v err=%v during destination cooldown", claimed, err)
+	}
+}
+
+func insertPendingNotificationForTest(t *testing.T, database *store.Store, userID, destinationID int64, label string, now time.Time) int64 {
+	t.Helper()
+	artist, err := database.UpsertArtist(context.Background(), store.Artist{MBID: label + "-artist", Name: label + " Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	releaseResult, err := database.DB.Exec(`INSERT INTO release_groups
+		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,first_observed_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, label+"-release", artist.ID, label+" Release", "Album", "[]", "2026-01-01", 3,
+		"https://musicbrainz.org/release-group/"+label+"-release", stamp, stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := releaseResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventResult, err := database.DB.Exec(`INSERT INTO notification_events
+		(user_id,release_group_id,event_type,title,body,created_at) VALUES(?,?,?,?,?,?)`,
+		userID, releaseID, "announcement", label+" title", label+" body", stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := eventResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := database.DB.Exec(`INSERT INTO deliveries
+		(event_id,destination_id,status,attempts,next_attempt_at,last_error) VALUES(?,?,?,?,?,?)`,
+		eventID, destinationID, "pending", 0, stamp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deliveryID
+}
+
+func TestTelegramCooldownDoesNotDegradeQueuedWebhookDestination(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "telegram-cooldown-webhook@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cipher, err := security.NewCipher("telegram cooldown jobs test secret 32 chars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceURL := "generic+" + server.URL + "/hook"
+	encrypted, err := cipher.Encrypt(serviceURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Webhook", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	insertPendingNotificationForTest(t, database, userID, destinations[0].ID, "telegram-cooldown-webhook", now)
+	limiter := notify.NewNotificationRequestLimiter(0)
+	limiter.Cooldown("telegram://12345:mock-token@telegram?chats=-100123", time.Hour)
+	sender := notify.NewShoutrrrSenderWithRequestLimiter(true, time.Second, limiter)
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, sender, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	summary, err := runner.deliver(ctx, time.Now().UTC())
+	if err != nil || summary.Attempted != 1 || summary.Sent != 1 || summary.Failed != 0 {
+		t.Fatalf("webhook delivery summary=%#v err=%v, want sent during Telegram cooldown", summary, err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("webhook requests=%d, want 1", requests.Load())
+	}
+	var deliveryStatus, healthStatus string
+	var consecutiveFailures int
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM deliveries`).Scan(&deliveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,consecutive_failures FROM destination_health WHERE destination_id=?`, destinations[0].ID).
+		Scan(&healthStatus, &consecutiveFailures); err != nil {
+		t.Fatal(err)
+	}
+	if deliveryStatus != "sent" || healthStatus != "healthy" || consecutiveFailures != 0 {
+		t.Fatalf("delivery status=%q destination health=%q failures=%d, want sent/healthy/0", deliveryStatus, healthStatus, consecutiveFailures)
+	}
+}
+
+func TestPostSendDeliveryStateErrorDoesNotDamageDestinationHealth(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "post-send-state-error@example.com", "unused", "member", "UTC", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher("post send error test secret with 32 characters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("generic+https://hooks.example.test/delivery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddDestination(ctx, userID, "Webhook", "generic", encrypted); err != nil {
+		t.Fatal(err)
+	}
+	destinations, err := database.Destinations(ctx, userID)
+	if err != nil || len(destinations) != 1 {
+		t.Fatalf("destinations=%#v err=%v", destinations, err)
+	}
+	now := time.Now().UTC()
+	deliveryID := insertPendingNotificationForTest(t, database, userID, destinations[0].ID, "post-send-state-error", now.Add(-time.Minute))
+	if _, err := database.DB.ExecContext(ctx, `INSERT INTO destination_health
+		(destination_id,status,consecutive_failures,last_failure_at,last_error,updated_at)
+		VALUES(?,'degraded',4,?,?,?)`, destinations[0].ID, now.Add(-time.Hour).Format(time.RFC3339Nano), "prior transient failure", now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.DB.ExecContext(ctx, `CREATE TRIGGER fail_delivery_mark_sent
+		BEFORE UPDATE OF status ON deliveries WHEN NEW.status='sent'
+		BEGIN SELECT RAISE(FAIL, 'post-send status write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	runner := New(database, nil, catalog.AlbumEPNormalizer{}, &parallelTestSender{}, cipher, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result := runner.deliverOne(ctx, now, store.Delivery{
+		ID: deliveryID, Destination: destinations[0], Title: "sent title", Body: "sent body",
+	})
+	if !result.sent || result.failed || result.err == nil {
+		t.Fatalf("post-send result=%#v, want accepted send with a recorded state error", result)
+	}
+	var deliveryStatus, healthStatus, attemptStatus, attemptError string
+	var consecutiveFailures int
+	if err := database.DB.QueryRowContext(ctx, `SELECT status FROM deliveries WHERE id=?`, deliveryID).Scan(&deliveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,consecutive_failures FROM destination_health WHERE destination_id=?`, destinations[0].ID).
+		Scan(&healthStatus, &consecutiveFailures); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT status,last_error FROM delivery_attempts WHERE delivery_id=?`, deliveryID).
+		Scan(&attemptStatus, &attemptError); err != nil {
+		t.Fatal(err)
+	}
+	if deliveryStatus != "pending" || healthStatus != "degraded" || consecutiveFailures != 4 || attemptStatus != "sent" || attemptError == "" {
+		t.Fatalf("delivery=%q health=%q failures=%d attempt=%q error=%q", deliveryStatus, healthStatus, consecutiveFailures, attemptStatus, attemptError)
 	}
 }
 

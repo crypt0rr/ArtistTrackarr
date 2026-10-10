@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +100,7 @@ const (
 	// delivery burst fans out across the four background workers.
 	defaultNotificationRequestInterval = time.Second
 	maxNotificationCooldown            = time.Hour
+	maxNotificationResponseBodyBytes   = 64 << 10
 )
 
 // requestLimiter reserves request slots process-wide. Reservation happens
@@ -106,26 +108,55 @@ const (
 // the same idle instant and issue a burst. Waiting always honours the caller's
 // context; an abandoned reservation simply leaves a harmless gap.
 type requestLimiter struct {
-	mu            sync.Mutex
-	interval      time.Duration
-	next          time.Time
-	cooldownUntil time.Time
+	mu        sync.Mutex
+	interval  time.Duration
+	next      time.Time
+	cooldowns map[notificationCooldownKey]providerCooldown
 }
 
-func rateLimitCooldownError(until time.Time) *RateLimitError {
+type notificationCooldownKey [sha256.Size]byte
+
+type providerCooldown struct {
+	until   time.Time
+	service string
+}
+
+// NotificationRequestLimiter lets related senders share pacing and provider
+// cooldowns while keeping tests and isolated integrations independent from the
+// process-wide limiter.
+type NotificationRequestLimiter struct {
+	limiter *requestLimiter
+}
+
+func NewNotificationRequestLimiter(interval time.Duration) *NotificationRequestLimiter {
+	return &NotificationRequestLimiter{limiter: &requestLimiter{interval: interval}}
+}
+
+// Cooldown applies the bounded provider cooldown for one destination. Telegram
+// destinations are keyed by a hash of the bot token; other destinations use a
+// hash of their configured URL.
+func (l *NotificationRequestLimiter) Cooldown(serviceURL string, delay time.Duration) {
+	if l == nil || l.limiter == nil {
+		return
+	}
+	key, service := notificationCooldownScope(serviceURL)
+	l.limiter.cooldown(key, service, delay)
+}
+
+func rateLimitCooldownError(service string, until time.Time) *RateLimitError {
 	remaining := time.Until(until)
 	if remaining <= 0 {
 		return nil
 	}
 	return &RateLimitError{
-		Service:    "Telegram",
+		Service:    service,
 		StatusCode: http.StatusTooManyRequests,
 		RetryAfter: remaining,
 		Reason:     "provider cooldown active",
 	}
 }
 
-func (l *requestLimiter) wait(ctx context.Context) error {
+func (l *requestLimiter) wait(ctx context.Context, key notificationCooldownKey, service string) error {
 	if l == nil {
 		return nil
 	}
@@ -134,12 +165,13 @@ func (l *requestLimiter) wait(ctx context.Context) error {
 	}
 	now := time.Now()
 	l.mu.Lock()
-	if err := rateLimitCooldownError(l.cooldownUntil); err != nil {
+	cooldown := l.cooldowns[key]
+	if err := rateLimitCooldownError(cooldown.service, cooldown.until); err != nil {
 		l.mu.Unlock()
 		return err
 	}
-	if !l.cooldownUntil.IsZero() {
-		l.cooldownUntil = time.Time{}
+	if !cooldown.until.IsZero() {
+		delete(l.cooldowns, key)
 	}
 	if l.interval <= 0 {
 		l.mu.Unlock()
@@ -165,9 +197,9 @@ func (l *requestLimiter) wait(ctx context.Context) error {
 		// issuing the request so queued work is returned to the durable retry
 		// queue instead of sending into an active provider ban.
 		l.mu.Lock()
-		cooldownUntil := l.cooldownUntil
+		cooldown := l.cooldowns[key]
 		l.mu.Unlock()
-		if err := rateLimitCooldownError(cooldownUntil); err != nil {
+		if err := rateLimitCooldownError(cooldown.service, cooldown.until); err != nil {
 			return err
 		}
 		return nil
@@ -176,7 +208,7 @@ func (l *requestLimiter) wait(ctx context.Context) error {
 	}
 }
 
-func (l *requestLimiter) cooldown(delay time.Duration) {
+func (l *requestLimiter) cooldown(key notificationCooldownKey, service string, delay time.Duration) {
 	if l == nil || delay <= 0 {
 		return
 	}
@@ -185,13 +217,39 @@ func (l *requestLimiter) cooldown(delay time.Duration) {
 	}
 	target := time.Now().Add(delay)
 	l.mu.Lock()
-	if target.After(l.cooldownUntil) {
-		l.cooldownUntil = target
+	if l.cooldowns == nil {
+		l.cooldowns = make(map[notificationCooldownKey]providerCooldown)
 	}
-	if target.After(l.next) {
-		l.next = target
+	current := l.cooldowns[key]
+	if target.After(current.until) {
+		l.cooldowns[key] = providerCooldown{until: target, service: service}
 	}
 	l.mu.Unlock()
+}
+
+func notificationCooldownScope(serviceURL string) (notificationCooldownKey, string) {
+	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || parsed == nil {
+		return sha256.Sum256([]byte(strings.TrimSpace(serviceURL))), "Notification"
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	service := "Notification"
+	switch scheme {
+	case "telegram":
+		service = "Telegram"
+	case "discord":
+		service = "Discord"
+	case "ntfy":
+		service = "ntfy"
+	case "generic+http", "generic+https":
+		service = "Webhook"
+	}
+	keyMaterial := strings.TrimSpace(serviceURL)
+	if scheme == "telegram" && parsed.User != nil {
+		password, _ := parsed.User.Password()
+		keyMaterial = "telegram:" + parsed.User.Username() + ":" + password
+	}
+	return sha256.Sum256([]byte(keyMaterial)), service
 }
 
 var notificationRequestLimiter = &requestLimiter{interval: defaultNotificationRequestInterval}
@@ -318,6 +376,14 @@ func NewShoutrrrSender(allowPrivateTargets bool, timeout time.Duration) Shoutrrr
 	}
 }
 
+func NewShoutrrrSenderWithRequestLimiter(allowPrivateTargets bool, timeout time.Duration, limiter *NotificationRequestLimiter) ShoutrrrSender {
+	sender := NewShoutrrrSender(allowPrivateTargets, timeout)
+	if limiter != nil && limiter.limiter != nil {
+		sender.limiter = limiter.limiter
+	}
+	return sender
+}
+
 // CloseIdleConnections releases pooled notification connections during a
 // graceful application shutdown. It is safe to call when the sender was
 // created as a zero value in tests.
@@ -395,6 +461,8 @@ type observedRoundTripper struct {
 	mu         sync.Mutex
 	err        error
 	inFlight   int
+	statusCode int
+	retryAfter time.Duration
 }
 
 func (t *observedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -410,6 +478,22 @@ func (t *observedRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		t.mu.Unlock()
 	}()
 	response, err := t.base.RoundTrip(req)
+	if response != nil {
+		retryAfter := time.Duration(0)
+		if response.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseRetryAfterHeader(response.Header.Get("Retry-After"))
+		}
+		t.mu.Lock()
+		t.statusCode = response.StatusCode
+		t.retryAfter = retryAfter
+		t.mu.Unlock()
+		if response.Body != nil {
+			response.Body = &boundedResponseBody{
+				Reader: io.LimitReader(response.Body, maxNotificationResponseBodyBytes),
+				closer: response.Body,
+			}
+		}
+	}
 	if err != nil {
 		t.mu.Lock()
 		if t.err == nil {
@@ -418,6 +502,15 @@ func (t *observedRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		t.mu.Unlock()
 	}
 	return response, err
+}
+
+type boundedResponseBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *boundedResponseBody) Close() error {
+	return b.closer.Close()
 }
 
 func (t *observedRoundTripper) error() error {
@@ -430,6 +523,12 @@ func (t *observedRoundTripper) hasInFlightRequest() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.inFlight > 0
+}
+
+func (t *observedRoundTripper) responseStatus() (int, time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.statusCode, t.retryAfter
 }
 
 func safeTransport(base http.RoundTripper, allowPrivate bool,
@@ -445,6 +544,8 @@ func safeTransport(base http.RoundTripper, allowPrivate bool,
 		transport = fallback.Clone()
 	}
 	transport = transport.Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return dialApproved(ctx, network, address, allowPrivate, lookup, dial)
 	}
@@ -493,12 +594,132 @@ func (s ShoutrrrSender) sendTimeout() time.Duration {
 	return s.SendTimeout
 }
 
+type telegramSendOptions struct {
+	token        string
+	chatID       string
+	threadID     *int
+	parseMode    string
+	preview      bool
+	notification bool
+}
+
+func parseTelegramSendOptions(serviceURL string) (telegramSendOptions, error) {
+	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || parsed == nil || !strings.EqualFold(parsed.Scheme, "telegram") {
+		return telegramSendOptions{}, ErrUnsupportedTransport
+	}
+	if parsed.User == nil {
+		return telegramSendOptions{}, errors.New("telegram bot token is invalid")
+	}
+	password, hasPassword := parsed.User.Password()
+	if !hasPassword {
+		return telegramSendOptions{}, errors.New("telegram bot token is invalid")
+	}
+	token := parsed.User.Username() + ":" + password
+	if !telegramTokenPattern.MatchString(token) {
+		return telegramSendOptions{}, errors.New("telegram bot token is invalid")
+	}
+	query := parsed.Query()
+	for _, option := range []string{"preview", "notification"} {
+		values := telegramQueryValues(query, option)
+		if len(values) > 1 {
+			return telegramSendOptions{}, errors.New("telegram option is ambiguous")
+		}
+		value := ""
+		if len(values) == 1 {
+			value = strings.TrimSpace(values[0])
+		}
+		if value != "" && !telegramOptionPattern.MatchString(value) {
+			return telegramSendOptions{}, errors.New("telegram option is invalid")
+		}
+	}
+	chatValues := append(telegramQueryValues(query, "chats"), telegramQueryValues(query, "channels")...)
+	var chats []string
+	for _, value := range chatValues {
+		for _, part := range strings.Split(value, ",") {
+			chat := strings.TrimSpace(part)
+			if chat == "" {
+				return telegramSendOptions{}, errors.New("telegram chat is invalid")
+			}
+			chats = append(chats, chat)
+		}
+	}
+	if len(chats) == 0 {
+		return telegramSendOptions{}, errors.New("telegram chat is required")
+	}
+	if len(chats) > 1 {
+		return telegramSendOptions{}, errors.New("telegram destinations support one chat per destination")
+	}
+	chatID, thread, hasThread := strings.Cut(chats[0], ":")
+	if strings.TrimSpace(chatID) == "" {
+		return telegramSendOptions{}, errors.New("telegram chat is invalid")
+	}
+	var threadID *int
+	if hasThread {
+		parsedThread, parseErr := strconv.Atoi(thread)
+		if parseErr != nil || parsedThread < 1 {
+			return telegramSendOptions{}, errors.New("telegram message thread is invalid")
+		}
+		threadID = &parsedThread
+	}
+	parseModes := telegramQueryValues(query, "parsemode")
+	if len(parseModes) > 1 {
+		return telegramSendOptions{}, errors.New("telegram parse mode is ambiguous")
+	}
+	parseModeValue := ""
+	if len(parseModes) == 1 {
+		parseModeValue = parseModes[0]
+	}
+	parseMode := strings.ToLower(strings.TrimSpace(parseModeValue))
+	switch parseMode {
+	case "", "none":
+		parseMode = ""
+	case "html":
+		parseMode = "HTML"
+	case "markdown", "markdownv2":
+		return telegramSendOptions{}, errors.New("telegram Markdown parse modes are unsupported; use HTML or plain text")
+	default:
+		return telegramSendOptions{}, errors.New("telegram parse mode is invalid")
+	}
+	return telegramSendOptions{
+		token:        token,
+		chatID:       chatID,
+		threadID:     threadID,
+		parseMode:    parseMode,
+		preview:      !telegramOptionDisabled(firstTelegramQueryValue(query, "preview")),
+		notification: !telegramOptionDisabled(firstTelegramQueryValue(query, "notification")),
+	}, nil
+}
+
+func telegramQueryValues(query url.Values, key string) []string {
+	var values []string
+	for name, candidates := range query {
+		if strings.EqualFold(name, key) {
+			values = append(values, candidates...)
+		}
+	}
+	return values
+}
+
+func firstTelegramQueryValue(query url.Values, key string) string {
+	values := telegramQueryValues(query, key)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
 func (s ShoutrrrSender) Validate(serviceURL string) error {
 	if strings.TrimSpace(serviceURL) == "" {
 		return errors.New("notification URL is required")
 	}
 	if err := ValidateTransportPolicy(serviceURL); err != nil {
 		return err
+	}
+	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
+		if _, err := parseTelegramSendOptions(serviceURL); err != nil {
+			return err
+		}
 	}
 	if err := validateOutboundTarget(context.Background(), serviceURL, s.AllowPrivateTargets, false); err != nil {
 		return err
@@ -523,6 +744,11 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	}
 	if err := ValidateTransportPolicy(serviceURL); err != nil {
 		return err
+	}
+	if strings.EqualFold(parsedScheme(serviceURL), "telegram") {
+		if _, err := parseTelegramSendOptions(serviceURL); err != nil {
+			return err
+		}
 	}
 	if err := validateNotificationMessage(serviceURL, title, body); err != nil {
 		return err
@@ -566,7 +792,7 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	// Reserve the request slot while the compatibility gate is held. Waiting
 	// before the gate would allow a send delayed by another Shoutrrr operation
 	// to issue immediately after a later reservation, defeating the spacing.
-	if err := s.waitForRateLimit(ctx); err != nil {
+	if err := s.waitForRateLimit(ctx, serviceURL); err != nil {
 		<-notificationHTTPClientGate
 		return err
 	}
@@ -615,8 +841,21 @@ func (s ShoutrrrSender) send(ctx context.Context, serviceURL, title, body string
 	params := types.Params{}
 	params.SetTitle(title)
 	sendStarted := time.Now()
-	if err := service.Send(body, &params); err != nil {
-		return err
+	sendErr := service.Send(body, &params)
+	if status, retryAfter := transportObserver.responseStatus(); status == http.StatusTooManyRequests {
+		key, serviceName := notificationCooldownScope(serviceURL)
+		if retryAfter > 0 {
+			s.limiter.cooldown(key, serviceName, retryAfter)
+		}
+		return &RateLimitError{
+			Service:    serviceName,
+			StatusCode: status,
+			RetryAfter: retryAfter,
+			Reason:     http.StatusText(status),
+		}
+	}
+	if sendErr != nil {
+		return sendErr
 	}
 	// Deliberately not re-checking sendCtx here. The transport has already
 	// accepted the message, so reporting the deadline instead would turn a
@@ -669,165 +908,109 @@ func parsedScheme(rawURL string) string {
 }
 
 func (s ShoutrrrSender) sendTelegram(ctx context.Context, serviceURL, title, body string) error {
-	parsed, err := url.Parse(strings.TrimSpace(serviceURL))
-	if err != nil || parsed == nil || !strings.EqualFold(parsed.Scheme, "telegram") {
-		return ErrUnsupportedTransport
+	options, err := parseTelegramSendOptions(serviceURL)
+	if err != nil {
+		return err
 	}
-	if parsed.User == nil {
-		return errors.New("telegram bot token is invalid")
-	}
-	password, hasPassword := parsed.User.Password()
-	if !hasPassword {
-		return errors.New("telegram bot token is invalid")
-	}
-	token := parsed.User.Username() + ":" + password
-	if !telegramTokenPattern.MatchString(token) {
-		return errors.New("telegram bot token is invalid")
-	}
-	query := parsed.Query()
-	for _, option := range []string{"preview", "notification"} {
-		value := strings.TrimSpace(query.Get(option))
-		if value != "" && !telegramOptionPattern.MatchString(value) {
-			return errors.New("telegram option is invalid")
-		}
-	}
-	chats := append([]string{}, query["chats"]...)
-	if len(chats) == 0 {
-		chats = append(chats, query["channels"]...)
-	}
-	var expandedChats []string
-	for _, value := range chats {
-		for _, chat := range strings.Split(value, ",") {
-			if chat = strings.TrimSpace(chat); chat != "" {
-				expandedChats = append(expandedChats, chat)
-			}
-		}
-	}
-	if len(expandedChats) == 0 {
-		return errors.New("telegram chat is required")
-	}
-	parseMode := strings.TrimSpace(query.Get("parsemode"))
-	if strings.EqualFold(parseMode, "none") {
-		parseMode = ""
-	}
-	if parseMode != "" && !telegramParseModePattern.MatchString(parseMode) {
-		return errors.New("telegram parse mode is invalid")
-	}
-	switch strings.ToLower(parseMode) {
-	case "markdown":
-		parseMode = "Markdown"
-	case "markdownv2":
-		parseMode = "MarkdownV2"
-	case "html":
-		parseMode = "HTML"
-	}
+	parseMode := options.parseMode
 	message := body
 	if strings.TrimSpace(title) != "" {
-		switch parseMode {
-		case "":
+		if parseMode == "" {
 			parseMode = "HTML"
-			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), html.EscapeString(message))
-		case "HTML":
-			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), message)
 		}
+		if parseMode == "HTML" {
+			message = fmt.Sprintf("<b>%s</b>\n%s", html.EscapeString(title), html.EscapeString(message))
+		}
+	} else if parseMode == "HTML" {
+		message = html.EscapeString(message)
 	}
 	if length := utf8.RuneCountInString(message); length > telegramMessageLimit {
 		return &MessageLimitError{Service: "Telegram", Limit: telegramMessageLimit, Length: length, Unit: "characters"}
 	}
-	preview := !telegramOptionDisabled(query.Get("preview"))
-	notification := !telegramOptionDisabled(query.Get("notification"))
 	client := s.httpClient()
-	for _, chat := range expandedChats {
-		chatID, thread, hasThread := strings.Cut(chat, ":")
-		if strings.TrimSpace(chatID) == "" {
-			return errors.New("telegram chat is invalid")
-		}
-		var threadID *int
-		if hasThread {
-			parsedThread, parseErr := strconv.Atoi(thread)
-			if parseErr != nil {
-				return errors.New("telegram message thread is invalid")
-			}
-			threadID = &parsedThread
-		}
-		payload := telegramSendPayload{
-			Text:                message,
-			ChatID:              chatID,
-			MessageThreadID:     threadID,
-			ParseMode:           parseMode,
-			DisablePreview:      !preview,
-			DisableNotification: !notification,
-		}
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		endpoint := "https://api.telegram.org/bot" + token + "/sendMessage"
-		if err := s.waitForRateLimit(ctx); err != nil {
-			return err
-		}
-		requestCtx, cancelRequest := context.WithTimeout(ctx, s.sendTimeout())
-		request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(encoded))
-		if err != nil {
-			cancelRequest()
-			return err
-		}
-		request.Header.Set("Content-Type", "application/json")
-		response, err := client.Do(request)
-		if err != nil {
-			cancelRequest()
-			return err
-		}
-		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-		_ = response.Body.Close()
+	payload := telegramSendPayload{
+		Text:                message,
+		ChatID:              options.chatID,
+		MessageThreadID:     options.threadID,
+		ParseMode:           parseMode,
+		DisablePreview:      !options.preview,
+		DisableNotification: !options.notification,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := "https://api.telegram.org/bot" + options.token + "/sendMessage"
+	if err := s.waitForRateLimit(ctx, serviceURL); err != nil {
+		return err
+	}
+	requestCtx, cancelRequest := context.WithTimeout(ctx, s.sendTimeout())
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(encoded))
+	if err != nil {
 		cancelRequest()
-		if readErr != nil {
-			return readErr
-		}
-		var result telegramSendResponse
-		if err := json.Unmarshal(responseBody, &result); err != nil {
-			if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-				if response.StatusCode == http.StatusTooManyRequests {
-					retryAfter := parseRetryAfterHeader(response.Header.Get("Retry-After"))
-					s.limiter.cooldown(retryAfter)
-					return &RateLimitError{Service: "Telegram", StatusCode: response.StatusCode, RetryAfter: retryAfter, Reason: response.Status}
-				}
-				return fmt.Errorf("telegram API returned %s", response.Status)
-			}
-			return fmt.Errorf("telegram API returned an invalid response")
-		}
-		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || !result.OK {
-			if response.StatusCode == http.StatusTooManyRequests || result.ErrorCode == http.StatusTooManyRequests {
-				var retryAfter time.Duration
-				if result.Parameters != nil && result.Parameters.RetryAfter > 0 {
-					retryAfter = boundedRetryAfter(int64(result.Parameters.RetryAfter))
-				} else {
-					retryAfter = parseRetryAfterHeader(response.Header.Get("Retry-After"))
-					if retryAfter <= 0 {
-						retryAfter = parseRetryAfterDescription(result.Description)
-					}
-				}
-				s.limiter.cooldown(retryAfter)
-				reason := result.Description
-				if reason == "" {
-					reason = response.Status
-				}
-				return &RateLimitError{Service: "Telegram", StatusCode: http.StatusTooManyRequests, RetryAfter: retryAfter, Reason: reason}
-			}
-			if result.Description != "" {
-				return fmt.Errorf("telegram API error %d: %s", result.ErrorCode, result.Description)
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		cancelRequest()
+		return err
+	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxNotificationResponseBodyBytes))
+	_ = response.Body.Close()
+	cancelRequest()
+	if readErr != nil {
+		return readErr
+	}
+	var result telegramSendResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			if response.StatusCode == http.StatusTooManyRequests {
+				retryAfter := parseRetryAfterHeader(response.Header.Get("Retry-After"))
+				s.recordProviderCooldown(serviceURL, retryAfter)
+				return &RateLimitError{Service: "Telegram", StatusCode: response.StatusCode, RetryAfter: retryAfter, Reason: response.Status}
 			}
 			return fmt.Errorf("telegram API returned %s", response.Status)
 		}
+		return fmt.Errorf("telegram API returned an invalid response")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices || !result.OK {
+		if response.StatusCode == http.StatusTooManyRequests || result.ErrorCode == http.StatusTooManyRequests {
+			var retryAfter time.Duration
+			if result.Parameters != nil && result.Parameters.RetryAfter > 0 {
+				retryAfter = boundedRetryAfter(int64(result.Parameters.RetryAfter))
+			} else {
+				retryAfter = parseRetryAfterHeader(response.Header.Get("Retry-After"))
+				if retryAfter <= 0 {
+					retryAfter = parseRetryAfterDescription(result.Description)
+				}
+			}
+			s.recordProviderCooldown(serviceURL, retryAfter)
+			reason := result.Description
+			if reason == "" {
+				reason = response.Status
+			}
+			return &RateLimitError{Service: "Telegram", StatusCode: http.StatusTooManyRequests, RetryAfter: retryAfter, Reason: reason}
+		}
+		if result.Description != "" {
+			return fmt.Errorf("telegram API error %d: %s", result.ErrorCode, result.Description)
+		}
+		return fmt.Errorf("telegram API returned %s", response.Status)
 	}
 	return nil
 }
 
-func (s ShoutrrrSender) waitForRateLimit(ctx context.Context) error {
+func (s ShoutrrrSender) waitForRateLimit(ctx context.Context, serviceURL string) error {
 	if s.limiter == nil {
 		return nil
 	}
-	return s.limiter.wait(ctx)
+	key, service := notificationCooldownScope(serviceURL)
+	return s.limiter.wait(ctx, key, service)
+}
+
+func (s ShoutrrrSender) recordProviderCooldown(serviceURL string, delay time.Duration) {
+	key, service := notificationCooldownScope(serviceURL)
+	s.limiter.cooldown(key, service, delay)
 }
 
 func parseRetryAfterHeader(value string) time.Duration {
@@ -836,10 +1019,18 @@ func parseRetryAfterHeader(value string) time.Duration {
 		return 0
 	}
 	seconds, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || seconds <= 0 {
-		return 0
+	if err == nil && seconds > 0 {
+		return boundedRetryAfter(seconds)
 	}
-	return boundedRetryAfter(seconds)
+	if until, parseErr := http.ParseTime(value); parseErr == nil {
+		if delay := time.Until(until); delay > 0 {
+			if delay > maxNotificationCooldown {
+				return maxNotificationCooldown
+			}
+			return delay
+		}
+	}
+	return 0
 }
 
 func parseRetryAfterDescription(value string) time.Duration {

@@ -1,6 +1,8 @@
 package notify
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +132,84 @@ func TestNewShoutrrrSenderReusesTransportAcrossSends(t *testing.T) {
 		t.Fatalf("sender did not reuse its transport: first=%T second=%T", first.Transport, second.Transport)
 	}
 	sender.CloseIdleConnections()
+}
+
+func TestNotificationTransportIgnoresEnvironmentProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+	client := newHTTPClient(time.Second, true, nil, nil)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("notification transport type=%T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("notification transport uses the environment proxy")
+	}
+	if !transport.DisableCompression {
+		t.Fatal("notification transport leaves transparent compression enabled")
+	}
+
+	fallback := safeTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("unexpected request")
+	}), true, nil, nil)
+	fallbackTransport, ok := fallback.(*http.Transport)
+	if !ok || fallbackTransport.Proxy != nil {
+		t.Fatalf("notification fallback transport=%T, proxy=%v; want *http.Transport with no proxy", fallback, func() any {
+			if fallbackTransport == nil {
+				return nil
+			}
+			return fallbackTransport.Proxy
+		}())
+	}
+}
+
+func TestNotificationResponseBodiesAreBounded(t *testing.T) {
+	const bodySize = 32 << 20
+	largeBody := bytes.Repeat([]byte("x"), bodySize)
+	var compressed bytes.Buffer
+	zipper := gzip.NewWriter(&compressed)
+	if _, err := zipper.Write(largeBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := zipper.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, service := range []string{"generic", "ntfy"} {
+		for _, compressedBody := range []bool{false, true} {
+			name := "uncompressed"
+			responseBody := largeBody
+			if compressedBody {
+				name = "gzip"
+				responseBody = compressed.Bytes()
+			}
+			t.Run(service+"/"+name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if compressedBody {
+						w.Header().Set("Content-Encoding", "gzip")
+					}
+					w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
+					_, _ = io.Copy(w, bytes.NewReader(responseBody))
+				}))
+				defer server.Close()
+				serviceURL := "generic+" + server.URL + "/hook"
+				if service == "ntfy" {
+					serviceURL = "ntfy://" + strings.TrimPrefix(server.URL, "http://") + "/topic?scheme=http"
+				}
+				sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: 5 * time.Second, limiter: &requestLimiter{}}
+				var before, after runtime.MemStats
+				runtime.ReadMemStats(&before)
+				err := sender.Send(context.Background(), serviceURL, "title", "body")
+				runtime.ReadMemStats(&after)
+				if service == "generic" && err != nil {
+					t.Fatalf("generic webhook send failed: %v", err)
+				}
+				if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= 8<<20 {
+					t.Fatalf("notification response allocated %d bytes, want less than 8 MiB", allocated)
+				}
+			})
+		}
+	}
 }
 
 func TestShoutrrrSenderValidationAndSendGuards(t *testing.T) {
@@ -359,8 +441,42 @@ func TestTelegramDirectClientBuildsBoundedPayload(t *testing.T) {
 	if got.ChatID != "-100123" || got.ParseMode != "HTML" || !got.DisablePreview || !got.DisableNotification {
 		t.Fatalf("payload=%#v", got)
 	}
-	if got.Text != "<b>A &lt;release&gt;</b>\nBody & details" {
+	if got.Text != "<b>A &lt;release&gt;</b>\nBody &amp; details" {
 		t.Fatalf("payload text=%q", got.Text)
+	}
+}
+
+func TestTelegramRejectsUnsafeOptionsBeforeSending(t *testing.T) {
+	var requests atomic.Int32
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second}
+	for _, serviceURL := range []string{
+		"telegram://12345:mock-token@telegram?chats=-100123,-100456",
+		"telegram://12345:mock-token@telegram?chats=-100123&channels=-100456",
+		"telegram://12345:mock-token@telegram?chats=-100123&parsemode=MarkdownV2",
+		"telegram://12345:mock-token@telegram?channels=-100123&ParseMode=Markdown",
+		"telegram://12345:mock-token@telegram?chats=-100123&parsemode=HTML&PARSEMODE=MarkdownV2",
+		"telegram://12345:mock-token@telegram?chats=-100123:thread",
+		"telegram://12345:mock-token@telegram?chats=-100123:-1",
+		"telegram://12345:mock-token@telegram?chats=-100123,,-100456",
+	} {
+		if err := sender.Validate(serviceURL); err == nil {
+			t.Fatalf("unsafe Telegram destination %q was accepted", serviceURL)
+		}
+		if err := sender.Send(context.Background(), serviceURL, "title", "body"); err == nil {
+			t.Fatalf("unsafe Telegram destination %q was sent", serviceURL)
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("Telegram sent %d requests before rejecting invalid options, want 0", got)
 	}
 }
 
@@ -395,11 +511,16 @@ func TestTelegramRateLimitErrorParsesRetryAfter(t *testing.T) {
 	if requests.Load() != 1 {
 		t.Fatalf("Telegram requests=%d, want 1", requests.Load())
 	}
+	key, _ := notificationCooldownScope("telegram://12345:mock-token@telegram?chats=-100123")
 	limiter.mu.Lock()
+	cooldown := limiter.cooldowns[key]
 	next := limiter.next
 	limiter.mu.Unlock()
-	if time.Until(next) < 23*time.Second {
-		t.Fatalf("limiter cooldown=%s, want at least 23s", time.Until(next))
+	if remaining := time.Until(cooldown.until); remaining < 23*time.Second {
+		t.Fatalf("bot cooldown=%s, want at least 23s", remaining)
+	}
+	if time.Until(next) > time.Second {
+		t.Fatalf("provider cooldown moved shared pacing slot by %s", time.Until(next))
 	}
 }
 
@@ -421,6 +542,128 @@ func TestTelegramRateLimitErrorParsesRetryAfterDescription(t *testing.T) {
 	}
 }
 
+func TestTelegramCooldownIsScopedPerBot(t *testing.T) {
+	var requests atomic.Int32
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		if strings.Contains(req.URL.Path, "bot12345:mock-token/") {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     http.Header{"Retry-After": []string{"30"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":false,"error_code":429,"description":"Too Many Requests"}`)),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}
+	limiter := &requestLimiter{}
+	sender := ShoutrrrSender{client: client, SendTimeout: time.Second, limiter: limiter}
+	botA := "telegram://12345:mock-token@telegram?chats=-100123"
+	botB := "telegram://67890:other-token@telegram?chats=-100456"
+	var rateLimitErr *RateLimitError
+	if err := sender.Send(context.Background(), botA, "title", "body"); !errors.As(err, &rateLimitErr) {
+		t.Fatalf("first bot A result=%v, want a Telegram rate limit", err)
+	}
+	keyA, serviceA := notificationCooldownScope(botA)
+	if serviceA != "Telegram" || strings.Contains(string(keyA[:]), "12345:mock-token") {
+		t.Fatalf("cooldown scope contains an unexpected service or raw token: service=%q key=%x", serviceA, keyA)
+	}
+	if err := sender.Send(context.Background(), botB, "title", "body"); err != nil {
+		t.Fatalf("different Telegram bot was blocked by bot A cooldown: %v", err)
+	}
+	if err := sender.Send(context.Background(), botA, "title", "body"); !errors.As(err, &rateLimitErr) || rateLimitErr.Service != "Telegram" {
+		t.Fatalf("second bot A result=%v, want its scoped Telegram cooldown", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("Telegram HTTP requests=%d, want 2; cooled bot A must not issue a second request", got)
+	}
+}
+
+func TestTelegramCooldownDoesNotBlockOtherTransports(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	limiter := &requestLimiter{}
+	botKey, botService := notificationCooldownScope("telegram://12345:mock-token@telegram?chats=-100123")
+	limiter.cooldown(botKey, botService, time.Hour)
+	sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: time.Second, limiter: limiter}
+	started := time.Now()
+	if err := sender.Send(context.Background(), "generic+"+server.URL+"/hook", "title", "body"); err != nil {
+		t.Fatalf("unrelated generic webhook was blocked by Telegram cooldown: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("generic send waited %s during an unrelated Telegram cooldown", elapsed)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("generic webhook requests=%d, want 1", requests.Load())
+	}
+}
+
+func TestNonTelegram429ResponsesAreRateLimited(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer testServer.Close()
+	tests := []struct {
+		name       string
+		serviceURL string
+		service    string
+		client     *http.Client
+	}{
+		{
+			name:       "generic webhook",
+			serviceURL: "generic+" + testServer.URL + "/hook",
+			service:    "Webhook",
+		},
+		{
+			name:       "ntfy",
+			serviceURL: "ntfy://" + strings.TrimPrefix(testServer.URL, "http://") + "/topic?scheme=http",
+			service:    "ntfy",
+		},
+		{
+			name:       "discord",
+			serviceURL: "discord://mock-token@123456",
+			service:    "Discord",
+			client: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Status:     "429 Too Many Requests",
+					Header:     http.Header{"Retry-After": []string{"2"}},
+					Body:       io.NopCloser(strings.NewReader(`{"message":"rate limited"}`)),
+					Request:    req,
+				}, nil
+			})},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sender := ShoutrrrSender{AllowPrivateTargets: true, SendTimeout: time.Second, client: test.client, limiter: &requestLimiter{}}
+			if test.client == nil {
+				sender.client = nil
+			}
+			err := sender.Send(context.Background(), test.serviceURL, "title", "body")
+			var rateLimitErr *RateLimitError
+			if !errors.As(err, &rateLimitErr) {
+				t.Fatalf("send error=%v, want RateLimitError", err)
+			}
+			if rateLimitErr.Service != test.service || rateLimitErr.StatusCode != http.StatusTooManyRequests || rateLimitErr.RetryAfter != 2*time.Second {
+				t.Fatalf("rate limit=%#v, want service=%q status=429 retry-after=2s", rateLimitErr, test.service)
+			}
+		})
+	}
+}
+
 func TestNotificationRequestLimiterSpacesTelegramRequests(t *testing.T) {
 	var mu sync.Mutex
 	var requestTimes []time.Time
@@ -437,8 +680,10 @@ func TestNotificationRequestLimiterSpacesTelegramRequests(t *testing.T) {
 	})}
 	const interval = 20 * time.Millisecond
 	sender := ShoutrrrSender{client: client, SendTimeout: time.Second, limiter: &requestLimiter{interval: interval}}
-	if err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats=-100123,-100456", "title", "body"); err != nil {
-		t.Fatalf("Telegram send failed: %v", err)
+	for _, chat := range []string{"-100123", "-100456"} {
+		if err := sender.Send(context.Background(), "telegram://12345:mock-token@telegram?chats="+chat, "title", "body"); err != nil {
+			t.Fatalf("Telegram send failed: %v", err)
+		}
 	}
 	mu.Lock()
 	times := append([]time.Time(nil), requestTimes...)
@@ -469,7 +714,7 @@ func TestTelegramQueueWaitDoesNotConsumeTransportBudget(t *testing.T) {
 		}, nil
 	})}
 	limiter := &requestLimiter{interval: interval}
-	if err := limiter.wait(context.Background()); err != nil {
+	if err := limiter.wait(context.Background(), notificationCooldownKey{}, "test"); err != nil {
 		t.Fatalf("priming limiter: %v", err)
 	}
 	sender := ShoutrrrSender{client: client, SendTimeout: transportBudget, limiter: limiter}
@@ -483,30 +728,35 @@ func TestTelegramQueueWaitDoesNotConsumeTransportBudget(t *testing.T) {
 
 func TestRequestLimiterWaitHonorsCancellationAndBoundsCooldown(t *testing.T) {
 	limiter := &requestLimiter{interval: time.Hour}
-	if err := limiter.wait(context.Background()); err != nil {
+	if err := limiter.wait(context.Background(), notificationCooldownKey{}, "test"); err != nil {
 		t.Fatalf("first limiter wait failed: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if err := limiter.wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if err := limiter.wait(ctx, notificationCooldownKey{}, "test"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("canceled limiter wait=%v, want deadline exceeded", err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("canceled limiter wait took %s", elapsed)
 	}
 	cooldownLimiter := &requestLimiter{interval: time.Second}
-	cooldownLimiter.cooldown(2 * time.Hour)
+	key := notificationCooldownKey{1}
+	cooldownLimiter.cooldown(key, "Telegram", 2*time.Hour)
 	cooldownLimiter.mu.Lock()
+	cooldown := cooldownLimiter.cooldowns[key]
 	next := cooldownLimiter.next
 	cooldownLimiter.mu.Unlock()
-	if remaining := time.Until(next); remaining > maxNotificationCooldown+time.Second || remaining < maxNotificationCooldown-time.Second {
+	if remaining := time.Until(cooldown.until); remaining > maxNotificationCooldown+time.Second || remaining < maxNotificationCooldown-time.Second {
 		t.Fatalf("cooldown=%s, want bounded to %s", remaining, maxNotificationCooldown)
+	}
+	if time.Until(next) > time.Second {
+		t.Fatalf("cooldown moved shared pacing slot by %s", time.Until(next))
 	}
 	ctxCooldown, cancelCooldown := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancelCooldown()
 	var cooldownErr *RateLimitError
-	if err := cooldownLimiter.wait(ctxCooldown); !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter <= 0 {
+	if err := cooldownLimiter.wait(ctxCooldown, key, "Telegram"); !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter <= 0 {
 		t.Fatalf("active cooldown wait=%v, want RateLimitError", err)
 	}
 }
