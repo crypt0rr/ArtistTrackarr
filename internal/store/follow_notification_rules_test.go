@@ -954,25 +954,38 @@ func TestOrphanCancellationSweepMatchesUnfollow(t *testing.T) {
 	s := testStore(t)
 	userID, canonicalID, guestID, _, deliveryID := seedTwoFollowScenario(t, s)
 
-	// Remove both follows directly, bypassing Unfollow entirely.
-	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=?`, userID); err != nil {
+	// Removing one of the two qualifying follows must leave the delivery in
+	// place; the cleanup sweep asks the same coarse ownership question as
+	// Unfollow without mutating the remaining follow.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, guestID); err != nil {
 		t.Fatal(err)
 	}
-	_ = canonicalID
-	_ = guestID
 	cancelled, err := s.CancelOrphanedDeliveries(ctx, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cancelled != 1 {
-		t.Fatalf("sweep cancelled=%d, want 1", cancelled)
+	if cancelled != 0 {
+		t.Fatalf("sweep cancelled=%d while canonical follow remains, want 0", cancelled)
 	}
 	var remaining int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE id=?`, deliveryID).Scan(&remaining); err != nil {
 		t.Fatal(err)
 	}
+	if remaining != 1 {
+		t.Fatal("the sweep removed a delivery that remains visible through the canonical follow")
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM follows WHERE user_id=? AND artist_id=?`, userID, canonicalID); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err = s.CancelOrphanedDeliveries(ctx, time.Now().UTC())
+	if err != nil || cancelled != 1 {
+		t.Fatalf("sweep cancelled=%d err=%v after the final qualifying follow was removed, want 1", cancelled, err)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM deliveries WHERE id=?`, deliveryID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
 	if remaining != 0 {
-		t.Fatal("the sweep left an orphaned delivery queued")
+		t.Fatal("the sweep left an orphaned delivery queued after the final qualifying follow was removed")
 	}
 }
 
