@@ -478,21 +478,25 @@ func (s *Store) RecentReleases(ctx context.Context, userID int64, limit int) ([]
 func (s *Store) DashboardReleases(
 	ctx context.Context, userID int64, today string, limit int,
 ) (upcoming []Release, recent []Release, err error) {
-	const definitelyFuture = `(
-		(rg.date_precision=3 AND length(rg.first_release_date)=10
-			AND date(rg.first_release_date) IS NOT NULL AND rg.first_release_date>?)
-		OR (rg.date_precision=2 AND length(rg.first_release_date)=7
-			AND date(rg.first_release_date || '-01') IS NOT NULL AND rg.first_release_date>substr(?,1,7))
-		OR (rg.date_precision=1 AND length(rg.first_release_date)=4
-			AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
-	)`
 	// One definition, so the upcoming list and the calendar cannot drift apart.
 	const preferredProvider = calendarPreferredProvider
 	upcoming, err = func() ([]Release, error) {
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-			WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND `+definitelyFuture+`
-			ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?`,
-			userID, today, today, today, limit)
+		rows, err := s.readerDB().QueryContext(ctx, `WITH `+dashboardFollowedCandidateCTEs+`, candidates AS MATERIALIZED (
+			SELECT rg.id,rg.first_release_date
+			FROM candidate_release_ids candidate
+			CROSS JOIN release_groups rg
+			CROSS JOIN artists a
+			WHERE rg.id=candidate.id AND a.id=rg.artist_id
+			AND `+dashboardFollowedOwnerCandidate+` AND `+preferredProvider+` AND `+dashboardDefinitelyFuture+`
+			ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?
+		)
+		SELECT `+releaseSelectColumns+`
+		FROM candidates candidate
+		CROSS JOIN release_groups rg
+		CROSS JOIN artists a
+		WHERE rg.id=candidate.id AND a.id=rg.artist_id
+		ORDER BY candidate.first_release_date ASC,candidate.id ASC`,
+			userID, userID, today, today, today, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -503,10 +507,22 @@ func (s *Store) DashboardReleases(
 		return nil, nil, err
 	}
 	recent, err = func() ([]Release, error) {
-		rows, err := s.readerDB().QueryContext(ctx, `SELECT `+releaseSelectColumns+` FROM release_groups rg JOIN artists a ON a.id=rg.artist_id
-			WHERE `+followedReleasePredicate("?")+` AND `+preferredProvider+` AND NOT COALESCE(`+definitelyFuture+`,0)
-			ORDER BY CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END DESC,rg.id DESC LIMIT ?`,
-			userID, today, today, today, limit)
+		rows, err := s.readerDB().QueryContext(ctx, `WITH `+dashboardFollowedCandidateCTEs+`, candidates AS MATERIALIZED (
+			SELECT rg.id,CASE WHEN rg.first_release_date='' THEN '0000' ELSE rg.first_release_date END AS sort_date
+			FROM candidate_release_ids candidate
+			CROSS JOIN release_groups rg
+			CROSS JOIN artists a
+			WHERE rg.id=candidate.id AND a.id=rg.artist_id
+			AND `+dashboardFollowedOwnerCandidate+` AND `+preferredProvider+` AND NOT COALESCE(`+dashboardDefinitelyFuture+`,0)
+			ORDER BY sort_date DESC,rg.id DESC LIMIT ?
+		)
+		SELECT `+releaseSelectColumns+`
+		FROM candidates candidate
+		CROSS JOIN release_groups rg
+		CROSS JOIN artists a
+		WHERE rg.id=candidate.id AND a.id=rg.artist_id
+		ORDER BY candidate.sort_date DESC,candidate.id DESC`,
+			userID, userID, today, today, today, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -518,6 +534,38 @@ func (s *Store) DashboardReleases(
 	}
 	return upcoming, recent, nil
 }
+
+const dashboardDefinitelyFuture = `(
+	(rg.date_precision=3 AND length(rg.first_release_date)=10
+		AND date(rg.first_release_date) IS NOT NULL AND rg.first_release_date>?)
+	OR (rg.date_precision=2 AND length(rg.first_release_date)=7
+		AND date(rg.first_release_date || '-01') IS NOT NULL AND rg.first_release_date>substr(?,1,7))
+	OR (rg.date_precision=1 AND length(rg.first_release_date)=4
+		AND date(rg.first_release_date || '-01-01') IS NOT NULL AND rg.first_release_date>substr(?,1,4))
+)`
+
+const dashboardFollowedCandidateCTEs = `followed_artists AS MATERIALIZED (
+	SELECT artist_id FROM follows WHERE user_id=?
+), candidate_release_ids AS MATERIALIZED (
+	SELECT release_group_id AS id,MIN(followed_artist_id) AS followed_artist_id
+	FROM (
+		SELECT rg.id AS release_group_id,fa.artist_id AS followed_artist_id
+		FROM followed_artists fa CROSS JOIN release_groups rg INDEXED BY releases_artist
+		WHERE rg.artist_id=fa.artist_id
+		UNION ALL
+		SELECT rc.release_group_id,fa.artist_id AS followed_artist_id
+		FROM followed_artists fa CROSS JOIN release_credits rc INDEXED BY release_credits_artist_release
+		WHERE rc.artist_id=fa.artist_id
+	) associations
+	GROUP BY release_group_id
+)`
+
+const dashboardFollowedOwnerCandidate = `EXISTS (
+	SELECT 1 FROM follows owner_follow
+	WHERE owner_follow.user_id=?
+	AND owner_follow.artist_id=candidate.followed_artist_id
+)`
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {

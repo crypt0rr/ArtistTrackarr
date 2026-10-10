@@ -14,11 +14,12 @@ func followedReleasePredicate(userExpression string) string {
 	return `EXISTS (
 		SELECT 1 FROM follows owner_follow
 		WHERE owner_follow.user_id=` + userExpression + `
-		AND (owner_follow.artist_id=rg.artist_id OR EXISTS (
-			SELECT 1 FROM release_credits owner_credit
+		AND owner_follow.artist_id IN (
+			SELECT rg.artist_id
+			UNION ALL
+			SELECT owner_credit.artist_id FROM release_credits owner_credit
 			WHERE owner_credit.release_group_id=rg.id
-			AND owner_credit.artist_id=owner_follow.artist_id
-		))
+		)
 	)`
 }
 
