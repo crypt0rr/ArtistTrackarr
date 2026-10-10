@@ -2460,9 +2460,13 @@ func authenticatedTestServerLogging(
 	if runnerFactory != nil {
 		runner = runnerFactory(database)
 	}
+	logHandler := logging.NewHandler(slog.NewJSONHandler(sink, nil), 64)
+	logHandler.SetSink(func(entry logging.Entry) {
+		_ = database.InsertApplicationLog(context.Background(), entry)
+	})
 	app, err := New(
 		cfg, database, mb, spotify, fakeSender{}, cipher, fakeArtwork{}, runner,
-		slog.New(logging.NewHandler(slog.NewJSONHandler(sink, nil), 64)), itunes,
+		slog.New(logHandler), itunes,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -164,7 +164,7 @@ func TestCalendarFallsBackForInvalidInputsAndMarksToday(t *testing.T) {
 func TestCalendarFeedFailureDoesNotLogTheRawToken(t *testing.T) {
 	// /calendar/feed/{token} carries a year-long unauthenticated read
 	// credential in its path, and "path" is not a sensitive key, so logging
-	// r.URL.Path would put the token into stdout, the persisted
+	// the resolved request path would put the token into stdout, the persisted
 	// application_logs table, and the admin diagnostics panel.
 	database, err := store.Open(filepath.Join(t.TempDir(), "feed-logging.db"))
 	if err != nil {

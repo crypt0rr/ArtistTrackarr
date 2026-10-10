@@ -142,7 +142,7 @@ func (a *App) inboxStateAction(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		a.logger.Error("release inbox state update failed", "path", r.URL.Path,
+		a.logger.Error("release inbox state update failed", "route", routePattern(r),
 			"user_id", session.User.ID, "release_id", id, "error", err)
 		http.Error(w, "release inbox could not be updated", http.StatusInternalServerError)
 		return

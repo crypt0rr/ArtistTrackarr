@@ -129,7 +129,7 @@ func (a *App) testDestination(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		a.logger.Warn("notification test failed", "path", r.URL.Path, "destination_id", id, "error", notify.RedactError(err))
+		a.logger.Warn("notification test failed", "route", routePattern(r), "destination_id", id, "error", notify.RedactError(err))
 		http.Redirect(w, r, "/settings?"+a.statusQuery("Test failed; see destination health for details."), http.StatusSeeOther)
 		return
 	}

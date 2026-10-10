@@ -160,7 +160,7 @@ func (a *App) evidenceIssueStateAction(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		a.logger.Error("release evidence issue state update failed", "path", r.URL.Path,
+		a.logger.Error("release evidence issue state update failed", "route", routePattern(r),
 			"user_id", session.User.ID, "issue_id", id, "error", err)
 		http.Error(w, "release evidence issue could not be updated", http.StatusInternalServerError)
 		return

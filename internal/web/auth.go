@@ -97,7 +97,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	for _, key := range keys {
 		allowed, err := a.store.LoginAllowed(r.Context(), key)
 		if err != nil {
-			a.logger.Error("login throttling lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
+			a.logger.Error("login throttling lookup failed", "page", "Sign in", "route", routePattern(r), "error", err)
 			http.Error(w, "could not sign in", http.StatusInternalServerError)
 			return
 		}
@@ -128,7 +128,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		a.logger.Error("login user lookup failed", "page", "Sign in", "path", r.URL.Path, "error", err)
+		a.logger.Error("login user lookup failed", "page", "Sign in", "route", routePattern(r), "error", err)
 		http.Error(w, "could not sign in", http.StatusInternalServerError)
 		return
 	}

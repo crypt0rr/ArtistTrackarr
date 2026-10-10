@@ -81,7 +81,7 @@ func (a *App) queueCoverageSync(w http.ResponseWriter, r *http.Request) {
 	}
 	following, err := a.store.IsFollowing(r.Context(), session.User.ID, id)
 	if err != nil {
-		a.logger.Error("coverage artist lookup failed", "path", r.URL.Path, "user_id", session.User.ID,
+		a.logger.Error("coverage artist lookup failed", "route", routePattern(r), "user_id", session.User.ID,
 			"artist_id", id, "error", err)
 		http.Error(w, "could not load this artist", http.StatusInternalServerError)
 		return
@@ -91,7 +91,7 @@ func (a *App) queueCoverageSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.store.CreateManualSyncRequest(r.Context(), session.User.ID, "artist", &id); err != nil {
-		a.logger.Error("coverage sync queue failed", "path", r.URL.Path, "user_id", session.User.ID,
+		a.logger.Error("coverage sync queue failed", "route", routePattern(r), "user_id", session.User.ID,
 			"artist_id", id, "error", err)
 		http.Redirect(w, r, "/coverage?"+a.statusQuery("Synchronization could not be queued"), http.StatusSeeOther)
 		return

@@ -74,7 +74,7 @@ func (a *App) renderAdminDeliveryDetail(w http.ResponseWriter, r *http.Request, 
 func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 	health, err := a.store.ProviderHealth(r.Context())
 	if err != nil {
-		a.logger.Error("provider health lookup failed", "page", "Household administration", "operation", "provider health", "path", r.URL.Path, "error", err)
+		a.logger.Error("provider health lookup failed", "page", "Household administration", "operation", "provider health", "route", routePattern(r), "error", err)
 		http.Error(w, "provider health unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -96,7 +96,7 @@ func (a *App) providerHealth(w http.ResponseWriter, r *http.Request) {
 func (a *App) diagnostics(w http.ResponseWriter, r *http.Request) {
 	snapshot, err := a.store.Diagnostics(r.Context())
 	if err != nil {
-		a.logger.Error("system diagnostics failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("system diagnostics failed", "route", routePattern(r), "error", err)
 		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -122,7 +122,7 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 	logHealth := a.logSinkHealth()
 	snapshot, err := a.store.Diagnostics(r.Context())
 	if err != nil {
-		a.logger.Error("system diagnostics JSON failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("system diagnostics JSON failed", "route", routePattern(r), "error", err)
 		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -133,7 +133,7 @@ func (a *App) diagnosticsJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	retention, err := a.store.RetentionReport(r.Context(), now)
 	if err != nil {
-		a.logger.Error("retention diagnostics JSON failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("retention diagnostics JSON failed", "route", routePattern(r), "error", err)
 		http.Error(w, "diagnostics unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -368,7 +368,7 @@ type diagnosticsJSONRunner struct {
 func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request) {
 	const pageSize = 500
 	if _, err := a.store.AdminDeliveryHistoryCount(r.Context()); err != nil {
-		a.logger.Error("delivery audit export preflight failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("delivery audit export preflight failed", "route", routePattern(r), "error", err)
 		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -401,7 +401,7 @@ func (a *App) exportAdminDeliveryHistory(w http.ResponseWriter, r *http.Request)
 		return nil
 	})
 	if err != nil {
-		a.logger.Error("delivery audit export failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("delivery audit export failed", "route", routePattern(r), "error", err)
 		http.Error(w, "delivery audit unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -504,7 +504,7 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 	}
 	stats, err := a.store.CleanupRetention(r.Context(), time.Now().UTC())
 	if err != nil {
-		a.logger.Error("retention cleanup failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("retention cleanup failed", "route", routePattern(r), "error", err)
 		http.Redirect(w, r, "/admin?"+a.statusQuery("Retention cleanup could not be completed."), http.StatusSeeOther)
 		return
 	}
@@ -529,7 +529,7 @@ func (a *App) cleanupRetention(w http.ResponseWriter, r *http.Request) {
 func (a *App) repairClockSkewedDeliveries(w http.ResponseWriter, r *http.Request) {
 	stats, err := a.store.RepairClockSkewedDeliveries(r.Context(), time.Now().UTC(), 24*time.Hour)
 	if err != nil {
-		a.logger.Error("clock-skewed delivery repair failed", "path", r.URL.Path, "error", err)
+		a.logger.Error("clock-skewed delivery repair failed", "route", routePattern(r), "error", err)
 		http.Redirect(w, r, "/admin?"+a.statusQuery("Future deliveries could not be repaired."), http.StatusSeeOther)
 		return
 	}
@@ -713,7 +713,7 @@ func (a *App) queueArtistSync(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		a.logger.Error("admin artist lookup failed", "page", "Household administration", "path", r.URL.Path, "artist_id", id, "error", err)
+		a.logger.Error("admin artist lookup failed", "page", "Household administration", "route", routePattern(r), "artist_id", id, "error", err)
 		http.Error(w, "could not load this artist", http.StatusInternalServerError)
 		return
 	}
@@ -763,7 +763,7 @@ func (a *App) createInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "that user already exists", http.StatusConflict)
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		a.logger.Error("invite user lookup failed", "page", "Household administration", "path", r.URL.Path, "error", err)
+		a.logger.Error("invite user lookup failed", "page", "Household administration", "route", routePattern(r), "error", err)
 		http.Error(w, "could not create invitation", http.StatusInternalServerError)
 		return
 	}
@@ -795,7 +795,7 @@ func (a *App) createReset(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "user not found", http.StatusNotFound)
 			return
 		}
-		a.logger.Error("reset user lookup failed", "page", "Household administration", "path", r.URL.Path, "error", err)
+		a.logger.Error("reset user lookup failed", "page", "Household administration", "route", routePattern(r), "error", err)
 		http.Error(w, "could not create reset", http.StatusInternalServerError)
 		return
 	}

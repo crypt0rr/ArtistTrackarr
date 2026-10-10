@@ -318,6 +318,12 @@ func (s *Store) UpdatePassword(ctx context.Context, userID int64, hash string) e
 			WHERE user_id=? AND revoked_at IS NULL`, nowText(), userID); err != nil {
 			return err
 		}
+		// A direct password change must also invalidate every outstanding
+		// recovery link, which is another bearer credential for this account.
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
+			WHERE user_id=? AND kind='reset' AND used_at IS NULL`, nowText(), userID); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -437,9 +443,24 @@ func (s *Store) CreateAuthToken(ctx context.Context, kind, email string, userID 
 		return "", err
 	}
 	now := time.Now().UTC()
-	_, err = s.execWriteContext(ctx, `INSERT INTO auth_tokens(token_hash,kind,email,user_id,expires_at,created_by,created_at)
-		VALUES(?,?,?,?,?,?,?)`, security.Digest(raw), kind, strings.ToLower(strings.TrimSpace(email)), userID,
-		timeText(now.Add(ttl)), creator, timeText(now))
+	if kind == "reset" && userID != nil {
+		// Make issuing a replacement recovery link and retiring its predecessors
+		// one transaction, so a failed insert cannot strand the account.
+		err = s.withWriteTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
+				WHERE user_id=? AND kind='reset' AND used_at IS NULL`, timeText(now), *userID); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `INSERT INTO auth_tokens(token_hash,kind,email,user_id,expires_at,created_by,created_at)
+				VALUES(?,?,?,?,?,?,?)`, security.Digest(raw), kind, strings.ToLower(strings.TrimSpace(email)), userID,
+				timeText(now.Add(ttl)), creator, timeText(now))
+			return err
+		})
+	} else {
+		_, err = s.execWriteContext(ctx, `INSERT INTO auth_tokens(token_hash,kind,email,user_id,expires_at,created_by,created_at)
+			VALUES(?,?,?,?,?,?,?)`, security.Digest(raw), kind, strings.ToLower(strings.TrimSpace(email)), userID,
+			timeText(now.Add(ttl)), creator, timeText(now))
+	}
 	return raw, err
 }
 
@@ -478,6 +499,12 @@ func (s *Store) ResetPasswordWithToken(ctx context.Context, raw, hash string) er
 			return err
 		} else if changed != 1 {
 			return sql.ErrNoRows
+		}
+		// Older installations could have multiple unused links; consuming one
+		// recovery link closes every remaining path after the password changes.
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_tokens SET used_at=?
+			WHERE user_id=? AND kind='reset' AND used_at IS NULL`, nowText(), userID.Int64); err != nil {
+			return err
 		}
 		return nil
 	})
