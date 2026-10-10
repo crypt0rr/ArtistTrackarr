@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestFollowedReleaseQueriesUseFullFollowPrimaryKey(t *testing.T) {
+func TestDashboardMaterializesFollowedArtistsAndCalendarUsesFullFollowPrimaryKey(t *testing.T) {
 	s := testStore(t)
 	today := "2026-10-10"
 	from, to := "2026-01-01", "2027-01-01"
@@ -43,12 +43,12 @@ func TestFollowedReleaseQueriesUseFullFollowPrimaryKey(t *testing.T) {
 		AND rg.first_release_date BETWEEN ? AND ?
 		ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ? OFFSET ?`
 
-	assertFollowPrimaryKeyPlan(t, s, "dashboard upcoming", dashboardUpcoming, int64(1), today, today, today, 20)
-	assertFollowPrimaryKeyPlan(t, s, "dashboard recent", dashboardRecent, int64(1), today, today, today, 20)
-	assertFollowPrimaryKeyPlan(t, s, "calendar", calendar, int64(1), int64(1), from, to, 20, 0)
+	assertDashboardCandidatePlan(t, s, "dashboard upcoming", dashboardUpcoming, int64(1), today, today, today, 20)
+	assertDashboardCandidatePlan(t, s, "dashboard recent", dashboardRecent, int64(1), today, today, today, 20)
+	assertCalendarFollowPrimaryKeyPlan(t, s, "calendar", calendar, int64(1), int64(1), from, to, 20, 0)
 }
 
-func assertFollowPrimaryKeyPlan(t *testing.T, s *Store, name, query string, args ...any) {
+func explainQueryPlan(t *testing.T, s *Store, name, query string, args ...any) []string {
 	t.Helper()
 	rows, err := s.DB.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
@@ -56,7 +56,6 @@ func assertFollowPrimaryKeyPlan(t *testing.T, s *Store, name, query string, args
 	}
 	defer func() { _ = rows.Close() }()
 	var details []string
-	usesBothFollowColumns := false
 	for rows.Next() {
 		var id, parent, unused int
 		var detail string
@@ -64,19 +63,39 @@ func assertFollowPrimaryKeyPlan(t *testing.T, s *Store, name, query string, args
 			t.Fatalf("scan %s query plan: %v", name, err)
 		}
 		details = append(details, detail)
-		if strings.Contains(detail, "SEARCH follows USING COVERING INDEX sqlite_autoindex_follows_1 (user_id=?)") ||
-			(strings.Contains(detail, "SEARCH owner_follow") &&
-				(strings.Contains(detail, "(user_id=? AND artist_id=?)") || strings.Contains(detail, "(artist_id=? AND user_id=?)"))) {
-			usesBothFollowColumns = true
-		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read %s query plan: %v", name, err)
 	}
-	if !usesBothFollowColumns {
-		t.Fatalf("%s query did not search follows by both user_id and artist_id; plan: %s", name, strings.Join(details, " | "))
+	return details
+}
+
+func assertDashboardCandidatePlan(t *testing.T, s *Store, name, query string, args ...any) {
+	t.Helper()
+	details := explainQueryPlan(t, s, name, query, args...)
+	plan := strings.Join(details, " | ")
+	for _, expected := range []string{
+		"MATERIALIZE followed_artists",
+		"SEARCH follows USING COVERING INDEX sqlite_autoindex_follows_1 (user_id=?)",
+		"SEARCH rg USING COVERING INDEX releases_artist (artist_id=?)",
+		"SEARCH rc USING COVERING INDEX release_credits_artist_release (artist_id=?)",
+	} {
+		if !strings.Contains(plan, expected) {
+			t.Fatalf("%s query did not use candidate-first step %q; plan: %s", name, expected, plan)
+		}
 	}
-	t.Logf("%s query plan: %s", name, strings.Join(details, " | "))
+	t.Logf("%s query plan: %s", name, plan)
+}
+
+func assertCalendarFollowPrimaryKeyPlan(t *testing.T, s *Store, name, query string, args ...any) {
+	t.Helper()
+	details := explainQueryPlan(t, s, name, query, args...)
+	plan := strings.Join(details, " | ")
+	if !strings.Contains(plan, "SEARCH owner_follow USING COVERING INDEX sqlite_autoindex_follows_1 (user_id=? AND artist_id=?)") &&
+		!strings.Contains(plan, "SEARCH owner_follow USING COVERING INDEX sqlite_autoindex_follows_1 (artist_id=? AND user_id=?)") {
+		t.Fatalf("%s query did not search follows by both user_id and artist_id; plan: %s", name, plan)
+	}
+	t.Logf("%s query plan: %s", name, plan)
 }
 
 func TestDashboardAndCalendarKeepCreditedReleasesVisibleOnce(t *testing.T) {
