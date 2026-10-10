@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,7 @@ type perArtistCatalog struct {
 	errors        map[string]error
 	resolveErrors map[string]error
 	resolved      map[string]catalog.ArtistResult
+	resolveCalls  atomic.Int32
 }
 
 func (f *perArtistCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
@@ -56,6 +58,7 @@ func (f *perArtistCatalog) SearchArtists(context.Context, string, int) ([]catalo
 }
 
 func (f *perArtistCatalog) ResolveArtist(_ context.Context, mbid string) (catalog.ArtistResult, error) {
+	f.resolveCalls.Add(1)
 	if err := f.resolveErrors[mbid]; err != nil {
 		return catalog.ArtistResult{}, err
 	}
@@ -1631,7 +1634,138 @@ func TestImportedIdentityFailuresBecomeTerminalAndLeaveDueQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mbid := "import-terminal-artist"
+	tests := []struct {
+		name    string
+		mbid    string
+		resolve error
+		result  catalog.ArtistResult
+	}{
+		{name: "definitive 404", mbid: "import-terminal-404", resolve: &catalog.HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusNotFound}},
+		{name: "different MBID", mbid: "import-terminal-different", result: catalog.ArtistResult{MBID: "different-mbid", Name: "Wrong Artist"}},
+		{name: "incomplete identity", mbid: "import-terminal-incomplete", result: catalog.ArtistResult{MBID: "import-terminal-incomplete"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: test.mbid, DisplayName: test.mbid, MBID: test.mbid}); err != nil {
+				t.Fatal(err)
+			}
+			artist, err := database.ArtistByMBID(ctx, test.mbid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &perArtistCatalog{releases: map[string][]store.Release{}}
+			if test.resolve != nil {
+				provider.resolveErrors = map[string]error{test.mbid: test.resolve}
+			} else {
+				provider.resolved = map[string]catalog.ArtistResult{test.mbid: test.result}
+			}
+			runner := testRunner(database, provider)
+			now := time.Now().UTC().Truncate(time.Second)
+			for attempt := 0; attempt < artistIdentityMaxAttempts; attempt++ {
+				if _, err := runner.syncOne(ctx, artist, now.Add(time.Duration(attempt)*time.Hour)); err == nil {
+					t.Fatalf("attempt %d unexpectedly succeeded", attempt+1)
+				}
+			}
+			identity, found, err := database.ArtistIdentityStatus(ctx, artist.ID)
+			if err != nil || !found || identity.Status != "unresolvable" || identity.Attempts != artistIdentityMaxAttempts {
+				t.Fatalf("identity=%#v found=%v err=%v, want terminal after %d attempts", identity, found, err, artistIdentityMaxAttempts)
+			}
+			due, err := database.ArtistsDue(ctx, now.Add(48*time.Hour), 25)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, candidate := range due {
+				if candidate.ID == artist.ID {
+					t.Fatal("terminal imported artist remained in automatic due queue")
+				}
+			}
+		})
+	}
+}
+
+func TestTransientIdentityFailuresDoNotBecomeTerminal(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "503 response", err: &catalog.HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusServiceUnavailable}},
+		{name: "network error", err: &url.Error{Op: "Get", URL: "https://musicbrainz.org/ws/2/artist", Err: errors.New("connection refused")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database := resolutionTestStore(t)
+			userID, err := database.CreateUser(ctx, "transient-identity@example.com", "unused", "member", "UTC", "transient-identity")
+			if err != nil {
+				t.Fatal(err)
+			}
+			job, err := database.CreateImportJob(ctx, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mbid := "transient-identity-artist"
+			if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: mbid, MBID: mbid}); err != nil {
+				t.Fatal(err)
+			}
+			artist, err := database.ArtistByMBID(ctx, mbid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &perArtistCatalog{
+				resolveErrors: map[string]error{mbid: test.err},
+				releases:      map[string][]store.Release{},
+			}
+			runner := testRunner(database, provider)
+			start := time.Now().UTC().Truncate(time.Second)
+			for attempt := 0; attempt <= artistIdentityMaxAttempts; attempt++ {
+				now := start.Add(time.Duration(attempt) * 2 * time.Hour)
+				if _, err := runner.syncOne(ctx, artist, now); !errors.Is(err, test.err) {
+					t.Fatalf("attempt %d error=%v, want transient error %v", attempt+1, err, test.err)
+				}
+				identity, found, err := database.ArtistIdentityStatus(ctx, artist.ID)
+				if err != nil || !found || identity.Status != "pending" || identity.Attempts != 0 || identity.NextCheckAt == nil {
+					t.Fatalf("attempt %d identity=%#v found=%v err=%v, want pending/0 with retry", attempt+1, identity, found, err)
+				}
+				dueBefore, err := database.ArtistsDue(ctx, identity.NextCheckAt.Add(-time.Second), 25)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, candidate := range dueBefore {
+					if candidate.ID == artist.ID {
+						t.Fatalf("attempt %d artist was due before retry time", attempt+1)
+					}
+				}
+				dueAfter, err := database.ArtistsDue(ctx, identity.NextCheckAt.Add(time.Second), 25)
+				if err != nil {
+					t.Fatal(err)
+				}
+				foundDue := false
+				for _, candidate := range dueAfter {
+					foundDue = foundDue || candidate.ID == artist.ID
+				}
+				if !foundDue {
+					t.Fatalf("attempt %d pending artist was not due after retry time %s", attempt+1, identity.NextCheckAt)
+				}
+			}
+			if provider.resolveCalls.Load() != artistIdentityMaxAttempts+1 {
+				t.Fatalf("ResolveArtist calls=%d, want %d retries", provider.resolveCalls.Load(), artistIdentityMaxAttempts+1)
+			}
+		})
+	}
+}
+
+func TestMusicBrainzCooldownDefersPendingIdentityWithoutResolving(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "cooldown-identity@example.com", "unused", "member", "UTC", "cooldown-identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := database.CreateImportJob(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mbid := "cooldown-identity-artist"
 	if _, err := database.SaveImportRow(ctx, userID, job.ID, store.ImportInput{SourceValue: mbid, DisplayName: mbid, MBID: mbid}); err != nil {
 		t.Fatal(err)
 	}
@@ -1639,30 +1773,42 @@ func TestImportedIdentityFailuresBecomeTerminalAndLeaveDueQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := &perArtistCatalog{
-		resolveErrors: map[string]error{mbid: errors.New("MusicBrainz unavailable")},
-		releases:      map[string][]store.Release{},
+	now := time.Now().UTC().Truncate(time.Second)
+	cooldown := now.Add(30 * time.Minute)
+	if err := database.UpsertProviderHealth(ctx, "musicbrainz", false, &cooldown, false, false, "provider unavailable"); err != nil {
+		t.Fatal(err)
 	}
+	provider := &perArtistCatalog{releases: map[string][]store.Release{}}
 	runner := testRunner(database, provider)
-	now := time.Now().UTC()
-	for attempt := 0; attempt < artistIdentityMaxAttempts; attempt++ {
-		if _, err := runner.syncOne(ctx, artist, now.Add(time.Duration(attempt)*time.Hour)); err == nil {
-			t.Fatalf("attempt %d unexpectedly succeeded", attempt+1)
-		}
+	if _, err := runner.syncOne(ctx, artist, now); err != nil {
+		t.Fatalf("sync during MusicBrainz cooldown: %v", err)
+	}
+	if provider.resolveCalls.Load() != 0 {
+		t.Fatalf("ResolveArtist calls=%d, want no request during cooldown", provider.resolveCalls.Load())
 	}
 	identity, found, err := database.ArtistIdentityStatus(ctx, artist.ID)
-	if err != nil || !found || identity.Status != "unresolvable" || identity.Attempts != artistIdentityMaxAttempts {
-		t.Fatalf("identity=%#v found=%v err=%v, want terminal after %d attempts", identity, found, err, artistIdentityMaxAttempts)
+	if err != nil || !found || identity.Status != "pending" || identity.Attempts != 0 || identity.NextCheckAt == nil || !identity.NextCheckAt.Equal(cooldown) {
+		t.Fatalf("identity=%#v found=%v err=%v, want pending/0 at cooldown expiry %s", identity, found, err, cooldown)
 	}
-	due, err := database.ArtistsDue(ctx, now.Add(48*time.Hour), 25)
+	due, err := database.ArtistsDue(ctx, now, 25)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, candidate := range due {
 		if candidate.ID == artist.ID {
-			t.Fatal("terminal imported artist remained in automatic due queue")
+			t.Fatal("identity remained due while provider cooldown was active")
 		}
 	}
+	due, err = database.ArtistsDue(ctx, cooldown.Add(time.Second), 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == artist.ID {
+			return
+		}
+	}
+	t.Fatal("pending identity was not re-admitted after provider cooldown")
 }
 
 func TestManualSyncResetsTerminalImportedIdentity(t *testing.T) {

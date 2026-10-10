@@ -956,6 +956,206 @@ func TestITunesAndMusicBrainzReleaseObservationsMerge(t *testing.T) {
 	}
 }
 
+func TestMusicBrainzPromotesMergedSpotifyITunesRelease(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "provider-claim@example.com", "unused", "member", "UTC", "provider-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "provider-claim-artist", Name: "Provider Claim Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Truncate(24 * time.Hour).Add(8 * time.Hour)
+	releaseDay := observed.AddDate(0, 0, 3)
+	date := releaseDay.Format("2006-01-02")
+	spotify := Release{
+		SpotifyID: "provider-claim-spotify", SpotifyURL: "https://open.spotify.com/album/provider-claim-spotify",
+		Title: "Shared Provider Release", PrimaryType: "Album", FirstReleaseDate: date, DatePrecision: 3,
+	}
+	itunes := Release{
+		ITunesID: "provider-claim-itunes", ITunesURL: "https://music.apple.com/us/album/provider-claim-itunes",
+		Title: spotify.Title, PrimaryType: spotify.PrimaryType, FirstReleaseDate: date, DatePrecision: 3,
+	}
+	musicBrainz := Release{
+		MBID: "provider-claim-mbid", MusicBrainzURL: "https://musicbrainz.org/release-group/provider-claim-mbid",
+		Title: spotify.Title, PrimaryType: spotify.PrimaryType, FirstReleaseDate: date, DatePrecision: 3,
+	}
+	for _, batch := range []ReleaseBatch{
+		{Provider: "spotify", Releases: []Release{spotify}},
+		{Provider: "itunes", Releases: []Release{itunes}},
+		{Provider: "musicbrainz", Releases: []Release{musicBrainz}},
+	} {
+		if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{batch}, observed); err != nil {
+			t.Fatalf("apply %s batch: %v", batch.Provider, err)
+		}
+	}
+	var releaseRows int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&releaseRows); err != nil {
+		t.Fatal(err)
+	}
+	if releaseRows != 1 {
+		t.Fatalf("release rows=%d, want one provider-promoted row", releaseRows)
+	}
+	releases, err := s.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].MBID != musicBrainz.MBID || releases[0].Source != "both" ||
+		releases[0].SpotifyID != spotify.SpotifyID || releases[0].ITunesID != itunes.ITunesID {
+		t.Fatalf("promoted release=%#v err=%v", releases, err)
+	}
+	assertEventCount(t, s, userID, "announcement", 1)
+	if err := s.QueueDueReleaseDays(ctx, releaseDay.Add(12*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 1)
+	inbox, err := s.ReleaseInbox(ctx, userID, "", "", "", 50, 0, releaseDay.Add(13*time.Hour))
+	if err != nil || len(inbox) != 1 || inbox[0].ID != releases[0].ID {
+		t.Fatalf("release inbox=%#v err=%v, want one entry for the promoted row", inbox, err)
+	}
+}
+
+func TestMergedProviderRowAcceptsDateCorrection(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	userID, err := s.CreateUser(ctx, "provider-correction@example.com", "unused", "member", "UTC", "provider-correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "provider-correction-artist", Name: "Provider Correction Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateNotificationPreferences(ctx, NotificationPreferences{
+		UserID: userID, Albums: true, EPs: true, Singles: true, Announcements: true, ReleaseDay: true,
+		DigestEnabled: true, DigestFrequency: "daily",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddDestination(ctx, userID, "Date correction digest", "generic", []byte("encrypted")); err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Truncate(24 * time.Hour).Add(8 * time.Hour)
+	originalDay := observed.AddDate(0, 0, 5)
+	correctedDay := observed.AddDate(0, 0, 12)
+	originalDate := originalDay.Format("2006-01-02")
+	correctedDate := correctedDay.Format("2006-01-02")
+	spotify := Release{
+		SpotifyID: "provider-correction-spotify", SpotifyURL: "https://open.spotify.com/album/provider-correction-spotify",
+		Title: "Corrected Provider Release", PrimaryType: "Album", FirstReleaseDate: originalDate, DatePrecision: 3,
+	}
+	itunes := Release{
+		ITunesID: "provider-correction-itunes", ITunesURL: "https://music.apple.com/us/album/provider-correction-itunes",
+		Title: spotify.Title, PrimaryType: spotify.PrimaryType, FirstReleaseDate: originalDate, DatePrecision: 3,
+	}
+	for _, batch := range []ReleaseBatch{
+		{Provider: "spotify", Releases: []Release{spotify}},
+		{Provider: "itunes", Releases: []Release{itunes}},
+	} {
+		if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{batch}, observed); err != nil {
+			t.Fatalf("apply initial %s batch: %v", batch.Provider, err)
+		}
+	}
+	correctedSpotify := spotify
+	correctedSpotify.FirstReleaseDate = correctedDate
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{correctedSpotify}}}, observed.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := s.RecentReleases(ctx, userID, 10)
+	if err != nil || len(releases) != 1 || releases[0].FirstReleaseDate != correctedDate {
+		t.Fatalf("corrected release=%#v err=%v, want date %s", releases, err, correctedDate)
+	}
+	issues, err := s.EvidenceIssues(ctx, userID, "open", "all", "date_conflict", "", 10, 0, observed.Add(2*time.Minute))
+	if err != nil || len(issues) != 1 {
+		t.Fatalf("open date conflicts=%#v err=%v, want the existing provider evidence review", issues, err)
+	}
+	correctedITunes := itunes
+	correctedITunes.FirstReleaseDate = correctedDate
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "itunes", Releases: []Release{correctedITunes}}}, observed.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	issues, err = s.EvidenceIssues(ctx, userID, "open", "all", "date_conflict", "", 10, 0, observed.Add(4*time.Minute))
+	if err != nil || len(issues) != 0 {
+		t.Fatalf("date conflicts after providers agree=%#v err=%v, want none", issues, err)
+	}
+
+	calendar, err := s.CalendarReleasesPage(ctx, userID, observed.Format("2006-01-02"), correctedDay.AddDate(0, 0, 1).Format("2006-01-02"), 20, 0)
+	if err != nil || len(calendar) != 1 || calendar[0].CalendarDate != correctedDate {
+		t.Fatalf("calendar after correction=%#v err=%v, want date %s", calendar, err, correctedDate)
+	}
+	if err := s.QueueDueReleaseDays(ctx, correctedDay.Add(12*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	assertEventCount(t, s, userID, "release_day", 1)
+	var releaseDay string
+	if err := s.DB.QueryRowContext(ctx, `SELECT rg.first_release_date FROM notification_events e JOIN release_groups rg ON rg.id=e.release_group_id
+		WHERE e.user_id=? AND e.event_type='release_day'`, userID).Scan(&releaseDay); err != nil || releaseDay != correctedDate {
+		t.Fatalf("release-day date=%q err=%v, want %s", releaseDay, err, correctedDate)
+	}
+	digestNow := correctedDay.Add(-23 * time.Hour)
+	if queued, err := s.QueueDueReleaseDigests(ctx, digestNow); err != nil || queued != 1 {
+		t.Fatalf("corrected-date digest queued=%d err=%v, want one upcoming-release digest", queued, err)
+	}
+	var digestBody string
+	if err := s.DB.QueryRowContext(ctx, `SELECT body FROM release_digest_runs WHERE user_id=?`, userID).Scan(&digestBody); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(digestBody, correctedDate) || strings.Contains(digestBody, originalDate) {
+		t.Fatalf("digest body=%q, want corrected date %s and no stale date %s", digestBody, correctedDate, originalDate)
+	}
+}
+
+func TestMusicBrainzDoesNotMatchAClaimedRowToAnotherReleaseGroup(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	artist, err := s.UpsertArtist(ctx, Artist{MBID: "provider-no-cross-merge-artist", Name: "No Cross Merge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(24 * time.Hour).Add(8 * time.Hour)
+	spotify := Release{
+		SpotifyID: "provider-no-cross-merge-spotify", Title: "Same Provider Identity", PrimaryType: "Album",
+		FirstReleaseDate: now.AddDate(0, 0, 10).Format("2006-01-02"), DatePrecision: 3,
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "spotify", Releases: []Release{spotify}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	firstMusicBrainz := Release{
+		MBID: "provider-no-cross-merge-first-mbid", Title: spotify.Title, PrimaryType: spotify.PrimaryType,
+		FirstReleaseDate: spotify.FirstReleaseDate, DatePrecision: spotify.DatePrecision,
+	}
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "musicbrainz", Releases: []Release{firstMusicBrainz}}}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	secondMusicBrainz := firstMusicBrainz
+	secondMusicBrainz.MBID = "provider-no-cross-merge-second-mbid"
+	if err := s.ApplyReleaseBatches(ctx, artist, []ReleaseBatch{{Provider: "musicbrainz", Releases: []Release{secondMusicBrainz}}}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("release rows=%d, want two distinct MusicBrainz groups", rows)
+	}
+	var firstCount, secondCount int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=? AND mbid=?`, artist.ID, firstMusicBrainz.MBID).Scan(&firstCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=? AND mbid=?`, artist.ID, secondMusicBrainz.MBID).Scan(&secondCount); err != nil {
+		t.Fatal(err)
+	}
+	if firstCount != 1 || secondCount != 1 {
+		t.Fatalf("first MusicBrainz rows=%d second=%d, want each identity stored once", firstCount, secondCount)
+	}
+}
+
 func TestArtistCoverageRecordsProviderOutcomes(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
