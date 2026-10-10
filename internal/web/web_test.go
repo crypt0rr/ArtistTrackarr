@@ -66,6 +66,7 @@ type searchCatalog struct {
 	resolveError map[string]error
 	err          error
 	calls        int
+	resolveCalls int
 }
 
 func (f *searchCatalog) SearchArtists(context.Context, string, int) ([]catalog.ArtistResult, error) {
@@ -74,6 +75,7 @@ func (f *searchCatalog) SearchArtists(context.Context, string, int) ([]catalog.A
 }
 
 func (f *searchCatalog) ResolveArtist(_ context.Context, mbid string) (catalog.ArtistResult, error) {
+	f.resolveCalls++
 	if err := f.resolveError[mbid]; err != nil {
 		return catalog.ArtistResult{}, err
 	}
