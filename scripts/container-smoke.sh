@@ -9,6 +9,8 @@ HELPER_IMAGE="${SMOKE_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5
 IMAGE="${1:-artist-trackarr:ci}"
 PORT="${SMOKE_PORT:-18080}"
 EXPECTED_VERSION="${SMOKE_EXPECTED_VERSION:-}"
+PLATFORM="${SMOKE_PLATFORM:-}"
+READY_TIMEOUT="${SMOKE_READY_TIMEOUT_SECONDS:-180}"
 suffix="${CI_RUN_ID:-$$}"
 volume="artist-trackarr-smoke-${suffix}"
 container="artist-trackarr-smoke-${suffix}"
@@ -17,6 +19,7 @@ jar=$(mktemp)
 setup_token='ci-setup-token-123456789012345678901234567890'
 encryption_key='ci-encryption-key-123456789012345678901234567890'
 session_secret='ci-session-secret-123456789012345678901234567890'
+docker_platform=()
 
 cleanup() {
 	rm -f "$jar"
@@ -27,8 +30,19 @@ cleanup() {
 # ash, which would leak the smoke-test container and its volume.
 trap cleanup EXIT INT TERM HUP
 
+if [[ -n "$PLATFORM" ]]; then
+	case "$PLATFORM" in
+		linux/amd64|linux/arm64) docker_platform=(--platform "$PLATFORM") ;;
+		*) echo "container smoke: unsupported platform ${PLATFORM}" >&2; exit 2 ;;
+	esac
+fi
+if [[ ! "$READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+	echo 'container smoke: SMOKE_READY_TIMEOUT_SECONDS must be a positive integer' >&2
+	exit 2
+fi
+
 docker volume create "$volume" >/dev/null
-docker run -d --name "$container" --network host -v "$volume:/data" \
+docker run -d "${docker_platform[@]}" --name "$container" --network host -v "$volume:/data" \
 	-e LISTEN_ADDR=":$PORT" \
 	-e PUBLIC_URL="$base" \
 	-e ALLOW_INSECURE_HTTP=true \
@@ -41,7 +55,7 @@ docker run -d --name "$container" --network host -v "$volume:/data" \
 
 wait_ready() {
 	attempt=1
-	while [ "$attempt" -le 90 ]; do
+	while [ "$attempt" -le "$READY_TIMEOUT" ]; do
 		if curl --fail --silent "$base/readyz" >/dev/null; then
 			return 0
 		fi
@@ -49,7 +63,7 @@ wait_ready() {
 		attempt=$((attempt + 1))
 	done
 	docker logs "$container" >&2 || true
-	echo 'container smoke: application did not become ready' >&2
+	echo "container smoke: application did not become ready within ${READY_TIMEOUT}s" >&2
 	return 1
 }
 
