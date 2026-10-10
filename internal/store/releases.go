@@ -207,7 +207,11 @@ func matchingReleaseIDTx(
 	}
 	sourceClause := "source IN ('musicbrainz','spotify','itunes','both')"
 	if spotifyOnly {
-		sourceClause = "source IN ('spotify','itunes')"
+		// A cross-provider row may already have source='both' while its MBID is
+		// still the synthetic identity assigned by Spotify or iTunes. MusicBrainz
+		// may claim that row once; after the MBID becomes canonical, it is no
+		// longer eligible for a different MusicBrainz release group.
+		sourceClause = "source IN ('spotify','itunes','both') AND " + unclaimedProviderReleaseIdentity
 	}
 	dateClause := "date_precision=? AND first_release_date=?"
 	dateArgs := []any{candidate.DatePrecision, candidate.FirstReleaseDate}

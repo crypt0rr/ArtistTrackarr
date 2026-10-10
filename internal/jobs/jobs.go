@@ -1541,6 +1541,17 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 		return outcome, fmt.Errorf("MusicBrainz identity is marked unresolvable; run an explicit sync to retry")
 	}
 	if found && identity.Status == "pending" {
+		cooldown, cooldownErr := r.musicBrainzProviderCooldown(ctx, now)
+		if cooldownErr != nil {
+			return outcome, cooldownErr
+		}
+		if cooldown.After(now) {
+			if scheduleErr := r.store.ScheduleArtistIdentityFailure(ctx, artist.ID, identity.Attempts, cooldown,
+				"MusicBrainz artist identity verification deferred by provider cooldown", false); scheduleErr != nil {
+				return outcome, scheduleErr
+			}
+			return outcome, nil
+		}
 		resolved, resolveErr := r.catalog.ResolveArtist(ctx, artist.MBID)
 		if resolveErr == nil {
 			if !strings.EqualFold(strings.TrimSpace(resolved.MBID), strings.TrimSpace(artist.MBID)) || strings.TrimSpace(resolved.Name) == "" {
@@ -1548,6 +1559,20 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			}
 		}
 		if resolveErr != nil {
+			if ctx.Err() != nil || errors.Is(resolveErr, context.Canceled) || errors.Is(resolveErr, context.DeadlineExceeded) {
+				return outcome, resolveErr
+			}
+			if catalog.IsTransient(resolveErr) {
+				retryAt := now.Add(r.musicBrainzFailureDelay())
+				r.setMusicBrainzCooldown(retryAt)
+				message := "MusicBrainz is temporarily unavailable during artist identity verification"
+				healthErr := r.store.UpsertProviderHealth(ctx, "musicbrainz", false, &retryAt, false, false, sanitizedProviderError(resolveErr))
+				scheduleErr := r.store.ScheduleArtistIdentityFailure(ctx, artist.ID, identity.Attempts, retryAt, message, false)
+				if healthErr != nil || scheduleErr != nil {
+					return outcome, errors.Join(resolveErr, healthErr, scheduleErr)
+				}
+				return outcome, resolveErr
+			}
 			attempts := identity.Attempts + 1
 			terminal := attempts >= artistIdentityMaxAttempts
 			delay := artistIdentityRetryDelay(attempts, terminal)
@@ -1560,6 +1585,8 @@ func (r *Runner) syncOne(ctx context.Context, artist store.Artist, now time.Time
 			}
 			return outcome, resolveErr
 		}
+		r.clearMusicBrainzCooldown()
+		_ = r.store.UpsertProviderHealth(ctx, "musicbrainz", true, nil, false, false, "")
 		canonical := resolved.StoreArtist()
 		canonical.ID = artist.ID
 		canonical.SpotifyID, canonical.SpotifyURL, canonical.SpotifyImageURL = artist.SpotifyID, artist.SpotifyURL, artist.SpotifyImageURL

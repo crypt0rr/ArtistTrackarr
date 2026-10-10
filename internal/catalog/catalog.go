@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -235,6 +236,29 @@ func (m *MusicBrainz) getJSON(ctx context.Context, endpoint string, target any) 
 
 func transientStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+}
+
+// IsTransient reports whether an error is safe to retry without counting it as
+// a failed identity verification. MusicBrainz HTTP failures use the same
+// status classification as getJSON; transport and response-read failures can
+// recover once the provider or network is available again.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return transientStatus(statusErr.Status)
+	}
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func (m *MusicBrainz) waitForRetry(ctx context.Context, attempt int, retryAfter string) error {

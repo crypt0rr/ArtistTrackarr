@@ -16,6 +16,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const unclaimedProviderReleaseIdentity = `(mbid LIKE 'spotify:%' OR mbid LIKE 'itunes:%')`
+
 func saveMusicBrainzReleaseTx(
 	ctx context.Context, tx *sql.Tx, artistID int64, release Release, observed time.Time,
 ) (syncedRelease, error) {
@@ -121,11 +123,11 @@ func saveSpotifyReleaseTx(
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE release_groups SET
 			spotify_id=COALESCE(spotify_id,?),spotify_url=?,spotify_image_url=?,
-			title=CASE WHEN source='spotify' THEN ? ELSE title END,
-			primary_type=CASE WHEN source='spotify' THEN ? ELSE primary_type END,
-			secondary_types=CASE WHEN source='spotify' THEN ? ELSE secondary_types END,
-			first_release_date=CASE WHEN source='spotify' AND ?>=date_precision THEN ? ELSE first_release_date END,
-			date_precision=CASE WHEN source='spotify' THEN MAX(date_precision,?) ELSE date_precision END,
+			title=CASE WHEN source='spotify' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE title END,
+			primary_type=CASE WHEN source='spotify' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE primary_type END,
+			secondary_types=CASE WHEN source='spotify' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE secondary_types END,
+			first_release_date=CASE WHEN (source='spotify' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`)) AND ?>=date_precision THEN ? ELSE first_release_date END,
+			date_precision=CASE WHEN source='spotify' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN MAX(date_precision,?) ELSE date_precision END,
 			artist_credit_role=CASE WHEN artist_credit_role='primary' OR ?='primary' THEN 'primary' ELSE 'featured' END,
 			source=CASE WHEN source IN ('musicbrainz','itunes') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,
@@ -196,11 +198,11 @@ func saveITunesReleaseTx(
 			itunes_artwork_url=CASE WHEN ?>'' THEN ? ELSE itunes_artwork_url END,
 			itunes_artwork_checked_at=?,
 			itunes_artwork_next_check_at=CASE WHEN ?>'' THEN NULL ELSE ? END,
-			title=CASE WHEN source='itunes' THEN ? ELSE title END,
-			primary_type=CASE WHEN source='itunes' THEN ? ELSE primary_type END,
-			secondary_types=CASE WHEN source='itunes' THEN ? ELSE secondary_types END,
-			first_release_date=CASE WHEN source='itunes' AND ?>=date_precision THEN ? ELSE first_release_date END,
-			date_precision=CASE WHEN source='itunes' THEN MAX(date_precision,?) ELSE date_precision END,
+			title=CASE WHEN source='itunes' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE title END,
+			primary_type=CASE WHEN source='itunes' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE primary_type END,
+			secondary_types=CASE WHEN source='itunes' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN ? ELSE secondary_types END,
+			first_release_date=CASE WHEN (source='itunes' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`)) AND ?>=date_precision THEN ? ELSE first_release_date END,
+			date_precision=CASE WHEN source='itunes' OR (source='both' AND `+unclaimedProviderReleaseIdentity+`) THEN MAX(date_precision,?) ELSE date_precision END,
 			artist_credit_role=CASE WHEN artist_credit_role='primary' OR ?='primary' THEN 'primary' ELSE 'featured' END,
 			source=CASE WHEN source IN ('musicbrainz','spotify') THEN 'both' ELSE source END,updated_at=?
 			WHERE id=?`,

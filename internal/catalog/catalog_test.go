@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,29 @@ func TestMusicBrainzRetriesTransientTransportFailures(t *testing.T) {
 	}
 	if requests.Load() != 3 || len(results) != 1 || results[0].Name != "Recovered" {
 		t.Fatalf("requests=%d results=%#v", requests.Load(), results)
+	}
+}
+
+func TestIsTransientMusicBrainzErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "wrapped 503", err: fmt.Errorf("resolve artist: %w", &HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusServiceUnavailable}), want: true},
+		{name: "429", err: &HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusTooManyRequests}, want: true},
+		{name: "408", err: &HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusRequestTimeout}, want: true},
+		{name: "404", err: &HTTPStatusError{Provider: "MusicBrainz", Status: http.StatusNotFound}, want: false},
+		{name: "network request", err: &url.Error{Op: "Get", URL: "https://musicbrainz.org/ws/2/artist", Err: errors.New("connection refused")}, want: true},
+		{name: "truncated response", err: fmt.Errorf("read MusicBrainz response: %w", io.ErrUnexpectedEOF), want: true},
+		{name: "invalid response", err: errors.New("decode MusicBrainz response: invalid character"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsTransient(test.err); got != test.want {
+				t.Fatalf("IsTransient(%v)=%v, want %v", test.err, got, test.want)
+			}
+		})
 	}
 }
 

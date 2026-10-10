@@ -70,8 +70,8 @@ func (s *Store) VerifyArtistIdentity(ctx context.Context, artistID int64, artist
 // and advances both artist schedules so a failed import cannot pin the due
 // queue (including when it carries a Spotify identity).
 func (s *Store) ScheduleArtistIdentityFailure(ctx context.Context, artistID int64, attempts int, next time.Time, message string, terminal bool) error {
-	if attempts < 1 {
-		attempts = 1
+	if attempts < 0 {
+		attempts = 0
 	}
 	if len(message) > 500 {
 		message = message[:500]
