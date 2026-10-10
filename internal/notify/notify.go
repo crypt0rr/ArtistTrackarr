@@ -1070,7 +1070,6 @@ var (
 	credentialPattern         = regexp.MustCompile(`(?i)(password|passwd|token|secret|api[_-]?key|key)=([^&\s]+)`)
 	bearerPattern             = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
 	telegramTokenPattern      = regexp.MustCompile(`^[0-9]+:[a-zA-Z0-9_-]+$`)
-	telegramParseModePattern  = regexp.MustCompile(`(?i)^(markdown|markdownv2|html)$`)
 	telegramOptionPattern     = regexp.MustCompile(`(?i)^(0|1|true|false|yes|no|on|off)$`)
 	telegramRetryAfterPattern = regexp.MustCompile(`(?i)\bretry\s+after\s+([0-9]+)`)
 )
