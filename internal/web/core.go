@@ -1089,7 +1089,7 @@ func (a *App) loadArtistsData(r *http.Request, d *PageData) bool {
 	const pageSize = 50
 	d.Query = strings.TrimSpace(r.URL.Query().Get("q"))
 	if d.Query != "" {
-		key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+		key := userRateLimitKey(session.User.ID)
 		if a.discoveryLimiter != nil && !a.discoveryLimiter.Allow(key) {
 			d.Error = "Artist search is temporarily rate limited. Please try again in a few minutes."
 		} else {

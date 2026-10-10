@@ -325,19 +325,19 @@ func (a *App) followITunes(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) followITunesBatch(w http.ResponseWriter, r *http.Request) {
-	if !a.allowProviderAction(w, r) {
+	values, err := selectedValues(r, "itunes_ids")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if a.itunes == nil {
 		http.Error(w, "iTunes is unavailable", http.StatusBadRequest)
 		return
 	}
-	session, _ := currentSession(r)
-	values, err := selectedValues(r, "itunes_ids")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !a.allowProviderActionCost(w, r, len(values)) {
 		return
 	}
+	session, _ := currentSession(r)
 	var queued, existing, failed int
 	for _, value := range values {
 		if !validProviderID(value) {
@@ -533,15 +533,19 @@ func (a *App) follow(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?"+a.statusQuery(message), http.StatusSeeOther)
 }
 func (a *App) followBatch(w http.ResponseWriter, r *http.Request) {
-	if !a.allowProviderAction(w, r) {
-		return
-	}
-	session, _ := currentSession(r)
 	values, err := selectedValues(r, "mbids")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	cost := len(values)
+	if a.spotify != nil {
+		cost *= 2
+	}
+	if !a.allowProviderActionCost(w, r, cost) {
+		return
+	}
+	session, _ := currentSession(r)
 	var added, existing, failed int
 	for _, mbid := range values {
 		result, resolveErr := a.mb.ResolveArtist(r.Context(), mbid)

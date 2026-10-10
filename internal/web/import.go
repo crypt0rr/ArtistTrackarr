@@ -239,7 +239,7 @@ func (a *App) importArtists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.releaseImportSlot()
-	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+	key := userRateLimitKey(session.User.ID)
 	if a.importLimiter != nil && !a.importLimiter.Allow(key) {
 		rateLimited(w, 3600, "artist imports are temporarily rate limited; try again later")
 		return
@@ -414,7 +414,7 @@ func (a *App) resumeArtistImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.releaseImportSlot()
-	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
+	key := userRateLimitKey(session.User.ID)
 	if a.importLimiter != nil && !a.importLimiter.Allow(key) {
 		rateLimited(w, 3600, "artist imports are temporarily rate limited; try again later")
 		return

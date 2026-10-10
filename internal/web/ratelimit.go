@@ -33,8 +33,21 @@ func newFixedWindowLimiter(limit int, window time.Duration) *fixedWindowLimiter 
 }
 
 func (l *fixedWindowLimiter) Allow(key string) bool {
+	return l.AllowN(key, 1)
+}
+
+// AllowN atomically charges n requests against one fixed-window bucket. A
+// rejected charge leaves the bucket unchanged so callers can safely account
+// for provider work before making any upstream requests.
+func (l *fixedWindowLimiter) AllowN(key string, n int) bool {
+	if n < 1 {
+		return true
+	}
 	if l == nil || l.limit < 1 || l.window <= 0 {
 		return true
+	}
+	if n > l.limit {
+		return false
 	}
 	now := time.Now()
 	l.mu.Lock()
@@ -61,13 +74,13 @@ func (l *fixedWindowLimiter) Allow(key string) bool {
 				delete(l.entries, oldestKey)
 			}
 		}
-		l.entries[key] = windowEntry{started: now, count: 1}
+		l.entries[key] = windowEntry{started: now, count: n}
 		return true
 	}
-	if entry.count >= l.limit {
+	if n > l.limit-entry.count {
 		return false
 	}
-	entry.count++
+	entry.count += n
 	l.entries[key] = entry
 	return true
 }
@@ -85,14 +98,22 @@ func formatRetryAfter(seconds int) string {
 }
 
 func (a *App) allowProviderAction(w http.ResponseWriter, r *http.Request) bool {
+	return a.allowProviderActionCost(w, r, 1)
+}
+
+func (a *App) allowProviderActionCost(w http.ResponseWriter, r *http.Request, cost int) bool {
 	session, ok := currentSession(r)
 	if !ok || a.providerLimiter == nil {
 		return true
 	}
-	key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)
-	if a.providerLimiter.Allow(key) {
+	key := userRateLimitKey(session.User.ID)
+	if a.providerLimiter.AllowN(key, cost) {
 		return true
 	}
 	rateLimited(w, 600, "provider requests are temporarily rate limited; try again later")
 	return false
+}
+
+func userRateLimitKey(userID int64) string {
+	return strconv.FormatInt(userID, 10)
 }

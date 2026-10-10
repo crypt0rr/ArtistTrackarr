@@ -123,7 +123,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	// bucket per account: any stranger can saturate it and lock the owner out,
 	// and the per-IP limiter becomes one household-wide cap. Say so, once the
 	// evidence is actually in front of us.
-	if peer, reason := a.resolveClientIP(r); reason != "" && strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" {
+	if peer, reason := a.resolveClientIP(r); reason != "" && strings.TrimSpace(forwardedForHeader(r)) != "" {
 		a.warnUntrustedForwarding(reason, peer)
 	}
 	user, err := a.store.UserByEmail(r.Context(), email)
@@ -311,12 +311,12 @@ func (a *App) resolveClientIP(r *http.Request) (string, string) {
 	}
 	peer := net.ParseIP(host)
 	if !a.cfg.TrustProxy {
-		return host, "trust-proxy-disabled"
+		return normalizeIPIdentity(peer, host), "trust-proxy-disabled"
 	}
 	if peer == nil || !a.trustedProxy(peer) {
-		return host, "peer-outside-trusted-cidrs"
+		return normalizeIPIdentity(peer, host), "peer-outside-trusted-cidrs"
 	}
-	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	forwarded := strings.Split(forwardedForHeader(r), ",")
 	// Walk from the nearest proxy toward the original client. Ignore entries
 	// that are themselves trusted proxies and return the first untrusted IP;
 	// this prevents a direct client from spoofing a throttling key.
@@ -326,13 +326,30 @@ func (a *App) resolveClientIP(r *http.Request) (string, string) {
 			continue
 		}
 		if !a.trustedProxy(candidate) {
-			return candidate.String(), ""
+			return normalizeIPIdentity(candidate, ""), ""
 		}
 	}
 	// If every forwarded entry is trusted (or malformed), there is no
 	// trustworthy client identity in the header. Use the direct peer instead
 	// of accepting a caller-controlled leftmost value as a throttling key.
-	return host, "no-untrusted-forwarded-entry"
+	return normalizeIPIdentity(peer, host), "no-untrusted-forwarded-entry"
+}
+
+func forwardedForHeader(r *http.Request) string {
+	return strings.Join(r.Header.Values("X-Forwarded-For"), ",")
+}
+
+func normalizeIPIdentity(ip net.IP, fallback string) string {
+	if ip == nil {
+		return fallback
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		return ipv4.String()
+	}
+	if ipv6 := ip.To16(); ipv6 != nil {
+		return ipv6.Mask(net.CIDRMask(64, 128)).String()
+	}
+	return fallback
 }
 
 // loginThrottleKeys applies both the peer identity and an account identity.

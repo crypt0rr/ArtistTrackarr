@@ -424,6 +424,76 @@ func (s *Store) NotificationHoldsForRelease(ctx context.Context, userID, release
         guards="A SQL-executing wrapper defined in the package but missing "
                "from bindMethods, which narrows the guard without saying so.",
     ),
+    Mutation(
+        name="forwarded-header-first-line-only",
+        file="internal/web/auth.go",
+        find='forwarded := strings.Split(forwardedForHeader(r), ",")',
+        replace='forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")',
+        package="./internal/web/",
+        test="TestClientIPJoinsRepeatedForwardedHeaderLines",
+        guards="#332 - repeated X-Forwarded-For field lines were ignored when "
+               "the proxy added a later client address.",
+    ),
+    Mutation(
+        name="ipv6-peer-not-aggregated",
+        file="internal/web/auth.go",
+        find='return normalizeIPIdentity(peer, host), "trust-proxy-disabled"',
+        replace='return host, "trust-proxy-disabled"',
+        package="./internal/web/",
+        test="TestClientIPAggregatesIPv6Slash64",
+        guards="#332 - changing a client address inside one IPv6 /64 reset its "
+               "password-throttle identity.",
+    ),
+    Mutation(
+        name="forwarding-warning-first-line-only",
+        file="internal/web/auth.go",
+        find='strings.TrimSpace(forwardedForHeader(r)) != ""',
+        replace='strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != ""',
+        package="./internal/web/",
+        test="TestLoginWarningUsesJoinedForwardedHeaderLines",
+        guards="#332 - an empty first X-Forwarded-For field hid a warning even "
+               "when a later field carried the forwarded client.",
+    ),
+    Mutation(
+        name="authenticated-budget-uses-client-ip",
+        file="internal/web/ratelimit.go",
+        find="key := userRateLimitKey(session.User.ID)",
+        replace='key := strconv.FormatInt(session.User.ID, 10) + "|" + a.clientIP(r)',
+        package="./internal/web/",
+        test="TestAuthenticatedLimiterKeysUseUserIDOnly",
+        guards="#332 - changing a member's client address reset that member's "
+               "provider-action budget.",
+    ),
+    Mutation(
+        name="batch-charge-one-per-request",
+        file="internal/web/artists.go",
+        find="cost := len(values)",
+        replace="cost := 1",
+        package="./internal/web/",
+        test="TestFollowBatchChargesOneTokenPerArtistWithoutSpotify",
+        guards="#348 - a ten-artist batch consumed only one provider-action "
+               "token.",
+    ),
+    Mutation(
+        name="batch-spotify-enrichment-uncharged",
+        file="internal/web/artists.go",
+        find="cost *= 2",
+        replace="cost++",
+        package="./internal/web/",
+        test="TestFollowBatchChargesSpotifyEnrichmentPerArtist",
+        guards="#348 - MusicBrainz plus Spotify lookups were not both charged "
+               "for each selected artist.",
+    ),
+    Mutation(
+        name="batch-limiter-ignores-token-count",
+        file="internal/web/ratelimit.go",
+        find="entry.count += n",
+        replace="entry.count++",
+        package="./internal/web/",
+        test="TestFixedWindowLimiterAllowNChargesAtomically",
+        guards="#348 - a multi-token provider charge incremented the bucket by "
+               "only one token.",
+    ),
 ]
 
 
