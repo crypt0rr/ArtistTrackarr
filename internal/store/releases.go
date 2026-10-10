@@ -487,7 +487,7 @@ func (s *Store) DashboardReleases(
 			CROSS JOIN release_groups rg
 			CROSS JOIN artists a
 			WHERE rg.id=candidate.id AND a.id=rg.artist_id
-			AND `+dashboardFollowedOwnerCandidate+` AND `+preferredProvider+` AND `+dashboardDefinitelyFuture+`
+			AND `+preferredProvider+` AND `+dashboardDefinitelyFuture+`
 			ORDER BY rg.first_release_date ASC,rg.id ASC LIMIT ?
 		)
 		SELECT `+releaseSelectColumns+`
@@ -496,7 +496,7 @@ func (s *Store) DashboardReleases(
 		CROSS JOIN artists a
 		WHERE rg.id=candidate.id AND a.id=rg.artist_id
 		ORDER BY candidate.first_release_date ASC,candidate.id ASC`,
-			userID, userID, today, today, today, limit)
+			userID, today, today, today, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -513,7 +513,7 @@ func (s *Store) DashboardReleases(
 			CROSS JOIN release_groups rg
 			CROSS JOIN artists a
 			WHERE rg.id=candidate.id AND a.id=rg.artist_id
-			AND `+dashboardFollowedOwnerCandidate+` AND `+preferredProvider+` AND NOT COALESCE(`+dashboardDefinitelyFuture+`,0)
+			AND `+preferredProvider+` AND NOT COALESCE(`+dashboardDefinitelyFuture+`,0)
 			ORDER BY sort_date DESC,rg.id DESC LIMIT ?
 		)
 		SELECT `+releaseSelectColumns+`
@@ -522,7 +522,7 @@ func (s *Store) DashboardReleases(
 		CROSS JOIN artists a
 		WHERE rg.id=candidate.id AND a.id=rg.artist_id
 		ORDER BY candidate.sort_date DESC,candidate.id DESC`,
-			userID, userID, today, today, today, limit)
+			userID, today, today, today, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -558,12 +558,6 @@ const dashboardFollowedCandidateCTEs = `followed_artists AS MATERIALIZED (
 		WHERE rc.artist_id=fa.artist_id
 	) associations
 	GROUP BY release_group_id
-)`
-
-const dashboardFollowedOwnerCandidate = `EXISTS (
-	SELECT 1 FROM follows owner_follow
-	WHERE owner_follow.user_id=?
-	AND owner_follow.artist_id=candidate.followed_artist_id
 )`
 
 func firstNonEmpty(values ...string) string {

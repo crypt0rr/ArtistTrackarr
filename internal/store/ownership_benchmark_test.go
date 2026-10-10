@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -47,90 +48,86 @@ func seedDashboardBenchmarkData(ctx context.Context, b *testing.B, database *Sto
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	artistStmt, err := tx.PrepareContext(ctx, `INSERT INTO artists(mbid,name,created_at,updated_at) VALUES(?,?,?,?)`)
-	if err != nil {
-		return nil, err
-	}
 	artistIDs := make([]int64, 0, followedArtists+otherArtists)
-	for i := 0; i < followedArtists+otherArtists; i++ {
-		result, err := artistStmt.ExecContext(ctx, fmt.Sprintf("dashboard-benchmark-artist-%03d", i), fmt.Sprintf("Benchmark Artist %03d", i), stamp, stamp)
+	if err := func() (resultErr error) {
+		artistStmt, err := tx.PrepareContext(ctx, `INSERT INTO artists(mbid,name,created_at,updated_at) VALUES(?,?,?,?)`)
 		if err != nil {
-			_ = artistStmt.Close()
-			return nil, err
+			return err
 		}
-		id, err := result.LastInsertId()
+		defer func() { resultErr = errors.Join(resultErr, artistStmt.Close()) }()
+		for i := 0; i < followedArtists+otherArtists; i++ {
+			result, err := artistStmt.ExecContext(ctx, fmt.Sprintf("dashboard-benchmark-artist-%03d", i), fmt.Sprintf("Benchmark Artist %03d", i), stamp, stamp)
+			if err != nil {
+				return err
+			}
+			id, err := result.LastInsertId()
+			if err != nil {
+				return err
+			}
+			artistIDs = append(artistIDs, id)
+		}
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
+	if err := func() (resultErr error) {
+		followStmt, err := tx.PrepareContext(ctx, `INSERT INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`)
 		if err != nil {
-			_ = artistStmt.Close()
-			return nil, err
+			return err
 		}
-		artistIDs = append(artistIDs, id)
-	}
-	if err := artistStmt.Close(); err != nil {
-		return nil, err
-	}
-	followStmt, err := tx.PrepareContext(ctx, `INSERT INTO follows(user_id,artist_id,created_at) VALUES(?,?,?)`)
-	if err != nil {
-		return nil, err
-	}
-	for i := 0; i < followedArtists; i++ {
-		if _, err := followStmt.ExecContext(ctx, userID, artistIDs[i], stamp); err != nil {
-			_ = followStmt.Close()
-			return nil, err
+		defer func() { resultErr = errors.Join(resultErr, followStmt.Close()) }()
+		for i := 0; i < followedArtists; i++ {
+			if _, err := followStmt.ExecContext(ctx, userID, artistIDs[i], stamp); err != nil {
+				return err
+			}
 		}
-	}
-	if err := followStmt.Close(); err != nil {
+		return nil
+	}(); err != nil {
 		return nil, err
 	}
-	releaseStmt, err := tx.PrepareContext(ctx, `INSERT INTO release_groups
-		(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
-		VALUES(?,?,?,'Album','[]',?,3,?,'spotify',?,?)`)
-	if err != nil {
-		return nil, err
-	}
-	creditStmt, err := tx.PrepareContext(ctx, `INSERT INTO release_credits
-		(release_group_id,artist_id,provider,provider_id,role,first_seen_at,last_seen_at)
-		VALUES(?,?,'musicbrainz',?,'guest',?,?)`)
-	if err != nil {
-		_ = releaseStmt.Close()
-		return nil, err
-	}
-	for i := 0; i < releaseGroups; i++ {
-		artistIndex := i % otherArtists
-		creditIndex := (i*7 + 1) % otherArtists
-		if i >= unownedGroups {
-			artistIndex = (i - unownedGroups) % followedArtists
-			creditIndex = (artistIndex + 1) % followedArtists
-		}
-		mbid := fmt.Sprintf("dashboard-benchmark-release-%05d", i)
-		result, err := releaseStmt.ExecContext(ctx, mbid, artistIDs[artistIndex], fmt.Sprintf("Benchmark release %05d", i), future,
-			"https://musicbrainz.org/release-group/"+mbid, stamp, stamp)
+	if err := func() (resultErr error) {
+		releaseStmt, err := tx.PrepareContext(ctx, `INSERT INTO release_groups
+			(mbid,artist_id,title,primary_type,secondary_types,first_release_date,date_precision,musicbrainz_url,source,first_observed_at,updated_at)
+			VALUES(?,?,?,'Album','[]',?,3,?,'spotify',?,?)`)
 		if err != nil {
-			_ = releaseStmt.Close()
-			_ = creditStmt.Close()
-			return nil, err
+			return err
 		}
-		releaseID, err := result.LastInsertId()
+		defer func() { resultErr = errors.Join(resultErr, releaseStmt.Close()) }()
+		creditStmt, err := tx.PrepareContext(ctx, `INSERT INTO release_credits
+			(release_group_id,artist_id,provider,provider_id,role,first_seen_at,last_seen_at)
+			VALUES(?,?,'musicbrainz',?,'guest',?,?)`)
 		if err != nil {
-			_ = releaseStmt.Close()
-			_ = creditStmt.Close()
-			return nil, err
+			return err
 		}
-		creditArtistIndex := creditIndex
-		if i < unownedGroups {
-			creditArtistIndex += followedArtists
+		defer func() { resultErr = errors.Join(resultErr, creditStmt.Close()) }()
+		for i := 0; i < releaseGroups; i++ {
+			artistIndex := i % otherArtists
+			creditIndex := (i*7 + 1) % otherArtists
+			if i >= unownedGroups {
+				artistIndex = (i - unownedGroups) % followedArtists
+				creditIndex = (artistIndex + 1) % followedArtists
+			}
+			mbid := fmt.Sprintf("dashboard-benchmark-release-%05d", i)
+			result, err := releaseStmt.ExecContext(ctx, mbid, artistIDs[artistIndex], fmt.Sprintf("Benchmark release %05d", i), future,
+				"https://musicbrainz.org/release-group/"+mbid, stamp, stamp)
+			if err != nil {
+				return err
+			}
+			releaseID, err := result.LastInsertId()
+			if err != nil {
+				return err
+			}
+			creditArtistIndex := creditIndex
+			if i < unownedGroups {
+				creditArtistIndex += followedArtists
+			}
+			creditArtistID := artistIDs[creditArtistIndex]
+			if _, err := creditStmt.ExecContext(ctx, releaseID, creditArtistID, mbid+"-credit", stamp, stamp); err != nil {
+				return err
+			}
 		}
-		creditArtistID := artistIDs[creditArtistIndex]
-		if _, err := creditStmt.ExecContext(ctx, releaseID, creditArtistID, mbid+"-credit", stamp, stamp); err != nil {
-			_ = releaseStmt.Close()
-			_ = creditStmt.Close()
-			return nil, err
-		}
-	}
-	if err := releaseStmt.Close(); err != nil {
-		_ = creditStmt.Close()
-		return nil, err
-	}
-	if err := creditStmt.Close(); err != nil {
+		return nil
+	}(); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
