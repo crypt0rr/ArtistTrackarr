@@ -1284,7 +1284,6 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 		case "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums":
 			albumRequests.Add(1)
 			if request.URL.Query().Get("limit") != "10" || request.URL.Query().Get("market") != "NL" ||
-				request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" ||
 				request.Header.Get("Authorization") != "Bearer test-token" {
 				t.Errorf("unexpected Spotify albums request: %s headers=%v", request.URL, request.Header)
 				return
@@ -1294,7 +1293,9 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 				t.Errorf("unexpected Spotify offset: %s", request.URL.Query().Get("offset"))
 				return
 			}
-			_, _ = io.WriteString(w, `{"items":[
+			switch request.URL.Query().Get("include_groups") {
+			case "album,single,compilation":
+				_, _ = io.WriteString(w, `{"total":4,"items":[
 					{"id":"album-id","name":"Album","album_type":"album","album_group":"album","total_tracks":10,
 					 "release_date":"2026-08-01","release_date_precision":"day",
 					 "external_urls":{"spotify":"https://open.spotify.com/album/album-id"},
@@ -1304,12 +1305,16 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 					{"id":"ep-id","name":"1. KRUIS","album_type":"single","album_group":"single","total_tracks":6,
 					 "release_date":"2026-07","release_date_precision":"month","external_urls":{"spotify":"https://open.spotify.com/album/ep-id"}},
 					{"id":"compilation-id","name":"Collected","album_type":"compilation","album_group":"compilation","total_tracks":14,
-					 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}
-					,{"id":"featured-id","name":"Guest Album","album_type":"album","album_group":"appears_on","total_tracks":10,
+					 "release_date":"2025-01-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/compilation-id"}}]}`)
+			case "appears_on":
+				_, _ = io.WriteString(w, `{"total":2,"items":[
+					{"id":"featured-id","name":"Guest Album","album_type":"album","album_group":"appears_on","total_tracks":10,
 					 "release_date":"2026-09-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/featured-id"}},
 					{"id":"album-id","name":"Album","album_type":"album","album_group":"appears_on","total_tracks":10,
-					 "release_date":"2026-08-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/album-id"}}
-				]}`)
+					 "release_date":"2026-08-01","release_date_precision":"day","external_urls":{"spotify":"https://open.spotify.com/album/album-id"}}]}`)
+			default:
+				t.Errorf("unexpected Spotify include_groups=%q", request.URL.Query().Get("include_groups"))
+			}
 			return
 		default:
 			http.NotFound(w, request)
@@ -1332,7 +1337,7 @@ func TestSpotifyArtistReleasesFetchesNewestPageAndFiltersAlbumsAndEPs(t *testing
 	if err != nil || len(fresh) != len(releases) {
 		t.Fatalf("fresh releases=%#v err=%v", fresh, err)
 	}
-	if tokenRequests.Load() != 1 || albumRequests.Load() != 2 || len(releases) != 5 {
+	if tokenRequests.Load() != 1 || albumRequests.Load() != 4 || len(releases) != 5 {
 		t.Fatalf("token requests=%d album requests=%d releases=%#v",
 			tokenRequests.Load(), albumRequests.Load(), releases)
 	}
@@ -1464,11 +1469,19 @@ func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testi
 			http.NotFound(w, request)
 			return
 		}
-		if request.URL.Query().Get("include_groups") != "album,single,compilation,appears_on" {
-			t.Errorf("unexpected include_groups=%q", request.URL.Query().Get("include_groups"))
+		albumRequests.Add(1)
+		groups := request.URL.Query().Get("include_groups")
+		if groups == "appears_on" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"total":2,"items":[
+				{"id":"shared","name":"shared featured title","album_type":"album","album_group":"appears_on","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"},
+				{"id":"featured-late","name":"featured-late","album_type":"album","album_group":"appears_on","total_tracks":10,"release_date":"2026-08-02","release_date_precision":"day"}]}`)
 			return
 		}
-		albumRequests.Add(1)
+		if groups != "album,single,compilation" {
+			t.Errorf("unexpected include_groups=%q", groups)
+			return
+		}
 		offset := 0
 		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
 			t.Errorf("invalid offset: %v", err)
@@ -1476,26 +1489,19 @@ func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testi
 		}
 		count := 10
 		if offset == 20 {
-			count = 5
+			count = 2
 		}
 		items := make([]string, count)
 		for index := range items {
 			id := fmt.Sprintf("release-%02d", offset+index)
-			group := "album"
 			if offset == 0 && index == 0 {
 				id = "shared"
 			}
-			if offset == 20 && index == 0 {
-				id, group = "shared", "appears_on"
-			}
-			if offset == 20 && index == 1 {
-				id, group = "featured-late", "appears_on"
-			}
-			items[index] = fmt.Sprintf(`{"id":%q,"name":%q,"album_type":"album","album_group":%q,"total_tracks":10,"release_date":"2026-08-%02d","release_date_precision":"day"}`,
-				id, id, group, (offset+index)%28+1)
+			items[index] = fmt.Sprintf(`{"id":%q,"name":%q,"album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-%02d","release_date_precision":"day"}`,
+				id, id, (offset+index)%28+1)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"total":25,"items":[%s]}`, strings.Join(items, ","))
+		_, _ = fmt.Fprintf(w, `{"total":22,"items":[%s]}`, strings.Join(items, ","))
 	}))
 	defer server.Close()
 	spotify := NewSpotify("client-id", "client-secret")
@@ -1505,8 +1511,8 @@ func TestSpotifyArtistReleasesPagesCompleteCatalogAndDeduplicateCredits(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if albumRequests.Load() != 3 || len(releases) != 24 {
-		t.Fatalf("requests=%d releases=%d, want 3 requests and 24 deduplicated releases", albumRequests.Load(), len(releases))
+	if albumRequests.Load() != 4 || len(releases) != 23 {
+		t.Fatalf("requests=%d releases=%d, want three primary pages plus one appearance page and 23 deduplicated releases", albumRequests.Load(), len(releases))
 	}
 	var shared, featured bool
 	for _, release := range releases {
@@ -1533,6 +1539,10 @@ func TestSpotifyArtistReleasesFailsAtCatalogPageSafetyCap(t *testing.T) {
 			return
 		}
 		albumRequests.Add(1)
+		if request.URL.Query().Get("include_groups") != "album,single,compilation" || request.URL.Query().Get("offset") != "0" {
+			t.Errorf("unexpected first Spotify page request: %s", request.URL)
+			return
+		}
 		offset := 0
 		if _, err := fmt.Sscanf(request.URL.Query().Get("offset"), "%d", &offset); err != nil {
 			t.Errorf("invalid offset: %v", err)
@@ -1551,8 +1561,57 @@ func TestSpotifyArtistReleasesFailsAtCatalogPageSafetyCap(t *testing.T) {
 	spotify.requestInterval = 0
 	_, err := spotify.ArtistReleases(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF")
 	var limitErr *CatalogLimitError
-	if !errors.As(err, &limitErr) || limitErr.Pages != 100 || albumRequests.Load() != 100 {
+	if !errors.As(err, &limitErr) || limitErr.Pages != 100 || albumRequests.Load() != 1 {
 		t.Fatalf("requests=%d limit=%#v err=%v", albumRequests.Load(), limitErr, err)
+	}
+}
+
+func TestSpotifyOverCapAppearsOnStreamKeepsPrimaryCatalog(t *testing.T) {
+	for _, since := range []string{"", "2026-07-01"} {
+		name := "full"
+		if since != "" {
+			name = "incremental"
+		}
+		t.Run(name, func(t *testing.T) {
+			var primaryRequests, appearanceRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/api/token" {
+					_, _ = io.WriteString(w, `{"access_token":"test-token","expires_in":3600}`)
+					return
+				}
+				if request.URL.Path != "/v1/artists/0OdUWJ0sBjDrqHygGUXeCF/albums" {
+					http.NotFound(w, request)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch request.URL.Query().Get("include_groups") {
+				case "album,single,compilation":
+					primaryRequests.Add(1)
+					_, _ = io.WriteString(w, `{"total":1,"items":[{"id":"primary-release","name":"Primary Release","album_type":"album","album_group":"album","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}]}`)
+				case "appears_on":
+					appearanceRequests.Add(1)
+					items := make([]string, 10)
+					for index := range items {
+						items[index] = fmt.Sprintf(`{"id":"guest-%d","name":"Guest %d","album_type":"album","album_group":"appears_on","total_tracks":10,"release_date":"2026-08-01","release_date_precision":"day"}`, index, index)
+					}
+					_, _ = fmt.Fprintf(w, `{"total":1001,"items":[%s]}`, strings.Join(items, ","))
+				default:
+					t.Errorf("unexpected Spotify groups=%q", request.URL.Query().Get("include_groups"))
+				}
+			}))
+			defer server.Close()
+			spotify := NewSpotify("client-id", "client-secret")
+			spotify.accountsURL, spotify.apiURL, spotify.client = server.URL, server.URL, server.Client()
+			spotify.requestInterval = 0
+
+			releases, err := spotify.ArtistReleasesSince(context.Background(), "0OdUWJ0sBjDrqHygGUXeCF", since)
+			if err != nil {
+				t.Fatalf("supplementary over-cap appears_on stream failed the primary catalog: %v", err)
+			}
+			if primaryRequests.Load() != 1 || appearanceRequests.Load() != 1 || len(releases) != 1 || releases[0].SpotifyID != "primary-release" {
+				t.Fatalf("primary requests=%d appearance requests=%d releases=%#v, want one complete primary result and one bounded appearance request", primaryRequests.Load(), appearanceRequests.Load(), releases)
+			}
+		})
 	}
 }
 

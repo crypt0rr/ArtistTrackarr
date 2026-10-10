@@ -1301,21 +1301,32 @@ func (s *Spotify) ArtistReleasesSince(ctx context.Context, artistID, since strin
 	}
 	var result []store.Release
 	seen := make(map[string]int)
-	// A full mixed catalog is safe to page until Spotify's reported total. For
-	// incremental polling, Spotify may place appears_on entries after the
-	// primary catalog, so fetch that group independently instead of letting the
-	// primary watermark hide guest releases.
-	if since == "" {
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation,appears_on", false, &result, seen); err != nil {
+	// Keep the complete primary catalog authoritative even when Spotify has
+	// more featured appearances than the request safety limit can safely walk.
+	// Fetching the supplementary stream separately ensures an enormous
+	// appears_on list cannot make the primary releases disappear.
+	if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", false, &result, seen); err != nil {
+		return nil, err
+	}
+	appearances := make([]store.Release, 0)
+	appearanceIDs := make(map[string]int)
+	if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", true, &appearances, appearanceIDs); err != nil {
+		var limitErr *CatalogLimitError
+		if !errors.As(err, &limitErr) || limitErr.Provider != "Spotify" {
 			return nil, err
 		}
-	} else {
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "album,single,compilation", false, &result, seen); err != nil {
-			return nil, err
+		// Featured appearances are supplementary. Keep the successfully
+		// completed primary stream and omit the incomplete guest stream rather
+		// than treating partial guest results as a complete catalog.
+		appearances = nil
+	}
+	for _, appearance := range appearances {
+		if existing, ok := seen[appearance.SpotifyID]; ok {
+			result[existing].Credits = mergeReleaseCredits(result[existing].Credits, appearance.Credits)
+			continue
 		}
-		if err := s.fetchSpotifyReleasePages(ctx, artistID, "appears_on", true, &result, seen); err != nil {
-			return nil, err
-		}
+		seen[appearance.SpotifyID] = len(result)
+		result = append(result, appearance)
 	}
 	s.cacheReleases(artistID, result)
 	return result, nil
@@ -1337,6 +1348,9 @@ func (s *Spotify) fetchSpotifyReleasePages(ctx context.Context, artistID, includ
 		var page spotifyAlbumPage
 		if err := s.getAPIJSON(ctx, "Spotify artist albums", endpoint, &page); err != nil {
 			return err
+		}
+		if page.Total > maxPages*pageSize {
+			return &CatalogLimitError{Provider: "Spotify", Pages: maxPages}
 		}
 		for _, item := range page.Items {
 			s.appendSpotifyRelease(result, seen, item, featuredOnly)
