@@ -1107,8 +1107,8 @@ restoring the backup taken before the upgrade.
 
 For a consistent backup, use the repository helper. It stops the app, resolves
 the volume actually mounted at `/data`, refuses missing or empty databases, and
-always attempts to restart the service. The archive contains the complete
-persistent data directory and is accompanied by a restrictive-permission
+restores the service to its original running state after the backup. The archive
+contains the complete persistent data directory and is accompanied by a restrictive-permission
 `.sha256` sidecar. Keep the archive and sidecar together:
 
 ```console
