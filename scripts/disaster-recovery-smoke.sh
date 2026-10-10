@@ -6,7 +6,7 @@ umask 077
 # project and volume owned by this process, then invokes the same backup and
 # restore helpers operators use. It never points either helper at a production
 # project or volume.
-HELPER_IMAGE="${DR_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}"
+HELPER_IMAGE="${DR_HELPER_IMAGE:-alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6}"
 IMAGE="${ARTIST_TRACKARR_IMAGE:-artist-trackarr:disaster-recovery}"
 suffix="${CI_RUN_ID:-$$}"
 project="${DR_COMPOSE_PROJECT_NAME:-artist-trackarr-dr-${suffix}}"
@@ -15,8 +15,6 @@ restore_prefix="artist-trackarr-dr-restore-${suffix}"
 base="http://127.0.0.1:${port}"
 jar=$(mktemp)
 archive=$(mktemp "${TMPDIR:-/tmp}/artist-trackarr-dr.XXXXXX.tgz")
-signal_archive="${archive}.signal.tgz"
-signal_marker="${signal_archive}.sha256"
 legacy_archive="${archive}.legacy.tgz"
 setup_token="${DR_SETUP_TOKEN:-ci-dr-setup-token-123456789012345678901234567890}"
 encryption_key="${APP_ENCRYPTION_KEY:-ci-dr-encryption-key-123456789012345678901234567890}"
@@ -42,7 +40,12 @@ cleanup() {
 	docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
 	docker ps -aq --filter "name=^/${restore_prefix}-" | xargs -r docker rm -f >/dev/null 2>&1 || true
 	docker volume ls -q --filter "name=^${restore_prefix}-" | xargs -r docker volume rm >/dev/null 2>&1 || true
-	rm -f "$jar" "$archive" "$archive.sha256" "$signal_archive" "$signal_marker" "$legacy_archive"
+	rm -f "$jar" "$archive" "$archive.sha256" "$legacy_archive" \
+		"${archive}.INT.tgz" "${archive}.INT.tgz.sha256" \
+		"${archive}.TERM.tgz" "${archive}.TERM.tgz.sha256" \
+		"${archive}.HUP.tgz" "${archive}.HUP.tgz.sha256" \
+		"${archive}.stopped.tgz" "${archive}.stopped.tgz.sha256" \
+		"${archive}.INT.tgz."*.tmp "${archive}.TERM.tgz."*.tmp "${archive}.HUP.tgz."*.tmp
 	exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
@@ -151,30 +154,55 @@ curl --fail --silent --show-error --cookie "$jar" --cookie-jar "$jar" \
 settings_page=$(curl --fail --silent --cookie "$jar" "$base/settings")
 grep -q 'CI encrypted destination' <<<"$settings_page"
 
-# Exercise the backup trap on SIGHUP after the service has actually been
+# Exercise every backup signal trap after the running service has actually
 # stopped. The interrupted archive must not become an apparent backup, and the
-# helper must restart the Compose service before returning.
-COMPOSE_SERVICE=app BACKUP_HELPER_IMAGE="$HELPER_IMAGE" \
-	./scripts/backup.sh "$signal_archive" &
-backup_pid=$!
-interrupt_when "$backup_pid" HUP backup_stopped
-if wait "$backup_pid"; then
-	echo 'disaster recovery: interrupted backup unexpectedly succeeded' >&2
-	exit 1
-fi
-wait_ready
-test ! -e "$signal_archive"
-test ! -e "$signal_marker"
-if compgen -G "${signal_archive}.*.tmp" >/dev/null; then
-	echo 'disaster recovery: interrupted backup left temporary files' >&2
-	exit 1
-fi
+# helper must restore the service's original running state before returning.
+for signal in INT TERM HUP; do
+	signal_archive="${archive}.${signal}.tgz"
+	signal_marker="${signal_archive}.sha256"
+	# Bash marks asynchronous jobs as ignoring SIGINT unless job control is
+	# enabled at launch. Enable it briefly so the shell helper can install and
+	# exercise its real INT trap in this non-interactive rehearsal.
+	set -m
+	COMPOSE_SERVICE=app BACKUP_HELPER_IMAGE="$HELPER_IMAGE" \
+		./scripts/backup.sh "$signal_archive" &
+	backup_pid=$!
+	set +m
+	interrupt_when "$backup_pid" "$signal" backup_stopped
+	if wait "$backup_pid"; then
+		echo "disaster recovery: backup interrupted by $signal unexpectedly succeeded" >&2
+		exit 1
+	fi
+	wait_ready
+	test ! -e "$signal_archive"
+	test ! -e "$signal_marker"
+	if compgen -G "${signal_archive}.*.tmp" >/dev/null; then
+		echo "disaster recovery: backup interrupted by $signal left temporary files" >&2
+		exit 1
+	fi
+done
 
 BACKUP_HELPER_IMAGE="$HELPER_IMAGE" ./scripts/backup.sh "$archive"
 test -s "$archive"
 test -s "$archive.sha256"
 test "$(stat -c '%a' "$archive")" = 600
 test "$(stat -c '%a' "$archive.sha256")" = 600
+
+# A backup of a service stopped by the operator must stay stopped after both
+# the archive and checksum have been written successfully.
+stopped_archive="${archive}.stopped.tgz"
+docker compose stop app >/dev/null
+if ! backup_stopped; then
+	echo 'disaster recovery: could not establish stopped-service fixture' >&2
+	exit 1
+fi
+BACKUP_HELPER_IMAGE="$HELPER_IMAGE" ./scripts/backup.sh "$stopped_archive"
+test -s "$stopped_archive"
+test -s "$stopped_archive.sha256"
+if ! backup_stopped; then
+	echo 'disaster recovery: backup restarted a service that was already stopped' >&2
+	exit 1
+fi
 
 image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
 case "$image_id" in

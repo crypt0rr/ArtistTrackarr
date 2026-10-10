@@ -5,7 +5,7 @@ CDPATH=''
 
 # Pin the helper image so backups do not silently change behavior when Alpine
 # publishes a new tag. The manifest digest supports the runtime architectures.
-HELPER_IMAGE=${BACKUP_HELPER_IMAGE:-alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b}
+HELPER_IMAGE=${BACKUP_HELPER_IMAGE:-alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6}
 
 # Resolve the volume mounted at /data from the Compose app container instead
 # of guessing the project-prefixed Docker volume name.
@@ -64,9 +64,20 @@ if [ "$mount_type" != "volume" ] || [ -z "$mount_name" ]; then
 	exit 1
 fi
 
-# Set the trap before stopping the app so a partial/failed stop still leaves
-# the service running again when the script exits.
-restart_needed=1
+# Preserve the service's original state. Set restart_needed before stopping a
+# running app so a partial/failed stop still restores that state on exit.
+if ! service_was_running=$(docker inspect --format '{{.State.Running}}' "$container_id"); then
+	echo "backup: could not determine whether service $service was running" >&2
+	exit 1
+fi
+case "$service_was_running" in
+	true) restart_needed=1 ;;
+	false) ;;
+	*)
+		echo "backup: unexpected running state for service $service: $service_was_running" >&2
+		exit 1
+		;;
+esac
 docker compose stop "$service" >/dev/null
 
 if ! docker run --rm --volumes-from "$container_id" "$HELPER_IMAGE" sh -ec 'test -s /data/artist-tracker.db'; then

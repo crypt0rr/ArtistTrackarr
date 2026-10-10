@@ -73,5 +73,24 @@ for script in scripts/*.sh; do
 	fi
 done
 
+# Keep the Alpine helpers used by shell rehearsals and smoke tests aligned with
+# the pinned runtime image. Renovate scans these duplicate script references,
+# while this check makes an accidental manual digest drift fail locally.
+docker_alpine_pin=$(sed -n 's/^FROM //p' Dockerfile | tail -n 1 | awk '{print $1}')
+if [ -z "$docker_alpine_pin" ]; then
+	printf '%s\n' "renovate-check: no pinned Alpine runtime image found in Dockerfile" >&2
+	exit 1
+fi
+helper_image_name=alpine
+for script in scripts/backup.sh scripts/container-smoke.sh scripts/disaster-recovery-smoke.sh scripts/restore-smoke.sh; do
+	helper_pins=$(grep -Eo "$helper_image_name:[^@[:space:]\"}]+@sha256:[a-f0-9]{64}" "$script" | sort -u)
+	pin_count=$(printf '%s\n' "$helper_pins" | awk 'NF {count++} END {print count+0}')
+	if [ "$pin_count" -ne 1 ] || [ "$helper_pins" != "$docker_alpine_pin" ]; then
+		printf 'renovate-check: %s Alpine helper pin does not match Dockerfile runtime (%s)\n' \
+			"$script" "$docker_alpine_pin" >&2
+		exit 1
+	fi
+done
+
 printf '%s\n' "renovate-check: Go toolchain identities are grouped"
 printf 'renovate-check: %s pinned quality tools agree across all call sites\n' "$(printf '%s\n' "$modules" | wc -l | tr -d ' ')"
