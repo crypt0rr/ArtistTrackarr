@@ -1493,6 +1493,94 @@ func TestSpotifyIDArtistIsRescheduledWhenSpotifyIsNotConfigured(t *testing.T) {
 	}
 }
 
+func TestEmptySyncAdvancesSpotifyWatermarkAcrossFallbackOutcomes(t *testing.T) {
+	cases := []struct {
+		name           string
+		withSpotify    bool
+		spotifyError   error
+		itunesError    error
+		itunesCooldown bool
+		mbCooldown     bool
+		wantError      bool
+	}{
+		{
+			name:         "non-429 Spotify failure and empty fallbacks",
+			withSpotify:  true,
+			spotifyError: errors.New("Spotify unavailable"),
+			wantError:    true,
+		},
+		{
+			name:        "healthy-empty Spotify and failed iTunes",
+			withSpotify: true,
+			itunesError: errors.New("iTunes unavailable"),
+			wantError:   true,
+		},
+		{
+			name:           "unconfigured Spotify with iTunes and MusicBrainz cooldowns",
+			itunesCooldown: true,
+			mbCooldown:     true,
+		},
+		{
+			name: "unconfigured Spotify with healthy-empty fallbacks",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := resolutionTestStore(t)
+			userID, err := database.CreateUser(ctx, "empty-sync@example.com", "unused", "member", "UTC", "empty-sync")
+			if err != nil {
+				t.Fatal(err)
+			}
+			artist, err := database.UpsertArtist(ctx, store.Artist{
+				MBID: "empty-sync-artist", Name: "Empty Sync Artist", SpotifyID: "spotify-empty-sync",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			options := []Option{WithSpotifyInterval(time.Hour), WithITunes(&itunesReleaseCatalog{err: tc.itunesError})}
+			if tc.withSpotify {
+				options = append(options, WithSpotify(&spotifyReleaseCatalog{err: tc.spotifyError}))
+			}
+			runner := New(database, &resolutionCatalog{}, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), options...)
+			if tc.itunesCooldown {
+				runner.setITunesProviderCooldown(now.Add(30 * time.Minute))
+			}
+			if tc.mbCooldown {
+				runner.setMusicBrainzCooldown(now.Add(45 * time.Minute))
+			}
+			if _, err := runner.syncOne(ctx, artist, now); tc.wantError && err == nil {
+				t.Fatal("sync succeeded despite provider errors")
+			} else if !tc.wantError && err != nil {
+				t.Fatalf("sync failed unexpectedly: %v", err)
+			}
+
+			after, err := database.ArtistByID(ctx, artist.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.SpotifyNextCheckAt == nil || !after.SpotifyNextCheckAt.After(now) {
+				t.Fatalf("spotify_next_check_at=%v is not in the future", after.SpotifyNextCheckAt)
+			}
+			due, err := database.ArtistsDue(ctx, now, 25)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, candidate := range due {
+				if candidate.ID == artist.ID {
+					t.Fatalf("artist remains due after empty sync: spotify_next=%v", after.SpotifyNextCheckAt)
+				}
+			}
+		})
+	}
+}
+
 func TestImportedIdentityVerificationPersistsCanonicalMetadata(t *testing.T) {
 	ctx := context.Background()
 	database := resolutionTestStore(t)
@@ -3128,6 +3216,153 @@ func TestTruncatedITunesCatalogueDoesNotSuppressTheFallback(t *testing.T) {
 	if observation.lastError == "" {
 		t.Fatal("truncation was not recorded as a provider reason, so an operator sees a healthy check")
 	}
+	if !observation.partial {
+		t.Fatal("usable rows from the truncated catalogue were not marked partial")
+	}
+}
+
+func TestTruncatedITunesCatalogueIsAppliedAlongsideMusicBrainz(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	userID, err := database.CreateUser(ctx, "itunes-partial@example.com", "unused", "member", "UTC", "itunes-partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "itunes-partial-artist", Name: "Partial Artist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
+	if err := database.ApplyReleaseBatches(ctx, artist, []store.ReleaseBatch{{Provider: "itunes"}}, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	shared := store.Release{
+		MBID: "itunes-partial-shared-mbid", ITunesID: "itunes-partial-shared-id",
+		ITunesURL: "https://music.apple.com/album/shared/101", Title: "Shared Future Album",
+		PrimaryType: "Album", FirstReleaseDate: "2026-11-10", DatePrecision: 3, Source: "itunes",
+	}
+	itunesOnly := store.Release{
+		MBID: "itunes-partial-only-mbid", ITunesID: "itunes-partial-only-id",
+		ITunesURL: "https://music.apple.com/album/itunes-only/102", Title: "iTunes Only Future Album",
+		PrimaryType: "Album", FirstReleaseDate: "2026-11-11", DatePrecision: 3, Source: "itunes",
+	}
+	mbOnly := store.Release{
+		MBID: "itunes-partial-mb-only-mbid", Title: "MusicBrainz Only Future Album",
+		MusicBrainzURL: "https://musicbrainz.org/release-group/itunes-partial-mb-only-mbid",
+		PrimaryType:    "Album", FirstReleaseDate: "2026-11-12", DatePrecision: 3, Source: "musicbrainz",
+	}
+	itunes := &canonicalITunesReleaseCatalog{
+		releases: []store.Release{shared, itunesOnly},
+		err:      &catalog.ITunesCatalogTruncatedError{ArtistID: "101", Limit: 200},
+	}
+	mb := &resolutionCatalog{releases: []store.Release{
+		{MBID: shared.MBID, Title: shared.Title, MusicBrainzURL: "https://musicbrainz.org/release-group/" + shared.MBID,
+			PrimaryType: shared.PrimaryType, FirstReleaseDate: shared.FirstReleaseDate, DatePrecision: shared.DatePrecision, Source: "musicbrainz"},
+		mbOnly,
+	}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(itunes))
+	if _, err := runner.syncOne(ctx, artist, now); err != nil {
+		t.Fatalf("sync with a truncated iTunes catalog and healthy MusicBrainz fallback: %v", err)
+	}
+	if len(itunes.canonicalIDs) != 1 || mb.releaseCalls.Load() != 1 {
+		t.Fatalf("provider calls iTunes=%d MusicBrainz=%d, want both once", len(itunes.canonicalIDs), mb.releaseCalls.Load())
+	}
+	var storedReleases int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=?`, artist.ID).Scan(&storedReleases); err != nil {
+		t.Fatal(err)
+	}
+	if storedReleases != 3 {
+		t.Fatalf("stored release groups=%d, want shared, iTunes-only, and MusicBrainz-only rows", storedReleases)
+	}
+	var sharedSource string
+	if err := database.DB.QueryRowContext(ctx, `SELECT source FROM release_groups WHERE mbid=?`, shared.MBID).Scan(&sharedSource); err != nil {
+		t.Fatal(err)
+	}
+	if sharedSource != "both" {
+		t.Fatalf("shared iTunes/MusicBrainz release source=%q, want both", sharedSource)
+	}
+	var events, distinctReleases int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*),COUNT(DISTINCT release_group_id) FROM notification_events WHERE user_id=?`, userID).
+		Scan(&events, &distinctReleases); err != nil {
+		t.Fatal(err)
+	}
+	if events != 3 || distinctReleases != 3 {
+		t.Fatalf("notification events=%d across %d releases, want one event per each of three releases", events, distinctReleases)
+	}
+}
+
+func TestTruncatedITunesRowsPersistAndRetryWhenMusicBrainzIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mbError    error
+		mbCooldown bool
+	}{
+		{name: "MusicBrainz failure", mbError: errors.New("MusicBrainz unavailable")},
+		{name: "MusicBrainz cooldown", mbCooldown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := resolutionTestStore(t)
+			userID, err := database.CreateUser(ctx, "itunes-partial-outage@example.com", "unused", "member", "UTC", "itunes-partial-outage")
+			if err != nil {
+				t.Fatal(err)
+			}
+			artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "itunes-partial-outage-artist", Name: "Partial Outage Artist"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.Follow(ctx, userID, artist.ID); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			itunesRelease := store.Release{
+				MBID: "itunes-partial-outage-release", ITunesID: "itunes-partial-outage-id",
+				Title: "Partial Catalogue Release", PrimaryType: "Album",
+				FirstReleaseDate: now.AddDate(0, 1, 0).Format("2006-01-02"), DatePrecision: 3, Source: "itunes",
+			}
+			provider := &canonicalITunesReleaseCatalog{
+				releases: []store.Release{itunesRelease},
+				err:      &catalog.ITunesCatalogTruncatedError{ArtistID: "202", Limit: 200},
+			}
+			mb := &resolutionCatalog{releaseErr: tc.mbError}
+			runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, 6*time.Hour,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
+			expectedRetry := now.Add(time.Minute)
+			if tc.mbCooldown {
+				expectedRetry = now.Add(45 * time.Minute)
+				runner.setMusicBrainzCooldown(expectedRetry)
+			}
+			_, syncErr := runner.syncOne(ctx, artist, now)
+			if tc.mbError != nil && syncErr == nil {
+				t.Fatal("sync succeeded despite a MusicBrainz failure")
+			}
+			if tc.mbError == nil && syncErr != nil {
+				t.Fatalf("cooldown sync failed unexpectedly: %v", syncErr)
+			}
+			var stored int
+			if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM release_groups WHERE artist_id=? AND itunes_id=?`, artist.ID, itunesRelease.ITunesID).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored != 1 {
+				t.Fatalf("truncated iTunes release rows stored=%d, want 1 despite MusicBrainz unavailability", stored)
+			}
+			var nextCheck string
+			if err := database.DB.QueryRowContext(ctx, `SELECT next_check_at FROM artists WHERE id=?`, artist.ID).Scan(&nextCheck); err != nil {
+				t.Fatal(err)
+			}
+			nextCheckAt, err := time.Parse(time.RFC3339Nano, nextCheck)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !nextCheckAt.Equal(expectedRetry) {
+				t.Fatalf("next_check_at=%v, want bounded retry %v", nextCheckAt, expectedRetry)
+			}
+		})
+	}
 }
 
 // TestCompleteITunesCatalogueStillCountsAsSuccess keeps the change off the
@@ -3141,17 +3376,71 @@ func TestCompleteITunesCatalogueStillCountsAsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &canonicalITunesReleaseCatalog{releases: []store.Release{{
-		MBID: "whole-release", ArtistID: artist.ID, Title: "Whole Release",
+		MBID: "whole-release", ITunesID: "whole-itunes-release", ArtistID: artist.ID, Title: "Whole Release",
 		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes",
 	}}}
-	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "whole-mb-release", Title: "MusicBrainz Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-02", DatePrecision: 3, Source: "musicbrainz",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
-	observation, err := runner.observeITunes(ctx, artist, time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC), true)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	if _, err := runner.syncOne(ctx, artist, now); err != nil {
+		t.Fatalf("sync a complete iTunes catalogue: %v", err)
+	}
+	if len(provider.canonicalIDs) != 1 || mb.releaseCalls.Load() != 0 {
+		t.Fatalf("iTunes canonical calls=%d MusicBrainz release calls=%d, want iTunes once and no fallback", len(provider.canonicalIDs), mb.releaseCalls.Load())
+	}
+	var itunesRows, musicBrainzRows int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='itunes'`).Scan(&itunesRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='musicbrainz'`).Scan(&musicBrainzRows); err != nil {
+		t.Fatal(err)
+	}
+	if itunesRows != 1 || musicBrainzRows != 0 {
+		t.Fatalf("provider observations iTunes=%d MusicBrainz=%d, want only one complete iTunes result", itunesRows, musicBrainzRows)
+	}
+}
+
+func TestAmbiguousITunesIdentityAddsNoEmptyBatchAndFallsBack(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "ambiguous-artist", Name: "Ambiguous Artist"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !observation.succeeded || observation.status != "healthy" {
-		t.Fatalf("a complete catalogue observation=%#v, want succeeded and healthy", observation)
+	itunes := &canonicalITunesReleaseCatalog{err: &catalog.ITunesAmbiguousArtistError{Name: artist.Name}}
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "ambiguous-mb-release", Title: "MusicBrainz Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-02", DatePrecision: 3, Source: "musicbrainz",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(itunes))
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	strategy, err := runner.observeReleaseProviders(ctx, artist, now, "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategy.batches) != 1 || strategy.batches[0].Provider != "musicbrainz" || len(strategy.batches[0].Releases) != 1 {
+		t.Fatalf("ambiguous iTunes fallback batches=%#v, want only the non-empty MusicBrainz batch", strategy.batches)
+	}
+	if mb.releaseCalls.Load() != 1 {
+		t.Fatalf("MusicBrainz calls=%d, want one fallback after ambiguous iTunes identity", mb.releaseCalls.Load())
+	}
+	if _, err := runner.syncOne(ctx, artist, now.Add(time.Minute)); err != nil {
+		t.Fatalf("full sync after ambiguous iTunes identity: %v", err)
+	}
+	var itunesRows, musicBrainzRows int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='itunes'`).Scan(&itunesRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='musicbrainz'`).Scan(&musicBrainzRows); err != nil {
+		t.Fatal(err)
+	}
+	if itunesRows != 0 || musicBrainzRows != 1 || mb.releaseCalls.Load() != 2 {
+		t.Fatalf("provider observations iTunes=%d MusicBrainz=%d, want only MusicBrainz", itunesRows, musicBrainzRows)
 	}
 }
 
