@@ -31,6 +31,13 @@ func TestPasswordChangeRevokesOutstandingResetLinks(t *testing.T) {
 	if err := s.ResetPasswordWithToken(ctx, reset, "stale-reset-hash"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("password change left reset link usable: %v", err)
 	}
+	user, err := s.UserByID(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.PasswordHash != "changed-hash" {
+		t.Fatalf("stale reset link changed password hash to %q, want the password-change hash", user.PasswordHash)
+	}
 	if email, linkedUser, err := s.ConsumeAuthToken(ctx, invite, "invite"); err != nil || email != "new-member@example.com" || linkedUser != nil {
 		t.Fatalf("password change altered invitation: email=%q linkedUser=%v err=%v", email, linkedUser, err)
 	}

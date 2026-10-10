@@ -136,6 +136,25 @@ func TestCrossOriginProtectionRejectsCrossSitePosts(t *testing.T) {
 	}
 }
 
+func TestCrossOriginProtectionRejectsUntrustedOriginWithoutFetchMetadata(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/logout", strings.NewReader(url.Values{"_csrf": {csrf}}.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://attacker.invalid")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with untrusted Origin and no Sec-Fetch-Site returned %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+}
+
 func TestCrossOriginProtectionAcceptsSameOriginPost(t *testing.T) {
 	_, server, client := authenticatedTestServer(t, nil, nil, nil)
 	csrf := getCSRF(t, client, server.URL+"/settings")
