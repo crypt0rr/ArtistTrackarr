@@ -53,12 +53,40 @@ releases without creating releases or notifications.
 Use the moon/sun button in the header to switch between light and dark mode;
 your choice is remembered in the browser.
 The running application version and project repository are available in the
-footer. The current release is `v0.63.5`; local and published images use the
+footer. The current release is `v0.64.0`; local and published images use the
 same source-controlled semantic version. Operational timestamps are stored in
 UTC and rendered in the signed-in administrator's configured timezone in the
 web UI and downloaded assurance report; machine-readable JSON and CSV exports
 remain RFC3339 UTC. Existing databases are normalized automatically during the
 v0.20.0 migration.
+
+The v0.64.0 release improves release discovery and delivery reliability while
+reducing the cost of followed-release dashboard queries; the clean-runner
+benchmark median improved about 45× on the same fixture. Spotify catalog
+pagination is bounded, empty results no longer stall scheduled checks, usable
+partial iTunes results survive secondary-provider failures, and MusicBrainz
+outages leave imported identities retryable. Spotify and iTunes rows can be
+claimed by their canonical MusicBrainz release without duplicate alerts, and
+corrected dates flow through the calendar, ICS, release-day reminders, and
+digests. Provider requests also batch more efficiently and apply rate limits
+consistently.
+
+Notification transports now bound response bodies, ignore ambient proxy
+settings, keep Telegram cooldowns scoped to each bot, escape parse-mode text,
+and avoid duplicate multi-chat retries. Generic destination rate limits remain
+scoped to the affected destination, and a database error after a successful
+send does not pause it. Recovery rehearsals run without sending real
+notifications. Untrusted cross-origin actions are rejected. Password changes
+revoke existing sessions and calendar tokens; outstanding password-reset links
+are invalidated when a password changes, a link is redeemed, or another link
+is issued. Release CI smoke-tests the published amd64 and arm64 image digests
+before moving tags.
+
+Startup takes a private SQLite snapshot before applying pending migrations;
+`MIGRATION_SNAPSHOT_RETENTION` defaults to two snapshots and accepts values
+from 1 through 10. A failed snapshot stops startup before schema changes.
+Backup and restore preserve the service's original running state and clean up
+after interruption.
 
 The v0.63.5 maintenance release refreshes the Dockerfile frontend digest,
 updates SQLite to v1.60.1, and upgrades the pinned golangci-lint tool to
@@ -826,7 +854,7 @@ GitHub Actions builds and publishes the Docker image to
 
 - `latest` and `main` follow the current `main` branch.
 - `sha-<commit>` identifies an exact source revision.
-- Pushing a tag such as `v0.63.5` publishes `0.63.5`, `0.63`, and `latest`.
+- Pushing a tag such as `v0.64.0` publishes `0.64.0`, `0.64`, and `latest`.
 
 Before those tags move, CI pushes the multi-architecture image by immutable
 digest, smoke-tests the exact amd64 and arm64 manifests with the expected
@@ -839,7 +867,7 @@ with each release. Local, branch, and release images show that same semantic
 version in the interface and User-Agent. Build provenance remains available
 through image labels and immutable SHA tags.
 
-Compose defaults to the current release image tag (`0.63.5` in this checkout).
+Compose defaults to the current release image tag (`0.64.0` in this checkout).
 Set `ARTIST_TRACKARR_IMAGE` to select another release, the moving `latest` tag,
 or a locally built image.
 
@@ -893,7 +921,7 @@ its project, volume, containers, and temporary archives on success or signal.
 Pin a deployment to a release by setting the Compose image before starting:
 
 ```console
-ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.63.5 docker compose up -d
+ARTIST_TRACKARR_IMAGE=ghcr.io/crypt0rr/artist-trackarr:0.64.0 docker compose up -d
 ```
 
 ## Configuration
