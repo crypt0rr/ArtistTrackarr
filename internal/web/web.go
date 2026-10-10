@@ -3,6 +3,7 @@ package web
 import (
 	"html/template"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,7 @@ type App struct {
 	jobs                    *jobs.Runner
 	logger                  *slog.Logger
 	templates               *template.Template
+	crossOriginProtection   *http.CrossOriginProtection
 	setupLimiter            *fixedWindowLimiter
 	loginLimiter            *fixedWindowLimiter
 	tokenLimiter            *fixedWindowLimiter

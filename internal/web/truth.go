@@ -42,7 +42,7 @@ func (a *App) releaseTruthAction(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(operationErr, store.ErrReleaseTruthDecidedByAnotherMember):
 			http.Error(w, "another household member recorded this release source decision; ask them or an administrator to change it", http.StatusForbidden)
 		default:
-			a.logger.Error("release truth decision failed", "path", r.URL.Path, "user_id", session.User.ID,
+			a.logger.Error("release truth decision failed", "route", routePattern(r), "user_id", session.User.ID,
 				"release_id", id, "error", operationErr)
 			http.Error(w, "release truth decision could not be saved", http.StatusInternalServerError)
 		}

@@ -40,7 +40,7 @@ func (a *App) syncArtist(w http.ResponseWriter, r *http.Request) {
 	}
 	following, err := a.store.IsFollowing(r.Context(), session.User.ID, id)
 	if err != nil {
-		a.logger.Error("artist follow lookup failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "artist_id", id, "error", err)
+		a.logger.Error("artist follow lookup failed", "page", "Artists", "route", routePattern(r), "user_id", session.User.ID, "artist_id", id, "error", err)
 		http.Error(w, "could not load this artist", http.StatusInternalServerError)
 		return
 	}
@@ -653,7 +653,7 @@ func (a *App) selectArtistResolution(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		a.logger.Error("artist resolution lookup failed", "page", "Review artist", "path", r.URL.Path, "resolution_id", id, "error", err)
+		a.logger.Error("artist resolution lookup failed", "page", "Review artist", "route", routePattern(r), "resolution_id", id, "error", err)
 		http.Error(w, "could not load this resolution", http.StatusInternalServerError)
 		return
 	}
@@ -686,7 +686,7 @@ func (a *App) cancelArtistResolution(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		a.logger.Error("cancel artist resolution failed", "path", r.URL.Path, "user_id", session.User.ID, "resolution_id", id, "error", err)
+		a.logger.Error("cancel artist resolution failed", "route", routePattern(r), "user_id", session.User.ID, "resolution_id", id, "error", err)
 		http.Error(w, "could not cancel this resolution", http.StatusInternalServerError)
 		return
 	}
@@ -727,7 +727,7 @@ func (a *App) exportArtists(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		a.logger.Error("artist export failed", "page", "Artists", "path", r.URL.Path, "user_id", session.User.ID, "error", err)
+		a.logger.Error("artist export failed", "page", "Artists", "route", routePattern(r), "user_id", session.User.ID, "error", err)
 		http.Error(w, "could not export followed artists", http.StatusInternalServerError)
 		return
 	}

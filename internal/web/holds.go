@@ -32,7 +32,7 @@ func (a *App) notificationHoldAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid notification hold action", http.StatusBadRequest)
 			return
 		}
-		a.logger.Error("notification hold action failed", "path", r.URL.Path,
+		a.logger.Error("notification hold action failed", "route", routePattern(r),
 			"user_id", session.User.ID, "hold_id", id, "action", action, "error", err)
 		http.Error(w, "notification hold could not be updated", http.StatusInternalServerError)
 		return

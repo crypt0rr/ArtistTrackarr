@@ -535,10 +535,20 @@ func New(cfg config.Config, s *store.Store, mb catalog.CatalogProvider, spotify 
 	if err != nil {
 		return nil, err
 	}
+	crossOriginProtection := http.NewCrossOriginProtection()
+	if cfg.PublicURL != nil && cfg.PublicURL.Scheme != "" && cfg.PublicURL.Host != "" {
+		// A reverse proxy can send an internal Host even though browsers use
+		// this public origin for legitimate same-origin form submissions.
+		origin := cfg.PublicURL.Scheme + "://" + cfg.PublicURL.Host
+		if err := crossOriginProtection.AddTrustedOrigin(origin); err != nil {
+			return nil, fmt.Errorf("register public URL as a trusted origin: %w", err)
+		}
+	}
 	return &App{
 		cfg: cfg, store: s, mb: mb, spotify: spotify, sender: sender,
 		itunes: itunesProvider,
 		cipher: cipher, artwork: art, jobs: runner, logger: logger, templates: tmpl,
+		crossOriginProtection:   crossOriginProtection,
 		setupLimiter:            newFixedWindowLimiter(10, 15*time.Minute),
 		loginLimiter:            newFixedWindowLimiter(20, 5*time.Minute),
 		tokenLimiter:            newFixedWindowLimiter(20, 5*time.Minute),
@@ -613,6 +623,13 @@ func timelineStatusClass(status string) string {
 func (a *App) Handler() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, a.recoverPanic, middleware.Compress(5), middleware.Timeout(90*time.Second), a.requestLogging)
+	crossOrigin := a.crossOriginProtection
+	if crossOrigin == nil {
+		crossOrigin = http.NewCrossOriginProtection()
+	}
+	// Fetch Metadata and Origin checks reject cross-origin browser writes before
+	// the signed double-submit CSRF token is checked.
+	r.Use(crossOrigin.Handler)
 	r.Use(a.securityHeaders)
 	r.Use(a.csrf)
 	r.Use(a.session)
@@ -786,10 +803,7 @@ func (a *App) recoverPanic(next http.Handler) http.Handler {
 			if len(stack) > 2048 {
 				stack = stack[:2048] + "..."
 			}
-			route := "unknown"
-			if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
-				route = rctx.RoutePattern()
-			}
+			route := routePattern(r)
 			if a.logger != nil {
 				a.logger.Error("handler panic recovered",
 					"scope", "http handler", "method", r.Method, "route", route,
@@ -806,12 +820,7 @@ func (a *App) requestLogging(next http.Handler) http.Handler {
 		started := time.Now()
 		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(wrapped, r)
-		route := "unknown"
-		if routeContext := chi.RouteContext(r.Context()); routeContext != nil {
-			if pattern := routeContext.RoutePattern(); pattern != "" {
-				route = pattern
-			}
-		}
+		route := routePattern(r)
 		if a.logger != nil {
 			a.logger.Debug("http request completed",
 				"request_id", middleware.GetReqID(r.Context()),
@@ -820,6 +829,18 @@ func (a *App) requestLogging(next http.Handler) http.Handler {
 		}
 	})
 }
+
+// routePattern returns chi's registered route pattern, which is safe to log
+// because it excludes path parameters such as reset and invitation tokens.
+func routePattern(r *http.Request) string {
+	if routeContext := chi.RouteContext(r.Context()); routeContext != nil {
+		if pattern := routeContext.RoutePattern(); pattern != "" {
+			return pattern
+		}
+	}
+	return "unknown"
+}
+
 func (a *App) csrf(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || strings.HasPrefix(r.URL.Path, "/calendar/feed/") {
@@ -971,7 +992,7 @@ func (a *App) data(r *http.Request, title string) PageData {
 			// The badge is optional navigation chrome. Keep the page usable when
 			// its count lookup is temporarily unavailable, while retaining a
 			// structured diagnostic for operators.
-			a.logger.Error("navigation inbox count lookup failed", "path", r.URL.Path,
+			a.logger.Error("navigation inbox count lookup failed", "route", routePattern(r),
 				"request_id", middleware.GetReqID(r.Context()), "error", err)
 		} else {
 			d.InboxUnreadCount = count
@@ -1051,7 +1072,7 @@ func (a *App) pageStoreError(r *http.Request, d *PageData, page, operation strin
 		return false
 	}
 	a.logger.Error("page data lookup failed", "page", page, "operation", operation,
-		"path", r.URL.Path, "request_id", middleware.GetReqID(r.Context()), "error", err)
+		"route", routePattern(r), "request_id", middleware.GetReqID(r.Context()), "error", err)
 	if d.Error == "" {
 		d.Error = "We couldn't load this page right now. Please try again."
 	}

@@ -2,14 +2,17 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/artist-tracker/internal/store"
 )
@@ -108,6 +111,170 @@ func TestCsrfStillRejectsAForgedPost(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode == http.StatusOK {
 		t.Fatal("a POST with a forged CSRF token was accepted")
+	}
+}
+
+func TestCrossOriginProtectionRejectsCrossSitePosts(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	for _, fetchSite := range []string{"same-site", "cross-site"} {
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/logout", strings.NewReader(url.Values{"_csrf": {csrf}}.Encode()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("Origin", "http://attacker.invalid")
+		request.Header.Set("Sec-Fetch-Site", fetchSite)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Errorf("POST with Sec-Fetch-Site %q returned %d, want %d", fetchSite, response.StatusCode, http.StatusForbidden)
+		}
+	}
+}
+
+func TestCrossOriginProtectionRejectsUntrustedOriginWithoutFetchMetadata(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/logout", strings.NewReader(url.Values{"_csrf": {csrf}}.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://attacker.invalid")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST with untrusted Origin and no Sec-Fetch-Site returned %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestCrossOriginProtectionAcceptsSameOriginPost(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/logout", strings.NewReader(url.Values{"_csrf": {csrf}}.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", request.URL.Scheme+"://"+request.URL.Host)
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	noRedirect := &http.Client{
+		Jar: client.Jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := noRedirect.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("same-origin POST was rejected: status=%d", response.StatusCode)
+	}
+}
+
+func TestCrossOriginProtectionTrustsConfiguredPublicOriginBehindProxy(t *testing.T) {
+	_, server, client := authenticatedTestServer(t, nil, nil, nil)
+	csrf := getCSRF(t, client, server.URL+"/settings")
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/logout", strings.NewReader(url.Values{"_csrf": {csrf}}.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.test")
+	noRedirect := &http.Client{
+		Jar: client.Jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := noRedirect.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("trusted public origin was rejected behind the proxy: status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestTokenRouteErrorsLogRoutePatternsWithoutBearerTokens(t *testing.T) {
+	var stdout bytes.Buffer
+	database, server, client := authenticatedTestServerLogging(t, &stdout, nil, nil, nil, nil)
+	var userID int64
+	if err := database.DB.QueryRow(`SELECT id FROM users WHERE email='member@example.com'`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	inviteToken, err := database.CreateAuthToken(context.Background(), "invite", "invitee@example.com", nil, userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetToken, err := database.CreateAuthToken(context.Background(), "reset", "member@example.com", &userID, userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf := getCSRF(t, client, server.URL+"/settings")
+
+	// Break only the optional inbox count lookup after the authenticated session
+	// and token routes are ready. The pages continue rendering while their error
+	// logs exercise the paths that carry bearer tokens.
+	if _, err := database.DB.Exec(`DROP TABLE release_groups`); err != nil {
+		t.Fatalf("force inbox count lookup failure: %v", err)
+	}
+	for _, route := range []struct {
+		name  string
+		token string
+	}{
+		{name: "invite", token: inviteToken},
+		{name: "reset", token: resetToken},
+	} {
+		response, err := client.Get(server.URL + "/" + route.name + "/" + route.token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+
+		response, err = client.PostForm(server.URL+"/"+route.name+"/"+route.token, url.Values{
+			"_csrf":    {csrf},
+			"password": {"short"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+	}
+	entries, err := database.ApplicationLogs(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted strings.Builder
+	for _, entry := range entries {
+		persisted.WriteString(entry.Message)
+		for _, attribute := range entry.Attributes {
+			persisted.WriteString(attribute.Key)
+			persisted.WriteString(attribute.Value)
+		}
+	}
+	for label, logs := range map[string]string{"stdout": stdout.String(), "persisted": persisted.String()} {
+		for _, token := range []string{inviteToken, resetToken} {
+			if strings.Contains(logs, token) {
+				t.Errorf("%s logs contained a raw bearer token", label)
+			}
+		}
+		for _, pattern := range []string{"/invite/{token}", "/reset/{token}"} {
+			if !strings.Contains(logs, pattern) {
+				t.Errorf("%s logs did not retain safe route pattern %q: %s", label, pattern, logs)
+			}
+		}
 	}
 }
 
