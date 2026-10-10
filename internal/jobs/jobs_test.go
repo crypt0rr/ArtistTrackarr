@@ -1520,6 +1520,9 @@ func TestEmptySyncAdvancesSpotifyWatermarkAcrossFallbackOutcomes(t *testing.T) {
 			itunesCooldown: true,
 			mbCooldown:     true,
 		},
+		{
+			name: "unconfigured Spotify with healthy-empty fallbacks",
+		},
 	}
 
 	for _, tc := range cases {
@@ -3373,17 +3376,71 @@ func TestCompleteITunesCatalogueStillCountsAsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &canonicalITunesReleaseCatalog{releases: []store.Release{{
-		MBID: "whole-release", ArtistID: artist.ID, Title: "Whole Release",
+		MBID: "whole-release", ITunesID: "whole-itunes-release", ArtistID: artist.ID, Title: "Whole Release",
 		PrimaryType: "Album", FirstReleaseDate: "2026-09-01", DatePrecision: 3, Source: "itunes",
 	}}}
-	runner := New(database, nil, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "whole-mb-release", Title: "MusicBrainz Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-02", DatePrecision: 3, Source: "musicbrainz",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(provider))
-	observation, err := runner.observeITunes(ctx, artist, time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC), true)
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	if _, err := runner.syncOne(ctx, artist, now); err != nil {
+		t.Fatalf("sync a complete iTunes catalogue: %v", err)
+	}
+	if len(provider.canonicalIDs) != 1 || mb.releaseCalls.Load() != 0 {
+		t.Fatalf("iTunes canonical calls=%d MusicBrainz release calls=%d, want iTunes once and no fallback", len(provider.canonicalIDs), mb.releaseCalls.Load())
+	}
+	var itunesRows, musicBrainzRows int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='itunes'`).Scan(&itunesRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='musicbrainz'`).Scan(&musicBrainzRows); err != nil {
+		t.Fatal(err)
+	}
+	if itunesRows != 1 || musicBrainzRows != 0 {
+		t.Fatalf("provider observations iTunes=%d MusicBrainz=%d, want only one complete iTunes result", itunesRows, musicBrainzRows)
+	}
+}
+
+func TestAmbiguousITunesIdentityAddsNoEmptyBatchAndFallsBack(t *testing.T) {
+	ctx := context.Background()
+	database := resolutionTestStore(t)
+	artist, err := database.UpsertArtist(ctx, store.Artist{MBID: "ambiguous-artist", Name: "Ambiguous Artist"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !observation.succeeded || observation.status != "healthy" {
-		t.Fatalf("a complete catalogue observation=%#v, want succeeded and healthy", observation)
+	itunes := &canonicalITunesReleaseCatalog{err: &catalog.ITunesAmbiguousArtistError{Name: artist.Name}}
+	mb := &resolutionCatalog{releases: []store.Release{{
+		MBID: "ambiguous-mb-release", Title: "MusicBrainz Release", PrimaryType: "Album",
+		FirstReleaseDate: "2026-09-02", DatePrecision: 3, Source: "musicbrainz",
+	}}}
+	runner := New(database, mb, catalog.AlbumEPNormalizer{}, nil, nil, time.Hour,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), WithITunes(itunes))
+	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
+	strategy, err := runner.observeReleaseProviders(ctx, artist, now, "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategy.batches) != 1 || strategy.batches[0].Provider != "musicbrainz" || len(strategy.batches[0].Releases) != 1 {
+		t.Fatalf("ambiguous iTunes fallback batches=%#v, want only the non-empty MusicBrainz batch", strategy.batches)
+	}
+	if mb.releaseCalls.Load() != 1 {
+		t.Fatalf("MusicBrainz calls=%d, want one fallback after ambiguous iTunes identity", mb.releaseCalls.Load())
+	}
+	if _, err := runner.syncOne(ctx, artist, now.Add(time.Minute)); err != nil {
+		t.Fatalf("full sync after ambiguous iTunes identity: %v", err)
+	}
+	var itunesRows, musicBrainzRows int
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='itunes'`).Scan(&itunesRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM provider_observations WHERE provider='musicbrainz'`).Scan(&musicBrainzRows); err != nil {
+		t.Fatal(err)
+	}
+	if itunesRows != 0 || musicBrainzRows != 1 || mb.releaseCalls.Load() != 2 {
+		t.Fatalf("provider observations iTunes=%d MusicBrainz=%d, want only MusicBrainz", itunesRows, musicBrainzRows)
 	}
 }
 
