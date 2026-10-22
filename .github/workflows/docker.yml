@@ -134,7 +134,7 @@ jobs:
         with:
           # Keep CI on the same patched Go toolchain used by the Docker build
           # and the module language version.
-          go-version: '1.27.2'
+          go-version: '1.27.3'
           cache: true
 
       - name: Run race detector
