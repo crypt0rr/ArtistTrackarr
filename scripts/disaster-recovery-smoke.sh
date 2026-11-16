@@ -6,7 +6,7 @@ umask 077
 # project and volume owned by this process, then invokes the same backup and
 # restore helpers operators use. It never points either helper at a production
 # project or volume.
-HELPER_IMAGE="${DR_HELPER_IMAGE:-alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6}"
+HELPER_IMAGE="${DR_HELPER_IMAGE:-alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf}"
 IMAGE="${ARTIST_TRACKARR_IMAGE:-artist-trackarr:disaster-recovery}"
 suffix="${CI_RUN_ID:-$$}"
 project="${DR_COMPOSE_PROJECT_NAME:-artist-trackarr-dr-${suffix}}"
